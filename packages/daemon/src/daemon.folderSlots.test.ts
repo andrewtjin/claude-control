@@ -49,11 +49,8 @@ import {
 } from './controlPlaneClient.js';
 import { AutoSwitcher } from './autoSwitcher.js';
 import { Daemon, type SwitchEngineLike } from './daemon.js';
-import type {
-  BackgroundSession,
-  BackgroundSessionHost,
-  SessionActivity,
-} from './backgroundMover.js';
+import { FakeBackgroundHost } from './fakeBackgroundHost.js';
+import type { BackgroundSessionHost } from './backgroundMover.js';
 
 const NOW = Date.parse('2026-07-25T19:00:00.000Z');
 const HOUR_MS = 60 * 60 * 1000;
@@ -1801,52 +1798,26 @@ describe('daemon folder-bound slots — background sessions move onto their fold
   const HEALTHY = { limits: [{ kind: 'weekly_all', percent: 10, resets_at: iso(NOW + DAY_MS) }] };
   const OUT = { limits: [{ kind: 'weekly_all', percent: 100, resets_at: iso(NOW + 3 * HOUR_MS) }] };
 
-  /** A Claude Code service on the global slot hosting one idle background session in `cwd`; a
-   *  resume moves it to the named config dir, unless `silent` (accepted, never shows up). Records
-   *  every command. */
+  /** A Claude Code service on the global slot hosting one idle background session in `cwd`, its
+   *  row there saved with one option; a resume moves it to the named config dir, unless `silent`
+   *  (accepted, never shows up). Records every command. */
   function recordingHost(
     cwd: string,
     opts: { silent?: boolean } = {},
   ): { host: BackgroundSessionHost; calls: string[] } {
-    const calls: string[] = [];
-    const hosted = new Map<string | null, BackgroundSession[]>([
-      [null, [{ short: SID.slice(0, 8), sessionId: SID, cwd }]],
-    ]);
-    const host: BackgroundSessionHost = {
-      listHosted: (configDir) => {
-        calls.push(`list ${String(configDir)}`);
-        return Promise.resolve([...(hosted.get(configDir) ?? [])]);
-      },
-      activity: (configDir) => {
-        calls.push(`activity ${String(configDir)}`);
-        return Promise.resolve(
-          new Map<string, SessionActivity>([[SID.slice(0, 8), { idle: true, name: 'pods' }]]),
-        );
-      },
-      stop: (configDir, short) => {
-        calls.push(`stop ${String(configDir)} ${short}`);
-        hosted.set(configDir, []);
-        return Promise.resolve();
-      },
-      attachedNow: () => Promise.resolve(false),
-      lockSession: () => Promise.resolve({ release: () => {} }),
-      savedOptions: (configDir) =>
-        Promise.resolve(
-          configDir === null
-            ? { kind: 'replayable' as const, options: ['--model=opus'] }
-            : { kind: 'none' as const },
-        ),
-      resumeIdle: (input) => {
-        calls.push(`resume ${String(input.configDir)} ${input.sessionId}`);
-        if (opts.silent !== true) {
-          hosted.set(input.configDir, [
-            { short: input.short, sessionId: input.sessionId, cwd: input.cwd },
-          ]);
-        }
-        return Promise.resolve();
-      },
-    };
-    return { host, calls };
+    const profile = `/profiles/${ruleSlotId('g1')}`;
+    const host = new FakeBackgroundHost([null, profile]);
+    host.add(
+      null,
+      { short: SID.slice(0, 8), sessionId: SID, cwd },
+      { idle: true, name: 'pods' },
+      { saved: { kind: 'replayable', options: ['--model=opus'] } },
+    );
+    if (opts.silent === true) {
+      host.silentResumeIn.add(null);
+      host.silentResumeIn.add(profile);
+    }
+    return { host, calls: host.calls };
   }
 
   /** The notices of a move that failed. */
@@ -1878,7 +1849,9 @@ describe('daemon folder-bound slots — background sessions move onto their fold
     await waitFor(() => movedNotices(rig.relay).length > 0);
 
     expect(calls).toContain('stop null 1ee43a2b');
-    expect(calls).toContain(`resume /profiles/${ruleSlotId('g1')} ${SID}`);
+    expect(calls).toContainEqual(
+      expect.stringMatching(new RegExp(`^resume /profiles/${ruleSlotId('g1')} ${SID} `)),
+    );
     const [notice] = movedNotices(rig.relay);
     expect(notice?.level).toBe('info');
     expect(notice?.body).toContain('"pods" (1ee43a2b) in C:/work onto Member One');
@@ -1957,7 +1930,9 @@ describe('daemon folder-bound slots — background sessions move onto their fold
 
     expect(hopsIn(controls, ruleSlotId('g1'))).toEqual(['m1']);
     expect(countUsageSnapshots(rig.relay)).toBe(1);
-    expect(calls).toContain(`resume /profiles/${ruleSlotId('g1')} ${SID}`);
+    expect(calls).toContainEqual(
+      expect.stringMatching(new RegExp(`^resume /profiles/${ruleSlotId('g1')} ${SID} `)),
+    );
     expect(movedNotices(rig.relay)[0]?.body).toContain('onto Inc One');
   });
 

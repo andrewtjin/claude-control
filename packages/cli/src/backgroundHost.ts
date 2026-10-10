@@ -9,9 +9,11 @@
 //     session id, working directory and the pid of its terminal host. It also holds attach secrets;
 //     only the four fields above are ever read out of it, and nothing from it is logged;
 //   - `jobs/<short>/state.json`: the session's job row, with its state (`running`, `stopped`,
-//     `failed`...), its name, the launch options it saved (`respawnFlags`, see {@link replayOptions})
-//     and the permission rules granted while it ran (`sessionPermissionRules`). One session can have
-//     a row in several config dirs, each with its own state, name and options;
+//     `failed`...), its name, the launch options it saved (`respawnFlags`, see {@link replayOptions}),
+//     the permission rules granted while it ran (`sessionPermissionRules`), the worktree Claude Code
+//     made for it (`worktreePath`), the conversation it runs now after /clear (`resumeSessionId`) and
+//     the work it holds between turns (`inFlight`: a scheduled wakeup, a background task). One session
+//     can have a row in several config dirs, each with its own state, name and options;
 //   - `daemon/attach-journal/*.json`: one entry per terminal opening a session of the service
 //     (`claude attach`, or the agent view), naming that terminal's process; Claude Code clears it
 //     when the terminal leaves the session. It does not say which session.
@@ -19,7 +21,10 @@
 // which every folder profile shares with the main config dir. Each entry says whether the session is
 // a background one (`kind: bg`, with its job's short id) or open in a terminal (`interactive`), and
 // what it is doing (`status`: `idle` between turns, `busy` in one, `waiting` on a prompt), whichever
-// service hosts it. A session's conversation is `projects/<project>/<session id>.jsonl`, shared too;
+// service hosts it. Registry and roster entries record their process's start time (`procStart`, a
+// FILETIME on Windows), so a file a hard-killed process left behind is not taken for a live session
+// when its pid is reused: a decision reads them verified against the operating system's start time,
+// as Claude Code does. A session's conversation is `projects/<project>/<session id>.jsonl`, shared too;
 // its title (what `claude --resume <name>` matches) is its last `custom-title` line, else its last
 // `ai-title` line.
 // Everything else is asked of Claude Code itself, run as the operator's own `claude` on PATH (the
@@ -29,20 +34,28 @@
 //   - `claude stop <short>`: stops it. It returns a moment before the session has exited, so the
 //     host waits until the registry and the roster no longer hold it;
 //   - `claude --bg --resume <session id> [options]` with no prompt: resumes it idle under that
-//     config dir's service ("idle — send a prompt to start"), or prints that it started a copy.
-// `claude rm` is never run: it deletes the session's worktree and branch along with its job row.
+//     config dir's service ("idle — send a prompt to start"), or prints that it started a copy;
+//   - `claude rm <short>`: deletes the job row and keeps the conversation (measured: the transcript is
+//     unchanged), but also deletes a worktree recorded on the row, and kills the session when it is
+//     live. So it is run only on a row that records no worktree, for a session that runs nowhere.
 // These shapes were measured against Claude Code 2.1.295; anything else is read defensively, and an
-// unexpected answer fails the operation rather than guessing.
+// unexpected answer fails the operation rather than guessing. Every command runs detached from the
+// operator's terminal, so a Ctrl-C there cannot cut one off half way.
 
 import { spawn as nodeSpawn } from 'node:child_process';
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import type {
-  BackgroundSession,
-  BackgroundSessionHost,
-  SavedLaunch,
-  SessionActivity,
-  SessionLock,
+import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
+import { dirname, join, resolve as resolvePath } from 'node:path';
+import {
+  JOB_ID_PATTERN,
+  SESSION_ID_PATTERN,
+  type BackgroundSession,
+  type BackgroundSessionHost,
+  type JobRow,
+  type LiveSession,
+  type RowRead,
+  type SavedLaunch,
+  type SessionActivity,
+  type SessionLock,
 } from '@claude-control/daemon';
 import { LockTimeoutError, acquireLock } from '@claude-control/switch-engine';
 import { findClaudeOnPath, resolveLaunchTarget } from './launcher.js';
@@ -60,56 +73,53 @@ export type RunClaude = (
   opts: { env: NodeJS.ProcessEnv; cwd?: string },
 ) => Promise<ClaudeRunResult>;
 
-/** One live entry of Claude Code's shared session registry (`sessions/<pid>.json`). */
-export interface LiveSession {
-  /** The session process. Only entries whose process is alive are ever returned. */
-  pid: number;
-  /** The full, lowercase session id. */
-  sessionId: string;
-  /** `bg` for a session a background service hosts, `interactive` for one open in a terminal. */
-  kind: string;
-  /** `idle` between turns, `busy` in one, `waiting` on a prompt; absent while it starts. */
-  status?: string;
-  /** A background session's short id. */
-  jobId?: string;
-  name?: string;
-  cwd?: string;
-}
-
-/** One job row a config dir holds for a session. */
-export interface JobRow {
-  short: string;
-  sessionId: string;
-  /** Claude Code's state for it: `running`, `working`, `stopped`, `failed`, ... */
-  state: string;
-  name?: string;
-  cwd?: string;
-  /** When the row last changed (ISO 8601), to tell the latest of several apart. */
-  updatedAt?: string;
-}
+export type { JobRow, LiveSession } from '@claude-control/daemon';
 
 /** The host `cctl claude` reads to find where a background session lives (see
- *  backgroundAttach.ts): the daemon's seam, plus the shared registry, each config dir's job rows,
- *  the folder profiles and a session's title. */
+ *  backgroundAttach.ts): the daemon's seam, plus what only an operator's launch needs. */
 export interface ClaudeBackgroundHost extends BackgroundSessionHost {
-  /** Every live entry of the shared session registry. */
-  liveSessions(): Promise<LiveSession[]>;
-  /** Every job row a config dir holds; rows that cannot be read are left out. */
-  jobRows(configDir: string | null): Promise<JobRow[]>;
-  /** Every folder profile dir under the profiles root, including those of rules since removed:
-   *  each is a config dir with a background service of its own. */
-  profileConfigDirs(): Promise<string[]>;
   /** A session's title, as `claude --resume <name>` matches it, or undefined when it has none or
-   *  its conversation cannot be found. */
+   *  its conversation cannot be found. Reads the whole conversation. */
   sessionTitle(sessionId: string): Promise<string | undefined>;
+  /** The title of every conversation filed under these folders' projects, by session id: what
+   *  `claude --resume <name>` searches among. Read cheaply (the head and tail of each conversation,
+   *  where Claude Code writes a title and re-writes it on exit), so a title set mid-conversation of
+   *  a session that has not exited since can be missed. */
+  titlesIn(folders: readonly string[]): Promise<Map<string, string>>;
+  /** Whether the attach journal of a config dir's service shows the terminal of this process
+   *  (the one `cctl claude` started) right now. */
+  attachedBy(configDir: string | null, pid: number): Promise<boolean>;
+  /** The CLAUDE_CONFIG_DIR that reaches a config dir's service, or undefined for none (the main
+   *  config dir at its default place): a launch there is run with exactly this. */
+  configEnv(configDir: string | null): string | undefined;
+}
+
+/** How a host reaches the main config dir, from the paths cctl resolved: the dir itself, and
+ *  whether Claude Code reaches it through CLAUDE_CONFIG_DIR, which is so exactly when its
+ *  `.claude.json` lives inside it (the default `~/.claude` keeps it beside it, as `~/.claude.json`). */
+export function mainConfigOf(paths: { claudeDir: string; claudeJsonPath: string }): {
+  mainConfigDir: string;
+  mainConfigDirInEnv: boolean;
+} {
+  return {
+    mainConfigDir: paths.claudeDir,
+    mainConfigDirInEnv: resolvePath(dirname(paths.claudeJsonPath)) === resolvePath(paths.claudeDir),
+  };
 }
 
 export interface ClaudeBackgroundHostOptions {
   /** The main config dir: the global slot's, which a `null` config dir names. */
   mainConfigDir: string;
+  /**
+   * Whether Claude Code reaches the main config dir through CLAUDE_CONFIG_DIR (a main dir set by
+   * that variable) rather than with it unset (the default `~/.claude`, whose `.claude.json` sits
+   * beside it, not in it: naming it in CLAUDE_CONFIG_DIR would be another config). Default: whether
+   * this process's environment sets it.
+   */
+  mainConfigDirInEnv?: boolean;
   /** Where the cross-process move locks live, one per session (see {@link moveLocksDir}). */
   moveLockDir: string;
-  /** cctl's folder profiles root, listed by {@link ClaudeBackgroundHost.profileConfigDirs}. */
+  /** cctl's folder profiles root: every directory in it is a config dir with a service. */
   profilesRoot?: string;
   /** The environment Claude Code is run with (default: this process's). */
   env?: NodeJS.ProcessEnv;
@@ -117,6 +127,9 @@ export interface ClaudeBackgroundHostOptions {
   /** How Claude Code is run (default: the `claude` on PATH, without a shell). */
   run?: RunClaude;
   readFile?: (path: string) => string;
+  /** The head and the tail of a conversation, where its title lines are (default: read from disk,
+   *  {@link TITLE_WINDOW_BYTES} of each end); undefined when it cannot be read. */
+  readEnds?: (path: string) => string | undefined;
   /** The names in a directory; throws (ENOENT) for one that does not exist. */
   readDir?: (path: string) => string[];
   isProcessAlive?: (pid: number) => boolean;
@@ -127,6 +140,12 @@ export interface ClaudeBackgroundHostOptions {
   clock?: () => number;
   /** How long a stopped session may take to exit before the stop counts as not seen through. */
   stopExitTimeoutMs?: number;
+  /** The operating system's start time of each live process, as Claude Code records one
+   *  (`procStart`); a process it cannot read is left out (default: one Get-Process call on Windows,
+   *  one `ps` call elsewhere). */
+  processStarts?: (pids: readonly number[]) => Promise<Map<number, string>>;
+  /** How often a held move lock's claim is refreshed (default {@link MOVE_LOCK_REFRESH_MS}). */
+  lockRefreshMs?: number;
 }
 
 /** Where the move locks live under cctl's data dir (the vault dir's parent). */
@@ -143,16 +162,25 @@ const CLAUDE_COMMAND_TIMEOUT_MS = 60_000;
  *  and short of anything the operator would wait out. */
 const DEFAULT_STOP_EXIT_TIMEOUT_MS = 10_000;
 const STOP_EXIT_POLL_MS = 100;
-/** A move lock whose holder is older than this is presumed dead even when its process looks alive
- *  (a reused pid). Well above the longest move: a stop, a resume, its confirm window and the tries
- *  of a way back, each bounded by the command timeout. A holder that died is noticed at once. */
-const MOVE_LOCK_STALE_MS = 10 * 60_000;
+/** A move lock whose claim has not been refreshed for this long is presumed dead even when its
+ *  process looks alive (a reused pid). A live holder refreshes its claim every
+ *  {@link MOVE_LOCK_REFRESH_MS} for as long as it holds it, however long that is (a move that waits
+ *  on Claude Code, then the hold until a terminal shows up), so no live holder ever outlives it; a
+ *  holder that died is noticed at once by its pid. */
+const MOVE_LOCK_STALE_MS = 2 * 60_000;
+export const MOVE_LOCK_REFRESH_MS = 20_000;
 const MOVE_LOCK_POLL_MS = 250;
+/** How long a process's start time is taken as read (Claude Code keeps its own reads a minute). */
+const START_TIME_TTL_MS = 60_000;
+/** How long the start-time query may take before every start it was to read counts as unknown. */
+const START_QUERY_TIMEOUT_MS = 10_000;
+/** How much of each end of a conversation a title search reads. */
+const TITLE_WINDOW_BYTES = 64 * 1024;
 
-const SHORT_ID = /^[0-9a-f]{8}$/;
+const SHORT_ID = JOB_ID_PATTERN;
+const SESSION_ID = SESSION_ID_PATTERN;
 /** How Claude Code says a resume started a copy instead (every reason it gives ends this way). */
 const COPY_STARTED = /started a (?:restricted )?copy(?: of that conversation)? as ([0-9a-f]{8})/;
-const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
  * The launch options Claude Code saves in a job row (`respawnFlags`), by how it reads them: options
@@ -346,6 +374,136 @@ function holdsPermissionRules(rules: unknown): boolean {
   );
 }
 
+/**
+ * Whether a row's `inFlight` record holds work between turns: a scheduled wakeup, a background task
+ * or monitor, a queued prompt. Claude Code writes an empty record (`tasks: 0`, no `wake`) for a
+ * session holding none; anything else, read or not, counts as work a stop would drop.
+ */
+export function holdsPendingWork(inFlight: unknown): boolean {
+  if (inFlight === undefined || inFlight === null) return false;
+  if (typeof inFlight !== 'object' || Array.isArray(inFlight)) return true;
+  const f = inFlight as Record<string, unknown>;
+  const count = (v: unknown): boolean => v !== undefined && v !== 0;
+  const kinds = f.kinds;
+  return (
+    count(f.tasks) ||
+    count(f.queued) ||
+    count(f.drainableMonitors) ||
+    f.wake !== undefined ||
+    (kinds !== undefined && (!Array.isArray(kinds) || kinds.length > 0))
+  );
+}
+
+/**
+ * Whether a process's start time, as the operating system reports it now, is the one Claude Code
+ * recorded for it, by Claude Code's own rule: equal, or not comparable (nothing read now; or, on
+ * Windows, one a FILETIME and the other .NET ticks, told apart by size), which counts as the same.
+ */
+export function sameProcessStart(
+  recorded: string,
+  actual: string | undefined,
+  platform: NodeJS.Platform,
+): boolean {
+  if (actual === undefined || actual === recorded) return true;
+  if (platform !== 'win32') return false;
+  const r = Number(recorded);
+  const a = Number(actual);
+  return Number.isFinite(r) && Number.isFinite(a) && r > 3e17 !== a > 3e17;
+}
+
+/** Read live processes' start times in one call: `Get-Process` on Windows (each a FILETIME, as
+ *  Claude Code records it there), `ps -o lstart` elsewhere (as Claude Code reads it, in UTC and the
+ *  C locale). A process that cannot be read, or a query that fails, is left out. */
+function defaultProcessStarts(
+  platform: NodeJS.Platform,
+): (pids: readonly number[]) => Promise<Map<number, string>> {
+  return (pids) =>
+    new Promise((resolve) => {
+      const out = new Map<number, string>();
+      const list = pids.filter((pid) => Number.isInteger(pid) && pid > 0).join(',');
+      if (list === '') {
+        resolve(out);
+        return;
+      }
+      const [command, args, env]: [string, string[], NodeJS.ProcessEnv] =
+        platform === 'win32'
+          ? [
+              'powershell.exe',
+              [
+                '-NoProfile',
+                '-NonInteractive',
+                '-Command',
+                `Get-Process -Id ${list} -ErrorAction SilentlyContinue | ` +
+                  'ForEach-Object { "$($_.Id) $($_.StartTime.ToFileTimeUtc())" }',
+              ],
+              process.env,
+            ]
+          : ['ps', ['-o', 'pid=,lstart=', '-p', list], { ...process.env, LC_ALL: 'C', TZ: 'UTC' }];
+      let text = '';
+      let child;
+      try {
+        child = nodeSpawn(command, args, {
+          env,
+          stdio: ['ignore', 'pipe', 'ignore'],
+          shell: false,
+          windowsHide: true,
+          detached: true,
+        });
+      } catch {
+        resolve(out);
+        return;
+      }
+      const timer = setTimeout(() => child.kill(), START_QUERY_TIMEOUT_MS);
+      child.stdout.setEncoding('utf8').on('data', (c: string) => (text += c));
+      child.on('error', () => {
+        clearTimeout(timer);
+        resolve(out);
+      });
+      child.on('close', () => {
+        clearTimeout(timer);
+        for (const line of text.split(/\r?\n/)) {
+          const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
+          if (m !== null) out.set(Number(m[1]), m[2]!);
+        }
+        resolve(out);
+      });
+    });
+}
+
+/** The `projects/` dir name Claude Code files a folder's conversations under: every character that
+ *  is not a letter or digit becomes `-`. Past 200 characters Claude Code keeps the first 200 and
+ *  adds a hash of the rest, which is not reproduced here: such a folder is matched by that prefix. */
+export function projectDirName(folder: string): { exact: string } | { prefix: string } {
+  const name = folder.replace(/[^A-Za-z0-9]/g, '-');
+  return name.length <= 200 ? { exact: name } : { prefix: `${name.slice(0, 200)}-` };
+}
+
+/** The head and the tail of a file, at most {@link TITLE_WINDOW_BYTES} each: where a conversation's
+ *  title lines are. Undefined when it cannot be read. */
+function headAndTail(path: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    const size = statSync(path).size;
+    const read = (at: number, length: number): string => {
+      const buf = Buffer.alloc(length);
+      const n = readSync(fd!, buf, 0, length, at);
+      return buf.subarray(0, n).toString('utf8');
+    };
+    if (size <= 2 * TITLE_WINDOW_BYTES) return read(0, size);
+    return `${read(0, TITLE_WINDOW_BYTES)}\n${read(size - TITLE_WINDOW_BYTES, TITLE_WINDOW_BYTES)}`;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** One word of a command line, quoted for the operator's shell when it needs it. */
+function shellWord(word: string): string {
+  return /^[A-Za-z0-9_@%+=:,./\\-]+$/.test(word) ? word : `"${word.replace(/"/g, '\\"')}"`;
+}
+
 /** The first line of a command's output, trimmed, for an error message. */
 function firstLine(text: string): string {
   return text.trim().split(/\r?\n/)[0]?.trim() ?? '';
@@ -387,12 +545,16 @@ function defaultRunClaude(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): Ru
         reject(err instanceof Error ? err : new Error(String(err)));
         return;
       }
+      // Detached: a Ctrl-C in the operator's terminal reaches the terminal's own process group (on
+      // Windows, every process attached to its console), and must never cut a stop, a row removal
+      // or a resume off half way.
       const child = nodeSpawn(t.command, [...t.prefixArgs, ...args], {
         env: opts.env,
         ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: false,
         windowsHide: true,
+        detached: true,
       });
       let stdout = '';
       let stderr = '';
@@ -461,11 +623,15 @@ export function createClaudeBackgroundHost(
   const run = options.run ?? defaultRunClaude(platform, baseEnv);
   const readFile = options.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
   const readDir = options.readDir ?? ((p: string) => readdirSync(p));
+  const readEnds = options.readEnds ?? headAndTail;
   const isAlive = options.isProcessAlive ?? pidIsAlive;
   const sleep =
     options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const clock = options.clock ?? (() => performance.now());
   const stopExitTimeoutMs = options.stopExitTimeoutMs ?? DEFAULT_STOP_EXIT_TIMEOUT_MS;
+  const processStarts = options.processStarts ?? defaultProcessStarts(platform);
+  const lockRefreshMs = options.lockRefreshMs ?? MOVE_LOCK_REFRESH_MS;
+  const mainInEnv = options.mainConfigDirInEnv ?? baseEnv.CLAUDE_CONFIG_DIR !== undefined;
 
   /** The names in a directory, or none for one that does not exist or cannot be listed. */
   const namesIn = (dir: string): string[] => {
@@ -476,18 +642,36 @@ export function createClaudeBackgroundHost(
     }
   };
 
+  /** The names in a directory: none for one that does not exist; a directory that exists but
+   *  cannot be listed throws, so it is never read as empty. */
+  const namesInStrict = (dir: string): string[] => {
+    try {
+      return readDir(dir);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return [];
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+  };
+
   /** The config dir whose files describe a service: the named one, or the main one. */
   const home = (configDir: string | null): string => configDir ?? options.mainConfigDir;
 
+  /** The value of CLAUDE_CONFIG_DIR that reaches a config dir's service, or undefined for none:
+   *  the main config dir is reached exactly as a plain `claude` reaches it (see
+   *  {@link ClaudeBackgroundHostOptions.mainConfigDirInEnv}). */
+  const configEnv = (configDir: string | null): string | undefined =>
+    configDir ?? (mainInEnv ? options.mainConfigDir : undefined);
+
   /** The environment for a command against a config dir's service: this process's, minus session
-   *  markers, with CLAUDE_CONFIG_DIR naming a folder profile. The main config dir is reached exactly
-   *  as the daemon itself resolves it (its own CLAUDE_CONFIG_DIR, or none), so the command finds the
-   *  same service a plain `claude` started. */
+   *  markers and any CLAUDE_CONFIG_DIR it inherited, with the one that names that service. One main
+   *  config dir for every read and every command: the files read are the service talked to. */
   const envFor = (configDir: string | null): NodeJS.ProcessEnv => {
     const env: NodeJS.ProcessEnv = { ...baseEnv };
     for (const key of SESSION_MARKERS) delete env[key];
-    if (configDir !== null) env.CLAUDE_CONFIG_DIR = configDir;
-    else if (env.CLAUDE_CONFIG_DIR !== undefined) env.CLAUDE_CONFIG_DIR = options.mainConfigDir;
+    delete env.CLAUDE_CONFIG_DIR;
+    const named = configEnv(configDir);
+    if (named !== undefined) env.CLAUDE_CONFIG_DIR = named;
     return env;
   };
 
@@ -508,12 +692,48 @@ export function createClaudeBackgroundHost(
     return result;
   };
 
-  /** A config dir's job row for a session: none, one that cannot be read right now (caught
-   *  mid-write, or not what Claude Code writes), or the row. */
-  const jobRow = (
+  /** A process's start time as last read, by pid, and when it was read. */
+  const startCache = new Map<number, { at: number; start: string | undefined }>();
+  /** The start time of each of these live processes now (cached a while, as Claude Code does);
+   *  one that cannot be read is undefined. */
+  const startsOf = async (pids: readonly number[]): Promise<Map<number, string | undefined>> => {
+    const now = clock();
+    const stale = pids.filter((pid) => {
+      const hit = startCache.get(pid);
+      return hit === undefined || now - hit.at > START_TIME_TTL_MS;
+    });
+    if (stale.length > 0) {
+      const read = await processStarts(stale).catch(() => new Map<number, string>());
+      for (const pid of stale) startCache.set(pid, { at: now, start: read.get(pid) });
+    }
+    return new Map(pids.map((pid) => [pid, startCache.get(pid)?.start]));
+  };
+
+  /** Of these records of live processes, the ones whose process is the one recorded: alive, and,
+   *  when `verified`, started when Claude Code recorded it starting. */
+  const stillTheirs = async <T extends { pid: number; procStart?: string }>(
+    records: readonly T[],
+    verified: boolean,
+  ): Promise<T[]> => {
+    const alive = records.filter((r) => isAlive(r.pid));
+    if (!verified) return alive;
+    const starts = await startsOf(alive.filter((r) => r.procStart !== undefined).map((r) => r.pid));
+    return alive.filter(
+      (r) =>
+        r.procStart === undefined || sameProcessStart(r.procStart, starts.get(r.pid), platform),
+    );
+  };
+
+  /** The start time Claude Code recorded for a process, as it reads one back. */
+  const recordedStart = (e: { procStartFt?: unknown; procStart?: unknown }): string | undefined =>
+    nonEmpty(e.procStartFt) ?? nonEmpty(e.procStart);
+
+  /** A config dir's job row file for a short id, as written: none, one that cannot be read right
+   *  now (caught mid-write, locked, or not a JSON object), or its fields. */
+  const rawRow = (
     configDir: string | null,
     short: string,
-  ): { kind: 'none' } | { kind: 'unreadable' } | { kind: 'row'; row: Record<string, unknown> } => {
+  ): { kind: 'none' } | { kind: 'unreadable' } | { kind: 'raw'; raw: Record<string, unknown> } => {
     let text: string;
     try {
       text = readFile(join(home(configDir), 'jobs', short, 'state.json'));
@@ -521,139 +741,232 @@ export function createClaudeBackgroundHost(
       const code = (err as NodeJS.ErrnoException).code;
       return code === 'ENOENT' || code === 'ENOTDIR' ? { kind: 'none' } : { kind: 'unreadable' };
     }
+    let parsed: unknown;
     try {
-      const parsed: unknown = JSON.parse(text);
-      return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
-        ? { kind: 'row', row: parsed as Record<string, unknown> }
-        : { kind: 'unreadable' };
+      parsed = JSON.parse(text);
     } catch {
       return { kind: 'unreadable' };
     }
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? { kind: 'raw', raw: parsed as Record<string, unknown> }
+      : { kind: 'unreadable' };
   };
 
-  /** Whether an attach journal entry names a terminal that is still running. Claude Code records the
-   *  terminal's process before it writes an entry, and leaves `{}` where it cleared one, so an entry
-   *  naming no process names no terminal. One that cannot be read (caught mid-write) counts as open:
-   *  a stop under someone cannot be taken back. */
-  const attachLive = (path: string): boolean => {
-    let entry: unknown;
-    try {
-      entry = JSON.parse(readFile(path));
-    } catch (err) {
-      // Gone since the listing: that terminal has left.
-      return (err as NodeJS.ErrnoException).code !== 'ENOENT';
+  /** A config dir's job row for a session: none, one that cannot be read right now (see
+   *  {@link rawRow}, or one that is not a session's), or the row. */
+  const jobRow = (configDir: string | null, short: string): RowRead => {
+    const found = rawRow(configDir, short);
+    if (found.kind !== 'raw') return found;
+    const row = toJobRow(short, found.raw);
+    return row === undefined ? { kind: 'unreadable' } : { kind: 'row', row };
+  };
+
+  /** A row's fields as cctl reads them, or undefined for a row that is not one of a session (a
+   *  session id that is not this short's, or no state). */
+  const toJobRow = (short: string, raw: Record<string, unknown>): JobRow | undefined => {
+    const sessionId = raw.sessionId;
+    const state = nonEmpty(raw.state);
+    if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) return undefined;
+    if (!sessionId.startsWith(short) || state === undefined) return undefined;
+    const resumeSessionId = nonEmpty(raw.resumeSessionId);
+    const name = nonEmpty(raw.name);
+    const cwd = nonEmpty(raw.cwd);
+    const updatedAt = nonEmpty(raw.updatedAt);
+    const worktreePath = nonEmpty(raw.worktreePath);
+    return {
+      short,
+      sessionId,
+      state,
+      pending: holdsPendingWork(raw.inFlight),
+      ...(resumeSessionId !== undefined && SESSION_ID.test(resumeSessionId)
+        ? { resumeSessionId }
+        : {}),
+      ...(name !== undefined ? { name } : {}),
+      ...(cwd !== undefined ? { cwd } : {}),
+      ...(updatedAt !== undefined ? { updatedAt } : {}),
+      ...(worktreePath !== undefined ? { worktreePath } : {}),
+    };
+  };
+
+  /** The attach journal entries of a config dir's service that name a terminal still running, by
+   *  that terminal's pid. Claude Code records the terminal's process before it writes an entry, and
+   *  leaves `{}` where it cleared one, so an entry naming no process names no terminal. One that
+   *  cannot be read (caught mid-write) is returned as `torn`: it may be anyone's. */
+  const journal = (configDir: string | null): { pids: number[]; torn: boolean } => {
+    const dir = join(home(configDir), 'daemon', 'attach-journal');
+    const pids: number[] = [];
+    let torn = false;
+    // A journal that does not exist: no terminal has opened a session of this service. One that
+    // exists but cannot be listed throws.
+    for (const name of namesInStrict(dir)) {
+      // Only `<id>.json` names an entry; Claude Code renames one it is retiring to another suffix.
+      if (!name.endsWith('.json')) continue;
+      let entry: unknown;
+      try {
+        entry = JSON.parse(readFile(join(dir, name)));
+      } catch (err) {
+        // Gone since the listing: that terminal has left.
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') torn = true;
+        continue;
+      }
+      const pid =
+        entry !== null && typeof entry === 'object' ? (entry as { pid?: unknown }).pid : undefined;
+      if (typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && isAlive(pid)) {
+        pids.push(pid);
+      }
     }
-    const pid =
-      entry !== null && typeof entry === 'object' ? (entry as { pid?: unknown }).pid : undefined;
-    return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && isAlive(pid);
+    return { pids, torn };
   };
 
-  /** The sessions a config dir's service hosts, from its roster (see the header). */
-  const readHosted = (configDir: string | null): BackgroundSession[] => {
+  /** The sessions a config dir's service hosts, from its roster (see the header). No roster (no
+   *  service ever ran there) is nothing hosted; one that cannot be read right now (caught mid-write)
+   *  throws, so it is never read as nothing hosted. */
+  const readHosted = async (
+    configDir: string | null,
+    verified: boolean,
+  ): Promise<BackgroundSession[]> => {
+    const path = join(home(configDir), 'daemon', 'roster.json');
+    let text: string;
+    try {
+      text = readFile(path);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return [];
+      throw new Error(`the background service roster at ${path} could not be read`);
+    }
     let roster: unknown;
     try {
-      roster = JSON.parse(readFile(join(home(configDir), 'daemon', 'roster.json')));
+      roster = JSON.parse(text);
     } catch {
-      // No roster (no service ever ran there) or one caught mid-write: nothing hosted this read.
-      return [];
+      throw new Error(`the background service roster at ${path} could not be read`);
     }
-    const workers =
-      roster !== null && typeof roster === 'object'
-        ? (roster as { workers?: unknown }).workers
-        : undefined;
-    if (workers === null || typeof workers !== 'object') return [];
-    const out: BackgroundSession[] = [];
+    if (roster === null || typeof roster !== 'object' || Array.isArray(roster)) {
+      throw new Error(`the background service roster at ${path} could not be read`);
+    }
+    const workers = (roster as { workers?: unknown }).workers;
+    // A roster with no workers yet hosts nothing.
+    if (workers === undefined) return [];
+    if (workers === null || typeof workers !== 'object' || Array.isArray(workers)) {
+      throw new Error(`the background service roster at ${path} could not be read`);
+    }
+    const found: Array<BackgroundSession & { pid: number; procStart?: string }> = [];
     for (const [short, raw] of Object.entries(workers as Record<string, unknown>)) {
       if (!SHORT_ID.test(short) || raw === null || typeof raw !== 'object') continue;
-      const w = raw as { sessionId?: unknown; cwd?: unknown; pid?: unknown };
-      if (typeof w.sessionId !== 'string' || !SESSION_ID.test(w.sessionId)) continue;
-      if (!w.sessionId.startsWith(short)) continue;
-      if (typeof w.cwd !== 'string' || w.cwd.length === 0) continue;
-      // A roster left behind by a service that died still names its workers; only a live
-      // terminal host means the session is really hosted there.
-      if (typeof w.pid !== 'number' || !Number.isInteger(w.pid) || !isAlive(w.pid)) continue;
-      out.push({ short, sessionId: w.sessionId, cwd: w.cwd });
+      const w = raw as Record<string, unknown>;
+      const sessionId = w.sessionId;
+      if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) continue;
+      if (!sessionId.startsWith(short)) continue;
+      const cwd = nonEmpty(w.cwd);
+      if (cwd === undefined) continue;
+      // A roster left behind by a service that died still names its workers; only a live terminal
+      // host (the very process recorded, when verified) means the session is really hosted there.
+      if (typeof w.pid !== 'number' || !Number.isInteger(w.pid) || w.pid <= 0) continue;
+      const procStart = recordedStart(w);
+      found.push({ short, sessionId, cwd, pid: w.pid, ...(procStart ? { procStart } : {}) });
     }
-    return out;
+    return (await stillTheirs(found, verified)).map(({ short, sessionId, cwd }) => ({
+      short,
+      sessionId,
+      cwd,
+    }));
   };
 
   /** The live entries of the shared session registry (see the header). It sits in the main config
    *  dir, and every folder profile links its own `sessions/` there. An entry left by a process that
-   *  has exited is skipped: Claude Code removes its own on a clean exit, not on a hard kill. */
-  const readRegistry = (): LiveSession[] => {
+   *  has exited is skipped (Claude Code removes its own on a clean exit, not on a hard kill), and so
+   *  is one naming no kind of session. An entry of a live process that cannot be read right now
+   *  (caught mid-write) throws when `strict`: it could be the session asked about. */
+  const readRegistry = async (verified: boolean, strict: boolean): Promise<LiveSession[]> => {
     const dir = join(options.mainConfigDir, 'sessions');
-    const out: LiveSession[] = [];
-    for (const file of namesIn(dir)) {
-      if (!/^\d+\.json$/.test(file)) continue;
+    const found: Array<LiveSession & { procStart?: string }> = [];
+    for (const file of strict ? namesInStrict(dir) : namesIn(dir)) {
+      const m = /^(\d+)\.json$/.exec(file);
+      if (m === null) continue;
       const e = readObject(readFile, join(dir, file));
-      if (e === undefined) continue;
+      if (e === undefined) {
+        if (strict && isAlive(Number(m[1]))) {
+          throw new Error('a live session registry entry could not be read right now');
+        }
+        continue;
+      }
       const pid = e.pid;
       const sessionId = e.sessionId;
-      if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0 || !isAlive(pid)) continue;
-      if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) continue;
+      const kind = nonEmpty(e.kind);
+      if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) continue;
+      if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId) || kind === undefined) {
+        continue;
+      }
       const jobId = nonEmpty(e.jobId);
       const status = nonEmpty(e.status);
       const name = nonEmpty(e.name);
       const cwd = nonEmpty(e.cwd);
-      out.push({
+      const procStart = recordedStart(e);
+      found.push({
         pid,
         sessionId,
-        kind: nonEmpty(e.kind) ?? 'interactive',
+        kind,
         ...(status !== undefined ? { status } : {}),
         ...(jobId !== undefined && SHORT_ID.test(jobId) ? { jobId } : {}),
         ...(name !== undefined ? { name } : {}),
         ...(cwd !== undefined ? { cwd } : {}),
+        ...(procStart !== undefined ? { procStart } : {}),
       });
     }
-    return out;
+    return (await stillTheirs(found, verified)).map(({ procStart: _start, ...entry }) => entry);
   };
 
   /** Whether a session (by short id) still runs anywhere: in the registry, or in the roster of the
-   *  service that hosted it. The registry entry goes first and the terminal host a moment later. */
-  const stillRunning = (configDir: string | null, short: string): boolean =>
-    readRegistry().some((e) => e.jobId === short || e.sessionId.startsWith(short)) ||
-    readHosted(configDir).some((s) => s.short === short);
+   *  service that hosted it. The registry entry goes first and the terminal host a moment later. A
+   *  roster caught mid-write counts as still running: the wait goes on. Cheap, as it is polled. */
+  const stillRunning = async (configDir: string | null, short: string): Promise<boolean> => {
+    if (
+      (await readRegistry(false, false)).some(
+        (e) => e.jobId === short || e.sessionId.startsWith(short),
+      )
+    ) {
+      return true;
+    }
+    return readHosted(configDir, false).then(
+      (hosted) => hosted.some((s) => s.short === short),
+      () => true,
+    );
+  };
 
   return {
+    configDirs() {
+      const root = options.profilesRoot;
+      if (root === undefined) return Promise.resolve([null]);
+      // A profile is a directory named after its rule's id; anything else there is not one.
+      return Promise.resolve([
+        null,
+        ...namesIn(root)
+          .filter((name) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))
+          .map((name) => join(root, name)),
+      ]);
+    },
+
     liveSessions() {
-      return Promise.resolve(readRegistry());
+      return readRegistry(true, true);
     },
 
     jobRows(configDir) {
       const jobs = join(home(configDir), 'jobs');
       const out: JobRow[] = [];
-      for (const short of namesIn(jobs)) {
-        if (!SHORT_ID.test(short)) continue;
-        const row = readObject(readFile, join(jobs, short, 'state.json'));
-        if (row === undefined) continue;
-        const sessionId = row.sessionId;
-        const state = nonEmpty(row.state);
-        if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) continue;
-        if (!sessionId.startsWith(short) || state === undefined) continue;
-        const name = nonEmpty(row.name);
-        const cwd = nonEmpty(row.cwd);
-        const updatedAt = nonEmpty(row.updatedAt);
-        out.push({
-          short,
-          sessionId,
-          state,
-          ...(name !== undefined ? { name } : {}),
-          ...(cwd !== undefined ? { cwd } : {}),
-          ...(updatedAt !== undefined ? { updatedAt } : {}),
-        });
+      try {
+        for (const short of namesInStrict(jobs)) {
+          if (!SHORT_ID.test(short)) continue;
+          const found = jobRow(configDir, short);
+          if (found.kind === 'row') out.push(found.row);
+        }
+      } catch (err) {
+        return Promise.reject(err instanceof Error ? err : new Error(String(err)));
       }
       return Promise.resolve(out);
     },
 
-    profileConfigDirs() {
-      const root = options.profilesRoot;
-      if (root === undefined) return Promise.resolve([]);
-      // A profile is a directory named after its rule's id; anything else there is not one.
-      return Promise.resolve(
-        namesIn(root)
-          .filter((name) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))
-          .map((name) => join(root, name)),
-      );
+    jobRow(configDir, short) {
+      if (!SHORT_ID.test(short)) return Promise.resolve({ kind: 'none' });
+      return Promise.resolve(jobRow(configDir, short));
     },
 
     sessionTitle(sessionId) {
@@ -671,11 +984,35 @@ export function createClaudeBackgroundHost(
       return Promise.resolve(undefined);
     },
 
+    titlesIn(folders) {
+      const projects = join(options.mainConfigDir, 'projects');
+      const all = namesIn(projects);
+      const dirs = new Set<string>();
+      for (const folder of folders) {
+        const name = projectDirName(folder);
+        for (const dir of all) {
+          if ('exact' in name ? dir === name.exact : dir.startsWith(name.prefix)) dirs.add(dir);
+        }
+      }
+      const out = new Map<string, string>();
+      for (const dir of dirs) {
+        for (const file of namesIn(join(projects, dir))) {
+          const sessionId = file.endsWith('.jsonl') ? file.slice(0, -'.jsonl'.length) : '';
+          if (!SESSION_ID.test(sessionId)) continue;
+          const text = readEnds(join(projects, dir, file));
+          const title = text === undefined ? undefined : titleOfTranscript(text);
+          if (title !== undefined) out.set(sessionId, title);
+        }
+      }
+      return Promise.resolve(out);
+    },
+
     async lockSession(sessionId, waitMs): Promise<SessionLock | undefined> {
       // The id names the lock's directory, so only a session id may.
       if (!SESSION_ID.test(sessionId)) throw new Error(`not a background session id: ${sessionId}`);
+      let lock;
       try {
-        return await acquireLock(join(options.moveLockDir, sessionId), Date.now, {
+        lock = await acquireLock(join(options.moveLockDir, sessionId), Date.now, {
           timeoutMs: waitMs,
           pollMs: MOVE_LOCK_POLL_MS,
           staleMs: MOVE_LOCK_STALE_MS,
@@ -684,10 +1021,20 @@ export function createClaudeBackgroundHost(
         if (err instanceof LockTimeoutError) return undefined;
         throw err;
       }
+      // Kept fresh for as long as it is held, however long that is; unref'd so a held lock never
+      // keeps the process alive on its own.
+      const refresher = setInterval(() => lock.refresh(), lockRefreshMs);
+      refresher.unref();
+      return {
+        release: () => {
+          clearInterval(refresher);
+          lock.release();
+        },
+      };
     },
 
-    listHosted(configDir) {
-      return Promise.resolve(readHosted(configDir));
+    listHosted(configDir, opts) {
+      return readHosted(configDir, opts?.verified === true);
     },
 
     async activity(configDir) {
@@ -713,17 +1060,21 @@ export function createClaudeBackgroundHost(
     },
 
     attachedNow(configDir) {
-      const dir = join(home(configDir), 'daemon', 'attach-journal');
-      let names: string[];
       try {
-        names = readDir(dir);
+        const { pids, torn } = journal(configDir);
+        // An entry caught mid-write counts as open: a stop under someone cannot be taken back.
+        return Promise.resolve(pids.length > 0 || torn);
       } catch (err) {
-        // No journal: no terminal has opened a session of this service.
-        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return Promise.resolve(false);
         return Promise.reject(err instanceof Error ? err : new Error(String(err)));
       }
-      // Only `<id>.json` names an entry; Claude Code renames one it is retiring to another suffix.
-      return Promise.resolve(names.some((n) => n.endsWith('.json') && attachLive(join(dir, n))));
+    },
+
+    attachedBy(configDir, pid) {
+      try {
+        return Promise.resolve(journal(configDir).pids.includes(pid));
+      } catch (err) {
+        return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+      }
     },
 
     async stop(configDir, short) {
@@ -732,7 +1083,7 @@ export function createClaudeBackgroundHost(
       // Claude Code returns before the session has exited; a resume in that moment would find it
       // still running and start a copy instead.
       const deadline = clock() + stopExitTimeoutMs;
-      while (stillRunning(configDir, short)) {
+      while (await stillRunning(configDir, short)) {
         if (clock() >= deadline) {
           throw new Error(
             `it was still running ${Math.round(stopExitTimeoutMs / 1000)}s after claude stop`,
@@ -744,15 +1095,16 @@ export function createClaudeBackgroundHost(
 
     savedOptions(configDir, short): Promise<SavedLaunch> {
       if (!SHORT_ID.test(short)) return Promise.resolve({ kind: 'none' });
-      const found = jobRow(configDir, short);
-      if (found.kind !== 'row') return Promise.resolve(found);
-      if (holdsPermissionRules(found.row.sessionPermissionRules)) {
+      const found = rawRow(configDir, short);
+      if (found.kind !== 'raw') return Promise.resolve(found);
+      const raw = found.raw;
+      if (holdsPermissionRules(raw.sessionPermissionRules)) {
         return Promise.resolve({
           kind: 'unreplayable',
           reason: 'it holds permission rules granted while it ran, which a move cannot carry over',
         });
       }
-      const replay = replayOptions(found.row.respawnFlags);
+      const replay = replayOptions(raw.respawnFlags);
       return Promise.resolve(
         replay.ok
           ? { kind: 'replayable', options: replay.options }
@@ -767,8 +1119,7 @@ export function createClaudeBackgroundHost(
       const args = ['--bg', '--resume', input.sessionId];
       if (input.options !== undefined) {
         // A row this config dir already holds for the session keeps its own saved options and starts
-        // a copy when others are passed. It is never dropped to make way: `claude rm` deletes the
-        // session's worktree and branch along with it.
+        // a copy when others are passed: the caller removes it first, or wakes it with its own.
         if (jobRow(input.configDir, input.short).kind !== 'none') {
           throw new Error('that config dir already holds a job row for it');
         }
@@ -780,9 +1131,15 @@ export function createClaudeBackgroundHost(
       if (copy !== null) {
         // Claude Code forked the session under a new id instead (it counted the session as still
         // running or open somewhere, or could not check). The copy is not the session being moved:
-        // stop it and fail, with Claude Code's own reason, which is what tells the cases apart.
+        // stop it, under the config dir that started it, and fail with Claude Code's own reason,
+        // which is what tells the cases apart. A copy that cannot be stopped is said too: it would
+        // otherwise run on unnoticed.
         const short = copy[1]!;
-        await runOk(input.configDir, ['stop', short]).catch(() => undefined);
+        const stopped = await runOk(input.configDir, ['stop', short]).then(
+          () => '',
+          (err: unknown) =>
+            `; the copy could not be stopped (${err instanceof Error ? err.message : String(err)})`,
+        );
         const note = output
           .split(/\r?\n/)
           .find((line) => COPY_STARTED.test(line))
@@ -790,9 +1147,35 @@ export function createClaudeBackgroundHost(
           .replace(/^note:\s*/, '');
         throw new Error(
           `claude started a copy (${short}) instead of resuming it` +
-            (note !== undefined && note.length > 0 ? `: ${note}` : ''),
+            (note !== undefined && note.length > 0 ? `: ${note}` : '') +
+            stopped,
         );
       }
+    },
+
+    async removeRow(configDir, short) {
+      if (!SHORT_ID.test(short)) throw new Error(`not a background session id: ${short}`);
+      const found = jobRow(configDir, short);
+      if (found.kind === 'none') return;
+      if (found.kind === 'unreadable') throw new Error('its job row could not be read right now');
+      // `claude rm` deletes a worktree recorded on the row, and kills the session when it is live.
+      if (found.row.worktreePath !== undefined) {
+        throw new Error('its job row records a git worktree, which claude rm would delete');
+      }
+      const ids = [found.row.sessionId, found.row.resumeSessionId];
+      const live = (await readRegistry(false, false)).some(
+        (e) => e.kind === 'bg' && (e.jobId === short || ids.includes(e.sessionId)),
+      );
+      if (live) throw new Error('its session is live, and claude rm would kill it');
+      await runOk(configDir, ['rm', short]);
+    },
+
+    configEnv,
+
+    resumeHint(configDir, sessionId, opts) {
+      const named = configEnv(configDir);
+      const words = ['claude', '--bg', '--resume', sessionId, ...opts].map(shellWord).join(' ');
+      return named === undefined ? words : `CLAUDE_CONFIG_DIR=${shellWord(named)} ${words}`;
     },
   };
 }

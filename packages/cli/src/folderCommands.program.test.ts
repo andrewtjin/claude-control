@@ -912,6 +912,9 @@ describe('cctl claude opening a background session', () => {
         writeFileSync(join(main(), 'daemon', 'roster.json'), JSON.stringify({ workers: {} }));
         rmSync(join(main(), 'sessions', '100001.json'));
       }
+      if (args[0] === 'rm') {
+        rmSync(join(configDir ?? main(), 'jobs', SHORT), { recursive: true, force: true });
+      }
       if (args[0] === '--bg' && configDir === profile()) {
         mkdirSync(join(profile(), 'daemon'), { recursive: true });
         writeFileSync(
@@ -933,13 +936,17 @@ describe('cctl claude opening a background session', () => {
     expect(bgHost.calls.map((c) => [c.args.join(' '), c.configDir])).toEqual([
       ['agents --json', undefined],
       [`stop ${SHORT}`, undefined],
+      // While it runs nowhere, its row on the global slot goes: none is left there to wake it by.
+      [`rm ${SHORT}`, undefined],
       [`--bg --resume ${SID} --name=bg eval`, profile()],
     ]);
     expect(r.args).toEqual(['attach', SHORT]);
     expect(r.env?.CLAUDE_CONFIG_DIR).toBe(profile());
+    // Said before the move starts, and once it is done.
     expect(r.err).toContain(
-      'cctl: moved background session "bg eval" (c5f2097e) from A (the global slot) onto E',
+      'cctl: moving background session "bg eval" (c5f2097e) from A (the global slot) onto E',
     );
+    expect(r.err).toContain('cctl: moved background session "bg eval" (c5f2097e) onto E');
   });
 
   it('a busy session on the global slot is attached there, never stopped, and says why', async () => {
@@ -1002,6 +1009,149 @@ describe('cctl claude opening a background session', () => {
     expect(r.err).toContain('predates folder rules');
     expect(engine.ensureRuleLive).not.toHaveBeenCalled();
     expect(bgHost.calls).toEqual([]);
+  });
+
+  /** Claude Code answering the way it does for an idle session on the global slot: its listing,
+   *  a stop that takes it out of the service and the registry, a row removed, and a resume that puts
+   *  it in the profile's service. */
+  function answersAMove(): void {
+    bgHost.answer = (args, configDir) => {
+      if (args[0] === 'agents') {
+        return { code: 0, stdout: JSON.stringify([{ id: SHORT, status: 'idle' }]), stderr: '' };
+      }
+      if (args[0] === 'stop') {
+        writeFileSync(join(main(), 'daemon', 'roster.json'), JSON.stringify({ workers: {} }));
+        rmSync(join(main(), 'sessions', '100001.json'));
+      }
+      if (args[0] === 'rm') {
+        rmSync(join(configDir ?? main(), 'jobs', SHORT), { recursive: true, force: true });
+      }
+      if (args[0] === '--bg' && configDir === profile()) {
+        mkdirSync(join(profile(), 'daemon'), { recursive: true });
+        writeFileSync(
+          join(profile(), 'daemon', 'roster.json'),
+          JSON.stringify({
+            workers: { [SHORT]: { pid: process.pid, sessionId: SID, cwd: research } },
+          }),
+        );
+      }
+      return { code: 0, stdout: '', stderr: '' };
+    };
+  }
+
+  it('--account of the folder account never opens a session running on the global slot under the profile', async () => {
+    ruleOnE();
+    engine.activate.mockResolvedValue({} as never);
+    await runsIn(main(), 'busy');
+    await rowIn(profile(), 'stopped');
+    const r = await launchFrom(['--account', 'E', 'attach', SHORT]);
+    expect(r.exited).toBe(false);
+    expect(r.args).toEqual(['attach', SHORT]);
+    expect(r.env?.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(r.err).toContain('runs on A (the global slot); opening it there.');
+    expect(bgHost.calls).toEqual([]);
+  });
+
+  it('a shell inheriting the profile CLAUDE_CONFIG_DIR still attaches on the global slot where it runs', async () => {
+    ruleOnE();
+    await runsIn(main(), 'busy');
+    await rowIn(profile(), 'stopped');
+    vi.stubEnv('CLAUDE_CONFIG_DIR', profile());
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.exited).toBe(false);
+    expect(r.args).toEqual(['attach', SHORT]);
+    expect(r.env?.CLAUDE_CONFIG_DIR).toBeUndefined();
+  });
+
+  it('a folder slot on a shared account (its fallback) is no move target for cctl claude', async () => {
+    rulesLiveOnShared();
+    engine.ensureRuleLive.mockResolvedValue({
+      ruleId: 'r1',
+      liveAccount: 'b',
+      activated: false,
+      noWorkingAccount: false,
+    });
+    await runsIn(main(), 'idle');
+    answersAMove();
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.exited).toBe(false);
+    expect(bgHost.calls.map((c) => c.args[0])).not.toContain('stop');
+    expect(r.env?.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(r.err).toContain('does not hold one of its own accounts with usage left');
+  });
+
+  it('a usage record that cannot be read is no proof the folder account can take work: not moved', async () => {
+    ruleOnE();
+    await runsIn(main(), 'idle');
+    answersAMove();
+    await writeFile(join(sandbox.root, 'daemon.db'), 'not a database');
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.exited).toBe(false);
+    expect(bgHost.calls.map((c) => c.args[0])).not.toContain('stop');
+    expect(r.err).toContain('does not hold one of its own accounts with usage left');
+  });
+
+  it('with no usage record yet, the folder account counts as able: moved', async () => {
+    ruleOnE();
+    await runsIn(main(), 'idle');
+    answersAMove();
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.exited).toBe(false);
+    expect(bgHost.calls.map((c) => c.args[0])).toContain('stop');
+    expect(r.env?.CLAUDE_CONFIG_DIR).toBe(profile());
+  });
+
+  it('Ctrl-C during a move lets it finish, then opens nothing', async () => {
+    ruleOnE();
+    await runsIn(main(), 'idle');
+    answersAMove();
+    const answer = bgHost.answer;
+    bgHost.answer = (args, configDir) => {
+      // The operator presses Ctrl-C while the session is stopped and not yet resumed.
+      if (args[0] === 'rm') process.emit('SIGINT');
+      return answer(args, configDir);
+    };
+    const r = await launchFrom(['attach', SHORT]);
+    expect(bgHost.calls.map((c) => c.args[0])).toEqual(['agents', 'stop', 'rm', '--bg']);
+    expect(r.err).toContain('cctl: finishing the move first');
+    expect(r.err).toContain('cctl: interrupted; not opening the session.');
+    expect(launcher.spawnClaude).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(130);
+    process.exitCode = undefined;
+    // The signal is the operator's own again.
+    expect(process.listenerCount('SIGINT')).toBe(0);
+  });
+
+  it("Claude Code's resume picker is refused while the folder profile holds a row of a session running on the global slot", async () => {
+    ruleOnE();
+    await runsIn(main(), 'busy');
+    await rowIn(profile(), 'stopped');
+    for (const args of [['--resume'], ['--continue'], ['agents']]) {
+      const r = await launchFrom(args);
+      expect(r.exited).toBe(true);
+      expect(r.err).toContain(`open it with: cctl claude attach ${SHORT}`);
+    }
+    expect(launcher.spawnClaude).not.toHaveBeenCalled();
+    expect(bgHost.calls).toEqual([]);
+  });
+
+  it('stop of a session running on the global slot is run there, by its job id', async () => {
+    ruleOnE();
+    await runsIn(main(), 'busy');
+    await rowIn(profile(), 'stopped');
+    const r = await launchFrom(['stop', 'c5f2']);
+    expect(r.exited).toBe(false);
+    expect(r.args).toEqual(['stop', SHORT]);
+    expect(r.env?.CLAUDE_CONFIG_DIR).toBeUndefined();
+  });
+
+  it('a prompt after --resume <id> is passed to the session where it runs', async () => {
+    ruleOnE();
+    await runsIn(profile(), 'busy');
+    const r = await launchFrom(['--resume', SID, 'carry on']);
+    expect(r.exited).toBe(false);
+    expect(r.args).toEqual(['--resume', SID, 'carry on']);
+    expect(r.env?.CLAUDE_CONFIG_DIR).toBe(profile());
   });
 
   /** The research rule includes E, but its slot runs on the shared account B. */

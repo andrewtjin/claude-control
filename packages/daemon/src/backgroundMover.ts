@@ -11,19 +11,24 @@
 //
 // This module owns WHEN and WHICH: only sessions the main config's service hosts (the global slot),
 // only in a folder whose rule has an included account live in its slot that can take work, at most
-// once an hour per session, never again after an attempt that failed, and never while another cctl
-// process holds the session's move lock (`cctl claude` moves a session the operator opens). HOW is
-// the injected {@link BackgroundSessionHost}, the one seam to Claude Code's own commands, so every
-// decision here is testable without a Claude Code binary.
+// once an hour per session, never again after an attempt that failed or that nothing will change
+// (a worktree, options a move cannot carry over), and never while another cctl process holds the
+// session's move lock (`cctl claude` moves a session the operator opens). HOW is the injected
+// {@link BackgroundSessionHost}, the one seam to Claude Code's own commands, so every decision here
+// is testable without a Claude Code binary. The daemon's own reads every cycle are the cheap ones
+// (the global slot's roster); the move reads everything again, verified, before it touches anything.
 
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import {
   DEFAULT_CONFIRM_TIMEOUT_MS,
   moveBackgroundSession,
+  reasonOf,
+  sessionLabel,
   type BackgroundSession,
   type BackgroundSessionHost,
   type MoveResult,
   type MoveTiming,
+  type ResumeRecovery,
   type SessionLock,
 } from './backgroundMove.js';
 
@@ -80,16 +85,6 @@ export interface BackgroundMoverOptions {
 export const DEFAULT_MOVE_INTERVAL_MS = 60 * 60_000;
 /** How the mover names the global slot in its reasons. */
 const GLOBAL_SLOT = 'the global slot';
-
-/** A thrown value as one line. */
-function reasonOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-/** How a session is named to the operator: its name and short id, or the short id alone. */
-function describeSession(s: BackgroundSession, name: string | undefined): string {
-  return name !== undefined && name.length > 0 ? `"${name}" (${s.short})` : s.short;
-}
 
 export class BackgroundMover {
   private readonly host: BackgroundSessionHost;
@@ -198,22 +193,30 @@ export class BackgroundMover {
       }
       return { ...base, result: 'skipped', reason: moved.reason };
     }
-    // Claude Code said what the session is doing (a session found gone was never asked).
-    if (moved.result !== 'not-moved' || moved.cause !== 'gone')
+    // Claude Code said what the session is doing; a session found gone, or not found at all, was
+    // never asked, so it says nothing about whether asking works again.
+    if (moved.result !== 'not-moved' || (moved.cause !== 'gone' && moved.cause !== 'unknown')) {
       this.lastActivityFailure = undefined;
+    }
 
     switch (moved.result) {
       case 'not-moved':
         // Nothing touched: the session still runs where it was. Given up on only when nothing about
         // it will change; anything else is tried again next cycle.
         return moved.final
-          ? this.giveUp(session, moved.name, target, moved.reason, true)
+          ? this.giveUp(session, moved.name, target, moved.reason, undefined)
           : { ...base, result: 'skipped', reason: moved.reason };
       case 'failed':
-        return this.giveUp(session, moved.name, target, moved.reason, moved.restored);
+        return this.giveUp(
+          session,
+          moved.name,
+          target,
+          moved.reason,
+          moved.restored ? undefined : moved.recovery,
+        );
       case 'moved': {
         const body =
-          `cctl moved background session ${describeSession(session, moved.name)} in ` +
+          `cctl moved background session ${sessionLabel(moved.short, moved.name)} in ` +
           `${target.folder} onto ${target.accountLabel}, the folder's own account. Same session, ` +
           'same conversation; it is idle until its next prompt.';
         this.logger.info(
@@ -236,22 +239,28 @@ export class BackgroundMover {
     };
   }
 
-  /** Stop trying a session for good, and tell the operator once where it was left. */
+  /** Stop trying a session for good, and tell the operator once where it was left: still where it
+   *  was, or (`recovery`) possibly stopped, with the command that brings it back as it was. */
   private giveUp(
     session: BackgroundSession,
     name: string | undefined,
     target: MoveTarget,
     reason: string,
-    restored: boolean,
+    recovery: ResumeRecovery | undefined,
   ): MoveOutcome {
     this.gaveUp.add(session.sessionId);
+    const restored = recovery === undefined;
     const where = restored
       ? 'It is still on the shared account, as before.'
-      : `It may be stopped: resume it with: claude --bg --resume ${session.sessionId}`;
+      : `It may be stopped: resume it with: ${this.host.resumeHint(
+          recovery.configDir,
+          recovery.sessionId,
+          recovery.options,
+        )}`;
     const body =
-      `cctl could not move background session ${describeSession(session, name)} in ${target.folder} ` +
-      `onto ${target.accountLabel} (${reason}), and will not try again until the daemon restarts. ` +
-      where;
+      `cctl could not move background session ${sessionLabel(session.short, name)} in ` +
+      `${target.folder} onto ${target.accountLabel} (${reason}), and will not try again until the ` +
+      `daemon restarts. ${where}`;
     this.logger.warn({ sessionId: session.sessionId, ruleId: target.ruleId, restored }, body);
     this.notify({ title: 'Background session not moved', body, level: 'warn' });
     return {

@@ -9,7 +9,8 @@
 // / ensure-live), the pure helpers own resolution (launcher.ts), text (shellInit.ts) and rendering
 // (folderRender.ts). Here we only wire, resolve refs, and print what changed.
 
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { Command } from 'commander';
 import {
@@ -54,6 +55,7 @@ import type { AccountUsage } from '@claude-control/shared-protocol';
 import { buildEngine, daemonDbPath, fail } from './context.js';
 import {
   createClaudeBackgroundHost,
+  mainConfigOf,
   moveLocksDir,
   type ClaudeBackgroundHost,
 } from './backgroundHost.js';
@@ -1026,44 +1028,31 @@ async function refuseSeatingUnderOlderDaemon(engine: Engine, rule: FolderRule): 
  *  was asked to open: a move is a stop, a resume and a confirm, seconds each. */
 const BACKGROUND_LOCK_WAIT_MS = 90_000;
 
-/** The background-service host `cctl claude` reads and drives. It reaches the main config dir the
- *  way the launch below does: a CLAUDE_CONFIG_DIR naming a folder profile (a session's own, when
- *  cctl runs from inside one) is dropped, so a command meant for the main service never lands in a
- *  profile's. */
+/** The background-service host `cctl claude` reads and drives. It reads the main config dir cctl
+ *  resolved (a CLAUDE_CONFIG_DIR naming a folder profile, as inside a profile's session, is seen
+ *  through to it) and runs every command against that same dir's service, so what it reads is what
+ *  it talks to. */
 function launcherBackgroundHost(paths: Paths, profRoot: string): ClaudeBackgroundHost {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  if (
-    configDirPointsIntoProfiles(env.CLAUDE_CONFIG_DIR, profRoot, {
-      platform: process.platform,
-      cwd: process.cwd(),
-      realpath: (p) => realpathSync.native(p),
-    })
-  ) {
-    delete env.CLAUDE_CONFIG_DIR;
-  }
   return createClaudeBackgroundHost({
-    mainConfigDir: paths.claudeDir,
+    ...mainConfigOf(paths),
     moveLockDir: moveLocksDir(dirname(paths.vaultDir)),
     profilesRoot: profRoot,
-    env,
   });
 }
 
 /** A folder's canonical key, leniently: a path with no canonical form is keyed as spelled. */
 function folderKeyOf(folder: string, platform: NodeJS.Platform): string {
-  const r = canonicalizeFolder(folder, {
-    platform,
-    cwd: process.cwd(),
-    realpath: (p) => realpathSync.native(p),
-  });
-  return folderKey(r.ok ? r.path : folder, platform);
+  return folderKey(canonicalOrSpelled(folder, platform), platform);
 }
 
-/** The usage the daemon last recorded for an account, as the move judgment reads it: none known
- *  (no store yet, or no snapshot) counts as able, exactly as it does for the daemon's own poll. */
-function lastUsageOf(account: AccountView): AccountUsageInput {
+/** The usage the daemon last recorded for an account, as the move judgment reads it: no store yet,
+ *  or no snapshot in it, is an account never polled (no limits, so able); a store that cannot be
+ *  read says nothing (`undefined`: not known to be able). */
+export function lastUsageOf(
+  account: AccountView,
+  dbPath: string = daemonDbPath(),
+): AccountUsageInput | undefined {
   let limits: AccountUsage['limits'] = [];
-  const dbPath = daemonDbPath();
   if (existsSync(dbPath)) {
     let store: Store | undefined;
     try {
@@ -1071,7 +1060,7 @@ function lastUsageOf(account: AccountView): AccountUsageInput {
       const row = store.latestUsageSnapshot(account.id);
       if (row !== undefined) limits = (JSON.parse(row.json) as AccountUsage).limits ?? [];
     } catch {
-      // A store that cannot be read says nothing about the account.
+      return undefined;
     } finally {
       store?.close();
     }
@@ -1087,6 +1076,63 @@ function lastUsageOf(account: AccountView): AccountUsageInput {
   ])[0]!;
 }
 
+/** The folders `claude --resume <title>` searches from a folder, as Claude Code searches them: the
+ *  folder, every worktree of its git repository (`git worktree list`), and the worktrees Claude
+ *  Code makes under it (`.claude/worktrees/*`). A folder outside any repository is searched alone. */
+async function titleFolders(cwd: string): Promise<string[]> {
+  const listed = await new Promise<string>((resolve) =>
+    execFile(
+      'git',
+      ['worktree', 'list', '--porcelain'],
+      { cwd, timeout: 5_000, windowsHide: true },
+      (err, stdout) => resolve(err ? '' : stdout),
+    ),
+  );
+  const worktrees = listed
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith('worktree '))
+    .map((line) => line.slice('worktree '.length).trim());
+  let own: string[] = [];
+  try {
+    own = readdirSync(join(cwd, '.claude', 'worktrees')).map((n) =>
+      join(cwd, '.claude', 'worktrees', n),
+    );
+  } catch {
+    // No worktrees of Claude Code's here.
+  }
+  return [cwd, ...worktrees, ...own];
+}
+
+/** Ctrl-C held off around a move: between the stop and the resume the session runs nowhere, so a
+ *  move interrupted there would leave it stopped. The signals that would end cctl (Ctrl-C, Ctrl-Break,
+ *  a closing terminal) are taken while the move runs and said once; the move then finishes or puts
+ *  the session back, and `interrupted` tells the launch to open nothing after it. */
+function moveShield(say: (line: string) => void): {
+  shield: RouteContext['shield'];
+  interrupted: () => boolean;
+} {
+  let interrupted = false;
+  const signals: NodeJS.Signals[] =
+    process.platform === 'win32' ? ['SIGINT', 'SIGBREAK', 'SIGHUP'] : ['SIGINT', 'SIGHUP'];
+  const onSignal = (): void => {
+    if (!interrupted) {
+      say('cctl: finishing the move first; stopping now would leave the session stopped.');
+    }
+    interrupted = true;
+  };
+  return {
+    async shield(fn) {
+      for (const sig of signals) process.on(sig, onSignal);
+      try {
+        return await fn();
+      } finally {
+        for (const sig of signals) process.off(sig, onSignal);
+      }
+    },
+    interrupted: () => interrupted,
+  };
+}
+
 /**
  * What the background-session routing needs from the engine (see backgroundAttach.ts): where a
  * session in a folder belongs — the slot `cctl claude` would launch in there, made live as a launch
@@ -1097,6 +1143,7 @@ function routeContext(
   paths: Paths,
   host: ClaudeBackgroundHost,
   daemonRunning: boolean,
+  shield: RouteContext['shield'],
 ): RouteContext {
   const platform = process.platform;
   const profileOf = (ruleId: string): string => ruleProfilePath(paths.vaultDir, ruleId);
@@ -1105,6 +1152,16 @@ function routeContext(
     cwd: process.cwd(),
     platform,
     sameFolder: (a, b) => folderKeyOf(a, platform) === folderKeyOf(b, platform),
+    titleFolders,
+    async launchConfigDir() {
+      const match = resolveFolderRule(
+        canonicalizeCliFolder(process.cwd()),
+        await engine.listRules(),
+        platform,
+      );
+      return match === null ? null : profileOf(match.rule.id);
+    },
+    shield,
     async homeOf(cwd) {
       const match = resolveFolderRule(
         canonicalOrSpelled(cwd, platform),
@@ -1156,7 +1213,7 @@ function routeContext(
       const key = folderKeyOf(configDir, platform);
       const rule = rules.find((r) => folderKeyOf(profileOf(r.id), platform) === key);
       return rule === undefined
-        ? named(undefined, 'the profile of a folder rule since removed')
+        ? { slot: 'the profile of a folder rule since removed', removed: true }
         : named(labelIn(ruleSlotId(rule.id)), `the folder slot of ${foldersOf(rule)}`);
     },
     daemonRunning,
@@ -1207,9 +1264,10 @@ async function daemonIsRunning(): Promise<boolean> {
 }
 
 /** Orchestrate `cctl claude`: resolve the slot (explicit account > folder rule > global), make it
- *  live, print the one-line banner, and spawn the real executable. Arguments that open a background
- *  session (`attach <session>`, `--resume <session>`) are first routed to where that session runs
- *  or belongs (see backgroundAttach.ts). */
+ *  live, print the one-line banner, and spawn the real executable. Arguments that reach a background
+ *  session (`attach <session>`, `--resume <session>`, `stop|rm <session>`, the picker, the agents
+ *  view) are first routed to where that session runs or belongs, or checked against the slot's
+ *  rows (see backgroundAttach.ts). */
 async function runClaude(opts: {
   account?: string;
   override: boolean;
@@ -1224,13 +1282,24 @@ async function runClaude(opts: {
   const request = platform === 'darwin' ? undefined : parseBackgroundRequest(opts.args);
   let routing: { ctx: RouteContext; decision: RouteDecision } | undefined;
   const route = async (mode: RouteMode): Promise<RouteDecision> => {
+    const say = (line: string): void => void process.stderr.write(`${sanitizeForTerminal(line)}\n`);
+    const guard = moveShield(say);
     const ctx = routeContext(
       engine,
       paths,
       launcherBackgroundHost(paths, profRoot),
       await daemonIsRunning(),
+      guard.shield,
     );
     const decision = await routeBackgroundLaunch(request!, ctx, mode);
+    if (guard.interrupted()) {
+      // Asked to stop while a move ran: the move finished (or put the session back), and nothing is
+      // opened after it.
+      if ('hold' in decision) decision.hold?.lock.release();
+      say('cctl: interrupted; not opening the session.');
+      process.exitCode = 130;
+      return { kind: 'refuse', message: '' };
+    }
     if (decision.kind === 'refuse') fail(decision.message);
     routing = { ctx, decision };
     return decision;
@@ -1239,8 +1308,10 @@ async function runClaude(opts: {
   // belongs, or where it runs while it cannot move there.
   if (request !== undefined && opts.account === undefined && !opts.override) {
     const decision = await route({ kind: 'follow' });
+    // Interrupted while a move ran (any other refusal has ended the command already).
+    if (decision.kind === 'refuse') return;
     if (decision.kind === 'open') {
-      await launchRouted(routing!.ctx, decision, profRoot);
+      await launchRouted(routing!.ctx, decision);
       return;
     }
   }
@@ -1362,20 +1433,29 @@ async function runClaude(opts: {
       kind: 'fixed',
       configDir: slot.kind === 'group' ? (slot.profileDir ?? null) : null,
     });
+    if (decision.kind === 'refuse') return;
     if (decision.kind === 'open') {
-      await launchRouted(routing!.ctx, decision, profRoot);
+      await launchRouted(routing!.ctx, decision);
       return;
     }
   }
   const hold = routing?.decision.kind === 'pass' ? routing.decision.hold : undefined;
   const holdHost = routing?.ctx.host;
-  await runHolding(holdHost ?? NO_JOURNAL, hold, () =>
-    launchOnSlot({ slot, explicit, override: opts.override, args: opts.args, paths, profRoot }),
+  await runHolding(holdHost ?? NO_JOURNAL, hold, (spawned) =>
+    launchOnSlot({
+      slot,
+      explicit,
+      override: opts.override,
+      args: opts.args,
+      paths,
+      profRoot,
+      onSpawn: spawned,
+    }),
   );
 }
 
 /** A host for {@link runHolding} when nothing is held. */
-const NO_JOURNAL = { attachedNow: () => Promise.resolve(false) };
+const NO_JOURNAL = { attachedBy: () => Promise.resolve(false) };
 
 /** The real executable, located and classified, or the command fails saying why. */
 function claudeLaunchTarget(platform: NodeJS.Platform): { command: string; prefixArgs: string[] } {
@@ -1403,34 +1483,31 @@ function dropsInheritedConfigDir(slot: LaunchSlot, profRoot: string): boolean {
 
 /**
  * Run what the background-session routing chose: Claude Code under that config dir, with the
- * routing's arguments, behind the same banner as any launch. No relaxation token is minted: opening
- * a running background session starts no session of its own, and the session keeps the environment
- * it was started with.
+ * routing's arguments, behind the same banner as any launch. The config dir is named exactly as the
+ * routing's own commands named it (see ClaudeBackgroundHost.configEnv), whatever CLAUDE_CONFIG_DIR
+ * this shell inherited, so the terminal opens the service the session was found in. No relaxation
+ * token is minted: opening a running background session starts no session of its own, and the
+ * session keeps the environment it was started with.
  */
 async function launchRouted(
   ctx: RouteContext,
   decision: Extract<RouteDecision, { kind: 'open' }>,
-  profRoot: string,
 ): Promise<void> {
-  await runHolding(ctx.host, decision.hold, async () => {
+  await runHolding(ctx.host, decision.hold, async (spawned) => {
     const target = claudeLaunchTarget(process.platform);
     const slot = await slotOfConfig(ctx, decision.configDir);
-    const dropInheritedConfigDir = dropsInheritedConfigDir(slot, profRoot);
-    const env = buildLaunchEnv({ baseEnv: process.env, slot, dropInheritedConfigDir });
-    const context = bannerContextForLaunch(
-      slot,
-      process.env.CLAUDE_CONFIG_DIR,
-      dropInheritedConfigDir,
-    );
+    const env = buildLaunchEnv({ baseEnv: process.env, slot, dropInheritedConfigDir: true });
+    const named = ctx.host.configEnv(decision.configDir);
+    if (named !== undefined) env.CLAUDE_CONFIG_DIR = named;
     process.stderr.write(
-      `cctl: Claude Code on ${sanitizeForTerminal(slot.label)} (${sanitizeForTerminal(context)})
-`,
+      `cctl: Claude Code on ${sanitizeForTerminal(slot.label)} (${sanitizeForTerminal(slot.context)})\n`,
     );
     try {
       process.exitCode = await spawnClaude({
         command: target.command,
         args: [...target.prefixArgs, ...decision.args],
         env,
+        onSpawn: spawned,
       });
     } catch (err) {
       fail(`failed to launch Claude Code: ${err instanceof Error ? err.message : String(err)}`);
@@ -1447,6 +1524,8 @@ async function launchOnSlot(input: {
   args: string[];
   paths: Paths;
   profRoot: string;
+  /** Told the pid of the Claude Code it starts (see runHolding). */
+  onSpawn?: (pid: number) => void;
 }): Promise<void> {
   const { explicit, paths, profRoot } = input;
   let slot = input.slot;
@@ -1508,6 +1587,7 @@ async function launchOnSlot(input: {
       command: target.command,
       args: [...target.prefixArgs, ...input.args],
       env,
+      ...(input.onSpawn !== undefined ? { onSpawn: input.onSpawn } : {}),
     });
     process.exitCode = code;
   } catch (err) {

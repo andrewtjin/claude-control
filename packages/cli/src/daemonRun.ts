@@ -20,6 +20,7 @@ import {
   defaultPaths,
   defaultProtector,
   folderBindingsPath,
+  profilesRoot,
   type Logger,
   type Paths,
   type Protector,
@@ -57,7 +58,7 @@ import { createAgentSdkClient, createSessionManager } from '@claude-control/sess
 import type { AdvisorOptions, AutoSwitchPolicy } from '@claude-control/usage-advisor';
 import type { AgentSdkClient, CreateAgentSdkClientDeps } from '@claude-control/session-runtime';
 import { buildEngine, daemonDbPath, fail, resolveBindEnforce } from './context.js';
-import { createClaudeBackgroundHost, moveLocksDir } from './backgroundHost.js';
+import { createClaudeBackgroundHost, mainConfigOf, moveLocksDir } from './backgroundHost.js';
 import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
 import {
@@ -557,10 +558,12 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
           // The daemon's own environment, not the logging one: a service this starts hands its
           // environment to every session it hosts, and the daemon's log file is not theirs.
           // The move lock is the one `cctl claude` takes when it moves a session the operator
-          // opens, so the two never move one session at once.
+          // opens, so the two never move one session at once. The profiles root lists every config
+          // dir a session can have a job row in: a move removes them all but the target's.
           backgroundSessionHost: createClaudeBackgroundHost({
-            mainConfigDir: paths.claudeDir,
+            ...mainConfigOf(paths),
             moveLockDir: moveLocksDir(dataDir),
+            profilesRoot: profilesRoot(paths.vaultDir),
           }),
         }
       : {}),

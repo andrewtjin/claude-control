@@ -14,8 +14,12 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   createClaudeBackgroundHost,
+  holdsPendingWork,
+  mainConfigOf,
   moveLocksDir,
+  projectDirName,
   replayOptions,
+  sameProcessStart,
   titleOfTranscript,
   type ClaudeRunResult,
   type RunClaude,
@@ -61,6 +65,11 @@ function hostWith(opts: {
   /** Runs at each pause of a wait, to change the files the way Claude Code would meanwhile. */
   onSleep?: (files: Record<string, string>) => void;
   profilesRoot?: string;
+  /** The operating system's start time of each process (none given: none can be read). */
+  starts?: Map<number, string>;
+  /** Files whose read fails as a locked file does (EBUSY). */
+  locked?: string[];
+  mainConfigDirInEnv?: boolean;
 }): { host: ReturnType<typeof createClaudeBackgroundHost>; runs: Recorded[]; sleeps: number[] } {
   const runs: Recorded[] = [];
   const sleeps: number[] = [];
@@ -75,8 +84,23 @@ function hostWith(opts: {
     moveLockDir: LOCKS,
     env: opts.env ?? { PATH: '/bin' },
     run,
+    ...(opts.mainConfigDirInEnv !== undefined
+      ? { mainConfigDirInEnv: opts.mainConfigDirInEnv }
+      : {}),
+    readEnds: (p) => files[p.replace(/\\/g, '/')],
+    processStarts: (pids) =>
+      Promise.resolve(
+        new Map(
+          pids
+            .filter((pid) => opts.starts?.has(pid) === true)
+            .map((pid) => [pid, opts.starts!.get(pid)!]),
+        ),
+      ),
     readFile: (p) => {
       const key = p.replace(/\\/g, '/');
+      if (opts.locked?.includes(key) === true) {
+        throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' });
+      }
       const text = files[key];
       if (text === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
       return text;
@@ -261,7 +285,7 @@ describe('createClaudeBackgroundHost', () => {
       expect(await host.listHosted(null)).toEqual([]);
     });
 
-    it('skips malformed workers and reads a missing or torn roster as nothing hosted', async () => {
+    it('skips malformed workers, and reads a missing roster as nothing hosted', async () => {
       const { host } = hostWith({
         files: {
           [`${MAIN}/daemon/roster.json`]: roster({
@@ -270,12 +294,36 @@ describe('createClaudeBackgroundHost', () => {
             abcdef12: { ...worker('ABCDEF12-076B-42A1-B487-70A8B77401FA', 'C:/r') },
             '1ee43a2c': { pid: 1, sessionId: '1ee43a2c-076b-42a1-b487-70a8b77401fa' },
           }),
-          [`${PROFILE}/daemon/roster.json`]: '{"workers": {',
         },
       });
       expect(await host.listHosted(null)).toEqual([]);
-      expect(await host.listHosted(PROFILE)).toEqual([]);
       expect(await host.listHosted('C:/nowhere')).toEqual([]);
+    });
+
+    it('a roster caught mid-write is not known, never read as nothing hosted', async () => {
+      for (const text of ['{"workers": {', '[]', '{"workers": 3}']) {
+        const { host } = hostWith({ files: { [`${PROFILE}/daemon/roster.json`]: text } });
+        await expect(host.listHosted(PROFILE)).rejects.toThrow(/roster .* could not be read/);
+      }
+    });
+
+    it("verified, it also checks each worker's process is the one Claude Code recorded", async () => {
+      const recorded = (pid: number, procStart: string): Record<string, unknown> => ({
+        ...worker(SID, 'C:/r', pid),
+        procStart,
+      });
+      const files = {
+        [`${MAIN}/daemon/roster.json`]: roster({ [SHORT]: recorded(4242, '134360864829411286') }),
+      };
+      const reused = hostWith({ files, starts: new Map([[4242, '134360999999999999']]) });
+      // The cheap read (every daemon cycle) only asks whether the pid is alive.
+      expect(await reused.host.listHosted(null)).toHaveLength(1);
+      expect(await reused.host.listHosted(null, { verified: true })).toEqual([]);
+      const same = hostWith({ files, starts: new Map([[4242, '134360864829411286']]) });
+      expect(await same.host.listHosted(null, { verified: true })).toHaveLength(1);
+      // A start time that cannot be read is no reason to doubt the process, as for Claude Code.
+      const unread = hostWith({ files, starts: new Map() });
+      expect(await unread.host.listHosted(null, { verified: true })).toHaveLength(1);
     });
   });
 
@@ -649,11 +697,14 @@ describe('what cctl claude reads to find a session', () => {
         [`${REG}/200.json`]: entry({ pid: 200, sessionId: OTHER_SID, kind: 'interactive' }),
         // Left by a process that died hard.
         [`${REG}/300.json`]: entry({ pid: 300, sessionId: SID, kind: 'bg', status: 'idle' }),
+        // Torn, but its process has exited: nothing to wait for.
         [`${REG}/400.json`]: '{"pid": 4',
-        [`${REG}/500.json`]: entry({ pid: 500, sessionId: 'not-a-session' }),
+        [`${REG}/500.json`]: entry({ pid: 500, sessionId: 'not-a-session', kind: 'bg' }),
+        // No kind of session at all: not one Claude Code would act on.
+        [`${REG}/600.json`]: entry({ pid: 600, sessionId: SID }),
         [`${REG}/notes.txt`]: 'x',
       },
-      alive: (pid) => pid !== 300,
+      alive: (pid) => pid !== 300 && pid !== 400,
     });
     expect(await host.liveSessions()).toEqual([
       {
@@ -669,6 +720,47 @@ describe('what cctl claude reads to find a session', () => {
     ]);
     expect(runs).toEqual([]);
     expect(await hostWith({}).host.liveSessions()).toEqual([]);
+  });
+
+  it('an entry of a live process caught mid-write is not known: the read fails rather than miss it', async () => {
+    const { host } = hostWith({ files: { [`${REG}/400.json`]: '{"pid": 4' }, alive: () => true });
+    await expect(host.liveSessions()).rejects.toThrow(/could not be read right now/);
+  });
+
+  it('an entry whose pid now names another process is not a live session', async () => {
+    const files = {
+      [`${REG}/4242.json`]: entry({
+        pid: 4242,
+        sessionId: SID,
+        kind: 'interactive',
+        cwd: 'C:/work',
+        procStart: '134360864830620791',
+      }),
+    };
+    expect(
+      await hostWith({
+        files,
+        starts: new Map([[4242, '134360999999999999']]),
+      }).host.liveSessions(),
+    ).toEqual([]);
+    expect(
+      await hostWith({
+        files,
+        starts: new Map([[4242, '134360864830620791']]),
+      }).host.liveSessions(),
+    ).toHaveLength(1);
+  });
+
+  it("compares start times by Claude Code's rule", () => {
+    expect(sameProcessStart('134360864830620791', '134360864830620791', 'win32')).toBe(true);
+    expect(sameProcessStart('134360864830620791', '134360999999999999', 'win32')).toBe(false);
+    // Nothing read now: no reason to doubt it.
+    expect(sameProcessStart('134360864830620791', undefined, 'linux')).toBe(true);
+    // A FILETIME against .NET ticks (another build's encoding): not comparable, so the same.
+    expect(sameProcessStart('134360864830620791', '638960000000000000', 'win32')).toBe(true);
+    expect(sameProcessStart('Sat Oct 10 06:15:12 2026', 'Sat Oct 10 07:00:00 2026', 'linux')).toBe(
+      false,
+    );
   });
 
   it("reads each config dir's job rows: state, name, cwd, when it changed", async () => {
@@ -699,25 +791,132 @@ describe('what cctl claude reads to find a session', () => {
         name: 'bg eval',
         cwd: 'C:/work',
         updatedAt: '2026-10-09T22:45:19.367Z',
+        pending: false,
       },
     ]);
     expect(await host.jobRows(null)).toEqual([]);
   });
 
-  it('lists every profile under the profiles root, and nothing without one', async () => {
+  it("reads a row's worktree, the conversation it runs after /clear, and the work it holds", async () => {
+    const NEW = 'a579c3c9-9210-4268-84cf-e73a20d40b60';
+    // As measured: a session started with -w, cleared once, and waiting on a scheduled wakeup.
+    const { host } = hostWith({
+      files: {
+        [`${MAIN}/jobs/${SHORT}/state.json`]: JSON.stringify({
+          state: 'working',
+          sessionId: SID,
+          resumeSessionId: NEW,
+          cwd: 'C:/work',
+          worktreePath: 'C:/work/.claude/worktrees/wt1',
+          worktreeBranch: 'worktree-wt1',
+          inFlight: {
+            tasks: 1,
+            queued: 0,
+            kinds: ['session_cron'],
+            drainableMonitors: 0,
+            wake: { at: 1791613500000, reason: 'probe', fires: 0 },
+          },
+        }),
+      },
+    });
+    expect(await host.jobRow(null, SHORT)).toEqual({
+      kind: 'row',
+      row: {
+        short: SHORT,
+        sessionId: SID,
+        resumeSessionId: NEW,
+        state: 'working',
+        cwd: 'C:/work',
+        worktreePath: 'C:/work/.claude/worktrees/wt1',
+        pending: true,
+      },
+    });
+  });
+
+  it('holds work between turns only for a record of some: an empty one is none', () => {
+    expect(holdsPendingWork(undefined)).toBe(false);
+    expect(holdsPendingWork({ tasks: 0, queued: 0, kinds: [], drainableMonitors: 0 })).toBe(false);
+    for (const inFlight of [
+      { tasks: 1, queued: 0, kinds: ['session_cron'], drainableMonitors: 0 },
+      { tasks: 0, queued: 2, kinds: [], drainableMonitors: 0 },
+      { tasks: 0, queued: 0, kinds: [], drainableMonitors: 1 },
+      { tasks: 0, wake: { at: 1 } },
+      { tasks: 0, kinds: ['bash'] },
+      'garbled',
+      [],
+    ]) {
+      expect({ inFlight, pending: holdsPendingWork(inFlight) }).toEqual({
+        inFlight,
+        pending: true,
+      });
+    }
+  });
+
+  it('a row that is locked or caught mid-write is unreadable, never taken for no row', async () => {
+    const { host } = hostWith({
+      files: {
+        [`${MAIN}/jobs/${SHORT}/state.json`]: JSON.stringify({ state: 'stopped', sessionId: SID }),
+      },
+      locked: [`${MAIN}/jobs/${SHORT}/state.json`],
+    });
+    expect(await host.jobRow(null, SHORT)).toEqual({ kind: 'unreadable' });
+    expect(await host.savedOptions(null, SHORT)).toEqual({ kind: 'unreadable' });
+    expect(await host.jobRow(null, 'bbbbbbbb')).toEqual({ kind: 'none' });
+  });
+
+  it('a jobs dir that cannot be listed fails, rather than read as holding no rows', async () => {
+    const { host } = hostWith({ failDir: `${PROFILE}/jobs` });
+    await expect(host.jobRows(PROFILE)).rejects.toThrow('EACCES');
+  });
+
+  it('lists the main config dir and every profile under the profiles root', async () => {
     const root = 'C:/Users/me/AppData/Local/claude-control/profiles';
     const { host } = hostWith({
       profilesRoot: root,
       files: {
         [`${root}/rule-1/x`]: '',
         [`${root}/0b5f3c1e-aaaa-4bbb-8ccc-123456789abc/x`]: '',
+        [`${root}/.staging/x`]: '',
       },
     });
-    expect((await host.profileConfigDirs()).map((p) => p.replace(/\\/g, '/'))).toEqual([
+    expect((await host.configDirs()).map((p) => p?.replace(/\\/g, '/') ?? null)).toEqual([
+      null,
       `${root}/rule-1`,
       `${root}/0b5f3c1e-aaaa-4bbb-8ccc-123456789abc`,
     ]);
-    expect(await hostWith({}).host.profileConfigDirs()).toEqual([]);
+    expect(await hostWith({}).host.configDirs()).toEqual([null]);
+  });
+
+  it("finds titles in the projects of the given folders only, from each conversation's ends", async () => {
+    const title = (t: string): string => JSON.stringify({ type: 'custom-title', customTitle: t });
+    const filler = JSON.stringify({ type: 'user', text: 'x'.repeat(200) });
+    // A conversation long enough that its middle is never read: its title at the end is found.
+    const long = [
+      title('first'),
+      ...Array.from({ length: 1000 }, () => filler),
+      title('last'),
+    ].join('\n');
+    const { host } = hostWith({
+      files: {
+        [`${MAIN}/projects/C--work-app/${SID}.jsonl`]: long,
+        [`${MAIN}/projects/C--work-app-tree/${OTHER_SID}.jsonl`]: title('feat x'),
+        [`${MAIN}/projects/C--elsewhere/aaaaaaaa-076b-42a1-b487-70a8b77401fa.jsonl`]: title('nope'),
+        [`${MAIN}/projects/C--work-app/notes.txt`]: title('not a conversation'),
+      },
+    });
+    // The fake reads whole files: what this pins is which ones are searched.
+    expect([...(await host.titlesIn(['C:/work/app', 'C:/work/app/tree']))].sort()).toEqual(
+      [
+        [SID, 'last'],
+        [OTHER_SID, 'feat x'],
+      ].sort(),
+    );
+  });
+
+  it("names a folder's project dir the way Claude Code does", () => {
+    expect(projectDirName('C:\\Users\\me\\work_app')).toEqual({ exact: 'C--Users-me-work-app' });
+    const deep = `C:/${'a'.repeat(250)}`;
+    expect(projectDirName(deep)).toEqual({ prefix: `C--${'a'.repeat(197)}-` });
   });
 
   it("finds a session's title in whichever project holds its conversation", async () => {
@@ -787,6 +986,25 @@ describe('stop waits for the session to exit', () => {
     expect(sleeps).toEqual([100, 100, 100, 100, 100]);
   });
 
+  it('waits on the roster of the config dir it stopped it under, and on a torn one', async () => {
+    // The registry entry is gone at once; the profile's terminal host lingers, then its roster is
+    // caught mid-write once: the wait goes on through both.
+    let pauses = 0;
+    const { host, sleeps } = hostWith({
+      files: {
+        [`${MAIN}/daemon/roster.json`]: roster({}),
+        [`${PROFILE}/daemon/roster.json`]: roster({ [SHORT]: worker(SID, 'C:/work', 4242) }),
+      },
+      onSleep: (files) => {
+        pauses++;
+        if (pauses === 2) files[`${PROFILE}/daemon/roster.json`] = '{"workers": {';
+        if (pauses === 3) files[`${PROFILE}/daemon/roster.json`] = roster({});
+      },
+    });
+    await host.stop(PROFILE, SHORT);
+    expect(sleeps).toEqual([100, 100, 100]);
+  });
+
   it('fails when it is still running after the wait, saying so', async () => {
     const { host } = hostWith({ files: live() });
     await expect(host.stop(null, SHORT)).rejects.toThrow(
@@ -849,6 +1067,29 @@ describe('the move lock', () => {
     second!.release();
   });
 
+  it('keeps its claim fresh while held, so a long hold is never reclaimed as stale', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-movelock-'));
+    const host = createClaudeBackgroundHost({
+      mainConfigDir: MAIN,
+      moveLockDir: moveLocksDir(dir),
+      lockRefreshMs: 20,
+    });
+    const held = await host.lockSession(SID, 0);
+    const owner = join(moveLocksDir(dir), SID, 'owner.json');
+    const first = (JSON.parse(await readFile(owner, 'utf8')) as { startedAtMs: number })
+      .startedAtMs;
+    await new Promise((r) => setTimeout(r, 120));
+    const later = (JSON.parse(await readFile(owner, 'utf8')) as { startedAtMs: number })
+      .startedAtMs;
+    expect(later).toBeGreaterThan(first);
+    held!.release();
+    // Released: free at once, and no refresh brings it back.
+    await new Promise((r) => setTimeout(r, 60));
+    const again = await host.lockSession(SID, 0);
+    expect(again).toBeDefined();
+    again!.release();
+  });
+
   it('names its directory only after a session id', async () => {
     dir = await mkdtemp(join(tmpdir(), 'cctl-movelock-'));
     const host = createClaudeBackgroundHost({
@@ -856,6 +1097,161 @@ describe('the move lock', () => {
       moveLockDir: moveLocksDir(dir),
     });
     await expect(host.lockSession('../escape', 0)).rejects.toThrow(/not a background session id/);
+  });
+});
+
+describe('removing a row', () => {
+  const ROW = `${MAIN}/jobs/${SHORT}/state.json`;
+  const row = (o: Record<string, unknown> = {}): string =>
+    JSON.stringify({ state: 'stopped', sessionId: SID, cwd: 'C:/work', ...o });
+
+  it('runs claude rm under the config dir that holds it, for a stopped session with no worktree', async () => {
+    const { host, runs } = hostWith({ files: { [`${PROFILE}/jobs/${SHORT}/state.json`]: row() } });
+    await host.removeRow(PROFILE, SHORT);
+    expect(runs.map((r) => [r.args, r.env.CLAUDE_CONFIG_DIR])).toEqual([[['rm', SHORT], PROFILE]]);
+  });
+
+  it('never removes a row that records a worktree (rm would delete it), or one of a live session (rm would kill it)', async () => {
+    const tree = hostWith({
+      files: { [ROW]: row({ worktreePath: 'C:/work/.claude/worktrees/wt1' }) },
+    });
+    await expect(tree.host.removeRow(null, SHORT)).rejects.toThrow(/records a git worktree/);
+    const live = hostWith({
+      files: {
+        [ROW]: row(),
+        [`${MAIN}/sessions/100.json`]: JSON.stringify({
+          pid: 100,
+          sessionId: SID,
+          kind: 'bg',
+          jobId: SHORT,
+        }),
+      },
+    });
+    await expect(live.host.removeRow(null, SHORT)).rejects.toThrow(
+      /live, and claude rm would kill it/,
+    );
+    // Live after /clear: the registry names the conversation it runs now, and the row says which.
+    const NEW = 'a579c3c9-9210-4268-84cf-e73a20d40b60';
+    const cleared = hostWith({
+      files: {
+        [`${PROFILE}/jobs/${SHORT}/state.json`]: row({ resumeSessionId: NEW }),
+        [`${MAIN}/sessions/100.json`]: JSON.stringify({
+          pid: 100,
+          sessionId: NEW,
+          kind: 'bg',
+          jobId: 'a579c3c9',
+        }),
+      },
+    });
+    await expect(cleared.host.removeRow(PROFILE, SHORT)).rejects.toThrow(/live/);
+    const torn = hostWith({ files: { [ROW]: '{' } });
+    await expect(torn.host.removeRow(null, SHORT)).rejects.toThrow(/could not be read/);
+    for (const h of [tree, live, cleared, torn]) expect(h.runs).toEqual([]);
+  });
+
+  it('a row that is not there needs nothing; a refused rm fails with what Claude Code said', async () => {
+    const none = hostWith({});
+    await none.host.removeRow(null, SHORT);
+    expect(none.runs).toEqual([]);
+    const refused = hostWith({
+      files: { [ROW]: row() },
+      answer: () => ({ code: 1, stdout: '', stderr: "No job matching '1ee43a2b'" }),
+    });
+    await expect(refused.host.removeRow(null, SHORT)).rejects.toThrow(
+      "claude rm exited 1: No job matching '1ee43a2b'",
+    );
+  });
+});
+
+describe('one main config dir, for every read and every command', () => {
+  const answer = (): ClaudeRunResult => ({ code: 0, stdout: '[]', stderr: '' });
+
+  it('reaches the main config dir through CLAUDE_CONFIG_DIR only when it is reached so, whatever was inherited', async () => {
+    // A shell inside a folder profile's session inherits that profile's CLAUDE_CONFIG_DIR.
+    const inherited = { PATH: '/bin', CLAUDE_CONFIG_DIR: PROFILE };
+    const viaDefault = hostWith({ env: inherited, answer, mainConfigDirInEnv: false });
+    await viaDefault.host.activity(null);
+    expect('CLAUDE_CONFIG_DIR' in viaDefault.runs[0]!.env).toBe(false);
+    const viaEnv = hostWith({ env: inherited, answer, mainConfigDirInEnv: true });
+    await viaEnv.host.activity(null);
+    expect(viaEnv.runs[0]!.env.CLAUDE_CONFIG_DIR).toBe(MAIN);
+    expect(viaEnv.host.configEnv(null)).toBe(MAIN);
+    expect(viaDefault.host.configEnv(null)).toBeUndefined();
+    expect(viaDefault.host.configEnv(PROFILE)).toBe(PROFILE);
+  });
+
+  it('tells the two apart by where the main config keeps its .claude.json', () => {
+    expect(
+      mainConfigOf({
+        claudeDir: 'C:/Users/me/.claude',
+        claudeJsonPath: 'C:/Users/me/.claude.json',
+      }),
+    ).toEqual({ mainConfigDir: 'C:/Users/me/.claude', mainConfigDirInEnv: false });
+    expect(mainConfigOf({ claudeDir: 'D:/cfg/', claudeJsonPath: 'D:/cfg/.claude.json' })).toEqual({
+      mainConfigDir: 'D:/cfg/',
+      mainConfigDirInEnv: true,
+    });
+  });
+
+  it('a resume by hand names the config dir it must run under, and every option', () => {
+    const viaDefault = hostWith({ mainConfigDirInEnv: false });
+    expect(viaDefault.host.resumeHint(null, SID, ['--model=opus'])).toBe(
+      `claude --bg --resume ${SID} --model=opus`,
+    );
+    expect(viaDefault.host.resumeHint(PROFILE, SID, ['--name=bg eval'])).toBe(
+      `CLAUDE_CONFIG_DIR=${PROFILE} claude --bg --resume ${SID} "--name=bg eval"`,
+    );
+    const viaEnv = hostWith({ mainConfigDirInEnv: true });
+    expect(viaEnv.host.resumeHint(null, SID, [])).toBe(
+      `CLAUDE_CONFIG_DIR=${MAIN} claude --bg --resume ${SID}`,
+    );
+  });
+});
+
+describe('the terminal cctl claude started, in the attach journal', () => {
+  const JOURNAL = `${PROFILE}/daemon/attach-journal`;
+  it('is shown only by an entry naming its own pid, under the config dir it opened', async () => {
+    const { host } = hostWith({
+      files: {
+        [`${JOURNAL}/g1.json`]: JSON.stringify({ pid: 38016, procStart: '1' }),
+        [`${JOURNAL}/g2.json`]: JSON.stringify({ pid: 501 }),
+      },
+    });
+    expect(await host.attachedBy(PROFILE, 38016)).toBe(true);
+    expect(await host.attachedBy(PROFILE, 4242)).toBe(false);
+    expect(await host.attachedBy(null, 38016)).toBe(false);
+  });
+});
+
+describe('a copy started instead of the session', () => {
+  const COPY_NOTE =
+    'note: session 1ee43a2b is already running in the background, so this started a copy as 5ad47a09.';
+  it('is stopped under the config dir that started it', async () => {
+    const { host, runs } = hostWith({
+      answer: (args) =>
+        args[0] === '--bg'
+          ? { code: 0, stdout: COPY_NOTE, stderr: '' }
+          : { code: 0, stdout: '', stderr: '' },
+    });
+    await expect(
+      host.resumeIdle({ configDir: PROFILE, sessionId: SID, short: SHORT, cwd: 'C:/r' }),
+    ).rejects.toThrow(/started a copy/);
+    expect(runs.map((r) => [r.args[0], r.env.CLAUDE_CONFIG_DIR])).toEqual([
+      ['--bg', PROFILE],
+      ['stop', PROFILE],
+    ]);
+  });
+
+  it('that cannot be stopped is said too, so it does not run on unnoticed', async () => {
+    const { host } = hostWith({
+      answer: (args) =>
+        args[0] === '--bg'
+          ? { code: 0, stdout: COPY_NOTE, stderr: '' }
+          : { code: 1, stdout: '', stderr: 'refused' },
+    });
+    await expect(
+      host.resumeIdle({ configDir: PROFILE, sessionId: SID, short: SHORT, cwd: 'C:/r' }),
+    ).rejects.toThrow(/the copy could not be stopped \(claude stop exited 1: refused\)/);
   });
 });
 

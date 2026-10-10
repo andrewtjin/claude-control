@@ -1,97 +1,147 @@
-// `cctl claude attach <session>` and `cctl claude --resume <session>` when the session is a Claude
-// Code background session (`claude --bg`): open it on the account of the folder it works in, moving
-// it there when it can, and never let Claude Code take it from the service that runs it.
+// `cctl claude` with arguments that reach a Claude Code background session (`claude --bg`): open it
+// on the account of the folder it works in, moving it there when it can, and never let Claude Code
+// take it from the service that runs it.
 //
 // Claude Code runs one background service per config dir, and a session's account is the config
 // dir that hosts it. A ruled folder runs on its own profile (a config dir of its own), so the same
-// session can be hosted by the main config dir's service or by a profile's, and can have a job row
-// in several. What Claude Code does with `attach` or an interactive `--resume` under a config dir X
-// depends on where the session runs (measured against the real binary, 2.1.295):
-//   - live in X: it opens it;
-//   - live in another config dir's service while X holds a STOPPED row for it: it wakes X's row,
-//     and the wake kills the copy running elsewhere, even mid-turn (the turn is lost, and the other
-//     row ends failed). That is a steal, and nothing here ever lets one happen: no attach or resume
-//     is run under a config dir while the session runs as a background session in another;
-//   - live elsewhere while X holds a FAILED row: it echoes that row's stale error and exits 1;
-//   - live elsewhere while X holds no row: "No job matching", exit 1 (attach), or "running in the
-//     background", exit 1 (--resume);
-//   - live nowhere: attach wakes X's stopped row with X's saved options, but echoes a failed row's
-//     error even then; --resume opens it in the foreground (fine), unless X's row failed.
-// So the session is found first (the shared registry says whether it runs and what it is doing,
-// each service's roster says which one runs it), and then:
+// session can be hosted by the main config dir's service or by a profile's. Each config dir keeps a
+// job row for a session it ran, and a row under a config dir X for a session running in another
+// config dir's service is a trap (measured against the real binary, 2.1.295): whatever under X
+// wakes, stops or removes that row — `claude attach`, an interactive `--resume` (by id, by title,
+// or chosen in its picker), `claude stop`, `claude rm`, `claude respawn`, Enter or Ctrl+X in the
+// agents view — reaches the session where it runs and kills it there, mid-turn included (the turn
+// is lost), or answers with the row's stale error. So:
+//   - a move, by the daemon or by cctl, leaves a session a row only where it runs (see the daemon's
+//     backgroundMove.ts);
+//   - what `cctl claude` is asked to open is found first (by full id; a job id or any prefix of one,
+//     or a name, for `attach`; a title among this folder's sessions and its git worktrees' for
+//     `--resume`), and opened where it runs, or moved where it belongs first;
+//   - anything passed to Claude Code as typed under a config dir X is first checked against X's
+//     rows: a row there for a session live in another service refuses the launch, naming where the
+//     session runs and how to open it safely.
+// For one session found:
 //   - it runs where it belongs (the slot of the folder it works in): opened there;
-//   - it runs elsewhere and is idle, with no terminal on it: moved there by the same move the daemon
-//     makes (see the daemon's backgroundMove.ts), then opened; busy, watched, or not movable: opened
-//     where it runs, saying it stays on that account for now;
+//   - it runs elsewhere, idle with nothing held and no terminal on that service: moved there by the
+//     same move the daemon makes, then opened; busy, watched, in a git worktree Claude Code made for
+//     it, or not movable: opened where it runs, saying it stays on that account for now. A session
+//     left on the profile of a rule since removed has no login there, so it is moved to its folder's
+//     slot whenever it is idle, and said plainly when it cannot be;
 //   - it is open in a terminal: nothing is touched, and the operator is told where;
-//   - it runs nowhere: its row where it belongs is woken (a failed one restarted first; none at all
-//     started there with the options its latest row saved, as a move would), then opened; a plain
-//     --resume runs in the foreground as Claude Code does it.
+//   - it runs nowhere: `attach` wakes its row where it belongs (rows elsewhere removed first, a
+//     failed one restarted, none at all started there with the options its latest row saved), and a
+//     plain `--resume` runs it in the foreground as Claude Code does.
+// A prompt given with `--resume <session> <prompt>` is passed on to the session where it is opened.
 // The daemon's mover may reach the same session at the same moment, so all of this runs under the
 // session's move lock, which is kept until the terminal opened here has shown up in its service's
 // attach journal: from then on the daemon holds back on its own (see backgroundMover.ts).
 
 import {
+  SESSION_ID_PATTERN,
+  allRows,
   confirmHosted,
   moveBackgroundSession,
+  reasonOf,
+  sameConfigDir,
+  sessionLabel,
+  settledWhere,
+  type JobRow,
+  type Lineage,
+  type LiveSession,
+  type LocatedRow,
+  type MoveResult,
   type MoveTiming,
   type SessionLock,
+  type SessionWhere,
 } from '@claude-control/daemon';
-import type { ClaudeBackgroundHost, JobRow, LiveSession } from './backgroundHost.js';
+import type { BackgroundSession } from '@claude-control/daemon';
+import type { ClaudeBackgroundHost } from './backgroundHost.js';
 
-/** What the operator asked Claude Code to open. */
-export interface BackgroundRequest {
-  verb: 'attach' | 'resume';
-  /** The session as named: a session id, a short id (attach only), or a name. */
-  ref: string;
+/** Claude Code's own rule for a job id given to `attach` and its kin: one to eight lowercase hex
+ *  digits are always a prefix of a job id, never a name. */
+const JOB_PREFIX = /^[0-9a-f]{1,8}$/;
+
+/** What the operator asked Claude Code to do with a background session. */
+export type BackgroundRequest =
+  /** `attach <session>`, flags before or after. `refAt` is where the session is named in `args`
+   *  (the operator's words after a leading `--`). */
+  | { verb: 'attach'; ref: string; args: string[]; refAt: number }
+  /** An interactive `--resume <session>` (`-r`, `--resume=`), with every other word (a prompt, its
+   *  flags) in `rest`. */
+  | { verb: 'resume'; ref: string; rest: string[] }
+  /** `stop`, `kill`, `rm` or `respawn` of one session: run where it runs. */
+  | { verb: 'control'; ref: string; args: string[]; refAt: number }
+  /** Anything else that can wake or stop a row under the slot it runs on: Claude Code's resume
+   *  picker (a bare `--resume`, or a term matching no title), `--continue`, the agents view, a
+   *  `respawn` of every session, a print-mode resume. Passed as typed once that slot holds no trap
+   *  row (one matching `ref`, when given). */
+  | { verb: 'guard'; ref?: string };
+
+/** Options that start a copy or a new background start: neither ever wakes an existing row. */
+const FORKS: ReadonlySet<string> = new Set(['--bg', '--background', '--fork-session']);
+/** Subcommands that stop, remove or restart one session, or all of them. */
+const CONTROL: ReadonlySet<string> = new Set(['stop', 'kill', 'rm', 'respawn']);
+
+/** The first word after `from` that is not an option, and where it is. */
+function nextWord(
+  words: readonly string[],
+  from: number,
+): { word: string; at: number } | undefined {
+  for (let i = from + 1; i < words.length; i++) {
+    const word = words[i]!;
+    if (!word.startsWith('-')) return word.trim() === '' ? undefined : { word, at: i };
+  }
+  return undefined;
 }
 
-const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const SHORT_ID = /^[0-9a-f]{8}$/i;
-
-/** Options that make `--resume` something other than opening the session in this terminal: a copy,
- *  a new background start, a one-shot print run, or the folder's latest session instead. None of
- *  them opens a running background session, so they pass through untouched. */
-const NOT_AN_OPEN: ReadonlySet<string> = new Set([
-  '--bg',
-  '--background',
-  '--fork-session',
-  '-p',
-  '--print',
-  '-c',
-  '--continue',
-]);
-
 /**
- * The background session `cctl claude`'s arguments open, if they open one: `attach <session>`, or an
- * interactive `--resume <session>` (`-r`, `--resume=`), also after a leading `--`. `--resume` with no
- * value opens Claude Code's picker, and anything else is not a request to open a session, so both
- * are left alone.
+ * What `cctl claude`'s arguments ask of a background session, if anything (see
+ * {@link BackgroundRequest}), also after a leading `--`. A word that names a subcommand is taken as
+ * one wherever it stands, flags before or after: Claude Code reads it so, and a word read as one
+ * here that is not one only makes cctl look the session up.
  */
 export function parseBackgroundRequest(args: readonly string[]): BackgroundRequest | undefined {
-  const words = args[0] === '--' ? args.slice(1) : args;
-  if (words[0] === 'attach') {
-    // `claude attach` takes exactly one session; anything more is Claude Code's to refuse.
-    const ref = words[1];
-    if (words.length !== 2 || ref === undefined || ref.startsWith('-') || ref.trim() === '') {
-      return undefined;
-    }
-    return { verb: 'attach', ref };
+  const words = args[0] === '--' ? args.slice(1) : [...args];
+  if (words.some((w) => FORKS.has(w))) return undefined;
+  const attachAt = words.indexOf('attach');
+  if (attachAt >= 0) {
+    const ref = nextWord(words, attachAt);
+    return ref === undefined
+      ? { verb: 'guard' }
+      : { verb: 'attach', ref: ref.word, args: words, refAt: ref.at };
   }
+  const controlAt = words.findIndex((w) => CONTROL.has(w));
+  if (controlAt >= 0) {
+    const ref = nextWord(words, controlAt);
+    if (ref === undefined) return words[controlAt] === 'respawn' ? { verb: 'guard' } : undefined;
+    return { verb: 'control', ref: ref.word, args: words, refAt: ref.at };
+  }
+  if (words.includes('agents')) return words.includes('--json') ? undefined : { verb: 'guard' };
+  if (words.includes('-c') || words.includes('--continue')) return { verb: 'guard' };
   let ref: string | undefined;
+  let picker = false;
+  const rest: string[] = [];
   for (let i = 0; i < words.length; i++) {
     const word = words[i]!;
-    if (NOT_AN_OPEN.has(word)) return undefined;
     if (word === '--resume' || word === '-r') {
       const next = words[i + 1];
-      if (next === undefined || next.startsWith('-')) return undefined;
-      ref = next;
-      i++;
+      if (next === undefined || next.startsWith('-') || next.trim() === '') {
+        picker = true;
+      } else {
+        ref = next;
+        i++;
+      }
     } else if (word.startsWith('--resume=')) {
-      ref = word.slice('--resume='.length);
+      const value = word.slice('--resume='.length);
+      if (value.trim() === '') picker = true;
+      else ref = value;
+    } else {
+      rest.push(word);
     }
   }
-  return ref !== undefined && ref.trim() !== '' ? { verb: 'resume', ref } : undefined;
+  if (ref === undefined) return picker ? { verb: 'guard' } : undefined;
+  // A one-shot print run is no terminal to open the session in: it is passed on, checked.
+  if (rest.includes('-p') || rest.includes('--print')) return { verb: 'guard', ref };
+  return { verb: 'resume', ref, rest };
 }
 
 /** Where a session belongs: the slot of the folder it works in. */
@@ -111,25 +161,34 @@ export interface ConfigView {
   account?: string;
   /** The slot in words: "the global slot", "the folder slot of C:\work". */
   slot: string;
+  /** The profile of a folder rule since removed: no login, so every prompt there fails. */
+  removed?: boolean;
 }
 
 export interface RouteContext {
   host: ClaudeBackgroundHost;
-  /** The folder this command runs in; a name given to --resume is looked up there, as Claude Code
+  /** The folder this command runs in; a title given to --resume is looked up there, as Claude Code
    *  looks one up. */
   cwd: string;
   platform: NodeJS.Platform;
   /** Whether two folders are the same one, by the platform's path rules. */
   sameFolder(a: string, b: string): boolean;
+  /** The folders a title given to --resume from `cwd` is searched in, as Claude Code searches:
+   *  the folder itself and every git worktree of its repository (Claude Code's own among them). */
+  titleFolders(cwd: string): Promise<string[]>;
   /** Where a session working in a folder belongs. Makes that folder's slot live, as a launch there
    *  would, so it is asked only once a session has been found. */
   homeOf(cwd: string): Promise<SessionHome>;
+  /** The config dir a launch that follows the folder runs under, without making anything live. */
+  launchConfigDir(): Promise<string | null>;
   /** A config dir in words. */
   view(configDir: string | null): Promise<ConfigView>;
   /** Whether cctl's daemon is running, and so moves background sessions between turns. */
   daemonRunning: boolean;
   /** One line to the operator. */
   say(line: string): void;
+  /** Run a move with Ctrl-C held off until it has finished or put the session back. */
+  shield<T>(fn: () => Promise<T>): Promise<T>;
   /** How long to wait for another cctl process that is moving the same session. */
   lockWaitMs: number;
   timing: MoveTiming;
@@ -160,199 +219,329 @@ export type RouteDecision =
 
 const PASS: RouteDecision = { kind: 'pass' };
 
-/** One session as found: its ids, where it works, and what it is called. */
+/** Everything known of one background session: every id and job id it has had, its rows in every
+ *  config dir (the latest first), its registry entries and the services listing it. */
+interface Known {
+  lineage: Lineage;
+  rows: LocatedRow[];
+  entries: LiveSession[];
+  hosted: Array<{ configDir: string | null; worker: BackgroundSession }>;
+}
+
+/** How a found session is named and where it works. */
 interface Target {
-  sessionId: string;
+  known: Known;
+  /** Its job id where it runs, else its latest row's. */
   short: string;
+  /** The conversation it runs now. */
+  currentId: string;
+  /** The folder it works in: where its service started it, else its latest row's, else where its
+   *  registry entry is. */
   cwd: string;
   name?: string;
 }
 
-/** Everything read about one session before it is chosen. */
-interface Known {
-  sessionId: string;
-  short: string;
-  entry?: LiveSession;
-  /** Its rows, by config dir, the latest first. */
-  rows: Array<{ configDir: string | null; row: JobRow }>;
-  /** Hosted by some service's roster. */
-  hostedCwd?: string;
-}
-
-/** Whether two config dirs are the same one (null is the main config dir). */
-function sameConfig(a: string | null, b: string | null, platform: NodeJS.Platform): boolean {
-  if (a === null || b === null) return a === b;
-  const norm = (p: string): string => {
-    const trimmed = p.replace(/[\\/]+$/, '');
-    return platform === 'win32' ? trimmed.replace(/\//g, '\\').toLowerCase() : trimmed;
-  };
-  return norm(a) === norm(b);
-}
-
-/** Every config dir that can run a background service of cctl's: the main one, then each profile. */
-async function configDirs(host: ClaudeBackgroundHost): Promise<Array<string | null>> {
-  return [null, ...(await host.profileConfigDirs())];
-}
-
-/** Read everything known about every session: the live registry, every config dir's rows and
- *  rosters. */
-async function knownSessions(ctx: RouteContext): Promise<Map<string, Known>> {
-  const known = new Map<string, Known>();
-  const of = (sessionId: string): Known => {
-    let k = known.get(sessionId);
-    if (k === undefined) {
-      k = { sessionId, short: sessionId.slice(0, 8), rows: [] };
-      known.set(sessionId, k);
-    }
-    return k;
-  };
-  for (const entry of await ctx.host.liveSessions()) {
-    const k = of(entry.sessionId);
-    // A foreground entry wins over a background one: it says the session is open in a terminal.
-    if (k.entry === undefined || entry.kind !== 'bg') k.entry = entry;
-  }
-  for (const configDir of await configDirs(ctx.host)) {
-    for (const row of await ctx.host.jobRows(configDir))
-      of(row.sessionId).rows.push({ configDir, row });
-    for (const s of await ctx.host.listHosted(configDir).catch(() => [])) {
-      of(s.sessionId).hostedCwd = s.cwd;
+/** Read every config dir's rows and roster and the registry, and gather them by session: a row,
+ *  an entry and a roster worker belong together when they share an id or a job id (see the
+ *  daemon's lineageOf). Something that cannot be read right now is left out here: this only finds
+ *  the session, and where it runs is read again, strictly, before anything is done. Only background
+ *  sessions are kept: one with a row, a service listing it, or a background registry entry. */
+async function knownSessions(ctx: RouteContext): Promise<Known[]> {
+  const { host } = ctx;
+  const rows = await allRows(host).catch(() => [] as LocatedRow[]);
+  const entries = await host.liveSessions().catch(() => [] as LiveSession[]);
+  const hosted: Known['hosted'] = [];
+  for (const configDir of await host.configDirs()) {
+    for (const worker of await host.listHosted(configDir).catch(() => [])) {
+      hosted.push({ configDir, worker });
     }
   }
-  for (const k of known.values()) {
+  // Seeds, one per row, entry and worker, merged while any two share an id or a job id.
+  const groups: Known[] = [];
+  const seed = (ids: Array<string | undefined>, shorts: Array<string | undefined>): Known => {
+    const known: Known = {
+      lineage: {
+        ids: new Set(ids.filter((x): x is string => x !== undefined)),
+        shorts: new Set(shorts.filter((x): x is string => x !== undefined)),
+      },
+      rows: [],
+      entries: [],
+      hosted: [],
+    };
+    groups.push(known);
+    return known;
+  };
+  for (const r of rows) seed([r.row.sessionId, r.row.resumeSessionId], [r.row.short]).rows.push(r);
+  for (const e of entries) {
+    seed([e.sessionId], [e.kind === 'bg' ? e.jobId : undefined]).entries.push(e);
+  }
+  for (const h of hosted) seed([h.worker.sessionId], [h.worker.short]).hosted.push(h);
+  const overlaps = (a: Lineage, b: Lineage): boolean =>
+    [...a.ids].some((x) => b.ids.has(x)) || [...a.shorts].some((x) => b.shorts.has(x));
+  for (let merged = true; merged;) {
+    merged = false;
+    for (let i = 0; i < groups.length && !merged; i++) {
+      for (let j = i + 1; j < groups.length && !merged; j++) {
+        const a = groups[i]!;
+        const b = groups[j]!;
+        if (!overlaps(a.lineage, b.lineage)) continue;
+        a.lineage = {
+          ids: new Set([...a.lineage.ids, ...b.lineage.ids]),
+          shorts: new Set([...a.lineage.shorts, ...b.lineage.shorts]),
+        };
+        a.rows.push(...b.rows);
+        a.entries.push(...b.entries);
+        a.hosted.push(...b.hosted);
+        groups.splice(j, 1);
+        merged = true;
+      }
+    }
+  }
+  for (const k of groups) {
     k.rows.sort((a, b) => (b.row.updatedAt ?? '').localeCompare(a.row.updatedAt ?? ''));
   }
-  return known;
-}
-
-/** The folder a session works in: where it runs, else its latest row's. */
-function cwdOf(k: Known): string | undefined {
-  return k.entry?.cwd ?? k.hostedCwd ?? k.rows.find((r) => r.row.cwd !== undefined)?.row.cwd;
-}
-
-/** Claude Code's name for a session, when it has one other than its id. */
-function nameOf(k: Known): string | undefined {
-  const names = [k.entry?.name, ...k.rows.map((r) => r.row.name)];
-  return names.find((n) => n !== undefined && n.length > 0 && n !== k.short);
-}
-
-function targetOf(k: Known): Target | undefined {
-  const cwd = cwdOf(k);
-  if (cwd === undefined) return undefined;
-  const name = nameOf(k);
-  return { sessionId: k.sessionId, short: k.short, cwd, ...(name !== undefined ? { name } : {}) };
-}
-
-/** Whether a session runs as a background session somewhere, or has a row that failed: the only
- *  ones a --resume by name could make Claude Code steal, or answer with a stale error. */
-function atRisk(k: Known): boolean {
-  return (
-    k.hostedCwd !== undefined ||
-    k.entry?.kind === 'bg' ||
-    k.rows.some((r) => r.row.state === 'failed')
+  return groups.filter(
+    (k) => k.rows.length > 0 || k.hosted.length > 0 || k.entries.some((e) => e.kind === 'bg'),
   );
 }
 
-type Resolution =
-  { kind: 'none' } | { kind: 'one'; target: Target } | { kind: 'ambiguous'; candidates: Target[] };
+/** A known session as it is named and found: its live job and conversation, else its latest
+ *  row's; undefined when nothing says where it works. */
+function targetOf(k: Known): Target | undefined {
+  const live = k.entries.find((e) => e.kind === 'bg');
+  const latest = k.rows[0]?.row;
+  const worker = k.hosted[0]?.worker;
+  const cwd = worker?.cwd ?? latest?.cwd ?? live?.cwd ?? k.entries[0]?.cwd;
+  if (cwd === undefined) return undefined;
+  const short = live?.jobId ?? worker?.short ?? latest?.short;
+  const currentId =
+    live?.sessionId ??
+    (latest !== undefined ? (latest.resumeSessionId ?? latest.sessionId) : undefined) ??
+    worker?.sessionId;
+  if (short === undefined || currentId === undefined) return undefined;
+  const name = namesOf(k).find((n) => n !== short);
+  return { known: k, short, currentId, cwd, ...(name !== undefined ? { name } : {}) };
+}
 
-/** The session a request names, read the way Claude Code reads it: a session id anywhere; for
- *  attach, a short id, else a whole name, else part of one (job rows and live entries); for
- *  --resume, a title among the sessions of this folder. */
-async function resolve(req: BackgroundRequest, ctx: RouteContext): Promise<Resolution> {
+/** Claude Code's names for a session: its registry entries', then its rows'. */
+function namesOf(k: Known): string[] {
+  return [...k.entries.map((e) => e.name), ...k.rows.map((r) => r.row.name)].filter(
+    (n): n is string => n !== undefined && n.length > 0,
+  );
+}
+
+/** Every folder a session works in, by any record of it: where its service started it, where its
+ *  rows say, its git worktree, and where its registry entry says it runs now. */
+function foldersOfSession(k: Known): string[] {
+  return [
+    ...k.hosted.map((h) => h.worker.cwd),
+    ...k.rows.flatMap((r) => [r.row.cwd, r.row.worktreePath]),
+    ...k.entries.map((e) => e.cwd),
+  ].filter((f): f is string => f !== undefined);
+}
+
+type Resolution =
+  { kind: 'none' } | { kind: 'one'; target: Target } | { kind: 'ambiguous'; candidates: string[] };
+
+/** The candidates of an ambiguous name in words: an id with its name, as the operator retypes it. */
+function candidateOf(t: Target, verb: BackgroundRequest['verb']): string {
+  return `${verb === 'resume' ? t.currentId : t.short}${t.name !== undefined ? ` "${t.name}"` : ''}`;
+}
+
+/** The session a request names, read the way Claude Code reads it: a full session id (any id the
+ *  session has had); for attach and its kin, a job id prefix (never a name), else a whole name,
+ *  else part of one; for --resume, a title among the sessions of this folder and its worktrees,
+ *  counting every conversation there with that title, background or not. */
+async function resolve(
+  req: Extract<BackgroundRequest, { ref: string }>,
+  ctx: RouteContext,
+): Promise<Resolution> {
   const known = await knownSessions(ctx);
   const pick = (ks: Known[]): Resolution => {
     const targets = ks.map(targetOf).filter((t): t is Target => t !== undefined);
     if (targets.length === 0) return { kind: 'none' };
     return targets.length === 1
       ? { kind: 'one', target: targets[0]! }
-      : { kind: 'ambiguous', candidates: targets };
+      : { kind: 'ambiguous', candidates: targets.map((t) => candidateOf(t, req.verb)) };
   };
   const ref = req.ref.trim();
-  if (SESSION_ID.test(ref)) {
-    const k = known.get(ref.toLowerCase());
-    return k === undefined ? { kind: 'none' } : pick([k]);
+  if (SESSION_ID_PATTERN.test(ref.toLowerCase())) {
+    return pick(known.filter((k) => k.lineage.ids.has(ref.toLowerCase())));
   }
-  const all = [...known.values()];
-  if (req.verb === 'attach') {
-    if (SHORT_ID.test(ref)) {
-      const short = ref.toLowerCase();
-      const byShort = all.filter((k) => k.short === short || k.entry?.jobId === short);
-      if (byShort.length > 0) return pick(byShort);
-    }
+  if (req.verb !== 'resume') {
+    if (JOB_PREFIX.test(ref))
+      return pick(known.filter((k) => [...k.lineage.shorts].some((s) => s.startsWith(ref))));
     const lower = ref.toLowerCase();
-    const names = (k: Known): string[] =>
-      [k.entry?.name, ...k.rows.map((r) => r.row.name)]
-        .filter((n): n is string => n !== undefined)
-        .map((n) => n.toLowerCase().trim());
-    const whole = all.filter((k) => names(k).includes(lower));
+    const names = (k: Known): string[] => namesOf(k).map((n) => n.toLowerCase().trim());
+    const whole = known.filter((k) => names(k).includes(lower));
     if (whole.length > 0) return pick(whole);
     // Claude Code takes part of a name too.
-    return pick(all.filter((k) => names(k).some((n) => n.includes(lower))));
+    return pick(known.filter((k) => names(k).some((n) => n.includes(lower))));
   }
-  // --resume <name>: Claude Code matches a title among the sessions of the folder it runs in.
+  // --resume <title>: Claude Code matches a conversation's title among the sessions of the folder
+  // it runs in and of its repository's worktrees; one match resumes it, more open its picker.
   const wanted = ref.toLowerCase();
-  const matches: Known[] = [];
-  for (const k of all) {
-    const cwd = cwdOf(k);
-    if (cwd === undefined || !ctx.sameFolder(cwd, ctx.cwd) || !atRisk(k)) continue;
-    const title = await ctx.host.sessionTitle(k.sessionId);
-    if (title !== undefined && title.toLowerCase().trim() === wanted) matches.push(k);
+  const folders = await ctx.titleFolders(ctx.cwd);
+  const inScope = (f: string): boolean => folders.some((s) => ctx.sameFolder(s, f));
+  const background: Known[] = [];
+  for (const k of known) {
+    if (!foldersOfSession(k).some(inScope)) continue;
+    for (const id of k.lineage.ids) {
+      const title = await ctx.host.sessionTitle(id);
+      if (title !== undefined && title.toLowerCase().trim() === wanted) {
+        background.push(k);
+        break;
+      }
+    }
   }
-  return pick(matches);
+  const ordinary = [...(await ctx.host.titlesIn(folders))].filter(
+    ([id, title]) =>
+      title.toLowerCase().trim() === wanted && !known.some((k) => k.lineage.ids.has(id)),
+  );
+  if (background.length === 1 && ordinary.length === 0) return pick(background);
+  if (background.length + ordinary.length <= 1) return { kind: 'none' };
+  return {
+    kind: 'ambiguous',
+    candidates: [
+      ...background
+        .map(targetOf)
+        .filter((t): t is Target => t !== undefined)
+        .map((t) => candidateOf(t, 'resume')),
+      ...ordinary.map(([id]) => id),
+    ],
+  };
+}
+
+/** A job row under the launch's config dir for a session live in another service (see the
+ *  header): what wakes, stops or removes it kills that session where it runs. */
+interface Trap {
+  row: JobRow;
+  /** The config dir whose service runs the session, when one of cctl's lists it. */
+  runsIn: string | null | undefined;
+  name?: string;
+}
+
+/** How many times a trap check reads again when something is caught mid-write. */
+const TRAP_TRIES = 3;
+const TRAP_PAUSE_MS = 300;
+
+/** The trap rows a config dir holds (see {@link Trap}), read strictly: something that cannot be
+ *  read throws, and is read again a few times before the caller is told. */
+async function trapsIn(ctx: RouteContext, configDir: string | null): Promise<Trap[]> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await readTraps(ctx, configDir);
+    } catch (err) {
+      if (attempt >= TRAP_TRIES) throw err;
+      await ctx.timing.sleep(TRAP_PAUSE_MS);
+    }
+  }
+}
+
+async function readTraps(ctx: RouteContext, configDir: string | null): Promise<Trap[]> {
+  const { host, platform } = ctx;
+  const rows = await host.jobRows(configDir);
+  if (rows.length === 0) return [];
+  const live = (await host.liveSessions()).filter((e) => e.kind === 'bg');
+  const traps: Trap[] = [];
+  for (const row of rows) {
+    const ids = [row.sessionId, row.resumeSessionId];
+    const entry = live.find((e) => e.jobId === row.short || ids.includes(e.sessionId));
+    if (entry === undefined) continue;
+    let runsIn: string | null | undefined;
+    for (const c of await host.configDirs()) {
+      const hosted = await host.listHosted(c, { verified: true });
+      if (hosted.some((w) => w.short === entry.jobId || ids.includes(w.sessionId))) runsIn = c;
+    }
+    if (runsIn !== undefined && sameConfigDir(runsIn, configDir, platform)) continue;
+    traps.push({
+      row,
+      runsIn,
+      ...(entry.name !== undefined
+        ? { name: entry.name }
+        : row.name !== undefined
+          ? { name: row.name }
+          : {}),
+    });
+  }
+  return traps;
+}
+
+/** Whether Claude Code could take a reference typed under a config dir to mean a trap row's
+ *  session: an id it has had, a prefix of its job id, its name or part of it, or a title. */
+async function trapMatches(ctx: RouteContext, trap: Trap, ref: string): Promise<boolean> {
+  const r = ref.trim();
+  const ids = [trap.row.sessionId, trap.row.resumeSessionId].filter(
+    (x): x is string => x !== undefined,
+  );
+  if (SESSION_ID_PATTERN.test(r.toLowerCase())) return ids.includes(r.toLowerCase());
+  if (JOB_PREFIX.test(r)) return trap.row.short.startsWith(r);
+  const lower = r.toLowerCase();
+  if ([trap.name, trap.row.name].some((n) => n !== undefined && n.toLowerCase().includes(lower))) {
+    return true;
+  }
+  for (const id of ids) {
+    const title = await ctx.host.sessionTitle(id);
+    if (title !== undefined && title.toLowerCase().trim() === lower) return true;
+  }
+  return false;
+}
+
+/**
+ * Pass the operator's arguments to Claude Code as typed under the launch's config dir, once that
+ * config dir holds no trap row they could reach: one matching `ref` when the arguments name a
+ * session, any at all when they open a list to choose from. Otherwise refuse, naming the session,
+ * where it runs, and the command that opens it safely.
+ */
+async function guardedPass(
+  ctx: RouteContext,
+  mode: RouteMode,
+  ref: string | undefined,
+): Promise<RouteDecision> {
+  const under = mode.kind === 'fixed' ? mode.configDir : await ctx.launchConfigDir();
+  let traps: Trap[];
+  try {
+    traps = await trapsIn(ctx, under);
+  } catch (err) {
+    return {
+      kind: 'refuse',
+      message:
+        `cannot tell whether a background session would be taken from the service running it ` +
+        `(${reasonOf(err)}); try again in a moment.`,
+    };
+  }
+  const reached: Trap[] = [];
+  for (const trap of traps) {
+    if (ref === undefined || (await trapMatches(ctx, trap, ref))) reached.push(trap);
+  }
+  if (reached.length === 0) return PASS;
+  const here = await ctx.view(under);
+  const lines: string[] = [];
+  for (const trap of reached) {
+    const runs =
+      trap.runsIn === undefined
+        ? 'another background service'
+        : onWhat(await ctx.view(trap.runsIn));
+    lines.push(
+      `${sessionLabel(trap.row.short, trap.name)} runs on ${runs}; open it with: cctl claude attach ${trap.row.short}`,
+    );
+  }
+  return {
+    kind: 'refuse',
+    message:
+      `${here.slot} still holds a job row for a background session that runs elsewhere, and Claude ` +
+      `Code would stop it there and take it over from this command. ${lines.join('. ')}.`,
+  };
 }
 
 /** How a session is named to the operator: its name and short id, or the short id alone. */
 function label(t: Target): string {
-  return t.name !== undefined ? `"${t.name}" (${t.short})` : t.short;
+  return sessionLabel(t.short, t.name);
 }
 
 /** An account and its slot in words: "Alice (the global slot)", or the slot alone. */
 function onWhat(v: ConfigView): string {
   return v.account !== undefined ? `${v.account} (${v.slot})` : v.slot;
-}
-
-/** Where a session runs right now. */
-type Where =
-  | { kind: 'interactive'; pid: number; cwd?: string }
-  | { kind: 'bg'; configDir: string | null; status?: string; cwd: string }
-  | { kind: 'unclear' }
-  | { kind: 'nowhere' };
-
-/** How many times to look again when the registry and the rosters disagree for a moment (a session
- *  starting or stopping), and the pause between looks. */
-const LOCATE_TRIES = 3;
-const LOCATE_PAUSE_MS = 500;
-
-/** Where a session runs: open in a terminal (the registry says so), hosted by exactly one service
- *  (its roster says which), or nowhere. Anything else is unclear, and nothing is run on a guess. */
-async function locate(sessionId: string, ctx: RouteContext): Promise<Where> {
-  for (let attempt = 1; ; attempt++) {
-    const entries = (await ctx.host.liveSessions()).filter((e) => e.sessionId === sessionId);
-    const foreground = entries.find((e) => e.kind !== 'bg');
-    if (foreground !== undefined) {
-      return {
-        kind: 'interactive',
-        pid: foreground.pid,
-        ...(foreground.cwd !== undefined ? { cwd: foreground.cwd } : {}),
-      };
-    }
-    const holders: Array<{ configDir: string | null; cwd: string }> = [];
-    for (const configDir of await configDirs(ctx.host)) {
-      const hosted = await ctx.host.listHosted(configDir).catch(() => []);
-      const s = hosted.find((h) => h.sessionId === sessionId);
-      if (s !== undefined) holders.push({ configDir, cwd: s.cwd });
-    }
-    if (holders.length === 1) {
-      const status = entries[0]?.status;
-      return { kind: 'bg', ...holders[0]!, ...(status !== undefined ? { status } : {}) };
-    }
-    // No service hosts it and the registry has no entry: it runs nowhere.
-    if (holders.length === 0 && entries.length === 0) return { kind: 'nowhere' };
-    // Live in the registry with no service claiming it (one cctl does not know, or a moment
-    // between the two files), or claimed by two.
-    if (attempt >= LOCATE_TRIES) return { kind: 'unclear' };
-    await ctx.timing.sleep(LOCATE_PAUSE_MS);
-  }
 }
 
 /** Why a session running elsewhere is not moved where it belongs, in words. */
@@ -363,34 +552,39 @@ function stayReason(status: string | undefined): string {
 }
 
 /**
- * Decide what `cctl claude` runs for a request that names a background session (see the header).
- * The session's move lock is held while deciding, and handed on in the decision (`hold`) when
- * a terminal is about to open it; otherwise it is released before this returns.
+ * Decide what `cctl claude` runs for a request that reaches a background session (see the header).
+ * The session's move lock is held while deciding, and handed on in the decision (`hold`) when a
+ * terminal is about to open it; otherwise it is released before this returns.
  */
 export async function routeBackgroundLaunch(
   req: BackgroundRequest,
   ctx: RouteContext,
   mode: RouteMode,
 ): Promise<RouteDecision> {
+  if (req.verb === 'guard') return guardedPass(ctx, mode, req.ref);
   const found = await resolve(req, ctx);
-  if (found.kind === 'none') return PASS;
+  // A --resume term that is no title here opens Claude Code's picker, where anything can be
+  // chosen; what attach and its kin are given only ever names one session.
+  if (found.kind === 'none') {
+    return guardedPass(ctx, mode, req.verb === 'resume' ? undefined : req.ref);
+  }
   if (found.kind === 'ambiguous') {
-    const list = found.candidates
-      .map(
-        (t) =>
-          `${req.verb === 'resume' ? t.sessionId : t.short}${t.name !== undefined ? ` "${t.name}"` : ''}`,
-      )
-      .join(', ');
+    // A --resume title more than one conversation has opens Claude Code's picker: safe to pass on
+    // only while nothing there can be chosen into a steal.
+    if (req.verb === 'resume') {
+      const passed = await guardedPass(ctx, mode, undefined);
+      if (passed.kind === 'pass') return passed;
+    }
     return {
       kind: 'refuse',
-      message: `"${req.ref}" names more than one background session (${list}); name one by its id.`,
+      message: `"${req.ref}" names more than one session (${found.candidates.join(', ')}); name one by its id.`,
     };
   }
   const target = found.target;
-  let lock = await ctx.host.lockSession(target.sessionId, 0);
+  let lock = await ctx.host.lockSession(target.currentId, 0);
   if (lock === undefined) {
     ctx.say(`cctl: another cctl process is moving ${label(target)}; waiting for it to finish.`);
-    lock = await ctx.host.lockSession(target.sessionId, ctx.lockWaitMs);
+    lock = await ctx.host.lockSession(target.currentId, ctx.lockWaitMs);
   }
   if (lock === undefined) {
     return {
@@ -400,7 +594,10 @@ export async function routeBackgroundLaunch(
   }
   let decision: RouteDecision | undefined;
   try {
-    decision = await decide(req, target, ctx, mode, lock);
+    decision =
+      req.verb === 'control'
+        ? await decideControl(req, target, ctx)
+        : await decide(req, target, ctx, mode, lock);
     return decision;
   } finally {
     if (decision === undefined || !('hold' in decision) || decision.hold === undefined) {
@@ -409,18 +606,61 @@ export async function routeBackgroundLaunch(
   }
 }
 
+/** Where a session runs, read strictly (see the daemon's settledWhere). */
+function locate(t: Target, ctx: RouteContext): Promise<SessionWhere> {
+  return settledWhere(ctx.host, t.known.lineage, ctx.timing);
+}
+
+/** `stop`, `kill`, `rm` or `respawn` of one session: run under the config dir whose service runs
+ *  it, by its job id there, so no row elsewhere is ever what the command reaches. */
+async function decideControl(
+  req: Extract<BackgroundRequest, { verb: 'control' }>,
+  target: Target,
+  ctx: RouteContext,
+): Promise<RouteDecision> {
+  const where = await locate(target, ctx);
+  if (where.kind === 'unclear') {
+    return {
+      kind: 'refuse',
+      message: `cannot tell which account's background service runs ${label(target)} right now (${where.reason}); try again in a moment.`,
+    };
+  }
+  if (where.kind !== 'bg') return PASS;
+  const args = [...req.args];
+  args[req.refAt] = where.short;
+  const runsOn = await ctx.view(where.configDir);
+  ctx.say(`cctl: background session ${label(target)} runs on ${onWhat(runsOn)}; running it there.`);
+  return { kind: 'open', configDir: where.configDir, args };
+}
+
+/** What opens a session under a config dir: `attach` by its job id there, with the operator's
+ *  other words; a `--resume` with a prompt or flags is run as given, by the conversation's id, so
+ *  the prompt reaches the session (Claude Code sends it to the background session and opens it). */
+function openArgs(
+  req: Extract<BackgroundRequest, { verb: 'attach' | 'resume' }>,
+  short: string,
+  currentId: string,
+): string[] {
+  if (req.verb === 'resume') {
+    return req.rest.length > 0 ? ['--resume', currentId, ...req.rest] : ['attach', short];
+  }
+  const args = [...req.args];
+  args[req.refAt] = short;
+  return args;
+}
+
 /** The decision for one found session, under its move lock. `again` is set on the one second look
  *  taken when the session left the service it was found on while being moved. */
 async function decide(
-  req: BackgroundRequest,
+  req: Extract<BackgroundRequest, { verb: 'attach' | 'resume' }>,
   target: Target,
   ctx: RouteContext,
   mode: RouteMode,
   lock: SessionLock,
   again = false,
 ): Promise<RouteDecision> {
-  const { host, platform } = ctx;
-  const where = await locate(target.sessionId, ctx);
+  const { platform } = ctx;
+  const where = await locate(target, ctx);
   if (where.kind === 'interactive') {
     return {
       kind: 'refuse',
@@ -438,39 +678,45 @@ async function decide(
         'try again in a moment.',
     };
   }
-  const attach = (configDir: string | null): RouteDecision => ({
+  const open = (configDir: string | null, short: string, currentId: string): RouteDecision => ({
     kind: 'open',
     configDir,
-    args: ['attach', target.short],
+    args: openArgs(req, short, currentId),
     hold: { lock, configDir },
   });
+  const tree = target.known.rows.find((r) => r.row.worktreePath !== undefined);
 
   if (where.kind === 'bg') {
-    const home: SessionHome =
-      mode.kind === 'fixed'
-        ? { configDir: mode.configDir, movable: false }
-        : await ctx.homeOf(where.cwd);
-    if (sameConfig(where.configDir, home.configDir, platform)) {
-      // It runs where this launch runs: the operator's own arguments open it there.
-      return mode.kind === 'fixed'
-        ? { kind: 'pass', hold: { lock, configDir: where.configDir } }
-        : attach(where.configDir);
-    }
-    // It runs on another config dir's service. Anything run where it belongs would wake that
-    // config dir's row and kill it where it runs, so it is either moved first or opened where it runs.
-    const runsOn = await ctx.view(where.configDir);
+    const here = (configDir: string | null): RouteDecision =>
+      open(configDir, where.short, where.currentId);
     if (mode.kind === 'fixed') {
+      if (sameConfigDir(where.configDir, mode.configDir, platform)) {
+        // It runs where this launch runs: the operator's own arguments open it there.
+        return { kind: 'pass', hold: { lock, configDir: where.configDir } };
+      }
       ctx.say(
-        `cctl: background session ${label(target)} runs on ${onWhat(runsOn)}; opening it there.`,
+        `cctl: background session ${label(target)} runs on ${onWhat(await ctx.view(where.configDir))}; opening it there.`,
       );
-      return attach(where.configDir);
+      return here(where.configDir);
     }
+    const home = await ctx.homeOf(where.cwd);
+    if (sameConfigDir(where.configDir, home.configDir, platform)) return here(where.configDir);
+    // It runs on another config dir's service: anything run where it belongs would reach it through
+    // a row there, so it is either moved first or opened where it runs.
+    const runsOn = await ctx.view(where.configDir);
     const belongs = await ctx.view(home.configDir);
+    // A rule since removed left its profile without a login: there is nothing to keep it there for.
+    const orphaned = runsOn.removed === true && home.unusable === undefined;
     let why: string;
     let final = false;
-    if (home.unusable !== undefined) {
+    if (tree !== undefined) {
+      why =
+        'it works in a git worktree Claude Code made for it, which a move would delete, so it ' +
+        'stays where it runs';
+      final = true;
+    } else if (home.unusable !== undefined) {
       why = home.unusable;
-    } else if (!home.movable) {
+    } else if (!home.movable && !orphaned) {
       why =
         home.configDir === null
           ? 'cctl moves background sessions only onto a folder slot'
@@ -478,39 +724,44 @@ async function decide(
     } else if (where.status !== 'idle') {
       why = stayReason(where.status);
     } else {
-      const moved = await moveBackgroundSession(
-        host,
-        {
-          session: { short: target.short, sessionId: target.sessionId, cwd: where.cwd },
-          from: { configDir: where.configDir, name: runsOn.slot },
-          to: { configDir: home.configDir, name: belongs.slot },
-        },
-        ctx.timing,
+      ctx.say(
+        `cctl: moving background session ${label(target)} from ${onWhat(runsOn)} onto ` +
+          `${onWhat(belongs)}; Ctrl-C waits until it has finished.`,
+      );
+      const moved: MoveResult = await ctx.shield(() =>
+        moveBackgroundSession(
+          ctx.host,
+          {
+            session: { short: where.short, sessionId: where.sessionId, cwd: where.cwd },
+            from: { configDir: where.configDir, name: runsOn.slot },
+            to: { configDir: home.configDir, name: belongs.slot },
+            platform,
+          },
+          ctx.timing,
+        ),
       );
       if (moved.result === 'moved') {
         ctx.say(
-          `cctl: moved background session ${label(target)} from ${onWhat(runsOn)} onto ` +
+          `cctl: moved background session ${sessionLabel(moved.short, target.name)} onto ` +
             `${onWhat(belongs)}, the folder's own account. Same session, same conversation.`,
         );
-        return attach(home.configDir);
+        return open(home.configDir, moved.short, moved.sessionId);
       }
       // It stopped or left on its own between the look and the move: look once more.
       if (moved.result === 'not-moved' && moved.cause === 'gone' && !again) {
         return decide(req, target, ctx, mode, lock, true);
       }
       if (moved.result === 'failed' && !moved.restored) {
+        const { configDir, sessionId, options } = moved.recovery;
         return {
           kind: 'refuse',
           message:
             `could not move ${label(target)} onto ${onWhat(belongs)} (${moved.reason}), nor ` +
-            `resume it on ${onWhat(runsOn)}. Resume it there with: claude --bg --resume ` +
-            target.sessionId,
+            `resume it on ${onWhat(runsOn)}. Resume it there with: ` +
+            ctx.host.resumeHint(configDir, sessionId, options),
         };
       }
-      why =
-        moved.result === 'not-moved' && moved.cause === 'busy'
-          ? stayReason(undefined)
-          : moved.reason;
+      why = moved.reason;
       final = moved.result === 'not-moved' ? moved.final : true;
     }
     // The daemon moves sessions off the global slot only, onto a folder slot it judges movable.
@@ -522,126 +773,159 @@ async function decide(
       !final;
     ctx.say(
       `cctl: background session ${label(target)} stays on ${onWhat(runsOn)} for now: ${why}.` +
+        (runsOn.removed === true
+          ? ' That profile has no login, so prompts there fail with "Not logged in" until cctl ' +
+            'can move it, between turns.'
+          : '') +
         (daemonMoves
           ? ` cctl's daemon moves it onto ${belongs.account ?? belongs.slot} between turns.`
           : '') +
         ' Opening it there.',
     );
-    return attach(where.configDir);
+    return here(where.configDir);
   }
 
-  // It runs nowhere. With the slot chosen by the operator, Claude Code opens it as asked.
-  if (mode.kind === 'fixed') return PASS;
+  // It runs nowhere. With the slot chosen by the operator, or for a plain --resume (Claude Code
+  // runs it in the foreground there, whatever rows it has), Claude Code opens it as asked.
+  if (mode.kind === 'fixed' || req.verb === 'resume') return PASS;
+  const rows = target.known.rows;
+  // No row anywhere: nothing of cctl's to open, and Claude Code says so itself.
+  if (rows.length === 0) return PASS;
   const home = await ctx.homeOf(target.cwd);
-  const rows = (await host.jobRows(home.configDir)).filter((r) => r.sessionId === target.sessionId);
-  const here = rows[0];
-  // Started under a config dir, idle, and confirmed there; a refusal says why.
-  const wake = async (
-    configDir: string | null,
-    options?: string[],
-  ): Promise<string | undefined> => {
+
+  // Started under a config dir from its row there, idle, and confirmed; a refusal says why.
+  const wake = async (configDir: string | null, row: JobRow): Promise<string | undefined> => {
+    const currentId = row.resumeSessionId ?? row.sessionId;
     try {
-      await host.resumeIdle({
+      await ctx.host.resumeIdle({
         configDir,
-        sessionId: target.sessionId,
-        short: target.short,
+        sessionId: currentId,
+        short: currentId.slice(0, 8),
         cwd: target.cwd,
-        ...(options !== undefined ? { options } : {}),
       });
-      if (!(await confirmHosted(host, configDir, target.short, ctx.timing))) {
+      if (!(await confirmHosted(ctx.host, configDir, currentId.slice(0, 8), ctx.timing))) {
         return 'it did not show up there';
       }
       return undefined;
     } catch (err) {
-      return err instanceof Error ? err.message : String(err);
+      return reasonOf(err);
     }
   };
   const cannotStart = async (configDir: string | null, why: string): Promise<RouteDecision> => ({
     kind: 'refuse',
     message: `could not start ${label(target)} on ${onWhat(await ctx.view(configDir))}: ${why}.`,
   });
+  // Opened under one config dir: every other row it has goes first, while it runs nowhere, so no
+  // row is left elsewhere to reach it once it runs. One recording a worktree stays.
+  const keepOnly = async (configDir: string | null): Promise<void> => {
+    for (const r of rows) {
+      if (sameConfigDir(r.configDir, configDir, platform) || r.row.worktreePath !== undefined) {
+        continue;
+      }
+      await ctx.host
+        .removeRow(r.configDir, r.row.short)
+        .catch((err: unknown) =>
+          ctx.say(
+            `cctl: could not remove the job row of ${label(target)} left on ` +
+              `${r.configDir === null ? 'the main config dir' : r.configDir}: ${reasonOf(err)}.`,
+          ),
+        );
+    }
+  };
+  // Opened where its row is, waking a failed one first (attach only echoes a failed row's error).
+  const openRow = async (r: LocatedRow, note?: string): Promise<RouteDecision> => {
+    await keepOnly(r.configDir);
+    if (r.row.state === 'failed') {
+      const failed = await wake(r.configDir, r.row);
+      if (failed !== undefined) return cannotStart(r.configDir, failed);
+    }
+    if (note !== undefined) ctx.say(note);
+    const currentId = r.row.resumeSessionId ?? r.row.sessionId;
+    return open(r.configDir, r.row.short, currentId);
+  };
 
-  if (req.verb === 'resume') {
-    // A foreground resume works, except that a failed row there answers with its stale error.
-    if (here?.state !== 'failed') return PASS;
-    if (home.unusable !== undefined) return { kind: 'refuse', message: home.unusable };
-    const failed = await wake(home.configDir);
-    if (failed !== undefined) return cannotStart(home.configDir, failed);
-    ctx.say(
-      `cctl: background session ${label(target)} had stopped on an error; started it again on ` +
-        `${onWhat(await ctx.view(home.configDir))}.`,
+  if (tree !== undefined) {
+    const where = await ctx.view(tree.configDir);
+    return openRow(
+      tree,
+      sameConfigDir(tree.configDir, home.configDir, platform)
+        ? undefined
+        : `cctl: background session ${label(target)} stays on ${onWhat(where)}: it works in a git ` +
+            'worktree Claude Code made for it, which a move would delete. Opening it there.',
     );
-    return attach(home.configDir);
   }
-
-  const elsewhere: Array<{ configDir: string | null; row: JobRow }> = [];
-  for (const configDir of await configDirs(host)) {
-    if (sameConfig(configDir, home.configDir, platform)) continue;
-    for (const row of await host.jobRows(configDir)) {
-      if (row.sessionId === target.sessionId) elsewhere.push({ configDir, row });
-    }
-  }
-  elsewhere.sort((a, b) => (b.row.updatedAt ?? '').localeCompare(a.row.updatedAt ?? ''));
-  // No row anywhere: nothing of cctl's to open, and Claude Code says so itself.
-  if (here === undefined && elsewhere.length === 0) return PASS;
   if (home.unusable !== undefined) return { kind: 'refuse', message: home.unusable };
-  if (here !== undefined) {
-    // Claude Code wakes a stopped row with its own saved options; a failed one only echoes its error.
-    if (here.state === 'failed') {
-      const failed = await wake(home.configDir);
-      if (failed !== undefined) return cannotStart(home.configDir, failed);
-    }
-    return attach(home.configDir);
-  }
-  // The slot it belongs to holds no row: start it there with what its latest row saved, on the
-  // terms a move carries options over on.
-  const latest = elsewhere[0]!;
-  const saved = await host.savedOptions(latest.configDir, target.short);
-  if (saved.kind === 'replayable') {
-    const failed = await wake(home.configDir, saved.options);
-    if (failed !== undefined) return cannotStart(home.configDir, failed);
+  const here = rows.find((r) => sameConfigDir(r.configDir, home.configDir, platform));
+  if (here !== undefined) return openRow(here);
+  // The slot it belongs to holds no row: start it there from its latest row, on the terms a move
+  // carries options over on (its rows elsewhere go, so it is left one only there).
+  const latest = rows[0]!;
+  const started = await ctx.shield(() =>
+    moveBackgroundSession(
+      ctx.host,
+      {
+        session: { short: latest.row.short, sessionId: latest.row.sessionId, cwd: target.cwd },
+        from: { configDir: latest.configDir, name: 'its last config dir' },
+        to: { configDir: home.configDir, name: 'the slot it belongs to' },
+        start: true,
+        platform,
+      },
+      ctx.timing,
+    ),
+  );
+  if (started.result === 'moved') {
     ctx.say(
       `cctl: started background session ${label(target)} on ` +
         `${onWhat(await ctx.view(home.configDir))}, the slot of the folder it works in.`,
     );
-    return attach(home.configDir);
+    return open(home.configDir, started.short, started.sessionId);
+  }
+  if (started.result === 'failed') {
+    if (!started.restored) {
+      const { configDir, sessionId, options } = started.recovery;
+      return {
+        kind: 'refuse',
+        message:
+          `could not start ${label(target)} on ${onWhat(await ctx.view(home.configDir))} ` +
+          `(${started.reason}). Resume it with: ${ctx.host.resumeHint(configDir, sessionId, options)}`,
+      };
+    }
+    return cannotStart(home.configDir, started.reason);
   }
   // It cannot start there without changing: open it where its row is.
   const rowOn = await ctx.view(latest.configDir);
-  const why =
-    saved.kind === 'unreplayable' ? saved.reason : `its job row on ${rowOn.slot} could not be read`;
-  ctx.say(
-    `cctl: background session ${label(target)} stays on ${onWhat(rowOn)}: ${why}. Opening it there.`,
+  return openRow(
+    latest,
+    `cctl: background session ${label(target)} stays on ${onWhat(rowOn)}: ${started.reason}. Opening it there.`,
   );
-  if (latest.row.state === 'failed') {
-    const failed = await wake(latest.configDir);
-    if (failed !== undefined) return cannotStart(latest.configDir, failed);
-  }
-  return attach(latest.configDir);
 }
 
 /** How long the move lock is kept for a terminal that has not shown up in its attach journal: far
- *  past the few seconds an attach takes, and far short of the lock's staleness. */
+ *  past the few seconds an attach takes. The lock's claim is refreshed while held, so a hold never
+ *  outlives it (see backgroundHost.ts). */
 const HOLD_CAP_MS = 60_000;
 const HOLD_POLL_MS = 250;
 
 /**
- * Run the terminal that opens a session (`run`), keeping the move lock of `hold` until that service's
- * attach journal shows a terminal, the terminal exits, or {@link HOLD_CAP_MS} passes. Until then the
- * daemon could take the session idle and unwatched and move it, and the attach would then wake its
- * row here and kill the moved copy; once the journal shows it, the daemon holds back by itself.
+ * Run the terminal that opens a session (`run`, which reports the pid of the process it started),
+ * keeping the move lock of `hold` until that service's attach journal shows THAT process, the
+ * terminal exits, or {@link HOLD_CAP_MS} passes. Until then the daemon could take the session idle
+ * and unwatched and move it, and the attach would then wake its row here and kill the moved copy;
+ * once the journal shows it, the daemon holds back by itself. Another terminal already on that
+ * service says nothing about this one.
  */
 export async function runHolding<T>(
-  host: Pick<ClaudeBackgroundHost, 'attachedNow'>,
+  host: Pick<ClaudeBackgroundHost, 'attachedBy'>,
   hold: AttachHold | undefined,
-  run: () => Promise<T>,
+  run: (spawned: (pid: number) => void) => Promise<T>,
   opts: { clock?: () => number; sleep?: (ms: number) => Promise<void>; capMs?: number } = {},
 ): Promise<T> {
-  if (hold === undefined) return run();
+  if (hold === undefined) return run(() => {});
   const clock = opts.clock ?? (() => performance.now());
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const deadline = clock() + (opts.capMs ?? HOLD_CAP_MS);
   let released = false;
+  let pid: number | undefined;
   const release = (): void => {
     if (released) return;
     released = true;
@@ -649,13 +933,15 @@ export async function runHolding<T>(
   };
   const watch = (async (): Promise<void> => {
     while (!released && clock() < deadline) {
-      if (await host.attachedNow(hold.configDir).catch(() => false)) break;
+      if (pid !== undefined && (await host.attachedBy(hold.configDir, pid).catch(() => false))) {
+        break;
+      }
       await sleep(HOLD_POLL_MS);
     }
     release();
   })();
   try {
-    return await run();
+    return await run((p) => (pid = p));
   } finally {
     release();
     await watch;
