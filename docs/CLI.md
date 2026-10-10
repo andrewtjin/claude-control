@@ -335,8 +335,11 @@ still open), the daemon logs it and sends one phone notice, and it does not try 
 again until it restarts. When even that fails, the notice gives the command that brings it
 back as it was: `cctl claude --resume <id>`, in any shell, from any folder. A move saves how
 to bring the session back (where it ran, its folder and its saved options) before it touches
-anything, and drops that once the session runs again; that command runs the move's own way
-back from it, then opens the session as below.
+anything; that command runs the move's own way back from it, then opens the session as below.
+The move drops what it saved once the session runs again, moved or put back; `cctl claude`
+drops it whenever it finds the session running, or finds the job row the way back would wake
+woken since by other means, and it is kept a week at most. One that names no config dir of
+cctl's, or options other than a move saves, is never used.
 
 A session that cannot move without changing is left where it is, with one notice: one
 started with an option this cctl does not know, or one that would act again at startup

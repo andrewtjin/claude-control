@@ -48,7 +48,8 @@
 // command runs detached from the operator's terminal, so a Ctrl-C there cannot cut one off half way.
 // What cctl keeps of its own beside the move locks: one recovery per move that has committed and not
 // yet seen the session run again (see the daemon's ResumeRecovery), so `cctl claude --resume <id>`
-// can bring back a session whose move was cut off, its process gone with it.
+// can bring back a session whose move was cut off, its process gone with it. One is read back only
+// when it names a config dir of cctl's and options as a move saves them, and for a week at most.
 
 import { randomUUID } from 'node:crypto';
 import { spawn as nodeSpawn } from 'node:child_process';
@@ -69,6 +70,7 @@ import {
   JOB_ID_PATTERN,
   SESSION_ID_PATTERN,
   reasonOf,
+  sameConfigDir,
   type BackgroundSession,
   type BackgroundSessionHost,
   type JobRow,
@@ -182,6 +184,9 @@ export interface ClaudeBackgroundHostOptions {
   processStarts?: (pids: readonly number[]) => Promise<Map<number, string>>;
   /** How often a held move lock's claim is refreshed (default {@link MOVE_LOCK_REFRESH_MS}). */
   lockRefreshMs?: number;
+  /** The wall clock in ms (default `Date.now`), for how old a saved recovery is: it outlives this
+   *  process, so no clock of this process's own can tell. */
+  now?: () => number;
 }
 
 /** Where the move locks live under cctl's data dir (the vault dir's parent). */
@@ -230,6 +235,11 @@ const START_TIME_TTL_MS = 60_000;
 const START_QUERY_TIMEOUT_MS = 10_000;
 /** How much of each end of a conversation a title search reads. */
 const TITLE_WINDOW_BYTES = 64 * 1024;
+/** How long a committed move's recovery is kept. A move cut off is brought back within days if at
+ *  all; an older recovery may name a config dir, a row or options the session has long left, and
+ *  without one `cctl claude --resume <id>` resumes the conversation as Claude Code does, which loses
+ *  nothing of it. */
+const RECOVERY_LIFETIME_MS = 7 * 24 * 60 * 60_000;
 
 const SHORT_ID = JOB_ID_PATTERN;
 const SESSION_ID = SESSION_ID_PATTERN;
@@ -696,6 +706,7 @@ export function createClaudeBackgroundHost(
   const stopExitTimeoutMs = options.stopExitTimeoutMs ?? DEFAULT_STOP_EXIT_TIMEOUT_MS;
   const processStarts = options.processStarts ?? defaultProcessStarts(platform);
   const lockRefreshMs = options.lockRefreshMs ?? MOVE_LOCK_REFRESH_MS;
+  const wallClock = options.now ?? Date.now;
   const mainInEnv = options.mainConfigDirInEnv ?? baseEnv.CLAUDE_CONFIG_DIR !== undefined;
 
   /** The names in a directory, or none for one that does not exist or cannot be listed. */
@@ -1053,6 +1064,51 @@ export function createClaudeBackgroundHost(
   const recoveryDir = join(options.moveLockDir, 'recovery');
   const recoveryPath = (sessionId: string): string => join(recoveryDir, `${sessionId}.json`);
 
+  /** A saved recovery for a conversation, as read back: every field what a move saves, or nothing.
+   *  Its config dir must be one of cctl's (the main one, or a folder profile), and its options
+   *  options exactly as a move saves them (see {@link replayOptions}): the way back resumes the
+   *  session there with them, so no word of a record that is anything else may reach it. */
+  const recoveryFrom = (
+    r: Record<string, unknown>,
+    sessionId: string,
+  ): ResumeRecovery | undefined => {
+    const { configDir, cwd, options } = r;
+    const job = r.job as { short?: unknown; sessionId?: unknown } | null | undefined;
+    if (r.sessionId !== sessionId || typeof cwd !== 'string' || cwd.length === 0) return undefined;
+    const cctls =
+      configDir === null ||
+      (typeof configDir === 'string' &&
+        configDirsNow().some((c) => c !== null && sameConfigDir(c, configDir, platform)));
+    if (!cctls) return undefined;
+    const replay = replayOptions(options);
+    if (
+      !Array.isArray(options) ||
+      !replay.ok ||
+      replay.options.length !== options.length ||
+      replay.options.some((o, i) => o !== options[i])
+    ) {
+      return undefined;
+    }
+    if (
+      typeof job !== 'object' ||
+      job === null ||
+      typeof job.short !== 'string' ||
+      !SHORT_ID.test(job.short) ||
+      typeof job.sessionId !== 'string' ||
+      !SESSION_ID.test(job.sessionId) ||
+      !job.sessionId.startsWith(job.short)
+    ) {
+      return undefined;
+    }
+    return {
+      configDir,
+      sessionId,
+      job: { short: job.short, sessionId: job.sessionId },
+      options: replay.options,
+      cwd,
+    };
+  };
+
   return {
     configDirs() {
       return Promise.resolve(configDirsNow());
@@ -1298,7 +1354,11 @@ export function createClaudeBackgroundHost(
         return Promise.reject(new Error(`not a background session id: ${recovery.sessionId}`));
       }
       try {
-        writeWhole(recoveryPath(recovery.sessionId), JSON.stringify(recovery));
+        // When it was saved, so it is kept a bounded while (see RECOVERY_LIFETIME_MS).
+        writeWhole(
+          recoveryPath(recovery.sessionId),
+          JSON.stringify({ ...recovery, savedAt: wallClock() }),
+        );
         return Promise.resolve();
       } catch (err) {
         return Promise.reject(err instanceof Error ? err : new Error(String(err)));
@@ -1317,25 +1377,28 @@ export function createClaudeBackgroundHost(
 
     recoveryOf(sessionId) {
       if (!SESSION_ID.test(sessionId)) return Promise.resolve(undefined);
-      const r = readObject(readFile, recoveryPath(sessionId));
-      const options = r?.options;
-      const job = r?.job as { short?: unknown; sessionId?: unknown } | null | undefined;
-      const valid =
-        r !== undefined &&
-        r.sessionId === sessionId &&
-        (r.configDir === null || (typeof r.configDir === 'string' && r.configDir.length > 0)) &&
-        typeof r.cwd === 'string' &&
-        r.cwd.length > 0 &&
-        Array.isArray(options) &&
-        options.every((o) => typeof o === 'string') &&
-        typeof job === 'object' &&
-        job !== null &&
-        typeof job.short === 'string' &&
-        SHORT_ID.test(job.short) &&
-        typeof job.sessionId === 'string' &&
-        SESSION_ID.test(job.sessionId) &&
-        job.sessionId.startsWith(job.short);
-      return Promise.resolve(valid ? (r as unknown as ResumeRecovery) : undefined);
+      const path = recoveryPath(sessionId);
+      const r = readObject(readFile, path);
+      const recovery = r === undefined ? undefined : recoveryFrom(r, sessionId);
+      if (r === undefined || recovery === undefined) return Promise.resolve(undefined);
+      // Kept a bounded while either way of this clock (one saved "later" than now is as unknown as
+      // one saved long ago); past it, it is forgotten. A record that does not read as one is left
+      // in place: what made it so (a profiles root that cannot be listed) may pass.
+      const savedAt = r.savedAt;
+      if (
+        typeof savedAt !== 'number' ||
+        !(Math.abs(wallClock() - savedAt) <= RECOVERY_LIFETIME_MS)
+      ) {
+        if (typeof savedAt === 'number') {
+          try {
+            removeFile(path);
+          } catch {
+            // Read again, and refused again, next time.
+          }
+        }
+        return Promise.resolve(undefined);
+      }
+      return Promise.resolve(recovery);
     },
   };
 }

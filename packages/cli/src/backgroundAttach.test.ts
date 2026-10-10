@@ -1752,6 +1752,45 @@ describe('routeBackgroundLaunch — a move cut off half way', () => {
     });
     expect(w.host.calls).toEqual([]);
   });
+
+  it('after /clear, the lock and the look take in the job the move saved: one coming up under it is never brought back over', async () => {
+    // Its job is being woken on the global slot by hand: its worker is listed under the job id,
+    // recording the id the job started with, before any registry entry names the conversation.
+    const NEW = '7a7a7a7a-1111-4222-8333-444444444444';
+    const w = world();
+    w.host.recoveries.set(NEW, { ...recoveryOn(MAIN, []), sessionId: NEW });
+    w.host.row(MAIN, 'starting', SID, { resumeSessionId: NEW });
+    w.host.hosted.set('main', [{ short: SHORT, sessionId: SID, cwd: WORK }]);
+    expect(await decideIn(w, resume(NEW))).toEqual({
+      kind: 'refuse',
+      message: `cannot tell where ${NEW} runs right now (it is starting or stopping); try again in a moment.`,
+    });
+    expect(w.host.calls).toEqual([]);
+    // The daemon's mover locks the job by the id it started with: the two meet on it.
+    expect([...w.host.lockedIds].sort()).toEqual([NEW, SID].sort());
+    expect(w.host.recoveries.has(NEW)).toBe(true);
+  });
+
+  it('found running by any look of it, its recovery is dropped: nothing is ever brought back on a stale one', async () => {
+    const w = world();
+    w.host.runs(X);
+    w.host.recoveries.set(SID, recoveryOn(MAIN, []));
+    // An attach by its job id never reads the recovery, but sees the session run.
+    expect(await decideIn(w, attach(SHORT))).toMatchObject(openUnder(X));
+    expect(w.host.recoveries.size).toBe(0);
+  });
+
+  it('its job row there woken since the move was cut off: the recovery is stale, dropped, and nothing is brought back', async () => {
+    // Woken by hand afterwards, its process gone since: the row reads running, not stopped.
+    const w = world();
+    w.host.row(MAIN, 'running', SID);
+    w.host.recoveries.set(SID, recoveryOn(MAIN, []));
+    // A --resume of a session that runs nowhere: Claude Code runs it in the foreground.
+    expect(await decideIn(w, resume(SID))).toEqual({ kind: 'pass' });
+    expect(w.host.calls).toEqual([]);
+    expect(w.lines).toEqual([]);
+    expect(w.host.recoveries.size).toBe(0);
+  });
 });
 
 describe('routeBackgroundLaunch — rows of more than one conversation under one job id', () => {

@@ -702,13 +702,25 @@ function stayReason(status: string | undefined): string {
   return 'it is not idle between turns';
 }
 
+/** A job row's states once its session was stopped, or failed: a row a move left reads one of these
+ *  until something wakes it. */
+const STOPPED_STATES: ReadonlySet<string> = new Set(['stopped', 'failed']);
+
+/** Forget whatever a move cut off left to bring a session back by (see the daemon's
+ *  ResumeRecovery), by every id it has had: it was found running, so that is stale now. */
+async function dropRecoveries(ctx: RouteContext, ids: Iterable<string>): Promise<void> {
+  for (const id of ids) await ctx.host.dropRecovery(id).catch(() => undefined);
+}
+
 /**
  * Bring back a conversation whose move was cut off half way (its process killed, its window
  * closed, or its way back failed), when it is named by its full id: the move saved how before its
  * first change (see the daemon's ResumeRecovery). Under the session's move lock, a conversation that
  * runs nowhere is resumed where the move found it, as the move's own way back resumes it; one that
- * runs anywhere needs nothing, and its recovery is dropped. Undefined when the launch goes on;
- * otherwise why nothing runs.
+ * runs anywhere needs nothing, and its recovery is dropped, as it is when the row the way back would
+ * wake was woken since (it no longer reads stopped). The lock and the look take in the job the move
+ * saved too: after /clear its id is not the conversation's, and the way back wakes that job's row.
+ * Undefined when the launch goes on; otherwise why nothing runs.
  */
 async function recoverCutOffMove(
   ref: string,
@@ -718,7 +730,8 @@ async function recoverCutOffMove(
   if (!SESSION_ID_PATTERN.test(id)) return undefined;
   const saved = await ctx.host.recoveryOf(id);
   if (saved === undefined) return undefined;
-  const lock = await takeMoveLock(ctx, [id], ctx.lockWaitMs);
+  const ids = [id, saved.job.sessionId];
+  const lock = await takeMoveLock(ctx, ids, ctx.lockWaitMs);
   if (lock === undefined) {
     return {
       kind: 'refuse',
@@ -728,7 +741,7 @@ async function recoverCutOffMove(
   try {
     const where = await settledWhere(
       ctx.host,
-      { ids: new Set([id]), shorts: new Set([id.slice(0, 8)]) },
+      { ids: new Set(ids), shorts: new Set([id.slice(0, 8), saved.job.short]) },
       ctx.timing,
     );
     if (where.kind === 'unclear') {
@@ -737,7 +750,16 @@ async function recoverCutOffMove(
         message: `cannot tell where ${id} runs right now (${where.reason}); try again in a moment.`,
       };
     }
-    if (where.kind === 'nowhere') {
+    // Woken since by other means, and gone again: what the move saved no longer says where it is.
+    const own =
+      where.kind === 'nowhere'
+        ? await ctx.host.jobRow(saved.configDir, saved.job.short)
+        : undefined;
+    const wokenSince =
+      own?.kind === 'row' &&
+      own.row.sessionId === saved.job.sessionId &&
+      !STOPPED_STATES.has(own.row.state);
+    if (where.kind === 'nowhere' && !wokenSince) {
       const back = onWhat(await ctx.view(saved.configDir));
       if (!(await bringBack(ctx.host, saved, ctx.timing, back))) {
         return {
@@ -747,8 +769,8 @@ async function recoverCutOffMove(
       }
       ctx.say(`cctl: brought background session ${id} back on ${back}, where a move found it.`);
     }
-    // Running again: there is nothing left to bring back.
-    await ctx.host.dropRecovery(id).catch(() => undefined);
+    // Running again, or woken since: there is nothing left to bring back.
+    await dropRecoveries(ctx, [id]);
     return undefined;
   } finally {
     lock.release();
@@ -820,9 +842,14 @@ export async function routeBackgroundLaunch(
   }
 }
 
-/** Where a session runs, read strictly (see the daemon's settledWhere). */
-function locate(t: Target, ctx: RouteContext): Promise<SessionWhere> {
-  return settledWhere(ctx.host, t.known.lineage, ctx.timing);
+/** Where a session runs, read strictly (see the daemon's settledWhere). Found running anywhere, any
+ *  recovery a cut-off move left for it is dropped: it no longer says where the session is. */
+async function locate(t: Target, ctx: RouteContext): Promise<SessionWhere> {
+  const where = await settledWhere(ctx.host, t.known.lineage, ctx.timing);
+  if (where.kind === 'bg' || where.kind === 'interactive') {
+    await dropRecoveries(ctx, t.known.lineage.ids);
+  }
+  return where;
 }
 
 /** `stop`, `kill`, `rm` or `respawn` of one session: run under the config dir whose service runs

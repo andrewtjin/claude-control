@@ -79,6 +79,9 @@ function hostWith(opts: {
   onRead?: (path: string, files: Record<string, string>) => void;
   /** The host's clock; by default one that moves only by the host's own pauses. */
   clock?: () => number;
+  /** The wall clock a saved recovery's age is read by. */
+  now?: () => number;
+  platform?: NodeJS.Platform;
 }): { host: ReturnType<typeof createClaudeBackgroundHost>; runs: Recorded[]; sleeps: number[] } {
   const runs: Recorded[] = [];
   const sleeps: number[] = [];
@@ -140,6 +143,8 @@ function hostWith(opts: {
       return Promise.resolve();
     },
     ...(opts.profilesRoot !== undefined ? { profilesRoot: opts.profilesRoot } : {}),
+    ...(opts.now !== undefined ? { now: opts.now } : {}),
+    ...(opts.platform !== undefined ? { platform: opts.platform } : {}),
   });
   return { host, runs, sleeps };
 }
@@ -1559,6 +1564,7 @@ describe('one main config dir, for every read and every command', () => {
 
 describe("a committed move's recovery", () => {
   const REC = `${LOCKS}/recovery/${SID}.json`;
+  const ROOT = 'C:/Users/me/AppData/Local/claude-control/profiles';
   const recovery = {
     configDir: PROFILE,
     sessionId: SID,
@@ -1566,13 +1572,25 @@ describe("a committed move's recovery", () => {
     options: ['--name=bg eval'],
     cwd: 'C:/work',
   };
+  /** When the move saved it, on the wall clock; the hosts below read it at this time too. */
+  const SAVED_AT = 1_791_600_000_000;
+  const stored = { ...recovery, savedAt: SAVED_AT };
+  /** A host over these files whose profiles root lists the folder profile, reading at `at`, with
+   *  config dirs compared as on Windows (what these paths are). */
+  const hostAt = (files: Record<string, string>, at = SAVED_AT): ReturnType<typeof hostWith> =>
+    hostWith({
+      files: Object.assign(files, { [`${PROFILE}/x`]: '' }),
+      profilesRoot: ROOT,
+      now: () => at,
+      platform: 'win32',
+    });
 
-  it('is kept beside the move locks, read back, and forgotten', async () => {
+  it('is kept beside the move locks with when it was saved, read back, and forgotten', async () => {
     const files: Record<string, string> = {};
-    const { host } = hostWith({ files });
+    const { host } = hostAt(files);
     expect(await host.recoveryOf(SID)).toBeUndefined();
     await host.saveRecovery(recovery);
-    expect(JSON.parse(files[REC]!)).toEqual(recovery);
+    expect(JSON.parse(files[REC]!)).toEqual(stored);
     expect(await host.recoveryOf(SID)).toEqual(recovery);
     await host.dropRecovery(SID);
     expect(files[REC]).toBeUndefined();
@@ -1584,18 +1602,66 @@ describe("a committed move's recovery", () => {
   it('one that is not whole, or not the conversation asked for, is no recovery', async () => {
     for (const text of [
       '{"sessionId": "',
-      JSON.stringify({ ...recovery, sessionId: 'f38038c6-523b-4be5-9dff-160c472faeb0' }),
-      JSON.stringify({ ...recovery, options: [1] }),
-      JSON.stringify({ ...recovery, cwd: '' }),
-      JSON.stringify({ ...recovery, configDir: 3 }),
+      JSON.stringify({ ...stored, sessionId: 'f38038c6-523b-4be5-9dff-160c472faeb0' }),
+      JSON.stringify({ ...stored, options: [1] }),
+      JSON.stringify({ ...stored, cwd: '' }),
+      JSON.stringify({ ...stored, configDir: 3 }),
+      JSON.stringify({ ...stored, savedAt: 'yesterday' }),
+      JSON.stringify(recovery),
     ]) {
-      const { host } = hostWith({ files: { [REC]: text } });
+      const { host } = hostAt({ [REC]: text });
       expect({ text, read: await host.recoveryOf(SID) }).toEqual({ text, read: undefined });
     }
-    const { host } = hostWith({
-      files: { [REC]: JSON.stringify({ ...recovery, configDir: null }) },
-    });
+    const { host } = hostAt({ [REC]: JSON.stringify({ ...stored, configDir: null }) });
     expect(await host.recoveryOf(SID)).toEqual({ ...recovery, configDir: null });
+  });
+
+  it("one naming a config dir that is none of cctl's is no recovery: it would be resumed there", async () => {
+    for (const configDir of ['C:/Users/me/.claude-other', `${ROOT}/rule-9`, 'C:/elsewhere']) {
+      const { host } = hostAt({ [REC]: JSON.stringify({ ...stored, configDir }) });
+      expect({ configDir, read: await host.recoveryOf(SID) }).toEqual({
+        configDir,
+        read: undefined,
+      });
+    }
+    // The folder profile however it is spelled, and the main config dir, are cctl's.
+    const spelled = hostAt({
+      [REC]: JSON.stringify({ ...stored, configDir: PROFILE.toUpperCase().replace(/\//g, '\\') }),
+    });
+    expect(await spelled.host.recoveryOf(SID)).toMatchObject({ sessionId: SID });
+  });
+
+  it('one whose options are not options as a move saves them is no recovery: they would reach the resume', async () => {
+    for (const options of [
+      ['--name', 'bg eval'],
+      ['carry on with the plan'],
+      ['--brand-new-flag'],
+      ['--session-id=1ee43a2b-076b-42a1-b487-70a8b77401fa'],
+      'not a list',
+    ]) {
+      const { host } = hostAt({ [REC]: JSON.stringify({ ...stored, options }) });
+      expect({ options, read: await host.recoveryOf(SID) }).toEqual({ options, read: undefined });
+    }
+    const { host } = hostAt({
+      [REC]: JSON.stringify({
+        ...stored,
+        options: ['--model=opus', '--dangerously-skip-permissions'],
+      }),
+    });
+    expect(await host.recoveryOf(SID)).toMatchObject({
+      options: ['--model=opus', '--dangerously-skip-permissions'],
+    });
+  });
+
+  it('is kept a week at most: an older one is no recovery, and goes', async () => {
+    const WEEK = 7 * 24 * 60 * 60_000;
+    const files: Record<string, string> = { [REC]: JSON.stringify(stored) };
+    expect(await hostAt(files, SAVED_AT + WEEK).host.recoveryOf(SID)).toEqual(recovery);
+    expect(await hostAt(files, SAVED_AT + WEEK + 1).host.recoveryOf(SID)).toBeUndefined();
+    expect(files[REC]).toBeUndefined();
+    // One saved, by this clock, more than a week from now is not trusted either.
+    const ahead: Record<string, string> = { [REC]: JSON.stringify(stored) };
+    expect(await hostAt(ahead, SAVED_AT - WEEK - 1).host.recoveryOf(SID)).toBeUndefined();
   });
 
   it('is named only after a session id', async () => {
@@ -1613,10 +1679,10 @@ describe("a committed move's recovery", () => {
         mainConfigDir: MAIN,
         moveLockDir: moveLocksDir(dir),
       });
-      await host.saveRecovery(recovery);
+      await host.saveRecovery({ ...recovery, configDir: null });
       const kept = join(moveLocksDir(dir), 'recovery');
       expect(await readdir(kept)).toEqual([`${SID}.json`]);
-      expect(await host.recoveryOf(SID)).toEqual(recovery);
+      expect(await host.recoveryOf(SID)).toEqual({ ...recovery, configDir: null });
       await host.dropRecovery(SID);
       expect(await readdir(kept)).toEqual([]);
     } finally {
