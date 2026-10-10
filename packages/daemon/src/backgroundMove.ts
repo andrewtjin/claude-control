@@ -322,6 +322,8 @@ const PUT_BACK_PAUSE_MS = 2_000;
  *  a moment (a session starting or stopping, a file caught mid-write), and the pause between. */
 const WHERE_TRIES = 3;
 const WHERE_PAUSE_MS = 500;
+/** How long a job row must have been left alone before a move trusts what it says. */
+const ROW_QUIET_MS = 1_500;
 
 /** A thrown value as one line. */
 export function reasonOf(err: unknown): string {
@@ -553,6 +555,7 @@ async function planMove(
   host: BackgroundSessionHost,
   request: MoveRequest,
   timing: MoveTiming,
+  settled = false,
 ): Promise<{ plan: MovePlan; lineage: Lineage }> {
   const { session, from, start } = request;
   const platform = request.platform ?? process.platform;
@@ -583,6 +586,14 @@ async function planMove(
     (r) => sameConfigDir(r.configDir, from.configDir, platform) && r.row.short === sourceShort,
   );
   name = source?.row.name;
+  // A row Claude Code rewrote a moment ago may be between two states: as a scheduled wakeup fires,
+  // its row reads idle with nothing held until the next one is armed, a fraction of a second later.
+  // Such a row is read again, everything with it, once it has been quiet a while.
+  const changedAt = Date.parse(source?.row.updatedAt ?? '');
+  if (!settled && Number.isFinite(changedAt) && Date.now() - changedAt < ROW_QUIET_MS) {
+    await timing.sleep(ROW_QUIET_MS);
+    return planMove(host, request, timing, true);
+  }
 
   if (where.kind === 'bg') {
     let activity: SessionActivity | undefined;

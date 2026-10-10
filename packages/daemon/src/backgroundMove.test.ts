@@ -248,6 +248,35 @@ describe('moveBackgroundSession', () => {
     expect(changes(host)).toEqual([]);
   });
 
+  it('a row that changed a moment ago is read again once it has settled: a wakeup re-armed in between keeps the session', async () => {
+    // Measured: as a scheduled wakeup fires, the row reads idle with nothing held for a fraction of
+    // a second, until Claude Code arms the next one.
+    const host = fakeHost();
+    const row = host.rowOf(OLD, SHORT)!;
+    row.updatedAt = new Date().toISOString();
+    const settling: MoveTiming = {
+      ...timing,
+      sleep: () => {
+        row.pending = true;
+        return Promise.resolve();
+      },
+    };
+    expect(await moveBackgroundSession(host, REQUEST, settling)).toMatchObject({
+      result: 'not-moved',
+      cause: 'busy',
+    });
+    expect(changes(host)).toEqual([]);
+    // A row that has been quiet a while is not waited on.
+    const quiet = fakeHost();
+    quiet.rowOf(OLD, SHORT)!.updatedAt = new Date(Date.now() - 60_000).toISOString();
+    let paused = 0;
+    const counting: MoveTiming = { ...timing, sleep: () => (paused++, Promise.resolve()) };
+    expect(await moveBackgroundSession(quiet, REQUEST, counting)).toMatchObject({
+      result: 'moved',
+    });
+    expect(paused).toBe(0);
+  });
+
   it('a session whose registry entry says busy is not stopped, whatever the listing says', async () => {
     const host = fakeHost();
     host.liveSessions = () =>
