@@ -1138,6 +1138,22 @@ describe('cctl claude opening a background session', () => {
     expect(bgHost.calls).toEqual([]);
   });
 
+  it('a resume spelled -r<id> is opened where the session runs; spellings that are no plain resume are checked first', async () => {
+    ruleOnE();
+    await runsIn(main(), 'busy');
+    await rowIn(profile(), 'stopped');
+    const routed = await launchFrom([`-r${SID}`]);
+    expect(routed.exited).toBe(false);
+    expect(routed.args).toEqual(['attach', SHORT]);
+    expect(routed.env?.CLAUDE_CONFIG_DIR).toBeUndefined();
+    for (const args of [['-cr', SID], ['logs', SHORT], ['agents', '--json']]) {
+      const r = await launchFrom(args);
+      expect({ args, exited: r.exited }).toEqual({ args, exited: true });
+      expect(r.err).toContain(`open it with: cctl claude attach ${SHORT}`);
+    }
+    expect(bgHost.calls).toEqual([]);
+  });
+
   it('stop of a session running on the global slot is run there, by its job id', async () => {
     ruleOnE();
     await runsIn(main(), 'busy');

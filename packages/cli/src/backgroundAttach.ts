@@ -16,9 +16,10 @@
 //   - what `cctl claude` is asked to open is found first (by full id; a job id or any prefix of one,
 //     or a name, for `attach`; a title among this folder's sessions and its git worktrees' for
 //     `--resume`), and opened where it runs, or moved where it belongs first;
-//   - anything passed to Claude Code as typed under a config dir X is first checked against X's
-//     rows: a row there for a session live in another service refuses the launch, naming where the
-//     session runs and how to open it safely.
+//   - anything else passed to Claude Code as typed under a config dir X is first checked against
+//     X's rows: a row there for a session live in another service refuses the launch, naming where
+//     the session runs and how to open it safely. Arguments cctl cannot tell are a plain new session
+//     are checked so too, whatever they name.
 // For one session found:
 //   - it runs where it belongs (the slot of the folder it works in): opened there;
 //   - it runs elsewhere, idle with nothing held and no terminal on that service: moved there by the
@@ -73,14 +74,31 @@ export type BackgroundRequest =
   | { verb: 'control'; ref: string; args: string[]; refAt: number }
   /** Anything else that can wake or stop a row under the slot it runs on: Claude Code's resume
    *  picker (a bare `--resume`, or a term matching no title), `--continue`, the agents view, a
-   *  `respawn` of every session, a print-mode resume. Passed as typed once that slot holds no trap
-   *  row (one matching `ref`, when given). */
+   *  `respawn` of every session, a print-mode resume, and any arguments cctl cannot tell are a plain
+   *  new session. Passed as typed once that slot holds no trap row (one matching `ref`, when given). */
   | { verb: 'guard'; ref?: string };
 
-/** Options that start a copy or a new background start: neither ever wakes an existing row. */
-const FORKS: ReadonlySet<string> = new Set(['--bg', '--background', '--fork-session']);
+/** Options that start a new background session, or a copy of one: neither ever wakes an existing
+ *  row (measured: the words around them become the new session's prompt or options). */
+const BACKGROUND_STARTS: ReadonlySet<string> = new Set(['--bg', '--background']);
 /** Subcommands that stop, remove or restart one session, or all of them. */
 const CONTROL: ReadonlySet<string> = new Set(['stop', 'kill', 'rm', 'respawn']);
+/** Subcommands that reach a job row, or list rows to choose from: never a plain new session. */
+const ROW_SUBCOMMANDS: ReadonlySet<string> = new Set(['attach', 'agents', 'logs', ...CONTROL]);
+/** Long options that resume or continue a conversation: never a plain new session. */
+const RESUMING_OPTIONS: readonly string[] = ['--resume', '--continue', '--from-pr'];
+
+/**
+ * How Claude Code reads short options for a resume (its own argument pre-parser, the same in 2.1.296
+ * as in 2.1.295): it peels `-c`, `-p`, `-h` and `-v` off the front of a word (`-cr` and `-pr` become
+ * `-c` and `-p`, then `-r`), then reads what is left: `-r<value>` resumes that value, `-r` alone the
+ * next word unless it is an option. Print mode is decided on the words `-p` and `--print` alone, so
+ * `-pr <id>` is an interactive resume; a continue wins over any resume (measured: `-cr <id>` opens
+ * the latest conversation, whatever the id).
+ */
+const PEELED: ReadonlySet<string> = new Set(['-c', '-p', '-h', '-v']);
+/** A word that is a cluster of short options. */
+const SHORT_CLUSTER = /^-[A-Za-z]/;
 
 /** The first word after `from` that is not an option, and where it is. */
 function nextWord(
@@ -94,15 +112,121 @@ function nextWord(
   return undefined;
 }
 
+/** What one argument list asks of a conversation, read as Claude Code reads it (see
+ *  {@link PEELED}). */
+interface ResumeReading {
+  /** The session a resume names (the last one given, as Claude Code takes it). */
+  ref?: string;
+  /** A resume naming no session: the picker. */
+  picker: boolean;
+  /** `--continue`, in any spelling: Claude Code continues the latest conversation, whatever else
+   *  it is told. */
+  continues: boolean;
+  print: boolean;
+  /** A resume behind `-h` or `-v` in one word: Claude Code may print its help or version instead,
+   *  so it is no resume cctl opens by itself. */
+  unplain: boolean;
+  /** Every word that is not the resume itself. */
+  rest: string[];
+}
+
+function readResume(words: readonly string[]): ResumeReading {
+  const out: ResumeReading = {
+    picker: false,
+    continues: false,
+    print: false,
+    unplain: false,
+    rest: [],
+  };
+  /** An optional value: the word at `i` when it is no option. */
+  const optionalAt = (i: number): string | undefined => {
+    const next = words[i];
+    return next !== undefined && !next.startsWith('-') && next.trim() !== '' ? next : undefined;
+  };
+  const resumeWith = (value: string | undefined): void => {
+    if (value === undefined || value.trim() === '') {
+      out.picker = true;
+      delete out.ref;
+    } else {
+      out.picker = false;
+      out.ref = value;
+    }
+  };
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i]!;
+    if (word === '--') {
+      // Everything after it is the prompt, never an option.
+      out.rest.push(...words.slice(i));
+      break;
+    }
+    if (word === '--resume') {
+      const value = optionalAt(i + 1);
+      resumeWith(value);
+      if (value !== undefined) i++;
+      continue;
+    }
+    if (word.startsWith('--resume=')) {
+      resumeWith(word.slice('--resume='.length));
+      continue;
+    }
+    if (word === '--continue') out.continues = true;
+    if (word === '--print' || word === '-p') out.print = true;
+    if (!SHORT_CLUSTER.test(word)) {
+      out.rest.push(word);
+      continue;
+    }
+    // Peeled off its front, then read: what is left may be a resume.
+    let left = word;
+    while (/^-[a-zA-Z]./.test(left) && PEELED.has(left.slice(0, 2))) {
+      if (left[1] === 'c') out.continues = true;
+      if (left[1] === 'h' || left[1] === 'v') out.unplain = true;
+      left = `-${left.slice(2)}`;
+    }
+    if (left === '-c') out.continues = true;
+    if (left === '-r') {
+      const value = optionalAt(i + 1);
+      resumeWith(value);
+      if (value !== undefined) i++;
+      continue;
+    }
+    if (/^-r./.test(left)) {
+      resumeWith(left.slice(2));
+      continue;
+    }
+    out.rest.push(word);
+  }
+  return out;
+}
+
+/** Whether arguments are, by every word, a plain new session: no subcommand that reaches a row, no
+ *  resume or continue in any spelling, and no cluster of short options with `r` or `c` in it.
+ *  Anything else could reach a row, however it is spelled. */
+function plainNewSession(words: readonly string[], reading: ResumeReading): boolean {
+  if (reading.ref !== undefined || reading.picker || reading.continues || reading.unplain) {
+    return false;
+  }
+  return !words.some(
+    (w) =>
+      ROW_SUBCOMMANDS.has(w) ||
+      RESUMING_OPTIONS.some((o) => w === o || w.startsWith(`${o}=`)) ||
+      (SHORT_CLUSTER.test(w) && /[rc]/.test(w.slice(1))),
+  );
+}
+
 /**
  * What `cctl claude`'s arguments ask of a background session, if anything (see
  * {@link BackgroundRequest}), also after a leading `--`. A word that names a subcommand is taken as
  * one wherever it stands, flags before or after: Claude Code reads it so, and a word read as one
- * here that is not one only makes cctl look the session up.
+ * here that is not one only makes cctl look the session up. A resume is read in every spelling
+ * Claude Code takes (`--resume <id>`, `--resume=<id>`, `-r <id>`, `-r<id>`, `-pr <id>`); one that
+ * also continues is a continue, as Claude Code runs it. Undefined only for what is positively a plain new session,
+ * or a new background start: anything cctl cannot read so is checked against the slot's rows before
+ * it runs, whatever it names.
  */
 export function parseBackgroundRequest(args: readonly string[]): BackgroundRequest | undefined {
   const words = args[0] === '--' ? args.slice(1) : [...args];
-  if (words.some((w) => FORKS.has(w))) return undefined;
+  // A new background session, or a copy of one when it names a session to resume.
+  if (words.some((w) => BACKGROUND_STARTS.has(w))) return undefined;
   const attachAt = words.indexOf('attach');
   if (attachAt >= 0) {
     const ref = nextWord(words, attachAt);
@@ -113,36 +237,20 @@ export function parseBackgroundRequest(args: readonly string[]): BackgroundReque
   const controlAt = words.findIndex((w) => CONTROL.has(w));
   if (controlAt >= 0) {
     const ref = nextWord(words, controlAt);
-    if (ref === undefined) return words[controlAt] === 'respawn' ? { verb: 'guard' } : undefined;
+    if (ref === undefined) return { verb: 'guard' };
     return { verb: 'control', ref: ref.word, args: words, refAt: ref.at };
   }
-  if (words.includes('agents')) return words.includes('--json') ? undefined : { verb: 'guard' };
-  if (words.includes('-c') || words.includes('--continue')) return { verb: 'guard' };
-  let ref: string | undefined;
-  let picker = false;
-  const rest: string[] = [];
-  for (let i = 0; i < words.length; i++) {
-    const word = words[i]!;
-    if (word === '--resume' || word === '-r') {
-      const next = words[i + 1];
-      if (next === undefined || next.startsWith('-') || next.trim() === '') {
-        picker = true;
-      } else {
-        ref = next;
-        i++;
-      }
-    } else if (word.startsWith('--resume=')) {
-      const value = word.slice('--resume='.length);
-      if (value.trim() === '') picker = true;
-      else ref = value;
-    } else {
-      rest.push(word);
-    }
+  const reading = readResume(words);
+  if (plainNewSession(words, reading)) return undefined;
+  const rows = words.some((w) => ROW_SUBCOMMANDS.has(w));
+  // A fork of the conversation it resumes wakes no row.
+  if (words.includes('--fork-session') && !rows) return undefined;
+  if (rows || reading.continues || reading.unplain || reading.ref === undefined) {
+    return { verb: 'guard' };
   }
-  if (ref === undefined) return picker ? { verb: 'guard' } : undefined;
   // A one-shot print run is no terminal to open the session in: it is passed on, checked.
-  if (rest.includes('-p') || rest.includes('--print')) return { verb: 'guard', ref };
-  return { verb: 'resume', ref, rest };
+  if (reading.print) return { verb: 'guard', ref: reading.ref };
+  return { verb: 'resume', ref: reading.ref, rest: reading.rest };
 }
 
 /** Where a session belongs: the slot of the folder it works in. */

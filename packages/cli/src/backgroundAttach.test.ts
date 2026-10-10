@@ -528,19 +528,95 @@ describe('parseBackgroundRequest', () => {
     });
   });
 
-  it('leaves alone what can wake no row: a copy, a new background start, the agents listing, anything else', () => {
+  it('leaves alone only what is positively a plain new session, a new background start or a copy', () => {
     for (const args of [
       ['--resume', SID, '--fork-session'],
+      ['--continue', '--fork-session'],
       ['--bg', '--resume', SID],
+      ['--bg', `-r${SID}`],
       ['--background', '--resume', SID],
-      ['agents', '--json'],
+      ['--bg', 'attach', '--help'],
       ['--model', 'opus'],
-      ['stop'],
+      ['--model', 'opus', 'hello'],
+      ['-p', 'what is in this folder'],
+      ['-n', 'my session', 'do it'],
+      ['-w', 'feature', 'start here'],
+      ['-d'],
       [],
-      ['logs', SHORT],
-      ['--resume', '   '].slice(0, 1).concat(['--model', 'x']).slice(1),
     ]) {
       expect({ args, parsed: parseBackgroundRequest(args) }).toEqual({ args, parsed: undefined });
+    }
+  });
+
+  it('reads a resume in every spelling Claude Code takes: -r<id>, -r <id>, -pr <id>, --resume <id>, --resume=<id>', () => {
+    expect(parseBackgroundRequest([`-r${SID}`])).toEqual(resume(SID));
+    expect(parseBackgroundRequest([`-r${SID}`, 'carry on'])).toEqual(resume(SID, ['carry on']));
+    // Measured: Claude Code peels -p off the front of -pr, and decides print mode on the word -p
+    // alone, so -pr <id> "<prompt>" is an interactive resume with that prompt.
+    expect(parseBackgroundRequest(['-pr', SID, 'hi'])).toEqual(resume(SID, ['hi']));
+    expect(parseBackgroundRequest([`-pr${SID}`])).toEqual(resume(SID));
+    // -r=<id> searches for "=<id>" in Claude Code's picker: a term, as cctl reads it too.
+    expect(parseBackgroundRequest([`-r=${SID}`])).toEqual(resume(`=${SID}`));
+    expect(parseBackgroundRequest(['--model', 'opus', '-r', SID])).toEqual(
+      resume(SID, ['--model', 'opus']),
+    );
+    // The value Claude Code takes for -r is the rest of its cluster, whatever it is.
+    expect(parseBackgroundRequest(['-rc'])).toEqual(resume('c'));
+    // The last resume given is the one Claude Code takes.
+    expect(parseBackgroundRequest(['--resume', SID2, `--resume=${SID}`])).toEqual(resume(SID));
+  });
+
+  it('a cluster that continues is a continue, as Claude Code runs it; print mode is the word -p', () => {
+    // Measured: -cr <id>, -cr<id> and -cpr <id> continue the latest conversation, whatever id follows.
+    for (const args of [['-cr', SID], [`-cr${SID}`], ['-cpr', SID, 'hi'], ['-pc'], ['-c']]) {
+      expect({ args, parsed: parseBackgroundRequest(args) }).toEqual({ args, parsed: GUARD });
+    }
+    expect(parseBackgroundRequest(['-p', '-r', SID, 'hi'])).toEqual({ verb: 'guard', ref: SID });
+    expect(parseBackgroundRequest(['--print', `-r${SID}`])).toEqual({ verb: 'guard', ref: SID });
+  });
+
+  it('checks anything that could reach a row, however it is spelled, before passing it on', () => {
+    for (const args of [
+      ['agents', '--json'],
+      ['logs', SHORT],
+      ['stop'],
+      ['daemon', 'stop', '--any'],
+      ['--from-pr', '12'],
+      ['--from-pr=12'],
+      // A short option Claude Code reads as -d with the value "r": still a cluster with r in it.
+      ['-dr', SID],
+      // A resume behind -v or -h: Claude Code may print its version or help instead.
+      ['-vr', SID],
+      ['hi', '--', '-r', SID],
+    ]) {
+      expect({ args, parsed: parseBackgroundRequest(args) }).toEqual({ args, parsed: GUARD });
+    }
+  });
+});
+
+describe('routeBackgroundLaunch — arguments in any spelling, with a trap row on the slot', () => {
+  it('a resume spelled -r<id> or -pr <id> is routed like --resume <id>: opened where it runs, never passed under the trap row', async () => {
+    for (const args of [[`-r${SID}`], ['-pr', SID, 'carry on']]) {
+      const w = world();
+      w.host.runs(MAIN, SID, { status: 'busy' });
+      w.host.row(X, 'stopped');
+      const d = await decideIn(w, parseBackgroundRequest(args)!);
+      expect(d).toMatchObject({ kind: 'open', configDir: MAIN });
+    }
+  });
+
+  it('anything cctl cannot tell is a plain new session is refused while the slot holds a trap row', async () => {
+    for (const args of [
+      ['-cr', SID],
+      ['-vr', SID],
+      ['logs', SHORT],
+      ['agents', '--json'],
+    ]) {
+      const w = world();
+      w.host.runs(MAIN, SID, { status: 'busy' });
+      w.host.row(X, 'stopped');
+      const d = await decideIn(w, parseBackgroundRequest(args)!);
+      expect({ args, d }).toMatchObject({ args, d: { kind: 'refuse' } });
     }
   });
 });

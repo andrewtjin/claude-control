@@ -352,8 +352,9 @@ in the main config dir's service (the global slot) or in a folder profile's. A p
 the session runs in another service, a job row the profile still holds for it is the trap
 described above.
 
-`cctl claude attach <session>` and `cctl claude --resume <session>` (also after `--`, and with
-other options around them) find the session first:
+`cctl claude attach <session>` and `cctl claude --resume <session>` (also after `--`, with
+other options around them, and in every spelling Claude Code reads as a resume: `-r <id>`,
+`-r<id>`, `-pr <id>`, `--resume=<id>`) find the session first:
 
 - by any full session id it has had (the id it started with, and the conversation it runs
   after `/clear`);
@@ -398,10 +399,15 @@ to the session and opens it.
 
 `cctl claude stop|kill|rm|respawn <session>` is run under the config dir whose service runs
 the session, by its job id there. Anything else `cctl claude` passes to Claude Code that can
-reach a job row — the `--resume` picker, `--continue`, the `agents` view, a `respawn` of every
-session, an id or a title cctl does not find — is checked first against the job rows of the
-slot it runs on: one held there for a session running in another service refuses the
-command, naming the session, where it runs, and `cctl claude attach <short id>` to open it.
+reach a job row — the `--resume` picker, `--continue`, the `agents` view (`agents --json`
+too), `logs`, a `respawn` of every session, an id or a title cctl does not find — is checked
+first against the job rows of the slot it runs on: one held there for a session running in
+another service refuses the command, naming the session, where it runs, and
+`cctl claude attach <short id>` to open it. So is anything cctl cannot tell is a plain new
+session: a short option cluster with `r` or `c` in it that is no plain resume (`-cr <id>`,
+which Claude Code runs as `--continue` whatever the id, or `-dr`), or `--from-pr`. Only
+arguments that are plainly a new session (a prompt and options, none of the above), a new
+background start (`--bg`) and a copy (`--fork-session`) are passed on without that check.
 So nothing `cctl claude` runs opens, stops or removes a session through a row under one
 config dir while it runs in another's service. `cctl claude` holds the session's move lock
 while it decides, and until the terminal it started shows up in the service's attach journal,
