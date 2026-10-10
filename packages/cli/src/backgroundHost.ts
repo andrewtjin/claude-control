@@ -1,23 +1,29 @@
-// The daemon's seam to Claude Code's background service: the real {@link BackgroundSessionHost}
-// the daemon's background mover drives (see the daemon's backgroundMover.ts for when and why a
-// session moves).
+// The seam to Claude Code's background service: the real {@link BackgroundSessionHost} the daemon's
+// background mover drives (see the daemon's backgroundMover.ts for when and why a session moves).
 //
 // Claude Code runs one background service per config dir (keyed on CLAUDE_CONFIG_DIR, or on
 // ~/.claude when it is unset), and keeps that service's state under the config dir:
 //   - `daemon/roster.json`: the workers the service hosts right now, by short id, each with its full
 //     session id, working directory and the pid of its terminal host. It also holds attach secrets;
 //     only the four fields above are ever read out of it, and nothing from it is logged;
-//   - `jobs/<short>/state.json`: the session's job row, with the launch options it saved
-//     (`respawnFlags`, see {@link replayOptions}) and the permission rules granted while it ran
-//     (`sessionPermissionRules`);
+//   - `jobs/<short>/state.json`: the session's job row, with its state (`running`, `stopped`,
+//     `failed`...), its name, the launch options it saved (`respawnFlags`, see {@link replayOptions})
+//     and the permission rules granted while it ran (`sessionPermissionRules`). One session can have
+//     a row in several config dirs, each with its own state, name and options;
 //   - `daemon/attach-journal/*.json`: one entry per terminal opening a session of the service
 //     (`claude attach`, or the agent view), naming that terminal's process; Claude Code clears it
 //     when the terminal leaves the session. It does not say which session.
+// One file is shared instead: `sessions/<pid>.json`, the registry of every live session process,
+// which every folder profile shares with the main config dir. Each entry says whether the session is
+// a background one (`kind: bg`, with its job's short id) or open in a terminal (`interactive`), and
+// what it is doing (`status`: `idle` between turns, `busy` in one, `waiting` on a prompt), whichever
+// service hosts it.
 // Everything else is asked of Claude Code itself, run as the operator's own `claude` on PATH (the
 // binary that started the service), with CLAUDE_CONFIG_DIR naming the service to talk to:
-//   - `claude agents --json`: every session with its status (`idle` between turns, `busy` in one,
-//     `waiting` on a prompt or a permission); the listing spans every working directory;
-//   - `claude stop <short>`: stops it, synchronously;
+//   - `claude agents --json`: every session with its status; the listing spans every working
+//     directory;
+//   - `claude stop <short>`: stops it. It returns a moment before the session has exited, so the
+//     host waits until the registry and the roster no longer hold it;
 //   - `claude --bg --resume <session id> [options]` with no prompt: resumes it idle under that
 //     config dir's service ("idle — send a prompt to start"), or prints that it started a copy.
 // `claude rm` is never run: it deletes the session's worktree and branch along with its job row.
@@ -32,7 +38,9 @@ import type {
   BackgroundSessionHost,
   SavedLaunch,
   SessionActivity,
+  SessionLock,
 } from '@claude-control/daemon';
+import { LockTimeoutError, acquireLock } from '@claude-control/switch-engine';
 import { findClaudeOnPath, resolveLaunchTarget } from './launcher.js';
 
 /** One finished Claude Code command. */
@@ -48,9 +56,27 @@ export type RunClaude = (
   opts: { env: NodeJS.ProcessEnv; cwd?: string },
 ) => Promise<ClaudeRunResult>;
 
+/** One live entry of Claude Code's shared session registry (`sessions/<pid>.json`). */
+export interface LiveSession {
+  /** The session process. Only entries whose process is alive are ever returned. */
+  pid: number;
+  /** The full, lowercase session id. */
+  sessionId: string;
+  /** `bg` for a session a background service hosts, `interactive` for one open in a terminal. */
+  kind: string;
+  /** `idle` between turns, `busy` in one, `waiting` on a prompt; absent while it starts. */
+  status?: string;
+  /** A background session's short id. */
+  jobId?: string;
+  name?: string;
+  cwd?: string;
+}
+
 export interface ClaudeBackgroundHostOptions {
   /** The main config dir: the global slot's, which a `null` config dir names. */
   mainConfigDir: string;
+  /** Where the cross-process move locks live, one per session (see {@link moveLocksDir}). */
+  moveLockDir: string;
   /** The environment Claude Code is run with (default: this process's). */
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
@@ -60,11 +86,34 @@ export interface ClaudeBackgroundHostOptions {
   /** The names in a directory; throws (ENOENT) for one that does not exist. */
   readDir?: (path: string) => string[];
   isProcessAlive?: (pid: number) => boolean;
+  /** Pause between reads while waiting for a stopped session to exit. Injectable so tests need not
+   *  wait. */
+  sleep?: (ms: number) => Promise<void>;
+  /** A monotonic clock in ms, for that wait (default `performance.now`). */
+  clock?: () => number;
+  /** How long a stopped session may take to exit before the stop counts as not seen through. */
+  stopExitTimeoutMs?: number;
+}
+
+/** Where the move locks live under cctl's data dir (the vault dir's parent). */
+export function moveLocksDir(dataDir: string): string {
+  return join(dataDir, 'background-moves');
 }
 
 /** How long one Claude Code command may run. A resume returns once the session is dispatched, in
  *  about a second when the service is up and a few when it has to start. */
 const CLAUDE_COMMAND_TIMEOUT_MS = 60_000;
+
+/** Measured: a stopped session leaves the registry about a second after `claude stop` returns, and
+ *  its terminal host leaves the roster a moment later. Ten seconds is far past that on a loaded box,
+ *  and short of anything the operator would wait out. */
+const DEFAULT_STOP_EXIT_TIMEOUT_MS = 10_000;
+const STOP_EXIT_POLL_MS = 100;
+/** A move lock whose holder is older than this is presumed dead even when its process looks alive
+ *  (a reused pid). Well above the longest move: a stop, a resume, its confirm window and the tries
+ *  of a way back, each bounded by the command timeout. A holder that died is noticed at once. */
+const MOVE_LOCK_STALE_MS = 10 * 60_000;
+const MOVE_LOCK_POLL_MS = 250;
 
 const SHORT_ID = /^[0-9a-f]{8}$/;
 /** How Claude Code says a resume started a copy instead (every reason it gives ends this way). */
@@ -327,6 +376,26 @@ function defaultRunClaude(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): Ru
     });
 }
 
+/** A JSON file's top-level object, or undefined for one that is missing, torn or not an object. */
+function readObject(
+  readFile: (path: string) => string,
+  path: string,
+): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFile(path));
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A field that is a non-empty string, or nothing. */
+function nonEmpty(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
 /** Build the host for the daemon. */
 export function createClaudeBackgroundHost(
   options: ClaudeBackgroundHostOptions,
@@ -337,6 +406,19 @@ export function createClaudeBackgroundHost(
   const readFile = options.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
   const readDir = options.readDir ?? ((p: string) => readdirSync(p));
   const isAlive = options.isProcessAlive ?? pidIsAlive;
+  const sleep =
+    options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const clock = options.clock ?? (() => performance.now());
+  const stopExitTimeoutMs = options.stopExitTimeoutMs ?? DEFAULT_STOP_EXIT_TIMEOUT_MS;
+
+  /** The names in a directory, or none for one that does not exist or cannot be listed. */
+  const namesIn = (dir: string): string[] => {
+    try {
+      return readDir(dir);
+    } catch {
+      return [];
+    }
+  };
 
   /** The config dir whose files describe a service: the named one, or the main one. */
   const home = (configDir: string | null): string => configDir ?? options.mainConfigDir;
@@ -439,7 +521,59 @@ export function createClaudeBackgroundHost(
     return out;
   };
 
+  /** The live entries of the shared session registry (see the header). It sits in the main config
+   *  dir, and every folder profile links its own `sessions/` there. An entry left by a process that
+   *  has exited is skipped: Claude Code removes its own on a clean exit, not on a hard kill. */
+  const readRegistry = (): LiveSession[] => {
+    const dir = join(options.mainConfigDir, 'sessions');
+    const out: LiveSession[] = [];
+    for (const file of namesIn(dir)) {
+      if (!/^\d+\.json$/.test(file)) continue;
+      const e = readObject(readFile, join(dir, file));
+      if (e === undefined) continue;
+      const pid = e.pid;
+      const sessionId = e.sessionId;
+      if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0 || !isAlive(pid)) continue;
+      if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) continue;
+      const jobId = nonEmpty(e.jobId);
+      const status = nonEmpty(e.status);
+      const name = nonEmpty(e.name);
+      const cwd = nonEmpty(e.cwd);
+      out.push({
+        pid,
+        sessionId,
+        kind: nonEmpty(e.kind) ?? 'interactive',
+        ...(status !== undefined ? { status } : {}),
+        ...(jobId !== undefined && SHORT_ID.test(jobId) ? { jobId } : {}),
+        ...(name !== undefined ? { name } : {}),
+        ...(cwd !== undefined ? { cwd } : {}),
+      });
+    }
+    return out;
+  };
+
+  /** Whether a session (by short id) still runs anywhere: in the registry, or in the roster of the
+   *  service that hosted it. The registry entry goes first and the terminal host a moment later. */
+  const stillRunning = (configDir: string | null, short: string): boolean =>
+    readRegistry().some((e) => e.jobId === short || e.sessionId.startsWith(short)) ||
+    readHosted(configDir).some((s) => s.short === short);
+
   return {
+    async lockSession(sessionId, waitMs): Promise<SessionLock | undefined> {
+      // The id names the lock's directory, so only a session id may.
+      if (!SESSION_ID.test(sessionId)) throw new Error(`not a background session id: ${sessionId}`);
+      try {
+        return await acquireLock(join(options.moveLockDir, sessionId), Date.now, {
+          timeoutMs: waitMs,
+          pollMs: MOVE_LOCK_POLL_MS,
+          staleMs: MOVE_LOCK_STALE_MS,
+        });
+      } catch (err) {
+        if (err instanceof LockTimeoutError) return undefined;
+        throw err;
+      }
+    },
+
     listHosted(configDir) {
       return Promise.resolve(readHosted(configDir));
     },
@@ -483,6 +617,17 @@ export function createClaudeBackgroundHost(
     async stop(configDir, short) {
       if (!SHORT_ID.test(short)) throw new Error(`not a background session id: ${short}`);
       await runOk(configDir, ['stop', short]);
+      // Claude Code returns before the session has exited; a resume in that moment would find it
+      // still running and start a copy instead.
+      const deadline = clock() + stopExitTimeoutMs;
+      while (stillRunning(configDir, short)) {
+        if (clock() >= deadline) {
+          throw new Error(
+            `it was still running ${Math.round(stopExitTimeoutMs / 1000)}s after claude stop`,
+          );
+        }
+        await sleep(STOP_EXIT_POLL_MS);
+      }
     },
 
     savedOptions(configDir, short): Promise<SavedLaunch> {

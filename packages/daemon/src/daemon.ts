@@ -77,6 +77,7 @@ import {
 } from '@claude-control/usage-advisor';
 import type { ProbeCandidate } from './accountProbe.js';
 import { BackgroundMover, type BackgroundSessionHost, type MoveTarget } from './backgroundMover.js';
+import { isMoveTarget } from './backgroundMove.js';
 import {
   exhaustedCardBody,
   exhaustedCardTitle,
@@ -1845,10 +1846,8 @@ export class Daemon {
 
   /**
    * The folders whose background sessions should move onto their own slot right now, by rule id:
-   * each rule that includes accounts and whose slot holds one of them that can take work (by this
-   * cycle's numbers). A folder in fallback on a shared account, or whose included account is out, is
-   * left out: moving a session there would gain nothing. An exclude-only rule prefers no account, so
-   * it never asks for a move.
+   * each rule that includes accounts and whose slot holds one of them that can take work, by this
+   * cycle's numbers (see {@link isMoveTarget}, which `cctl claude` judges by too).
    */
   private backgroundMoveTargets(
     rules: FolderRule[],
@@ -1859,12 +1858,10 @@ export class Daemon {
     const now = this.clock();
     const targets = new Map<string, MoveTarget>();
     for (const rule of rules) {
-      if (rule.include.length === 0) continue;
       const slot = ruleSlotId(rule.id);
       const liveId = live.get(slot) ?? null;
-      if (liveId === null || !rule.include.includes(liveId)) continue;
       const input = inputs.find((i) => i.accountId === liveId);
-      if (input === undefined || !assessFleet([input], now).accounts[0]!.usable) continue;
+      if (!isMoveTarget(rule.include, liveId, input, now)) continue;
       const configDir = this.switchEngine.configDirForSlot?.(slot);
       if (configDir === undefined) continue;
       targets.set(rule.id, {

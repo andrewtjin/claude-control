@@ -57,7 +57,7 @@ import { createAgentSdkClient, createSessionManager } from '@claude-control/sess
 import type { AdvisorOptions, AutoSwitchPolicy } from '@claude-control/usage-advisor';
 import type { AgentSdkClient, CreateAgentSdkClientDeps } from '@claude-control/session-runtime';
 import { buildEngine, daemonDbPath, fail, resolveBindEnforce } from './context.js';
-import { createClaudeBackgroundHost } from './backgroundHost.js';
+import { createClaudeBackgroundHost, moveLocksDir } from './backgroundHost.js';
 import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
 import {
@@ -556,7 +556,12 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       ? {
           // The daemon's own environment, not the logging one: a service this starts hands its
           // environment to every session it hosts, and the daemon's log file is not theirs.
-          backgroundSessionHost: createClaudeBackgroundHost({ mainConfigDir: paths.claudeDir }),
+          // The move lock is the one `cctl claude` takes when it moves a session the operator
+          // opens, so the two never move one session at once.
+          backgroundSessionHost: createClaudeBackgroundHost({
+            mainConfigDir: paths.claudeDir,
+            moveLockDir: moveLocksDir(dataDir),
+          }),
         }
       : {}),
     installHooks: async () => {

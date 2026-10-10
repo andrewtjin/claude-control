@@ -167,13 +167,26 @@ export {
   BackgroundMover,
   DEFAULT_MOVE_INTERVAL_MS,
   type BackgroundMoverOptions,
-  type BackgroundSession,
-  type BackgroundSessionHost,
   type MoveOutcome,
   type MoveTarget,
+} from './backgroundMover.js';
+
+export {
+  DEFAULT_CONFIRM_TIMEOUT_MS,
+  confirmHosted,
+  isMoveTarget,
+  moveBackgroundSession,
+  type BackgroundSession,
+  type BackgroundSessionHost,
+  type MoveEnd,
+  type MoveRequest,
+  type MoveResult,
+  type MoveTiming,
+  type NotMovedCause,
   type SavedLaunch,
   type SessionActivity,
-} from './backgroundMover.js';
+  type SessionLock,
+} from './backgroundMove.js';
 
 export {
   bindTokensDir,

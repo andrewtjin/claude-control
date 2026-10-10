@@ -15,6 +15,7 @@ import {
   type SavedLaunch,
   type SessionActivity,
 } from './backgroundMover.js';
+import type { SessionLock } from './backgroundMove.js';
 
 const MAIN = null;
 const PROFILE = 'C:/vault/profiles/rule-1';
@@ -35,6 +36,10 @@ class FakeHost implements BackgroundSessionHost {
     [MAIN, { kind: 'replayable', options: ['--permission-mode=auto'] }],
   ]);
   attached = false;
+  /** Session ids whose move lock another process holds. */
+  readonly lockedElsewhere = new Set<string>();
+  /** Every lock taken and released, in order. */
+  readonly locks: string[] = [];
   failAttached = false;
   failListing = false;
   failActivity = false;
@@ -86,6 +91,12 @@ class FakeHost implements BackgroundSessionHost {
       (this.hosted.get(configDir) ?? []).filter((s) => s.short !== short),
     );
     return Promise.resolve();
+  }
+
+  lockSession(sessionId: string, waitMs: number): Promise<SessionLock | undefined> {
+    if (this.lockedElsewhere.has(sessionId)) return Promise.resolve(undefined);
+    this.locks.push(`take ${sessionId} ${waitMs}`);
+    return Promise.resolve({ release: () => void this.locks.push(`release ${sessionId}`) });
   }
 
   savedOptions(configDir: string | null, short: string): Promise<SavedLaunch> {
@@ -199,6 +210,8 @@ describe('BackgroundMover', () => {
     const outcomes = await h.mover.run(targets(TARGET));
     expect(outcomes).toEqual([{ sessionId: SID, ruleId: 'rule-1', result: 'moved' }]);
     expect(h.host.calls).toEqual([
+      'list null',
+      // Re-read under the session's move lock: another cctl process may have moved it meanwhile.
       'list null',
       'activity null',
       'attached null',
@@ -347,6 +360,66 @@ describe('BackgroundMover', () => {
     h.host.states.clear();
     expect((await h.mover.run(targets(TARGET)))[0]).toMatchObject({ result: 'skipped' });
     expect(h.host.calls.some((c) => c.startsWith('stop'))).toBe(false);
+  });
+
+  describe('the move lock it shares with cctl claude', () => {
+    it("takes the session's lock without waiting, and lets go of it after the move", async () => {
+      const h = harness();
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      expect((await h.mover.run(targets(TARGET)))[0]?.result).toBe('moved');
+      expect(h.host.locks).toEqual([`take ${SID} 0`, `release ${SID}`]);
+    });
+
+    it('leaves a session another cctl process holds the lock of alone, and looks again next cycle', async () => {
+      const h = harness();
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      h.host.lockedElsewhere.add(SID);
+      expect(await h.mover.run(targets(TARGET))).toEqual([
+        {
+          sessionId: SID,
+          ruleId: 'rule-1',
+          result: 'skipped',
+          reason: 'another cctl process is moving it',
+        },
+      ]);
+      expect(h.host.calls).toEqual(['list null']);
+      expect(h.notices).toEqual([]);
+      h.host.lockedElsewhere.clear();
+      expect((await h.mover.run(targets(TARGET)))[0]?.result).toBe('moved');
+    });
+
+    it('a session moved off the global slot by another process meanwhile is not touched', async () => {
+      const h = harness();
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      // The listing saw it; by the time the lock is held, cctl claude has moved it.
+      const listHosted = h.host.listHosted.bind(h.host);
+      let reads = 0;
+      h.host.listHosted = (configDir) => {
+        reads++;
+        if (reads === 2) h.host.hosted.set(MAIN, []);
+        return listHosted(configDir);
+      };
+      expect(await h.mover.run(targets(TARGET))).toEqual([
+        {
+          sessionId: SID,
+          ruleId: 'rule-1',
+          result: 'skipped',
+          reason: 'it is no longer on the global slot',
+        },
+      ]);
+      expect(h.host.calls.some((c) => c.startsWith('stop') || c.startsWith('activity'))).toBe(
+        false,
+      );
+      expect(h.host.locks).toEqual([`take ${SID} 0`, `release ${SID}`]);
+    });
+
+    it('lets go of the lock even when a move fails', async () => {
+      const h = harness();
+      h.host.add(MAIN, session(SID, 'C:/research'), { idle: true });
+      h.host.failResumeIn.add(PROFILE);
+      expect((await h.mover.run(targets(TARGET)))[0]?.result).toBe('failed');
+      expect(h.host.locks).toEqual([`take ${SID} 0`, `release ${SID}`]);
+    });
   });
 
   describe('what it carries over, or refuses to', () => {

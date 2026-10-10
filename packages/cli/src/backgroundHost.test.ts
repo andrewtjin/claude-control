@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   createClaudeBackgroundHost,
+  moveLocksDir,
   replayOptions,
   type ClaudeRunResult,
   type RunClaude,
@@ -23,6 +24,8 @@ const MAIN = 'C:/Users/me/.claude';
 const PROFILE = 'C:/Users/me/AppData/Local/claude-control/profiles/rule-1';
 const SID = '1ee43a2b-076b-42a1-b487-70a8b77401fa';
 const SHORT = '1ee43a2b';
+/** Never written by the in-memory hosts: their tests take no lock. */
+const LOCKS = 'C:/Users/me/AppData/Local/claude-control/background-moves';
 
 /** A roster as Claude Code writes it, including the attach secrets the host must never read out. */
 function roster(workers: Record<string, unknown>): string {
@@ -54,15 +57,20 @@ function hostWith(opts: {
   env?: NodeJS.ProcessEnv;
   alive?: (pid: number) => boolean;
   failDir?: string;
-}): { host: ReturnType<typeof createClaudeBackgroundHost>; runs: Recorded[] } {
+  /** Runs at each pause of a wait, to change the files the way Claude Code would meanwhile. */
+  onSleep?: (files: Record<string, string>) => void;
+}): { host: ReturnType<typeof createClaudeBackgroundHost>; runs: Recorded[]; sleeps: number[] } {
   const runs: Recorded[] = [];
+  const sleeps: number[] = [];
   const files = opts.files ?? {};
+  let now = 0;
   const run: RunClaude = (args, o) => {
     runs.push({ args, env: o.env, cwd: o.cwd });
     return Promise.resolve(opts.answer?.(args) ?? { code: 0, stdout: '', stderr: '' });
   };
   const host = createClaudeBackgroundHost({
     mainConfigDir: MAIN,
+    moveLockDir: LOCKS,
     env: opts.env ?? { PATH: '/bin' },
     run,
     readFile: (p) => {
@@ -74,16 +82,27 @@ function hostWith(opts: {
     readDir: (p) => {
       const dir = p.replace(/\\/g, '/');
       if (dir === opts.failDir) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
-      const names = Object.keys(files)
-        .filter((f) => f.startsWith(`${dir}/`))
-        .map((f) => f.slice(dir.length + 1))
-        .filter((n) => !n.includes('/'));
+      // Every file and every subdirectory directly in it.
+      const names = [
+        ...new Set(
+          Object.keys(files)
+            .filter((f) => f.startsWith(`${dir}/`))
+            .map((f) => f.slice(dir.length + 1).split('/')[0]!),
+        ),
+      ];
       if (names.length === 0) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
       return names;
     },
     isProcessAlive: opts.alive ?? (() => true),
+    clock: () => now,
+    sleep: (ms) => {
+      sleeps.push(ms);
+      now += ms;
+      opts.onSleep?.(files);
+      return Promise.resolve();
+    },
   });
-  return { host, runs };
+  return { host, runs, sleeps };
 }
 
 describe('replayOptions', () => {
@@ -606,6 +625,101 @@ describe('createClaudeBackgroundHost', () => {
   });
 });
 
+describe('stop waits for the session to exit', () => {
+  const REG = `${MAIN}/sessions`;
+  const live = (): Record<string, string> => ({
+    [`${REG}/100.json`]: JSON.stringify({ pid: 100, sessionId: SID, kind: 'bg', jobId: SHORT }),
+    [`${MAIN}/daemon/roster.json`]: roster({ [SHORT]: worker(SID, 'C:/work', 4242) }),
+  });
+
+  it('returns once the registry and the roster no longer hold it', async () => {
+    // Claude Code's stop returns first; the entry goes a moment later, and the terminal host after it.
+    let pauses = 0;
+    const { host, runs, sleeps } = hostWith({
+      files: live(),
+      onSleep: (files) => {
+        pauses++;
+        if (pauses === 3) delete files[`${REG}/100.json`];
+        if (pauses === 5) files[`${MAIN}/daemon/roster.json`] = roster({});
+      },
+    });
+    await host.stop(null, SHORT);
+    expect(runs.map((r) => r.args)).toEqual([['stop', SHORT]]);
+    expect(sleeps).toEqual([100, 100, 100, 100, 100]);
+  });
+
+  it('fails when it is still running after the wait, saying so', async () => {
+    const { host } = hostWith({ files: live() });
+    await expect(host.stop(null, SHORT)).rejects.toThrow(
+      'it was still running 10s after claude stop',
+    );
+  });
+
+  it('does not wait on another session, or on an entry whose process has exited', async () => {
+    const { host, sleeps } = hostWith({
+      files: {
+        [`${REG}/100.json`]: JSON.stringify({ pid: 100, sessionId: SID, kind: 'bg', jobId: SHORT }),
+        [`${REG}/200.json`]: JSON.stringify({
+          pid: 200,
+          sessionId: 'f38038c6-523b-4be5-9dff-160c472faeb0',
+          kind: 'bg',
+        }),
+      },
+      alive: (pid) => pid !== 100,
+    });
+    await host.stop(null, SHORT);
+    expect(sleeps).toEqual([]);
+  });
+});
+
+describe('the move lock', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    dir = undefined;
+  });
+
+  it('is one per session, held until released, and shared by every host on the same dir', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-movelock-'));
+    const locks = moveLocksDir(dir);
+    const a = createClaudeBackgroundHost({ mainConfigDir: MAIN, moveLockDir: locks });
+    const b = createClaudeBackgroundHost({ mainConfigDir: MAIN, moveLockDir: locks });
+    const held = await a.lockSession(SID, 0);
+    expect(held).toBeDefined();
+    expect(await b.lockSession(SID, 0)).toBeUndefined();
+    // Another session's lock is its own.
+    const other = await b.lockSession('f38038c6-523b-4be5-9dff-160c472faeb0', 0);
+    expect(other).toBeDefined();
+    held!.release();
+    const again = await b.lockSession(SID, 0);
+    expect(again).toBeDefined();
+    again!.release();
+    other!.release();
+  });
+
+  it('waits for a holder that lets go within the wait', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-movelock-'));
+    const host = createClaudeBackgroundHost({
+      mainConfigDir: MAIN,
+      moveLockDir: moveLocksDir(dir),
+    });
+    const first = await host.lockSession(SID, 0);
+    setTimeout(() => first!.release(), 300);
+    const second = await host.lockSession(SID, 5_000);
+    expect(second).toBeDefined();
+    second!.release();
+  });
+
+  it('names its directory only after a session id', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-movelock-'));
+    const host = createClaudeBackgroundHost({
+      mainConfigDir: MAIN,
+      moveLockDir: moveLocksDir(dir),
+    });
+    await expect(host.lockSession('../escape', 0)).rejects.toThrow(/not a background session id/);
+  });
+});
+
 describe('the real runner, against a fake claude on PATH', () => {
   // The fake records its argv, cwd, selected env and whether stdin was closed, then answers like
   // Claude Code's resume.
@@ -645,6 +759,7 @@ process.stdout.write('backgrounded · 1ee43a2b (idle — send a prompt to start)
     const record = join(dir, 'record.json');
     const host = createClaudeBackgroundHost({
       mainConfigDir: MAIN,
+      moveLockDir: join(dir, 'locks'),
       env: {
         PATH: bin,
         PATHEXT: '.EXE;.CMD',
@@ -676,7 +791,11 @@ process.stdout.write('backgrounded · 1ee43a2b (idle — send a prompt to start)
 
   it('fails plainly when no claude is on PATH', async () => {
     dir = await mkdtemp(join(tmpdir(), 'cctl-bghost-'));
-    const host = createClaudeBackgroundHost({ mainConfigDir: MAIN, env: { PATH: dir } });
+    const host = createClaudeBackgroundHost({
+      mainConfigDir: MAIN,
+      moveLockDir: join(dir, 'locks'),
+      env: { PATH: dir },
+    });
     await expect(host.activity(null)).rejects.toThrow(/claude is not on the PATH/);
   });
 });

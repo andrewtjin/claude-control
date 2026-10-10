@@ -1829,6 +1829,7 @@ describe('daemon folder-bound slots — background sessions move onto their fold
         return Promise.resolve();
       },
       attachedNow: () => Promise.resolve(false),
+      lockSession: () => Promise.resolve({ release: () => {} }),
       savedOptions: (configDir) =>
         Promise.resolve(
           configDir === null
