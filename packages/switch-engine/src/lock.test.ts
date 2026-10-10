@@ -133,6 +133,46 @@ describe('acquireLock', () => {
     expect(maxHeld).toBe(1);
   });
 
+  it('a holder whose lock was reclaimed from under it never releases its successor', async () => {
+    const root = await sandbox();
+    const lockDir = join(root, '.lock');
+    let now = 1_000;
+    const clock = (): number => now;
+    const first = await acquireLock(lockDir, clock, { staleMs: 100 });
+    // The first holder is still alive, but past the staleness: a contender reclaims by age.
+    now += 500;
+    const second = await acquireLock(lockDir, clock, { staleMs: 100, timeoutMs: 1_000 });
+    first.release();
+    // The second claim is untouched: a third contender still has to wait for it.
+    await expect(
+      acquireLock(lockDir, clock, { staleMs: 10_000, timeoutMs: 0, pollMs: 1 }),
+    ).rejects.toBeInstanceOf(LockTimeoutError);
+    expect(first.refresh()).toBe(false);
+    second.release();
+    const third = await acquireLock(lockDir, clock, { timeoutMs: 0 });
+    third.release();
+  });
+
+  it('a refreshed claim is not reclaimed by age while its holder keeps refreshing it', async () => {
+    const root = await sandbox();
+    const lockDir = join(root, '.lock');
+    let now = 1_000;
+    const clock = (): number => now;
+    const held = await acquireLock(lockDir, clock, { staleMs: 100 });
+    for (let i = 0; i < 5; i++) {
+      now += 80;
+      expect(held.refresh()).toBe(true);
+      await expect(
+        acquireLock(lockDir, clock, { staleMs: 100, timeoutMs: 0, pollMs: 1 }),
+      ).rejects.toBeInstanceOf(LockTimeoutError);
+    }
+    // Left unrefreshed past the staleness, it is reclaimable as before.
+    now += 500;
+    const next = await acquireLock(lockDir, clock, { staleMs: 100, timeoutMs: 1_000 });
+    expect(held.refresh()).toBe(false);
+    next.release();
+  });
+
   it('times out cleanly when a stale lock cannot be reclaimed (reclaim contention)', async () => {
     const root = await sandbox();
     const lockDir = join(root, '.lock');
