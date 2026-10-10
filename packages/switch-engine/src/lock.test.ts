@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, writeFile, mkdir, readFile } from 'node:fs/promises';
-import type { PathLike, RmOptions } from 'node:fs';
+import type { PathLike, PathOrFileDescriptor, RmOptions, WriteFileOptions } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireLock } from './lock.js';
@@ -10,7 +10,10 @@ import { LockTimeoutError } from './errors.js';
 // way a Windows EBUSY/EPERM (the holder still has the directory open) would — vi.spyOn can't
 // touch a builtin's ESM namespace, so we replace the module with a thin passthrough. `failFor`
 // is empty except during the reclaim-contention test, so every other test sees the real rmSync.
+// `writes` records the path of every writeFileSync, which still writes through: it shows whether a
+// file was written in place or under another name and renamed into place.
 const rmState = vi.hoisted(() => ({ failFor: new Set<string>() }));
+const writes = vi.hoisted(() => ({ paths: [] as string[] }));
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
   return {
@@ -23,6 +26,10 @@ vi.mock('node:fs', async (importOriginal) => {
       }
       return actual.rmSync(target, options);
     }) as typeof actual.rmSync,
+    writeFileSync: ((file: PathOrFileDescriptor, data: string, options?: WriteFileOptions) => {
+      writes.paths.push(String(file));
+      return actual.writeFileSync(file, data, options);
+    }) as typeof actual.writeFileSync,
   };
 });
 
@@ -171,6 +178,18 @@ describe('acquireLock', () => {
     const next = await acquireLock(lockDir, clock, { staleMs: 100, timeoutMs: 1_000 });
     expect(held.refresh()).toBe(false);
     next.release();
+  });
+
+  it('a refresh never writes the live owner record in place, so no contender reads it torn', async () => {
+    // A contender that read a half-written record would take the lock for broken and reclaim it
+    // from its live holder: the new record is written beside it and renamed over it.
+    const lockDir = join(await sandbox(), '.lock');
+    const held = await acquireLock(lockDir, () => 1_000, { staleMs: 100 });
+    writes.paths.length = 0;
+    expect(held.refresh()).toBe(true);
+    expect(writes.paths).not.toEqual([]);
+    expect(writes.paths.filter((p) => p === join(lockDir, 'owner.json'))).toEqual([]);
+    held.release();
   });
 
   it('times out cleanly when a stale lock cannot be reclaimed (reclaim contention)', async () => {

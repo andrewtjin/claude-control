@@ -10,9 +10,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { sandboxPaths, type FolderRule, type Paths } from '@claude-control/switch-engine';
-import { BIND_GUARD_MARKER, bindGuardPath } from '@claude-control/daemon';
-import { reconcileFolderGuard, relaxationBannerLine } from './folderCommands.js';
+import {
+  sandboxPaths,
+  type AccountView,
+  type FolderRule,
+  type Paths,
+} from '@claude-control/switch-engine';
+import { BIND_GUARD_MARKER, Store, bindGuardPath, isMoveTarget } from '@claude-control/daemon';
+import { lastUsageOf, reconcileFolderGuard, relaxationBannerLine } from './folderCommands.js';
 
 /** A minimal stand-in for the switch engine: `reconcileFolderGuard` only asks it how many folder
  *  rules exist. `count` is what `listRules` reports — the one input that decides install vs. remove. */
@@ -110,5 +115,57 @@ describe('relaxationBannerLine', () => {
     // The CR/LF that would forge a new banner line is gone (only the single trailing newline remains).
     expect(line.indexOf('\n')).toBe(line.length - 1);
     expect(line).not.toContain('\r');
+  });
+});
+
+// `cctl claude` judges whether a folder slot can take a moved session by the usage the daemon last
+// recorded for its account, in the daemon's own database.
+describe('lastUsageOf', () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'cctl-last-usage-'));
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true, maxRetries: 5 });
+  });
+
+  const E: AccountView = {
+    id: 'e',
+    label: 'E',
+    quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+  };
+
+  it('reads the usage the daemon recorded: an account out of its weekly allowance is no move target', () => {
+    const db = join(root, 'daemon.db');
+    const store = new Store(db);
+    store.insertUsageSnapshot({
+      accountId: 'e',
+      fetchedAtMs: Date.now(),
+      source: 'poll',
+      json: JSON.stringify({
+        accountId: 'e',
+        label: 'E',
+        active: true,
+        source: 'live',
+        fetchedAtMs: Date.now(),
+        limits: [
+          {
+            kind: 'weekly_all',
+            percent: 100,
+            resetsAt: new Date(Date.now() + 3_600_000).toISOString(),
+            isActive: true,
+          },
+        ],
+      }),
+    });
+    store.close();
+    const usage = lastUsageOf(E, db);
+    expect(usage).toBeDefined();
+    expect(isMoveTarget(['e'], 'e', usage, Date.now())).toBe(false);
+    // With no record at all it counts as able.
+    const none = lastUsageOf(E, join(root, 'none.db'));
+    expect(isMoveTarget(['e'], 'e', none, Date.now())).toBe(true);
   });
 });

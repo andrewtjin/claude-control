@@ -415,3 +415,23 @@ describe('spawnClaude signal shielding', () => {
     await expect(promise).resolves.toBe(130);
   });
 });
+
+describe('spawnClaude reporting what it started', () => {
+  it('tells the caller the pid of the Claude Code it started, as soon as it is spawned', async () => {
+    // A caller holding a move lock keeps it until the attach journal names this very process.
+    const fakeChild = Object.assign(new EventEmitter(), { pid: 4321 });
+    const fakeSpawn = vi.fn(() => fakeChild) as unknown as typeof spawn;
+    const told: number[] = [];
+    const promise = spawnClaude({
+      command: 'x',
+      args: [],
+      env: {},
+      onSpawn: (pid) => told.push(pid),
+      deps: { spawn: fakeSpawn, signals: { on: () => {}, off: () => {} }, platform: 'linux' },
+    });
+    // Told before the child has exited, not after.
+    expect(told).toEqual([4321]);
+    fakeChild.emit('close', 0, null);
+    await expect(promise).resolves.toBe(0);
+  });
+});
