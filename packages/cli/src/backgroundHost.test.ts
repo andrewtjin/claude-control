@@ -16,6 +16,7 @@ import {
   createClaudeBackgroundHost,
   moveLocksDir,
   replayOptions,
+  titleOfTranscript,
   type ClaudeRunResult,
   type RunClaude,
 } from './backgroundHost.js';
@@ -59,6 +60,7 @@ function hostWith(opts: {
   failDir?: string;
   /** Runs at each pause of a wait, to change the files the way Claude Code would meanwhile. */
   onSleep?: (files: Record<string, string>) => void;
+  profilesRoot?: string;
 }): { host: ReturnType<typeof createClaudeBackgroundHost>; runs: Recorded[]; sleeps: number[] } {
   const runs: Recorded[] = [];
   const sleeps: number[] = [];
@@ -101,6 +103,7 @@ function hostWith(opts: {
       opts.onSleep?.(files);
       return Promise.resolve();
     },
+    ...(opts.profilesRoot !== undefined ? { profilesRoot: opts.profilesRoot } : {}),
   });
   return { host, runs, sleeps };
 }
@@ -622,6 +625,142 @@ describe('createClaudeBackgroundHost', () => {
       ).rejects.toThrow(/not a background session id/);
       expect(runs).toEqual([]);
     });
+  });
+});
+
+describe('what cctl claude reads to find a session', () => {
+  const REG = `${MAIN}/sessions`;
+  const entry = (o: Record<string, unknown>): string => JSON.stringify(o);
+  const OTHER_SID = 'f38038c6-523b-4be5-9dff-160c472faeb0';
+
+  it('reads the shared registry: live entries only, with what each says it is doing', async () => {
+    const { host, runs } = hostWith({
+      files: {
+        [`${REG}/100.json`]: entry({
+          pid: 100,
+          sessionId: SID,
+          kind: 'bg',
+          status: 'busy',
+          jobId: SHORT,
+          name: 'bg eval',
+          cwd: 'C:/work',
+          messagingSocketPath: 'never read out',
+        }),
+        [`${REG}/200.json`]: entry({ pid: 200, sessionId: OTHER_SID, kind: 'interactive' }),
+        // Left by a process that died hard.
+        [`${REG}/300.json`]: entry({ pid: 300, sessionId: SID, kind: 'bg', status: 'idle' }),
+        [`${REG}/400.json`]: '{"pid": 4',
+        [`${REG}/500.json`]: entry({ pid: 500, sessionId: 'not-a-session' }),
+        [`${REG}/notes.txt`]: 'x',
+      },
+      alive: (pid) => pid !== 300,
+    });
+    expect(await host.liveSessions()).toEqual([
+      {
+        pid: 100,
+        sessionId: SID,
+        kind: 'bg',
+        status: 'busy',
+        jobId: SHORT,
+        name: 'bg eval',
+        cwd: 'C:/work',
+      },
+      { pid: 200, sessionId: OTHER_SID, kind: 'interactive' },
+    ]);
+    expect(runs).toEqual([]);
+    expect(await hostWith({}).host.liveSessions()).toEqual([]);
+  });
+
+  it("reads each config dir's job rows: state, name, cwd, when it changed", async () => {
+    const row = (o: Record<string, unknown>): string => JSON.stringify(o);
+    const { host } = hostWith({
+      files: {
+        [`${PROFILE}/jobs/${SHORT}/state.json`]: row({
+          state: 'failed',
+          name: 'bg eval',
+          sessionId: SID,
+          cwd: 'C:/work',
+          updatedAt: '2026-10-09T22:45:19.367Z',
+          detail: 'exit 1 before init',
+        }),
+        // A row whose session id is not its short's, a torn row, and one with no state.
+        [`${PROFILE}/jobs/f38038c6/state.json`]: row({ state: 'stopped', sessionId: SID }),
+        [`${PROFILE}/jobs/aaaaaaaa/state.json`]: '{',
+        [`${PROFILE}/jobs/bbbbbbbb/state.json`]: row({
+          sessionId: 'bbbbbbbb-076b-42a1-b487-70a8b77401fa',
+        }),
+      },
+    });
+    expect(await host.jobRows(PROFILE)).toEqual([
+      {
+        short: SHORT,
+        sessionId: SID,
+        state: 'failed',
+        name: 'bg eval',
+        cwd: 'C:/work',
+        updatedAt: '2026-10-09T22:45:19.367Z',
+      },
+    ]);
+    expect(await host.jobRows(null)).toEqual([]);
+  });
+
+  it('lists every profile under the profiles root, and nothing without one', async () => {
+    const root = 'C:/Users/me/AppData/Local/claude-control/profiles';
+    const { host } = hostWith({
+      profilesRoot: root,
+      files: {
+        [`${root}/rule-1/x`]: '',
+        [`${root}/0b5f3c1e-aaaa-4bbb-8ccc-123456789abc/x`]: '',
+      },
+    });
+    expect((await host.profileConfigDirs()).map((p) => p.replace(/\\/g, '/'))).toEqual([
+      `${root}/rule-1`,
+      `${root}/0b5f3c1e-aaaa-4bbb-8ccc-123456789abc`,
+    ]);
+    expect(await hostWith({}).host.profileConfigDirs()).toEqual([]);
+  });
+
+  it("finds a session's title in whichever project holds its conversation", async () => {
+    const lines = [
+      JSON.stringify({ type: 'user', message: 'hi' }),
+      JSON.stringify({ type: 'ai-title', aiTitle: 'ok', sessionId: SID }),
+      JSON.stringify({ type: 'custom-title', customTitle: 'bg eval', sessionId: SID }),
+      JSON.stringify({ type: 'ai-title', aiTitle: 'later', sessionId: SID }),
+    ].join('\n');
+    const { host } = hostWith({
+      files: {
+        [`${MAIN}/projects/C--other/other.jsonl`]: '',
+        [`${MAIN}/projects/C--work/${SID}.jsonl`]: lines,
+      },
+    });
+    expect(await host.sessionTitle(SID)).toBe('bg eval');
+    expect(await host.sessionTitle(OTHER_SID)).toBeUndefined();
+    expect(await host.sessionTitle('../x')).toBeUndefined();
+  });
+
+  it('a title is the last custom title, else the last ai title', () => {
+    const line = (o: Record<string, unknown>): string => JSON.stringify(o);
+    expect(
+      titleOfTranscript(
+        [
+          line({ type: 'ai-title', aiTitle: 'one' }),
+          line({ type: 'ai-title', aiTitle: 'two' }),
+        ].join('\n'),
+      ),
+    ).toBe('two');
+    expect(
+      titleOfTranscript(
+        [
+          line({ type: 'custom-title', customTitle: 'named' }),
+          line({ type: 'ai-title', aiTitle: 'two' }),
+          '{"type":"custom-title" torn',
+        ].join('\n'),
+      ),
+    ).toBe('named');
+    expect(
+      titleOfTranscript(line({ type: 'user', text: 'mentions "custom-title" in passing' })),
+    ).toBeUndefined();
+    expect(titleOfTranscript('')).toBeUndefined();
   });
 });
 

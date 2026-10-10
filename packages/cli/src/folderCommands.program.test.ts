@@ -4,7 +4,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { realpathSync } from 'node:fs';
+import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -94,6 +94,38 @@ vi.mock('./launcher.js', async (importOriginal) => ({
   resolveLaunchTarget: () => ({ kind: 'run', command: 'claude', prefixArgs: [] }),
   spawnClaude: launcher.spawnClaude,
 }));
+
+// The background-service host `cctl claude` builds reads the sandbox's real files, but never runs a
+// Claude Code: its commands go to a scripted runner that records them, and answers the way Claude Code
+// does (a stop takes the session out of its service, a resume puts it in the profile's).
+const bgHost = vi.hoisted(() => ({
+  built: 0,
+  calls: [] as Array<{ args: string[]; configDir: string | undefined }>,
+  answer: (
+    _args: string[],
+    _configDir: string | undefined,
+  ): { code: number | null; stdout: string; stderr: string } => ({
+    code: 0,
+    stdout: '',
+    stderr: '',
+  }),
+}));
+vi.mock('./backgroundHost.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./backgroundHost.js')>();
+  return {
+    ...real,
+    createClaudeBackgroundHost: (o: Parameters<typeof real.createClaudeBackgroundHost>[0]) => {
+      bgHost.built++;
+      return real.createClaudeBackgroundHost({
+        ...o,
+        run: (args, opts) => {
+          bgHost.calls.push({ args, configDir: opts.env.CLAUDE_CONFIG_DIR });
+          return Promise.resolve(bgHost.answer(args, opts.env.CLAUDE_CONFIG_DIR));
+        },
+      });
+    },
+  };
+});
 
 /** Run one command with stdout/stderr captured; a refusal comes back as `exited` with its line. */
 async function runCli(args: string[]) {
@@ -766,6 +798,224 @@ describe('cctl claude', () => {
     const onIncluded = await launch([], research);
     expect(onIncluded.exited).toBe(false);
   });
+});
+
+describe('cctl claude opening a background session', () => {
+  const SID = 'c5f2097e-d500-42a0-9ddf-8a33f4f9a886';
+  const SHORT = 'c5f2097e';
+  const main = (): string => join(sandbox.root, 'claude');
+  const profile = (): string => join(sandbox.root, 'profiles', 'r1');
+
+  /** Run `cctl claude` from the research folder, returning what it printed and what it spawned. */
+  async function launchFrom(args: string[]) {
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(research);
+    launcher.spawnClaude.mockClear();
+    try {
+      const r = await runCli(['claude', ...args]);
+      const spawned = launcher.spawnClaude.mock.calls[0]?.[0];
+      return { ...r, args: spawned?.args, env: spawned?.env };
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  }
+
+  /** The research folder's rule includes E, live in its slot. */
+  function ruleOnE(): void {
+    const rule = ruleOn(research, { include: ['e'], activeId: 'e' });
+    engine.listRules.mockResolvedValue([rule]);
+    engine.getRule.mockResolvedValue(rule);
+    engine.liveSlots.mockResolvedValue(
+      new Map([
+        ['global', 'a'],
+        ['group:r1', 'e'],
+      ]),
+    );
+    engine.ensureRuleLive.mockResolvedValue({
+      ruleId: 'r1',
+      liveAccount: 'e',
+      activated: false,
+      noWorkingAccount: false,
+    });
+  }
+
+  /** The session runs in a config dir's service (this process stands in for its processes, so it
+   *  counts as alive), with a row there, and the registry entry saying what it is doing. */
+  async function runsIn(configDir: string, status: string, kind = 'bg'): Promise<void> {
+    await mkdir(join(configDir, 'daemon'), { recursive: true });
+    if (kind === 'bg') {
+      await writeFile(
+        join(configDir, 'daemon', 'roster.json'),
+        JSON.stringify({
+          workers: { [SHORT]: { pid: process.pid, sessionId: SID, cwd: research } },
+        }),
+      );
+    }
+    await mkdir(join(main(), 'sessions'), { recursive: true });
+    await writeFile(
+      join(main(), 'sessions', '100001.json'),
+      JSON.stringify({
+        pid: process.pid,
+        sessionId: SID,
+        kind,
+        status,
+        jobId: SHORT,
+        cwd: research,
+      }),
+    );
+    await rowIn(configDir, 'running');
+  }
+
+  async function rowIn(configDir: string, state: string): Promise<void> {
+    await mkdir(join(configDir, 'jobs', SHORT), { recursive: true });
+    await writeFile(
+      join(configDir, 'jobs', SHORT, 'state.json'),
+      JSON.stringify({
+        state,
+        sessionId: SID,
+        name: 'bg eval',
+        cwd: research,
+        respawnFlags: ['-n', 'bg eval'],
+      }),
+    );
+  }
+
+  beforeEach(() => {
+    bgHost.built = 0;
+    bgHost.calls.length = 0;
+    bgHost.answer = () => ({ code: 0, stdout: '', stderr: '' });
+  });
+
+  it('a session running in the folder profile is attached there, with no Claude Code command first', async () => {
+    ruleOnE();
+    await runsIn(profile(), 'busy');
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.exited).toBe(false);
+    expect(r.args).toEqual(['attach', SHORT]);
+    expect(r.env?.CLAUDE_CONFIG_DIR).toBe(profile());
+    expect(r.err).toContain('cctl: Claude Code on E (the folder slot of');
+    expect(bgHost.calls).toEqual([]);
+  });
+
+  it('an idle session on the global slot is moved onto the folder slot first, then attached there', async () => {
+    ruleOnE();
+    await runsIn(main(), 'idle');
+    bgHost.answer = (args, configDir) => {
+      if (args[0] === 'agents') {
+        return {
+          code: 0,
+          stdout: JSON.stringify([{ id: SHORT, status: 'idle', name: 'bg eval' }]),
+          stderr: '',
+        };
+      }
+      if (args[0] === 'stop') {
+        // Claude Code takes it out of the global slot's service and the registry.
+        writeFileSync(join(main(), 'daemon', 'roster.json'), JSON.stringify({ workers: {} }));
+        rmSync(join(main(), 'sessions', '100001.json'));
+      }
+      if (args[0] === '--bg' && configDir === profile()) {
+        mkdirSync(join(profile(), 'daemon'), { recursive: true });
+        writeFileSync(
+          join(profile(), 'daemon', 'roster.json'),
+          JSON.stringify({
+            workers: { [SHORT]: { pid: process.pid, sessionId: SID, cwd: research } },
+          }),
+        );
+        return {
+          code: 0,
+          stdout: `backgrounded · ${SHORT} (idle — send a prompt to start)`,
+          stderr: '',
+        };
+      }
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    const r = await launchFrom(['--', 'attach', 'bg eval']);
+    expect(r.exited).toBe(false);
+    expect(bgHost.calls.map((c) => [c.args.join(' '), c.configDir])).toEqual([
+      ['agents --json', undefined],
+      [`stop ${SHORT}`, undefined],
+      [`--bg --resume ${SID} --name=bg eval`, profile()],
+    ]);
+    expect(r.args).toEqual(['attach', SHORT]);
+    expect(r.env?.CLAUDE_CONFIG_DIR).toBe(profile());
+    expect(r.err).toContain(
+      'cctl: moved background session "bg eval" (c5f2097e) from A (the global slot) onto E',
+    );
+  });
+
+  it('a busy session on the global slot is attached there, never stopped, and says why', async () => {
+    ruleOnE();
+    await runsIn(main(), 'busy');
+    await rowIn(profile(), 'failed');
+    const r = await launchFrom(['--resume', SID]);
+    expect(r.exited).toBe(false);
+    expect(r.args).toEqual(['attach', SHORT]);
+    expect(r.env?.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(r.err).toContain('stays on A (the global slot) for now: it is in a turn.');
+    expect(bgHost.calls).toEqual([]);
+  });
+
+  it('a session open in a terminal is refused, and nothing runs', async () => {
+    ruleOnE();
+    await runsIn(main(), 'idle', 'interactive');
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('is open in a terminal right now');
+    expect(launcher.spawnClaude).not.toHaveBeenCalled();
+    expect(bgHost.calls).toEqual([]);
+  });
+
+  it('--override does not take a session from the folder profile running it: it is opened there', async () => {
+    ruleOnE();
+    await runsIn(profile(), 'idle');
+    await rowIn(main(), 'stopped');
+    const r = await launchFrom(['--override', 'attach', SHORT]);
+    expect(r.exited).toBe(false);
+    expect(r.args).toEqual(['attach', SHORT]);
+    expect(r.env?.CLAUDE_CONFIG_DIR).toBe(profile());
+    expect(r.env?.CCTL_BIND_OVERRIDE).toBeUndefined();
+    expect(r.err).toContain('runs on E (the folder slot of');
+    expect(bgHost.calls).toEqual([]);
+  });
+
+  it('a session cctl knows nothing of is passed through to Claude Code as typed', async () => {
+    ruleOnE();
+    const r = await launchFrom(['attach', 'nothing-by-that-name']);
+    expect(r.exited).toBe(false);
+    expect(r.args).toEqual(['attach', 'nothing-by-that-name']);
+    expect(r.env?.CLAUDE_CONFIG_DIR).toBe(profile());
+  });
+
+  it('arguments that open no background session never read the background services', async () => {
+    ruleOnE();
+    const r = await launchFrom(['--model', 'opus', 'hello']);
+    expect(r.exited).toBe(false);
+    expect(r.args).toEqual(['--model', 'opus', 'hello']);
+    expect(bgHost.built).toBe(0);
+  });
+
+  it('the older-daemon fence still guards seating the folder slot a session belongs to', async () => {
+    await daemonRunning(olderReport);
+    rulesLiveOnShared();
+    await runsIn(main(), 'idle');
+    const r = await launchFrom(['attach', SHORT]);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('predates folder rules');
+    expect(engine.ensureRuleLive).not.toHaveBeenCalled();
+    expect(bgHost.calls).toEqual([]);
+  });
+
+  /** The research rule includes E, but its slot runs on the shared account B. */
+  function rulesLiveOnShared(): void {
+    const rule = ruleOn(research, { include: ['e'], activeId: 'b' });
+    engine.listRules.mockResolvedValue([rule]);
+    engine.getRule.mockResolvedValue(rule);
+    engine.liveSlots.mockResolvedValue(
+      new Map([
+        ['global', 'a'],
+        ['group:r1', 'b'],
+      ]),
+    );
+  }
 });
 
 describe('rule change reports say why a slot has nothing usable', () => {

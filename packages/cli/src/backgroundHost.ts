@@ -1,5 +1,7 @@
 // The seam to Claude Code's background service: the real {@link BackgroundSessionHost} the daemon's
-// background mover drives (see the daemon's backgroundMover.ts for when and why a session moves).
+// background mover drives (see the daemon's backgroundMover.ts for when and why a session moves), and
+// the wider {@link ClaudeBackgroundHost} `cctl claude` reads to find where a session it is asked to
+// open lives (see backgroundAttach.ts).
 //
 // Claude Code runs one background service per config dir (keyed on CLAUDE_CONFIG_DIR, or on
 // ~/.claude when it is unset), and keeps that service's state under the config dir:
@@ -17,7 +19,9 @@
 // which every folder profile shares with the main config dir. Each entry says whether the session is
 // a background one (`kind: bg`, with its job's short id) or open in a terminal (`interactive`), and
 // what it is doing (`status`: `idle` between turns, `busy` in one, `waiting` on a prompt), whichever
-// service hosts it.
+// service hosts it. A session's conversation is `projects/<project>/<session id>.jsonl`, shared too;
+// its title (what `claude --resume <name>` matches) is its last `custom-title` line, else its last
+// `ai-title` line.
 // Everything else is asked of Claude Code itself, run as the operator's own `claude` on PATH (the
 // binary that started the service), with CLAUDE_CONFIG_DIR naming the service to talk to:
 //   - `claude agents --json`: every session with its status; the listing spans every working
@@ -72,11 +76,41 @@ export interface LiveSession {
   cwd?: string;
 }
 
+/** One job row a config dir holds for a session. */
+export interface JobRow {
+  short: string;
+  sessionId: string;
+  /** Claude Code's state for it: `running`, `working`, `stopped`, `failed`, ... */
+  state: string;
+  name?: string;
+  cwd?: string;
+  /** When the row last changed (ISO 8601), to tell the latest of several apart. */
+  updatedAt?: string;
+}
+
+/** The host `cctl claude` reads to find where a background session lives (see
+ *  backgroundAttach.ts): the daemon's seam, plus the shared registry, each config dir's job rows,
+ *  the folder profiles and a session's title. */
+export interface ClaudeBackgroundHost extends BackgroundSessionHost {
+  /** Every live entry of the shared session registry. */
+  liveSessions(): Promise<LiveSession[]>;
+  /** Every job row a config dir holds; rows that cannot be read are left out. */
+  jobRows(configDir: string | null): Promise<JobRow[]>;
+  /** Every folder profile dir under the profiles root, including those of rules since removed:
+   *  each is a config dir with a background service of its own. */
+  profileConfigDirs(): Promise<string[]>;
+  /** A session's title, as `claude --resume <name>` matches it, or undefined when it has none or
+   *  its conversation cannot be found. */
+  sessionTitle(sessionId: string): Promise<string | undefined>;
+}
+
 export interface ClaudeBackgroundHostOptions {
   /** The main config dir: the global slot's, which a `null` config dir names. */
   mainConfigDir: string;
   /** Where the cross-process move locks live, one per session (see {@link moveLocksDir}). */
   moveLockDir: string;
+  /** cctl's folder profiles root, listed by {@link ClaudeBackgroundHost.profileConfigDirs}. */
+  profilesRoot?: string;
   /** The environment Claude Code is run with (default: this process's). */
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
@@ -396,10 +430,32 @@ function nonEmpty(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
-/** Build the host for the daemon. */
+/** A session's title from its conversation: the last `custom-title` line, else the last
+ *  `ai-title` line (Claude Code re-appends both, and the last one wins). Only lines naming one are
+ *  parsed: a conversation runs to megabytes. */
+export function titleOfTranscript(transcript: string): string | undefined {
+  let custom: string | undefined;
+  let ai: string | undefined;
+  for (const line of transcript.split('\n')) {
+    if (!line.includes('-title"')) continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (entry === null || typeof entry !== 'object') continue;
+    const e = entry as { type?: unknown; customTitle?: unknown; aiTitle?: unknown };
+    if (e.type === 'custom-title') custom = nonEmpty(e.customTitle) ?? custom;
+    else if (e.type === 'ai-title') ai = nonEmpty(e.aiTitle) ?? ai;
+  }
+  return custom ?? ai;
+}
+
+/** Build the host for the daemon, or for `cctl claude`. */
 export function createClaudeBackgroundHost(
   options: ClaudeBackgroundHostOptions,
-): BackgroundSessionHost {
+): ClaudeBackgroundHost {
   const baseEnv = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
   const run = options.run ?? defaultRunClaude(platform, baseEnv);
@@ -559,6 +615,62 @@ export function createClaudeBackgroundHost(
     readHosted(configDir).some((s) => s.short === short);
 
   return {
+    liveSessions() {
+      return Promise.resolve(readRegistry());
+    },
+
+    jobRows(configDir) {
+      const jobs = join(home(configDir), 'jobs');
+      const out: JobRow[] = [];
+      for (const short of namesIn(jobs)) {
+        if (!SHORT_ID.test(short)) continue;
+        const row = readObject(readFile, join(jobs, short, 'state.json'));
+        if (row === undefined) continue;
+        const sessionId = row.sessionId;
+        const state = nonEmpty(row.state);
+        if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) continue;
+        if (!sessionId.startsWith(short) || state === undefined) continue;
+        const name = nonEmpty(row.name);
+        const cwd = nonEmpty(row.cwd);
+        const updatedAt = nonEmpty(row.updatedAt);
+        out.push({
+          short,
+          sessionId,
+          state,
+          ...(name !== undefined ? { name } : {}),
+          ...(cwd !== undefined ? { cwd } : {}),
+          ...(updatedAt !== undefined ? { updatedAt } : {}),
+        });
+      }
+      return Promise.resolve(out);
+    },
+
+    profileConfigDirs() {
+      const root = options.profilesRoot;
+      if (root === undefined) return Promise.resolve([]);
+      // A profile is a directory named after its rule's id; anything else there is not one.
+      return Promise.resolve(
+        namesIn(root)
+          .filter((name) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))
+          .map((name) => join(root, name)),
+      );
+    },
+
+    sessionTitle(sessionId) {
+      if (!SESSION_ID.test(sessionId)) return Promise.resolve(undefined);
+      const projects = join(options.mainConfigDir, 'projects');
+      for (const project of namesIn(projects)) {
+        let transcript: string;
+        try {
+          transcript = readFile(join(projects, project, `${sessionId}.jsonl`));
+        } catch {
+          continue;
+        }
+        return Promise.resolve(titleOfTranscript(transcript));
+      }
+      return Promise.resolve(undefined);
+    },
+
     async lockSession(sessionId, waitMs): Promise<SessionLock | undefined> {
       // The id names the lock's directory, so only a session id may.
       if (!SESSION_ID.test(sessionId)) throw new Error(`not a background session id: ${sessionId}`);
