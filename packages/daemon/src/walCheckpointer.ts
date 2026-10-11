@@ -4,7 +4,9 @@
 // threshold (1000 pages, about 4 MB). In the daemon that is a main-thread commit, so the copy
 // back into the database file and its fsyncs block the event loop: hooks and `/healthz` wait
 // behind it (356ms and 589ms on a box under memory pressure). With `synchronous = NORMAL`
-// checkpoints are the only fsyncs SQLite makes, so moving them moves all of that disk wait.
+// checkpoints make nearly all of SQLite's fsyncs, so moving them moves nearly all of that disk
+// wait. One small sync stays on the writer: the commit that restarts a fully checkpointed WAL
+// syncs its new header (a few ms).
 //
 // The worker opens its own connection to the same file and runs a PASSIVE checkpoint every
 // `intervalMs`. PASSIVE never waits for readers or writers, and a WAL writer does not wait for

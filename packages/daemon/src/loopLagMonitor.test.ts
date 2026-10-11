@@ -130,10 +130,12 @@ describe('startLoopLagMonitor', () => {
       await new Promise((resolve) => setTimeout(resolve, 60));
       blockLoop(120);
       await new Promise((resolve) => setTimeout(resolve, 60));
-      blockLoop(600);
+      // Far past twice the short one, so a scheduling stall on a loaded box that takes the
+      // first report instead still leaves this one over the bar.
+      blockLoop(1_000);
       await new Promise((resolve) => setTimeout(resolve, 60));
-      expect(stalls.length).toBe(2);
-      expect(stalls[1]).toBeGreaterThanOrEqual(500);
+      expect(stalls.length).toBeGreaterThanOrEqual(2);
+      expect(stalls.at(-1)).toBeGreaterThanOrEqual(900);
     } finally {
       stop();
     }

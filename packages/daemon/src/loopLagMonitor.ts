@@ -33,8 +33,8 @@ export interface LoopLagMonitorOptions {
    *  interval. */
   intervalMs?: number;
   /** Floor between reports so a sustained stall logs a heartbeat, not a flood. Default 10s.
-   *  Inside it, a stall at least twice the largest one reported so far is still reported, so
-   *  a short stall can never hide a far worse one right behind it. */
+   *  Inside it, a stall at least twice the largest one reported since the floor opened is
+   *  still reported, so a short stall can never hide a far worse one right behind it. */
   reportFloorMs?: number;
   /** Must be monotonic (never steps); a wall clock turns every clock correction into a
    *  reported stall. Default `performance.now()`. */
