@@ -3,19 +3,28 @@
 // SQLite's automatic checkpoint runs inside whichever commit pushes the WAL past its
 // threshold (1000 pages, about 4 MB). In the daemon that is a main-thread commit, so the copy
 // back into the database file and its fsyncs block the event loop: hooks and `/healthz` wait
-// behind it (356ms and 589ms on a box under memory pressure). With `synchronous = NORMAL`
-// checkpoints make nearly all of SQLite's fsyncs, so moving them moves nearly all of that disk
-// wait. One small sync stays on the writer: the commit that restarts a fully checkpointed WAL
-// syncs its new header (a few ms).
+// behind it (356ms and 589ms on a box under memory pressure, 8.9s when ext4 was waiting on its
+// journal). With `synchronous = NORMAL` the checkpoint cycle makes all of SQLite's fsyncs, so
+// all of that disk wait has to leave the main thread, not most of it.
 //
-// The worker opens its own connection to the same file and runs a PASSIVE checkpoint every
-// `intervalMs`. PASSIVE never waits for readers or writers, and a WAL writer does not wait for
-// a checkpointer, so main-thread commits keep appending while the copy runs. The owner turns
-// off its own connection's automatic checkpoint while this runs, and turns it back on if the
-// worker dies or fails to start (see `Store`). That covers a worker that ends, not one that
-// hangs: a checkpoint stuck in the kernel goes unnoticed, though a disk stall that long would
-// stop the main thread's own commits too. A failed worker is not restarted; checkpoints stay
-// on the main thread, as before this file, until the daemon restarts.
+// The worker opens its own connection to the same file and, every `intervalMs`, runs a PASSIVE
+// checkpoint. PASSIVE never waits for readers or writers, and a WAL writer does not wait for a
+// checkpointer, so main-thread commits keep appending while the copy runs. A checkpoint that
+// copies the whole log leaves one fsync behind: the next write restarts the log from the top
+// and syncs its new header first. Under journal pressure that one small sync waits as long as a
+// big one, so the worker makes that next write itself (one row in `wal_restart`) and takes the
+// sync on its own thread. While it writes it holds the write lock, so the store's connection
+// carries a busy timeout and waits out the overlap (the sync it would otherwise have made
+// itself) instead of failing. If the worker finds the lock taken, it skips its write and tries
+// again next tick; the main thread takes the sync only when it commits in the instant between
+// the worker's checkpoint and its write. The worker does nothing at all while no other
+// connection has committed since its last complete checkpoint, so an idle daemon writes nothing.
+//
+// The owner turns off its own connection's automatic checkpoint while this runs, and turns it
+// back on if the worker dies or fails to start (see `Store`). That covers a worker that ends,
+// not one that hangs: a checkpoint stuck in the kernel goes unnoticed, though a disk stall that
+// long would stop the main thread's own commits too. A failed worker is not restarted;
+// checkpoints stay on the main thread, as before this file, until the daemon restarts.
 //
 // The worker source is inline (`eval`) so the bundle needs no separate file, the same way the
 // DPAPI worker is built.
@@ -24,7 +33,8 @@ import { Worker } from 'node:worker_threads';
 
 /** Options for {@link startWalCheckpointer}. */
 export interface WalCheckpointerOptions {
-  /** The database file. Must already be in WAL mode (the store sets it on open). */
+  /** The database file. Must already be in WAL mode and hold {@link WAL_RESTART_SCHEMA} (the
+   *  store sets up both on open). */
   dbPath: string;
   /** Called once if the worker cannot open the database, a checkpoint throws, or the worker
    *  dies. No checkpoint runs after it; the caller must fall back to its own. */
@@ -43,19 +53,64 @@ export interface WalCheckpointer {
 /**
  * How often the worker checkpoints. Short enough that the WAL stays far below the 4 MB
  * automatic threshold at any write rate the daemon has been measured at (about 1 MB a minute
- * at its heaviest), so each checkpoint is small; an idle checkpoint only reads the WAL index.
+ * at its heaviest), so each checkpoint is small.
  */
 export const WAL_CHECKPOINT_INTERVAL_MS = 30_000;
 
-/** The worker's whole program. Nothing in it catches: an open or a checkpoint that throws
- *  ends the worker with an 'error' event on the owner's side, and the owner then checkpoints
- *  on its own, which is what happened before this file existed. */
+/**
+ * The WAL file's size after it resets, in bytes. With the automatic checkpoint on, the commit
+ * that crossed 1000 pages checkpointed at once, so the file stopped near 4 MB. A checkpoint on
+ * another thread can't promise that (a burst between two runs, or a commit landing during one,
+ * lets the WAL keep growing), so whichever connection resets the WAL truncates it back to the
+ * same size. SQLite applies this on the connection that resets, which is usually the worker
+ * and sometimes the store's, so both set it.
+ */
+export const WAL_SIZE_LIMIT_BYTES = 4 * 1024 * 1024;
+
+/** The one-row table the worker writes to restart the log. Created by the database's owner
+ *  before the worker starts, so the worker never changes the schema under a live writer. */
+export const WAL_RESTART_SCHEMA =
+  'CREATE TABLE IF NOT EXISTS wal_restart (id INTEGER PRIMARY KEY CHECK (id = 1), restarts INTEGER NOT NULL)';
+
+/** The worker's whole program. The only error it catches is the lock it can't get while the
+ *  main thread writes: anything else ends the worker with an 'error' event on the owner's side,
+ *  and the owner then checkpoints on its own, which is what happened before this file existed. */
 const WORKER_SOURCE = `
 const { parentPort, workerData } = require('node:worker_threads');
 const { DatabaseSync } = require('node:sqlite');
 const db = new DatabaseSync(workerData.dbPath);
+// NORMAL: the restart write syncs only the new log header, not its commit too.
+db.exec('PRAGMA synchronous = NORMAL; PRAGMA journal_size_limit = ' + workerData.walSizeLimitBytes);
+const dataVersion = db.prepare('PRAGMA data_version');
 const checkpoint = db.prepare('PRAGMA wal_checkpoint(PASSIVE)');
-const timer = setInterval(() => checkpoint.get(), workerData.intervalMs);
+const restart = db.prepare(
+  'INSERT INTO wal_restart (id, restarts) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET restarts = restarts + 1',
+);
+const SQLITE_BUSY = 5;
+// data_version as of the last checkpoint that copied the whole log. It changes only when
+// another connection commits (never for this one's own restart write), so an unchanged value
+// means there is nothing to copy and no restart to take.
+let settledVersion;
+function tick() {
+  const version = dataVersion.get().data_version;
+  if (version === settledVersion) return;
+  const result = checkpoint.get();
+  // busy: another checkpoint is running. checkpointed < log: a reader still needs the old
+  // frames, so the log can't restart yet. Either way, try again next tick.
+  if (result.busy !== 0 || result.checkpointed !== result.log) return;
+  // 0: the log is already empty. -1: not in WAL mode, where a write would make a journal.
+  if (result.log > 0) {
+    try {
+      restart.run();
+    } catch (err) {
+      if ((err.errcode & 0xff) !== SQLITE_BUSY) throw err;
+      // Another connection holds the write lock: try again next tick.
+      return;
+    }
+  }
+  settledVersion = version;
+}
+const timer = setInterval(tick, workerData.intervalMs);
 parentPort.on('message', (msg) => {
   if (msg !== 'stop') return;
   clearInterval(timer);
@@ -74,6 +129,7 @@ export function startWalCheckpointer(options: WalCheckpointerOptions): WalCheckp
     workerData: {
       dbPath: options.dbPath,
       intervalMs: options.intervalMs ?? WAL_CHECKPOINT_INTERVAL_MS,
+      walSizeLimitBytes: WAL_SIZE_LIMIT_BYTES,
     },
   });
   worker.unref();

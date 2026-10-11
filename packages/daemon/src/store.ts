@@ -16,6 +16,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { extractWeeklyReading } from './usageHistory.js';
 import {
   startWalCheckpointer,
+  WAL_RESTART_SCHEMA,
+  WAL_SIZE_LIMIT_BYTES,
   type WalCheckpointer,
   type WalCheckpointerOptions,
 } from './walCheckpointer.js';
@@ -226,14 +228,21 @@ export interface StoreOptions {
 }
 
 /**
- * The WAL file's size after it resets, in bytes. With the automatic checkpoint on, the commit
- * that crossed 1000 pages checkpointed at once, so the file stopped near 4 MB. A checkpoint
- * on another thread can't promise that (a burst between two runs, or a commit landing during
- * one, lets the WAL keep growing), so the main connection truncates it back to the same size
- * when it next resets. SQLite applies this on the connection that resets the WAL, which is
- * the writer here, never the checkpointer.
+ * How long a write on this connection waits for another connection's write lock before it
+ * throws `database is locked`. The background checkpointer holds that lock for the one log
+ * header sync it takes off the main thread (see `walCheckpointer.ts`); a write that lands on it
+ * waits out a sync it would otherwise have made itself. A CLI write landing on the daemon's
+ * commit waits the same way. Ten seconds is past the slowest such sync measured (8.9 s, ext4
+ * stuck on its journal). The trade: a lock held longer than that, by a disk stuck past it or an
+ * outside tool keeping a write transaction open, costs each write ten seconds of blocked loop
+ * before it fails, where it used to fail at once; either way the write doesn't happen.
+ *
+ * The wait covers a write that has to take the lock. It can't save a transaction that read
+ * first and then finds another connection committed since (SQLITE_BUSY_SNAPSHOT), which the
+ * checkpointer's writes make possible at any time, so every multi-statement transaction here
+ * begins IMMEDIATE.
  */
-const WAL_SIZE_LIMIT_BYTES = 4 * 1024 * 1024;
+const BUSY_TIMEOUT_MS = 10_000;
 
 export class Store {
   private readonly db: DatabaseSync;
@@ -307,6 +316,7 @@ export class Store {
     this.db.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = NORMAL;
+      PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS};
     `);
     // Idempotent: every deploy of the daemon calls this on startup against a possibly
     // already-migrated file, so every statement is `IF NOT EXISTS`.
@@ -384,6 +394,9 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_pending_steering_session
         ON pending_steering (sessionId, kind, id);
     `);
+    // Created here rather than by the checkpointer, so its worker never changes the schema
+    // under a live writer.
+    this.db.exec(WAL_RESTART_SCHEMA);
     // A database written before `injectId` existed has rows that predate the channel path
     // entirely, so NULL is the honest value: they were never on a channel and nothing will ever
     // ack them. Added before the unique index below, which those NULLs are exempt from (SQLite
@@ -475,7 +488,7 @@ export class Store {
     const update = this.db.prepare(
       `UPDATE usage_snapshots SET weeklyPercent = ?, weeklyResetsAtMs = ? WHERE id = ?`,
     );
-    this.db.exec('BEGIN');
+    this.db.exec('BEGIN IMMEDIATE');
     try {
       for (const row of rows) {
         const reading = extractWeeklyReading(requireString(row, 'json'));
