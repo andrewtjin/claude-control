@@ -15,8 +15,9 @@
 // big one, so the worker makes that next write itself (one row in `wal_restart`) and takes the
 // sync on its own thread. While it writes it holds the write lock, so the store's connection
 // carries a busy timeout and waits out the overlap (the sync it would otherwise have made
-// itself) instead of failing. If the main thread is mid-write the worker's write is skipped;
-// that commit restarts the log as it always did, and the worker tries again next time. The worker does nothing at all while no other
+// itself) instead of failing. If the worker finds the lock taken, it skips its write and tries
+// again next tick; the main thread takes the sync only when it commits in the instant between
+// the worker's checkpoint and its write. The worker does nothing at all while no other
 // connection has committed since its last complete checkpoint, so an idle daemon writes nothing.
 //
 // The owner turns off its own connection's automatic checkpoint while this runs, and turns it
@@ -103,8 +104,7 @@ function tick() {
       restart.run();
     } catch (err) {
       if ((err.errcode & 0xff) !== SQLITE_BUSY) throw err;
-      // Another connection holds the write lock. If it commits, that commit restarts the log;
-      // if it doesn't, the next tick tries again.
+      // Another connection holds the write lock: try again next tick.
       return;
     }
   }

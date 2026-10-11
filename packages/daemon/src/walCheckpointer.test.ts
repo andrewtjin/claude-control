@@ -173,14 +173,18 @@ describe('startWalCheckpointer', () => {
       insert.run(ROW);
       await waitFor(() => restarts(db) === 1);
       // A commit the worker hasn't seen, then the lock held past several of its ticks: each
-      // one copies the log and then finds the lock taken.
+      // one copies the log and then finds the lock taken. A tick landing between the two
+      // statements restarts first; counting from inside the lock keeps the test exact anyway.
       insert.run(ROW);
       db.exec('BEGIN IMMEDIATE');
+      const before = restarts(db);
       await new Promise((resolve) => setTimeout(resolve, 200));
-      expect(restarts(db)).toBe(1);
+      expect(restarts(db)).toBe(before);
+      // A write inside the lock, so its commit is one the worker hasn't seen either way.
+      insert.run(ROW);
       db.exec('COMMIT');
       expect(onFailure).not.toHaveBeenCalled();
-      await waitFor(() => restarts(db) === 2);
+      await waitFor(() => restarts(db) === before + 1);
       expect(onFailure).not.toHaveBeenCalled();
     } finally {
       await checkpointer.stop();

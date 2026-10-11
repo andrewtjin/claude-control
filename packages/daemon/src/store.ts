@@ -233,8 +233,14 @@ export interface StoreOptions {
  * header sync it takes off the main thread (see `walCheckpointer.ts`); a write that lands on it
  * waits out a sync it would otherwise have made itself. A CLI write landing on the daemon's
  * commit waits the same way. Ten seconds is past the slowest such sync measured (8.9 s, ext4
- * stuck on its journal); a lock held longer than that still fails the write, as every lock did
- * before this timeout.
+ * stuck on its journal). The trade: a lock held longer than that, by a disk stuck past it or an
+ * outside tool keeping a write transaction open, costs each write ten seconds of blocked loop
+ * before it fails, where it used to fail at once; either way the write doesn't happen.
+ *
+ * The wait covers a write that has to take the lock. It can't save a transaction that read
+ * first and then finds another connection committed since (SQLITE_BUSY_SNAPSHOT), which the
+ * checkpointer's writes make possible at any time, so every multi-statement transaction here
+ * begins IMMEDIATE.
  */
 const BUSY_TIMEOUT_MS = 10_000;
 
@@ -482,7 +488,7 @@ export class Store {
     const update = this.db.prepare(
       `UPDATE usage_snapshots SET weeklyPercent = ?, weeklyResetsAtMs = ? WHERE id = ?`,
     );
-    this.db.exec('BEGIN');
+    this.db.exec('BEGIN IMMEDIATE');
     try {
       for (const row of rows) {
         const reading = extractWeeklyReading(requireString(row, 'json'));
