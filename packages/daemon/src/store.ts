@@ -14,6 +14,11 @@ import { DatabaseSync } from 'node:sqlite';
 // reverse import does not exist — `usageHistory` reaches the store through a structural interface
 // — so there is no cycle.
 import { extractWeeklyReading } from './usageHistory.js';
+import {
+  startWalCheckpointer,
+  type WalCheckpointer,
+  type WalCheckpointerOptions,
+} from './walCheckpointer.js';
 
 // ---------------------------------------------------------------------------
 // Row shapes
@@ -202,17 +207,93 @@ function optionalNumber(row: Record<string, unknown>, col: string): number | nul
 // Store
 // ---------------------------------------------------------------------------
 
+/** Options for {@link Store}. */
+export interface StoreOptions {
+  /**
+   * Run WAL checkpoints on a worker thread instead of inside whichever main-thread commit
+   * crosses the automatic threshold (see `walCheckpointer.ts`). The daemon sets this; a
+   * one-shot CLI reader has no event loop worth protecting and doesn't. Ignored for
+   * `:memory:`, which has no WAL.
+   */
+  backgroundCheckpoints?: {
+    /** Told once when the worker fails; checkpoints are back on this connection by then. */
+    onFailure: (err: Error) => void;
+    /** Checkpoint cadence; see {@link WalCheckpointerOptions.intervalMs}. */
+    intervalMs?: number;
+    /** Starts the checkpointer. Injectable so tests can fail it. */
+    start?: (options: WalCheckpointerOptions) => WalCheckpointer;
+  };
+}
+
+/**
+ * The WAL file's size after it resets, in bytes. With the automatic checkpoint on, the commit
+ * that crossed 1000 pages checkpointed at once, so the file stopped near 4 MB. A checkpoint
+ * on another thread can't promise that (a burst between two runs, or a commit landing during
+ * one, lets the WAL keep growing), so the main connection truncates it back to the same size
+ * when it next resets. SQLite applies this on the connection that resets the WAL, which is
+ * the writer here, never the checkpointer.
+ */
+const WAL_SIZE_LIMIT_BYTES = 4 * 1024 * 1024;
+
 export class Store {
   private readonly db: DatabaseSync;
+  private checkpointer: WalCheckpointer | undefined;
+  private closed = false;
 
   /** `path` is injectable so tests use `:memory:`; production passes a real file path. */
-  constructor(path: string) {
+  constructor(path: string, options: StoreOptions = {}) {
     this.db = new DatabaseSync(path);
     this.migrate();
+    const background = options.backgroundCheckpoints;
+    if (background && path !== ':memory:') this.startBackgroundCheckpoints(path, background);
+  }
+
+  /**
+   * Hand checkpoints to the worker. The automatic checkpoint goes off before the worker
+   * starts, so no main-thread commit checkpoints from here on, and every failure, including
+   * one in starting the worker, turns it back on before anyone is told, so the WAL never
+   * grows with no checkpointer at all.
+   */
+  private startBackgroundCheckpoints(
+    path: string,
+    background: NonNullable<StoreOptions['backgroundCheckpoints']>,
+  ): void {
+    const restorePages = this.autoCheckpointPages();
+    this.db.exec(`PRAGMA journal_size_limit = ${WAL_SIZE_LIMIT_BYTES}`);
+    this.db.exec('PRAGMA wal_autocheckpoint = 0');
+    let reported = false;
+    const fallBack = (err: Error): void => {
+      if (reported) return;
+      reported = true;
+      this.checkpointer = undefined;
+      if (!this.closed) this.db.exec(`PRAGMA wal_autocheckpoint = ${restorePages}`);
+      background.onFailure(err);
+    };
+    const start = background.start ?? startWalCheckpointer;
+    try {
+      this.checkpointer = start({
+        dbPath: path,
+        ...(background.intervalMs !== undefined ? { intervalMs: background.intervalMs } : {}),
+        onFailure: fallBack,
+      });
+    } catch (err) {
+      fallBack(err instanceof Error ? err : new Error(String(err)));
+    }
   }
 
   close(): void {
+    this.closed = true;
+    // Not awaited: the worker closes its own connection, and the WAL is valid whenever it does.
+    void this.checkpointer?.stop();
+    this.checkpointer = undefined;
     this.db.close();
+  }
+
+  /** This connection's automatic checkpoint threshold in pages; 0 while checkpoints run on
+   *  the background worker. */
+  autoCheckpointPages(): number {
+    const row = this.db.prepare('PRAGMA wal_autocheckpoint').get() as Record<string, unknown>;
+    return requireNumber(row, 'wal_autocheckpoint');
   }
 
   private migrate(): void {

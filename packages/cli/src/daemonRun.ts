@@ -293,7 +293,17 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // Two rows for one login would be polled as two accounts and shown twice on the phone;
   // resolve any left by an older build before the first poll (logged, never fatal).
   await engine.dedupeAccounts();
-  const store = new Store(daemonDbPath(paths));
+  // Checkpoints run on a worker thread: inside a main-thread commit they block hooks and
+  // `/healthz` for as long as the copy and its fsyncs take.
+  const store = new Store(daemonDbPath(paths), {
+    backgroundCheckpoints: {
+      onFailure: (err) =>
+        logger.warn(
+          { err },
+          'background WAL checkpoints stopped; checkpointing on the main thread',
+        ),
+    },
+  });
   const protector = defaultProtector();
 
   const settingsReport = { startedAtMs: Date.now(), settings: config.rows };
