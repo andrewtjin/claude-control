@@ -9,12 +9,13 @@
 // claimed-but-ownerless state, so reclaim can safely treat a missing/corrupt owner record as a
 // genuinely broken lock instead of a half-finished acquisition it must tiptoe around. A lock
 // records the holder's pid and start time so a crashed holder's stale lock can be reclaimed
-// instead of deadlocking forever.
+// instead of deadlocking forever, and a token of its own claim: a holder whose lock was reclaimed
+// from under it (it outlived the staleness) must never remove the lock its successor now holds.
 //
 // This is a mutex between OUR processes. It cannot lock out the Claude CLI itself — that
 // race is handled separately by reconcile-by-reading in the switch engine.
 
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { ensureDir } from './fsutil.js';
@@ -31,8 +32,11 @@ export interface LockOptions {
 
 interface LockRecord {
   pid: number;
+  /** When the holder claimed the lock, or last refreshed its claim (see {@link Lock.refresh}). */
   startedAtMs: number;
   host: string;
+  /** Unique to one claim, so a holder can tell its own lock from a successor's. */
+  token: string;
 }
 
 /**
@@ -57,13 +61,59 @@ const DEFAULTS: Required<LockOptions> = {
 export class Lock {
   private released = false;
 
-  constructor(private readonly dir: string) {}
+  constructor(
+    private readonly dir: string,
+    private readonly token: string,
+    private readonly clock: () => number,
+  ) {}
+
+  /** Whether the lock directory still holds this claim's owner record. */
+  private stillOurs(): boolean {
+    try {
+      const record = JSON.parse(readFileSync(join(this.dir, 'owner.json'), 'utf8')) as LockRecord;
+      return record.token === this.token;
+    } catch {
+      // Gone (reclaimed and released since), or not readable: nothing here is provably ours.
+      return false;
+    }
+  }
+
+  /**
+   * Restamp the claim's time, so a holder that is alive but holds for long (a move that waits on
+   * Claude Code) is never reclaimed as stale by age. The record is replaced by a rename, so a
+   * contender never reads it half-written. Returns false, touching nothing, once the lock is no
+   * longer this claim's.
+   */
+  refresh(): boolean {
+    if (this.released || !this.stillOurs()) return false;
+    const record: LockRecord = {
+      pid: process.pid,
+      startedAtMs: this.clock(),
+      host: hostId(),
+      token: this.token,
+    };
+    const temp = join(this.dir, `owner.${randomUUID()}.tmp`);
+    try {
+      writeFileSync(temp, JSON.stringify(record));
+      renameSync(temp, join(this.dir, 'owner.json'));
+      return true;
+    } catch {
+      // Reclaimed between the check and the write: the claim is lost, and the temp file with it.
+      try {
+        unlinkSync(temp);
+      } catch {
+        // Already gone with the directory.
+      }
+      return false;
+    }
+  }
 
   release(): void {
     if (this.released) return;
     this.released = true;
-    // Remove the lock directory; ignore if it is already gone (reclaimed as stale, etc.).
-    rmSync(this.dir, { recursive: true, force: true });
+    // Remove the lock directory only while it is still this claim's. A holder that outlived the
+    // staleness had it reclaimed, and the directory there now is its successor's.
+    if (this.stillOurs()) rmSync(this.dir, { recursive: true, force: true });
   }
 }
 
@@ -104,19 +154,20 @@ export async function acquireLock(
   // rename is a same-filesystem move (atomic), never a cross-device copy. A per-call unique name
   // means two processes — or two attempts — never collide on the staging dir itself.
   const staging = `${lockDir}.staging-${randomUUID()}`;
+  const token = randomUUID();
   mkdirSync(staging, { recursive: true });
   try {
     for (;;) {
       // Refresh the owner record on every attempt so `startedAtMs` reflects the moment of the
       // claim, not the (possibly much earlier) start of a long contended wait.
-      const record: LockRecord = { pid: process.pid, startedAtMs: clock(), host: hostId() };
+      const record: LockRecord = { pid: process.pid, startedAtMs: clock(), host: hostId(), token };
       writeFileSync(join(staging, 'owner.json'), JSON.stringify(record));
       try {
         // Atomic claim: rename fails if the lock already exists, so exactly one contender wins.
         // The owner record is already inside the directory being moved, so the lock never
         // becomes visible without it.
         renameSync(staging, lockDir);
-        return new Lock(lockDir);
+        return new Lock(lockDir, token, clock);
       } catch (err) {
         if (!isLockHeld(err)) throw err;
         // Someone holds it. Reclaim if the holder is dead; otherwise wait and retry. The staging

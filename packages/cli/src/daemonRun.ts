@@ -19,6 +19,7 @@ import {
   Vault,
   defaultPaths,
   defaultProtector,
+  folderBindingsPath,
   type Logger,
   type Paths,
   type Protector,
@@ -31,11 +32,15 @@ import {
   ControlPlaneRejectionError,
   DEFAULT_SECRET_HEADER,
   Daemon,
+  ExhaustionLog,
+  exhaustionLogPath,
   HeartbeatWriter,
   HookReceiver,
   Store,
   UsagePoller,
+  bindGuardPath,
   buildDaemonHookSpecs,
+  ensureBindGuard,
   hookEndpointPath,
   hookForwarderPath,
   hookSecretPath,
@@ -49,8 +54,10 @@ import {
   type IdentityStore,
 } from '@claude-control/daemon';
 import { createAgentSdkClient, createSessionManager } from '@claude-control/session-runtime';
-import type { AgentSdkClient } from '@claude-control/session-runtime';
-import { buildEngine, daemonDbPath, fail } from './context.js';
+import type { AdvisorOptions, AutoSwitchPolicy } from '@claude-control/usage-advisor';
+import type { AgentSdkClient, CreateAgentSdkClientDeps } from '@claude-control/session-runtime';
+import { buildEngine, daemonDbPath, fail, resolveBindEnforce } from './context.js';
+import { backgroundHostOptions, createClaudeBackgroundHost } from './backgroundHost.js';
 import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
 import {
@@ -64,6 +71,7 @@ import {
   writeSettingsReport,
 } from './settings.js';
 import { crashLogPath, installCrashLogging } from './daemonSupervise.js';
+import { resolveGuardProfileSettingsPaths } from './guardProfiles.js';
 import {
   acquireInstanceLock,
   probePredecessorEndpoint,
@@ -137,27 +145,47 @@ export function dpapiIdentityStore(filePath: string, protector: Protector): Iden
  * ResumeOrphanOptions). Exported for its colocated test; the rest of runDaemon is
  * untestable assembly.
  *
- * DECISION — no `configDirForAccount` is injected here, on purpose. Binding per-account
- * CLAUDE_CONFIG_DIRs would give per-session credential isolation, but it forgoes the
- * project's single-shared-~/.claude design (the CLI reads some config outside
- * CLAUDE_CONFIG_DIR, so per-account config dirs don't isolate) and with it credential
- * HOT-SWAP: a `cctl switch` on the PC rewrites the shared live credentials that running
- * sessions read per-request, whereas a
- * session pinned to its own config dir would never see the swap. So sessions inherit
- * whichever account the switch engine last ACTIVATED (activate-before-spawn model),
- * `accountId` stays an attribution tag rather than a credential selector, and a spawn whose
- * accountId was never activated is made LOUD through the daemon's logger instead of running
- * silently mis-attributed.
+ * The caller (the daemon's spawn/resume path) decides truth about which config dir a session
+ * binds to, and passes exactly one of two shapes:
+ *  - `configDir` undefined → a GLOBAL session. It is NOT pinned to a config dir, on purpose:
+ *    that preserves the single-shared-~/.claude design (the CLI reads some config outside
+ *    CLAUDE_CONFIG_DIR, so per-account config dirs don't isolate) and credential HOT-SWAP (a
+ *    `cctl switch` rewrites the shared live credentials running sessions read per-request,
+ *    whereas a session pinned to its own config dir would never see the swap). The session
+ *    inherits whichever account the switch engine last ACTIVATED (activate-before-spawn model),
+ *    `accountId` stays an attribution tag, and an accountId that was never activated is made
+ *    LOUD through the daemon's logger instead of running silently mis-attributed.
+ *  - `configDir` set → a FOLDER-BOUND session. It MUST be pinned to that group's profile dir:
+ *    the group slot is a distinct config dir whose `.credentials.json` holds the group's live
+ *    member, and hot-swap still works within the group (a `cctl switch <member>` rewrites the
+ *    profile's credentials the pinned session reads per-request). Not pinning it would run a
+ *    bound-folder session under the global account — the exact defect this branch exists to
+ *    prevent — so `configDir` is honored by binding `env.CLAUDE_CONFIG_DIR` to it via
+ *    `configDirForAccount`.
+ *
+ * `scrubInheritedConfigDir` (global sessions only) is honored too: it does not bind an account,
+ * it only drops an inherited CLAUDE_CONFIG_DIR that names a group profile so a global session is
+ * not silently redirected onto a group's account.
+ *
+ * `create` is injectable so the composition-root wiring (configDir → deps) can be verified
+ * without constructing the real SDK client; it defaults to the live adapter.
  */
-export function makeAgentSdkClientFactory(logger: Logger): () => AgentSdkClient {
-  return () =>
-    createAgentSdkClient({
+export function makeAgentSdkClientFactory(
+  logger: Logger,
+  create: (deps: CreateAgentSdkClientDeps) => AgentSdkClient = createAgentSdkClient,
+): (configDir?: string, scrubInheritedConfigDir?: boolean) => AgentSdkClient {
+  return (configDir?: string, scrubInheritedConfigDir?: boolean) =>
+    create({
       onUnboundAccountId: (accountId) =>
         logger.warn(
           { accountId },
           'session accountId is not bound to a config dir; it runs under the globally ' +
             'active account - confirm the switch engine activated it before spawn',
         ),
+      // A folder-bound spawn passes the group's profile dir; pin the session's CLAUDE_CONFIG_DIR
+      // to it so the session runs on the group's live member, not the global account.
+      ...(configDir !== undefined ? { configDirForAccount: () => configDir } : {}),
+      ...(scrubInheritedConfigDir ? { scrubInheritedConfigDir: true } : {}),
     });
 }
 
@@ -175,6 +203,25 @@ export interface ShutdownSequence {
   markStopped: () => void;
   /** Wait for every queued heartbeat write, marker included, to reach the disk. */
   flushHeartbeat: () => Promise<void>;
+}
+
+/**
+ * What the poller's plan (the one the phone renders) is computed under. The policy always goes
+ * in: it decides whether the Fable cap counts against an account's headroom, which has to match
+ * what auto-switch and the exhaustion log count, or the plan could say "No usable account" while
+ * the daemon logs no outage. Greedy auto-switch additionally makes the plan describe the hops the
+ * daemon itself will make and gate its targets by the same policy, so it never announces a hop
+ * the executor would refuse.
+ */
+export function pollerAdvisorOptions(args: {
+  autoSwitch: boolean;
+  greedy: boolean;
+  policy: AutoSwitchPolicy;
+}): AdvisorOptions {
+  return {
+    autoSwitchPolicy: args.policy,
+    ...(args.autoSwitch && args.greedy ? { greedyAutoSwitch: true } : {}),
+  };
 }
 
 /**
@@ -289,7 +336,13 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     env: loggingEnv,
   });
 
-  const engine = buildEngine(paths, DAEMON_LOG_SINK, loggingEnv);
+  // The guard's enforcement mode is resolved (env > config file > default) at EACH snapshot write via
+  // this resolver, not cached at construction — so a live `cctl settings set CCTL_BIND_ENFORCE ...`
+  // takes effect on the next snapshot the daemon writes (a bind, a repair, a refresh) rather than
+  // being reverted by a daemon-side rewrite until the next restart.
+  const engine = buildEngine(paths, DAEMON_LOG_SINK, loggingEnv, () =>
+    resolveBindEnforce(loggingEnv),
+  );
   // Two rows for one login would be polled as two accounts and shown twice on the phone;
   // resolve any left by an older build before the first poll (logged, never fatal).
   await engine.dedupeAccounts();
@@ -364,13 +417,8 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       },
       claudeJsonPath: paths.claudeJsonPath,
     }),
-    // Greedy-aware advice: when the daemon itself executes the burn plan, the plan's
-    // wording turns descriptive instead of telling the user to do it by hand — and its
-    // targets are gated by the executor's own policy, so it never announces a hop the
-    // executor would refuse.
-    ...(autoSwitch && greedy
-      ? { advisorOptions: { greedyAutoSwitch: true, autoSwitchPolicy } }
-      : {}),
+    // The plan is computed under the executor's policy (see pollerAdvisorOptions).
+    advisorOptions: pollerAdvisorOptions({ autoSwitch, greedy, policy: autoSwitchPolicy }),
   });
 
   const attributionJournal = new AttributionJournal({ store, vaultDir: paths.vaultDir });
@@ -497,6 +545,21 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     attributionJournal,
     hookReceiver,
     controlPlaneClient,
+    // Every time no account can take work, beside daemon.log; `cctl outages` reads the same
+    // path through the same helper.
+    exhaustionLog: new ExhaustionLog(exhaustionLogPath(dataDir)),
+    // Moves background sessions in a ruled folder off the global slot onto the folder's own slot,
+    // through the operator's own `claude`. Not on macOS, where folder rules are refused: a session
+    // there could not be hosted under a folder profile's login anyway (the CLI keeps one Keychain
+    // login for every config dir).
+    ...(process.platform !== 'darwin'
+      ? {
+          // The daemon's own environment, not the logging one: a service this starts hands its
+          // environment to every session it hosts, and the daemon's log file is not theirs. Built
+          // with the very options `cctl claude` builds its host with (see backgroundHostOptions).
+          backgroundSessionHost: createClaudeBackgroundHost(backgroundHostOptions(paths)),
+        }
+      : {}),
     installHooks: async () => {
       // The forwarder script is (re)written before the hook entries that point at it, so the
       // installed command always has a current script behind it. The command itself is
@@ -510,6 +573,22 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
         settingsPath,
         hooks: buildDaemonHookSpecs({ secret: hookSecret, forwarderPath }),
         ownedCommandMarker: DEFAULT_SECRET_HEADER,
+      });
+      // Reconcile the enforcement guard beside the forwarder, keyed off whether any folder is bound.
+      // Without this the guard is never installed and folder bindings are recorded but never enforced
+      // at prompt time. The snapshot it reads was refreshed just before this in Daemon.start(), so a
+      // restart always leaves the guard consistent with the live registry. Fail-open with the rest of
+      // this closure: a settings.json we cannot write only degrades enforcement, never daemon startup.
+      const rules = await engine.listRules();
+      const hasBindings = rules.length > 0;
+      await ensureBindGuard({
+        settingsPath,
+        guardPath: bindGuardPath(dataDir),
+        snapshotPath: folderBindingsPath(paths.vaultDir),
+        hasBindings,
+        // A group-slot session reads its profile's settings.json, which a temp+rename write to main
+        // severs from the guard; propagate the guard into (or clean it out of) each profile too.
+        profileSettingsPaths: resolveGuardProfileSettingsPaths(paths.vaultDir, rules, hasBindings),
       });
     },
     // Publish the receiver's actual loopback port so `cctl session register|label|watch` can

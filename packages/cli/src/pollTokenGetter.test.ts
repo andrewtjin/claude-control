@@ -8,6 +8,7 @@ import {
   RefreshError,
   type CredentialBundle,
   type RefreshTokenResult,
+  type SlotLiveToken,
 } from '@claude-control/switch-engine';
 import {
   createPollTokenGetter,
@@ -33,13 +34,21 @@ function fakeVault(bundles: Map<string, CredentialBundle>) {
 }
 
 /** A fake engine whose `refreshToken` mock is exposed separately, so assertions never touch
- *  the (lint-guarded) unbound method off the engine object. */
-function fakeEngine(impl: (accountId: string) => Promise<RefreshTokenResult>): {
+ *  the (lint-guarded) unbound method off the engine object. `liveSlotToken` defaults to "no slot
+ *  token" so the vault-bundle path (the bulk of these tests) is exercised unchanged; a test that
+ *  wants a slot-live account passes one. */
+function fakeEngine(
+  impl: (accountId: string) => Promise<RefreshTokenResult>,
+  liveSlot: (accountId: string) => Promise<SlotLiveToken | undefined> = () =>
+    Promise.resolve(undefined),
+): {
   engine: PollRefreshEngine;
   refreshToken: ReturnType<typeof vi.fn>;
+  liveSlotToken: ReturnType<typeof vi.fn>;
 } {
   const refreshToken = vi.fn(impl);
-  return { engine: { refreshToken }, refreshToken };
+  const liveSlotToken = vi.fn(liveSlot);
+  return { engine: { refreshToken, liveSlotToken }, refreshToken, liveSlotToken };
 }
 
 function bundle(access: string, expiresAt: number): CredentialBundle {
@@ -538,5 +547,77 @@ describe('createPollTokenGetter — identity invariant', () => {
 
     await expect(getToken('a1')).rejects.toThrow(/vault bundle identity mismatch/);
     expect(quarantined).toHaveLength(1);
+  });
+});
+
+describe('createPollTokenGetter — slot-live accounts', () => {
+  function slot(access: string, expiresAt: number, accountUuid?: string): SlotLiveToken {
+    return {
+      slot: 'group:g1',
+      accessToken: access,
+      expiresAt,
+      ...(accountUuid !== undefined ? { accountUuid } : {}),
+    };
+  }
+
+  it('returns the slot-live token and never reads the vault or refreshes', async () => {
+    // The vault bundle is intentionally absent: a slot-live account must not touch it.
+    const { engine, refreshToken, liveSlotToken } = fakeEngine(
+      () => Promise.reject(new Error('unused')),
+      () => Promise.resolve(slot('live-tok', 10 * HOUR)),
+    );
+    const getToken = createPollTokenGetter({
+      vault: fakeVault(new Map()),
+      engine,
+      minTtlMs: MIN_TTL_MS,
+      clock: () => 0,
+    });
+    expect(await getToken('a1')).toBe('live-tok');
+    expect(refreshToken).not.toHaveBeenCalled();
+    expect(liveSlotToken).toHaveBeenCalledWith('a1');
+  });
+
+  it('a stale slot token is not refreshed; it falls through to the vault path', async () => {
+    // Slot token expired; the vault bundle holds a fresh token so the fallthrough is observable,
+    // and the engine is never asked to refresh a slot-live account.
+    const bundles = new Map([['a1', bundle('vault-tok', 10 * HOUR)]]);
+    const { engine, refreshToken } = fakeEngine(
+      () => Promise.reject(new Error('unused')),
+      () => Promise.resolve(slot('stale', -HOUR)),
+    );
+    const getToken = createPollTokenGetter({
+      vault: fakeVault(bundles),
+      engine,
+      minTtlMs: MIN_TTL_MS,
+      clock: () => 0,
+    });
+    expect(await getToken('a1')).toBe('vault-tok');
+    expect(refreshToken).not.toHaveBeenCalled();
+  });
+
+  it('quarantines on a slot identity mismatch against the registry row', async () => {
+    const quarantined: string[] = [];
+    const identity: PollIdentityOptions = {
+      lookupAccount: (): Promise<AccountIdentityRow> =>
+        Promise.resolve({ accountUuid: 'real', quarantined: false }),
+      quarantine: (id) => {
+        quarantined.push(id);
+        return Promise.resolve();
+      },
+      verifyOwnership: false,
+    };
+    const { engine } = fakeEngine(
+      () => Promise.reject(new Error('unused')),
+      () => Promise.resolve(slot('live-tok', 10 * HOUR, 'intruder')),
+    );
+    const getToken = createPollTokenGetter({
+      vault: fakeVault(new Map()),
+      engine,
+      minTtlMs: MIN_TTL_MS,
+      clock: () => 0,
+      identity,
+    });
+    await expect(getToken('a1')).rejects.toThrow(/slot identity mismatch/);
+    expect(quarantined).toEqual(['a1']);
   });
 });

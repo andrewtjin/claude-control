@@ -91,6 +91,21 @@ export interface PollAccount {
  *  `/accounts` could only ever show what the terminal already showed better. */
 export interface RegistryFacts extends PlanTierSignals, BillingSignals {
   id: string;
+  /** The folder-bound group this account is reserved to, or absent for a shared account. Rides the
+   *  wire (display/grouping only) so `/accounts` and `/usage` can group reserved accounts under
+   *  their binding and never present one as a global-pool candidate. */
+  groupId?: string;
+  /** The group's display label, pre-rendered so the phone need not resolve a group id. */
+  groupLabel?: string;
+  /** True when this account is the one live in its group's slot — the group counterpart of the
+   *  global `active`. Absent/false for a shared account or a non-live member. */
+  groupActive?: boolean;
+  /** The slot the account is live in right now, shared accounts included (a folder slot in
+   *  fallback runs on one), and that slot's folders when it is a folder's. */
+  liveSlot?: string;
+  liveSlotLabel?: string;
+  /** Every rule including a reserved account. */
+  ruleIds?: string[];
 }
 
 /** The wire's plan/billing pair for one account. Both are omitted rather than nulled when
@@ -99,12 +114,29 @@ export interface RegistryFacts extends PlanTierSignals, BillingSignals {
 function registryFields(
   facts: RegistryFacts | undefined,
   nowMs: number,
-): { planWeight?: number; billing?: string } {
+): {
+  planWeight?: number;
+  billing?: string;
+  groupId?: string;
+  groupLabel?: string;
+  groupActive?: boolean;
+  liveSlot?: string;
+  liveSlotLabel?: string;
+  ruleIds?: string[];
+} {
   if (facts === undefined) return {};
   const weight = planWeight(facts);
   return {
     ...(weight.known ? { planWeight: weight.weight } : {}),
     billing: billingLabel(facts, nowMs),
+    // Group fields are omitted (not nulled) when absent, matching the additive/tolerant wire
+    // contract: a shared account carries none and reads exactly as "not reserved".
+    ...(facts.groupId !== undefined ? { groupId: facts.groupId } : {}),
+    ...(facts.groupLabel !== undefined ? { groupLabel: facts.groupLabel } : {}),
+    ...(facts.groupActive !== undefined ? { groupActive: facts.groupActive } : {}),
+    ...(facts.liveSlot !== undefined ? { liveSlot: facts.liveSlot } : {}),
+    ...(facts.liveSlotLabel !== undefined ? { liveSlotLabel: facts.liveSlotLabel } : {}),
+    ...(facts.ruleIds !== undefined ? { ruleIds: facts.ruleIds } : {}),
   };
 }
 
@@ -231,6 +263,7 @@ export class UsagePoller {
   assemble(
     polled: PollCycleResult,
     predictedResets: ReadonlyMap<string, number> = new Map(),
+    slotAccountIds?: ReadonlySet<string>,
   ): SnapshotResult {
     const inputs: AccountUsageInput[] = polled.results.map((r) => {
       const predicted = normalizePredictedReset(predictedResets.get(r.accountId));
@@ -238,7 +271,13 @@ export class UsagePoller {
         ? r.usage.advisorInput
         : { ...r.usage.advisorInput, predictedResetAt: predicted };
     });
-    return { ...polled, inputs, plan: computePlan(inputs, this.advisorOptions) };
+    // The plan describes the global slot: `slotAccountIds` (see `AdvisorOptions`) keeps it to the
+    // accounts that slot may switch to, so it never names a hop its executor refuses.
+    const options =
+      slotAccountIds === undefined
+        ? this.advisorOptions
+        : { ...this.advisorOptions, slotAccountIds };
+    return { ...polled, inputs, plan: computePlan(inputs, options) };
   }
 
   /** The executor's policy this poller's plan is gated by, when the composition root passed one

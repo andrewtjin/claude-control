@@ -22,7 +22,27 @@
 // command clears it. Do not read setup's yellow as a promise that a command follows.
 
 import { colorEnabled, sgr, type Paint } from '@claude-control/shared-protocol';
+import { sanitizeTerminalText } from '@claude-control/switch-engine';
 import { severityOf, type OutlookStyle, type PacingStyle } from '@claude-control/usage-advisor';
+
+// Every account label and folder path that reaches the terminal is operator- or filesystem-
+// controlled text, and both can carry bytes a terminal INTERPRETS rather than prints: SGR/OSC
+// escapes (an attacker-set label could recolor or retitle the window, or hide text), C0/C1/DEL
+// control codes, and the Unicode bidirectional/format controls that let a right-to-left run
+// reorder a path so what the eye reads is not what the binding matched. A folder name comes from
+// the filesystem and a label from `accounts add`, so neither is trustworthy on a shared box.
+//
+// The stripping itself lives in switch-engine (sanitizeTerminalText) so cctl-side renderers and
+// the enforcement guard — which embeds the same source rather than importing it — can never
+// disagree about which bytes are unsafe. This module only re-exports it under the name the CLI's
+// render helpers already call, so a single edit to the ranges reaches every terminal surface.
+
+/**
+ * Strip every terminal-interpreted control from a label or folder path before it is styled, padded,
+ * or written to a TTY. Re-exported from switch-engine (see its terminalSafe.ts) — the single
+ * authority — so the CLI's tables/summaries and the enforcement guard share one implementation.
+ */
+export const sanitizeForTerminal = sanitizeTerminalText;
 
 // `colorEnabled` (the NO_COLOR/TTY gate) and `sgr` (the SGR wrapper every paint below is built
 // from) are defined once in shared-protocol and re-exported/reused here rather than redeclared:

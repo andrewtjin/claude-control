@@ -90,9 +90,19 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
   snapshot the current live creds → reconcile (adopt the previous account's token if
   the CLI rotated it under us) → refresh the target if near expiry and persist the
   rotated single-use token immediately → atomically write both `.credentials.json` and
-  the `oauthAccount` block of `~/.claude.json` → read back and verify → commit. A
-  write-ahead intent makes every step crash-recoverable (`recover()` rolls forward if
-  the new creds are already live, else back to an encrypted snapshot).
+  the `oauthAccount` block of `~/.claude.json` → read back and verify → commit. Any
+  failure after the first live write undoes the switch before the error surfaces: the
+  previous login goes back (identity, then credentials), unless another writer's token
+  landed meanwhile, which stays live and is stored in no bundle. A write-ahead intent per
+  slot, recorded before the first live write, makes every step crash-recoverable: `recover()`
+  at startup, and every locked operation on a slot, looks at its live files and completes or
+  undoes the switch (undoing it when completing needs a write that cannot be made, or when the
+  target no longer belongs to that slot). A switch that can be neither is reported, refuses
+  writes to its slot and operations on the two accounts it was between, and is retried until it
+  settles; everything else still runs. Which slot a switch targets is decided under the same
+  lock, so a folder-rule change that lands first can never have a switch write an account
+  into a slot it just left. Rotation adoption never stores a live token that another account's bundle
+  already holds, and a token two accounts store is never seated in any slot.
 - **Usage.** Tier-0 reads each profile's cached `cachedUsageUtilization` for free;
   tier-1 hits the OAuth usage endpoint. Cross-account visibility never requires
   switching, and the poller degrades to cached data (labelled stale) rather than
@@ -124,6 +134,108 @@ The rule **"`control-plane-bot` imports only `shared-protocol`"** is what makes
   session (notify/approve/inject only). Switching mid-session interrupts, activates,
   and resumes via `claude --resume`.
 
+## Folder rules
+
+A session's account is decided by one thing: the config dir it runs in
+(`CLAUDE_CONFIG_DIR` at launch). Everything else — the `env` block in settings, a project
+API-key token — Claude Code ignores once a login is stored. So giving a folder its own
+accounts is, mechanically, launching its sessions in a different config dir that holds
+another login. That dir is a **slot**.
+
+A **folder rule** applies to its folder and everything under it (the longest matching rule
+wins; nested rules do not merge). It **includes** accounts — reserved to the folders that
+include them and used there first — and **excludes** shared accounts the folder must not
+use. A ruled folder's **effective pool** is its included accounts first, then the shared
+pool minus its exclusions, with global auto-switch exclusions and quarantine inherited; an
+unruled folder's pool is the shared pool.
+
+- **Slots.** The **global slot** is today's config dir (`~/.claude` or `CLAUDE_CONFIG_DIR`)
+  and holds a shared account. Each folder rule gets a **folder slot**: a **profile dir**
+  under `<machine-local data>/claude-control/profiles/<ruleId>/`. An account is live in at
+  most one slot at a time — Claude Code rotates a refresh token on use, so the same login
+  cannot be live in two dirs without one corrupting the other. A slot therefore takes from
+  its pool only an account live nowhere else; the global slot never takes a reserved account
+  or a shared one live in a folder slot, and keeps the last free shared account when both
+  want it. Swapping a slot's `.credentials.json` reaches its running sessions in about two
+  seconds, which is what makes a per-folder auto-switch work exactly like the global
+  switch, but scoped.
+- **Profile dirs.** A profile is not a copy of `~/.claude`; it is a dir whose
+  account-neutral entries are **shared** back to main and whose account-specific ones are
+  its own. Content dirs (`projects`, `plugins`, `skills`, `agents`, `commands`, `todos`,
+  `sessions`, …) are directory junctions (Windows) or symlinks (POSIX) to main, so
+  memories, skills and history are one set of files no matter which account a session runs
+  on. Root files that are account-neutral (`settings.json`, `CLAUDE.md` and other root
+  `*.md`, `keybindings.json`, `history.jsonl`) are **hardlinks** to main — one inode, so an
+  edit through either name is seen by both; the link is re-verified on every materialize and
+  repaired newest-wins if Claude Code's temp-and-rename write ever severs it. Account-scoped
+  dirs (`statsig`, `logs`, `backups`, `telemetry`, the daemon's own runtime, …) stay
+  profile-local. `.claude.json` is **profile-owned**: the profile keeps its own
+  `oauthAccount`, and only an allowlist of account-neutral keys (onboarding flags, theme,
+  `mcpServers`, migration markers) is merged main → profile — never the reverse. Trust flows
+  one way too: a project's `hasTrustDialogAccepted` propagates main → profile, never back.
+- **The reservation fence.** A reserved account's registry row is physically **moved out**
+  of `accounts.json` into a separate `groups.json`. This is the load-bearing downgrade-safety
+  move: an older cctl (the installed daemon may predate this feature) rewrites `accounts.json`
+  from only `{activeId, accounts}` and refreshes the tokens of every account it can see. It
+  must never see a reserved account — or it would poll it, refresh its single-use token, or
+  switch to it, silently breaking a rule. Because the row lives in a file the old code does
+  not know about, its writes cannot touch it. `groups.json` records the reserved rows and
+  each rule (its folders, includes, excludes, and which account is live in its slot). A row
+  found in both files (a crash mid-move) resolves to the `groups.json` copy and heals on the
+  next write. The fence covers reserved accounts only: a folder slot can also hold a SHARED
+  account (inherited, or in a folder that only excludes), which an older daemon sees. So
+  `cctl folder include|exclude` refuse while a running daemon's settings report lacks the
+  `folder rules` row, and `cctl doctor` flags the same mismatch.
+- **The guard.** A rule is only useful if a session in the wrong slot is caught. A
+  dependency-free `UserPromptSubmit` hook (installed beside the relay forwarder, which keeps
+  its own never-block contract) reads a non-secret snapshot — `folder-bindings.json`, written
+  last in every rule change — and compares the session's config dir and project dir
+  against it. A ruled folder accepts the global slot's account, since its pool inherits the
+  shared pool, unless the rule excludes that account or it is reserved to other folders; the
+  guard tells which account the global slot holds from the identity block in the main config's
+  `.claude.json`, matched against one-way identity keys in the snapshot, and never reads
+  credentials. An accepted session is told once (a marker per session id) that the folder
+  prefers its included accounts. A ruled folder on an account it rules out, a ruled folder on
+  another folder's slot, or a folder slot used outside its folders is blocked (or warned, or
+  ignored, per the enforce mode); when the global slot's account cannot be told, a rule that
+  excludes accounts blocks and one that excludes nothing allows. The guard fails **open** on
+  any internal error, a missing or unparseable snapshot, or an unknown schema version: it
+  exits 0 and lets the prompt through. It prevents accidents; it is not a security boundary
+  (see `docs/THREAT_MODEL.md`).
+- **Moving background sessions.** An interactive session cannot change account, but a
+  background session (`claude --bg`) can be stopped and resumed elsewhere: Claude Code hosts
+  them in one service per config dir, and the conversation lives in the shared `projects/`.
+  So once a rule's slot holds an included account with usage left, the daemon moves each idle
+  background session the main config's service hosts in that folder onto the rule's profile
+  (stop, then resume by full session id with no prompt and the saved options), confirms it in
+  the profile service's roster, and notifies once. At most one move per session per hour; a
+  failed move puts the session back and is not retried while the daemon runs. Claude Code's
+  commands sit behind one seam (`BackgroundSessionHost`), so every decision is tested without
+  the binary.
+- **One engine, one lock.** The switch engine became slot-aware rather than being duplicated:
+  the same `activate` / recovery / adoption / identity-guard machinery runs per slot, all
+  under one cross-process lock, so no two slots can be written at once and every slot is
+  crash-recoverable the same way the global one always was. A doctor pass (`checkSlots`)
+  detects the invariant violations — an account live in two slots, a reserved account in
+  global, an account outside a folder slot's pool live there, a drifted active id, a broken
+  profile link — and a
+  repair pass fixes them by adopting the freshest token and re-seating each slot's rightful
+  account.
+- **Per-slot auto-switch.** The daemon decides once per slot per poll cycle, each over the slot's
+  **effective pool**: the global slot over the shared pool, a folder rule's slot over its
+  included accounts first and the shared accounts it inherits (minus its excludes) after. A
+  folder slot rotates among its included accounts by the usual policy, falls back to an inherited
+  account only on the low-quota trigger when no included account can take over (greedy never
+  leaves the included accounts), and returns to an included account as soon as one is a
+  candidate again, under the same per-slot cooldown and cadence guard as any hop. An included
+  account is always a target in its folder, even when excluded from auto-switch globally; an
+  inherited one honors the global exclusion. No slot ever targets an account live in another
+  slot, and each hop is seen by the slots decided after it in the same cycle. The global slot
+  decides first, so under contention it keeps the last free shared account and a folder in
+  fallback waits (with one alert per episode naming the folder). The usage wire marks the slot
+  each account is live in and every rule including it, so a folder running on a shared account is
+  visible on the phone.
+
 ## State
 
 The daemon persists to `node:sqlite` (`daemon.db`): the attribution journal, usage
@@ -132,6 +244,18 @@ outbox that buffers messages during a bot outage. Both growing tables are bounde
 outbox by row count, usage snapshots by a 90-day cutoff trimmed on each poll cycle. The
 switch engine keeps its own file-based vault, intent, and audit trail so it works even when
 the daemon isn't running (e.g. from `cctl`).
+
+Beside `daemon.db`, `exhaustion-log.jsonl` records every time no account could take work:
+an append-only line when the last account runs out and one when the first comes back. The
+file is the only store for it (the daemon reads it back on start to resume an outage that
+spans a restart), so it is plain JSON lines a person can read without cctl. Whether an
+account can take work is one shared rule (`assessAccount` in the usage advisor), read by the
+advisor's plan, the post-switch session resume and the exhaustion log, so the plan can never say
+"No usable account" while the log records no outage (the resume always counts the Fable cap; the
+plan and the log follow the auto-switch policy on it). Auto-switch's target rule is
+deliberately stricter (it stops at its 94% trigger). While an outage is open, a `walls` line is
+added whenever what keeps an account out changes (a new limit at the wall, a reset that moved),
+so a restarted daemon judges each account's return by what it last saw.
 
 **`pending_steering` holds prompt bodies in plaintext**, and it is the one table here whose
 contents are the operator's own words rather than metadata about them. A prompt gets a row

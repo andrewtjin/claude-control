@@ -2202,6 +2202,37 @@ describe('HookReceiver', () => {
       ]);
     });
 
+    it('forwards a register configDir to the handler (the slot the session runs in)', async () => {
+      const cli = fakeCli(() => okApplied);
+      receiver.setCliHandlers(cli.handlers);
+      const res = await post(
+        port,
+        '/cli/session/register',
+        { sessionId: 'sess-1', idempotencyKey: 'k1', configDir: 'C:/profiles/g1' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(200);
+      expect(cli.calls).toEqual([
+        {
+          verb: 'register',
+          input: { sessionId: 'sess-1', idempotencyKey: 'k1', configDir: 'C:/profiles/g1' },
+        },
+      ]);
+    });
+
+    it('omits configDir when the forwarder sends null (the shared config dir)', async () => {
+      const cli = fakeCli(() => okApplied);
+      receiver.setCliHandlers(cli.handlers);
+      await post(
+        port,
+        '/cli/session/register',
+        { sessionId: 'sess-1', idempotencyKey: 'k1', configDir: null },
+        { 'x-claude-control-secret': SECRET },
+      );
+      // A null config dir means the shared/global slot — it must not reach the handler as a value.
+      expect(cli.calls[0]?.input).toEqual({ sessionId: 'sess-1', idempotencyKey: 'k1' });
+    });
+
     it('maps an unknown_session result onto a 404 with the daemon message', async () => {
       receiver.setCliHandlers(
         fakeCli(() => ({

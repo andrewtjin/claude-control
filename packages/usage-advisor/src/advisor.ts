@@ -17,8 +17,10 @@
 // weekly budget first) and who to hold in reserve — so frontends render ONE compact line,
 // not a recommendation heading plus a per-account advisory list.
 
-import { isAutoSwitchCandidate, MIN_USABLE_HEADROOM_PCT } from './autoswitch.js';
+import { isAutoSwitchCandidate } from './autoswitch.js';
+import { MIN_USABLE_HEADROOM_PCT } from './availability.js';
 import { humanizeDuration, roundPct } from './format.js';
+import { effectiveLimits, policyLimits, type FableCapPolicy } from './limits.js';
 import { selectWeeklyBudget } from './weekly.js';
 import type {
   AccountScore,
@@ -91,11 +93,23 @@ export function computePlan(
     significantUnusedPct: options.significantUnusedPct ?? DEFAULTS.significantUnusedPct,
     riskHeadroomPct: options.riskHeadroomPct ?? DEFAULTS.riskHeadroomPct,
     minUsableHeadroomPct: options.minUsableHeadroomPct ?? DEFAULTS.minUsableHeadroomPct,
+    // The Fable cap binds headroom exactly when the auto-switch policy counts it, so the plan's
+    // "No usable account" and the exhaustion log can never disagree about it.
+    fableCap: options.autoSwitchPolicy ?? {},
   };
 
   const greedy = options.greedyAutoSwitch === true;
   const analyses = accounts.map((a) => analyze(a, now, cfg));
   const ranking = toRanking(analyses);
+  // What the plan may say about where to GO is about its slot alone: an account the slot can never
+  // hold (reserved to a folder, or live in a folder slot) is neither burned, held nor recommended
+  // there, greedy or not — the executor will not hop to it, and a human switching the slot cannot
+  // put it there either. The live account always belongs to the slot.
+  const slotIds = options.slotAccountIds;
+  const inSlot =
+    slotIds === undefined
+      ? analyses
+      : analyses.filter((a) => a.input.active === true || slotIds.has(a.input.accountId));
   // May the plan name this account as somewhere to GO? Under greedy auto-switch the plan text
   // stops being advice and starts describing what the daemon will actually do ("Greedy
   // auto-switch burns A -> B"), so an account the operator excluded from auto-switch must not
@@ -116,7 +130,7 @@ export function computePlan(
   // expiry first (ties by label for determinism). This IS the plan — burn down the queue.
   // `dropped` keeps the entries greedy removed, so the advice can still account for them
   // rather than letting an expiring budget disappear from the line (see `buildReason`).
-  const burnable = analyses
+  const burnable = inSlot
     .filter((a) => a.usable && a.burn)
     .sort(
       (a, b) =>
@@ -133,28 +147,30 @@ export function computePlan(
   // There is deliberately no unfiltered fallback: resurrecting an excluded account as the
   // recommendation is exactly the false promise this gate exists to prevent — the advisories
   // would then announce a hop the executor refuses to make.
-  const recommended = burns[0] ?? pickRecommended(analyses.filter(targetable));
+  const recommended = burns[0] ?? pickRecommended(inSlot.filter(targetable));
   const advisories = buildAdvisories(analyses, recommended, burns.length > 0, greedy);
 
   return {
     recommendedAccountId: recommended?.input.accountId ?? null,
-    reason: buildReason(recommended, analyses, burns, dropped, greedy, now),
+    reason: buildReason(recommended, inSlot, burns, dropped, greedy, now),
     ranking,
     advisories,
     generatedAtMs: now,
   };
 }
 
-type Config = typeof DEFAULTS;
+type Config = typeof DEFAULTS & { fableCap: FableCapPolicy };
 
 /** Score one account: headroom, minus a near-cap risk penalty, plus a burn-urgency bonus. */
 function analyze(input: AccountUsageInput, now: number, cfg: Config): Analysis {
-  // Headroom is set by the MOST-constrained limit — the one closest to its cap binds the
-  // account. With no limits reported we optimistically assume full capacity.
+  // Headroom is set by the MOST-constrained live limit — the one closest to its cap binds the
+  // account. A limit whose reset has passed binds nothing (the window is rested; the snapshot is
+  // just older than the reset), and the Fable cap binds only while the policy counts it: the
+  // same limits the shared availability rule reads, so `usable` below is that rule's verdict.
+  // With no live limits we optimistically assume full capacity.
+  const live = effectiveLimits(policyLimits(input.limits, cfg.fableCap), now);
   const headroomPct =
-    input.limits.length === 0
-      ? 100
-      : Math.min(...input.limits.map((l) => 100 - clampPct(l.percent)));
+    live.length === 0 ? 100 : Math.min(...live.map((l) => 100 - clampPct(l.percent)));
 
   // The weekly budget — percent used AND the clock it resets on — comes from the one
   // fleet-wide rule (see weekly.ts) so the Plan line and the Pacing line in the same view can

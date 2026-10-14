@@ -163,6 +163,67 @@ describe('renderPush — lifecycle notification cards', () => {
     expect(fix?.value).toContain(RELOGIN_COMMAND);
   });
 
+  it('a slot_alert escapes the folder path and account label so they render literally', () => {
+    // The daemon composes the body with a bound folder path and an account label the operator
+    // chose. Both are identifiers, so any markdown they carry is at best noise and at worst an
+    // injection. This body packs the three attack shapes: an underscore-laden path (would
+    // italicize), a masked link (would become a clickable phishing link), and a backtick (would
+    // open a code span). All must survive as literal text.
+    const body =
+      'C:\\ai_research\\my_proj account [click me](https://evil.example) `x` is out of quota until it resets in 3h';
+    const push = renderPush(
+      env('hook.notification', {
+        event: 'notification',
+        title: 'Folder-bound account alert',
+        body,
+        level: 'warn',
+        notificationType: 'slot_alert',
+      }),
+    );
+    const content = push?.content ?? '';
+    // The masked link is defused: its brackets and parens are escaped, so no `[text](url)` remains.
+    expect(content).not.toMatch(/\[[^\]]*\]\([^)]*\)/);
+    expect(content).toContain('\\[click me\\]\\(https://evil.example\\)');
+    // Underscores in the path are escaped, so the path does not italicize.
+    expect(content).toContain('C:\\\\ai\\_research\\\\my\\_proj');
+    // The backtick is escaped, so it cannot open a code span.
+    expect(content).toContain('\\`x\\`');
+    // The title still renders as the bold heading.
+    expect(content.startsWith('**Folder-bound account alert**\n')).toBe(true);
+  });
+
+  it.each(['usage_exhausted', 'usage_restored'])(
+    'a %s card escapes the folder path and account labels, line by line',
+    (notificationType) => {
+      // The outage cards name a folder by its path and each account by its label, both chosen by
+      // the operator: an underscore pair in a path must not italicize, a label must not splice in a
+      // link. Unlike a slot alert the body is one account per line, so the lines must survive.
+      const title = String.raw`C:\ai_research\my_proj: every account in its pool is out`;
+      const body = [
+        String.raw`No account in C:\ai_research\my_proj's pool can take work.`,
+        String.raw`• work_main (live in the slot of C:\data_y\zed_w)`,
+        '• [click me](https://evil.example) (5-hour window 100%, back in 2h)',
+        '- `x` first back in 2h.',
+      ].join('\n');
+      const push = renderPush(
+        env('hook.notification', {
+          event: 'notification',
+          title,
+          body,
+          level: 'warn',
+          notificationType,
+        }),
+      );
+      expect((push?.content ?? '').split('\n')).toEqual([
+        String.raw`**C:\\ai\_research\\my\_proj: every account in its pool is out**`,
+        String.raw`No account in C:\\ai\_research\\my\_proj's pool can take work.`,
+        String.raw`• work\_main \(live in the slot of C:\\data\_y\\zed\_w\)`,
+        String.raw`• \[click me\]\(https://evil.example\) \(5-hour window 100%, back in 2h\)`,
+        String.raw`\- \`x\` first back in 2h.`,
+      ]);
+    },
+  );
+
   it('a tool_output notification renders a compact embed with a fenced preview', () => {
     const push = renderPush(
       env('hook.notification', {

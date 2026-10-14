@@ -6,6 +6,7 @@ import {
   outlookStyle,
   pacingStyle,
   PLAIN_PALETTE,
+  sanitizeForTerminal,
   severityPaint,
   type Palette,
 } from './ansi.js';
@@ -46,6 +47,48 @@ describe('ANSI_PALETTE', () => {
     for (const key of Object.keys(PLAIN_PALETTE) as (keyof Palette)[]) {
       expect(PLAIN_PALETTE[key]('same')).toBe('same');
     }
+  });
+});
+
+describe('sanitizeForTerminal', () => {
+  it('strips an ANSI/OSC escape injected into a label (the ESC that leads a CSI/OSC sequence)', () => {
+    // A label an attacker set to recolor the terminal and hide the rest of the line.
+    const evil = `${ESC}[31mroot${ESC}[0m${ESC}]0;pwned\u0007`;
+    const clean = sanitizeForTerminal(evil);
+    expect(clean).toBe('[31mroot[0m]0;pwned');
+    expect(clean).not.toContain(ESC);
+    expect(clean).not.toContain('\u0007'); // BEL, a C0 control
+  });
+
+  it('strips C0, C1, and DEL control characters', () => {
+    expect(sanitizeForTerminal('a\u0000b\u0008c\u007fd\u009fe')).toBe('abcde');
+    // A newline/carriage-return injected to forge extra output lines is C0 and goes too.
+    expect(sanitizeForTerminal('one\r\ntwo')).toBe('onetwo');
+  });
+
+  it('strips the Unicode bidi/format controls that reorder a folder path', () => {
+    // RLO makes a terminal render the tail reversed — what the eye reads is not the real path.
+    const spoofed = `C:\\repos\\${'\u202e'}gpj.evil\u202c`;
+    const clean = sanitizeForTerminal(spoofed);
+    expect(clean).toBe('C:\\repos\\gpj.evil');
+    for (const cc of ['\u200e', '\u200f', '\u202a', '\u202b', '\u202c', '\u202d', '\u202e']) {
+      expect(clean).not.toContain(cc);
+    }
+  });
+
+  it('strips isolates (U+2066–2069) and the BOM (U+FEFF)', () => {
+    expect(sanitizeForTerminal('\u2066a\u2067b\u2068c\u2069d\ufeff')).toBe('abcd');
+  });
+
+  it('leaves ordinary labels and Windows drive paths untouched, and is idempotent', () => {
+    const label = 'work (main)';
+    const folder = 'C:\\Users\\me\\repos\\research';
+    expect(sanitizeForTerminal(label)).toBe(label);
+    expect(sanitizeForTerminal(folder)).toBe(folder);
+    // Non-ASCII printable text (accents, CJK) is not a control and must survive.
+    const unicode = 'café — 研究';
+    expect(sanitizeForTerminal(unicode)).toBe(unicode);
+    expect(sanitizeForTerminal(sanitizeForTerminal(unicode))).toBe(unicode);
   });
 });
 

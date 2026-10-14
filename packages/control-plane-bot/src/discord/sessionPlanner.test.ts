@@ -7,12 +7,16 @@ const ROUTE: SessionRoute = { discordUserId: 'u1', sessionId: 's1' };
 type Status = PayloadOf<'session.status'>;
 type Output = PayloadOf<'session.output'>;
 
-function status(state: Status['state'], extra?: { summary?: string; accountId?: string }): Status {
+function status(
+  state: Status['state'],
+  extra?: { summary?: string; accountId?: string; slot?: string },
+): Status {
   return {
     sessionId: ROUTE.sessionId,
     state,
     ...(extra?.summary !== undefined ? { summary: extra.summary } : {}),
     ...(extra?.accountId !== undefined ? { accountId: extra.accountId } : {}),
+    ...(extra?.slot !== undefined ? { slot: extra.slot } : {}),
   };
 }
 
@@ -538,5 +542,38 @@ describe('SessionPlanner — state lines only ask for what the deployment can do
     expect(unread).not.toContain('send a message here');
     expect(unread).toContain('/say');
     expect(unread).toContain('not read');
+  });
+});
+
+describe('SessionPlanner — folder-bound slot on the card', () => {
+  /** Read the fields off the embed a card send/edit carries. */
+  function embedFields(op: GatewayOp): { name: string; value: string }[] {
+    return 'embed' in op && op.embed ? (op.embed.toJSON().fields ?? []) : [];
+  }
+
+  it('shows the folder-bound slot on the live card of a group-slot session', () => {
+    const p = new SessionPlanner();
+    const r = p.onStatus(ROUTE, status('running', { accountId: 'acct-9', slot: 'group:abc' }), 0);
+    const card = cardSends(r.ops)[0]!;
+    const slot = embedFields(card).find((f) => f.name === 'Slot');
+    expect(slot?.value).toBe('folder-bound group');
+  });
+
+  it('carries the slot forward when a later frame omits it', () => {
+    const p = new SessionPlanner({ coalesceWindowMs: 1000 });
+    p.onStatus(ROUTE, status('running', { slot: 'group:abc' }), 0);
+    // A terminal frame with no slot must not erase the binding the first frame established.
+    const done = p.onStatus(ROUTE, status('done'), 5000);
+    // The final summary posts as its own standalone line, not a card edit.
+    const summary = lineSends(done.ops).find((op) => embedTitle(op)?.includes('complete'));
+    expect(summary).toBeDefined();
+    expect(embedFields(summary!).find((f) => f.name === 'Slot')?.value).toBe('folder-bound group');
+  });
+
+  it('adds no slot field for a global session', () => {
+    const p = new SessionPlanner();
+    const r = p.onStatus(ROUTE, status('running', { slot: 'global' }), 0);
+    const card = cardSends(r.ops)[0]!;
+    expect(embedFields(card).some((f) => f.name === 'Slot')).toBe(false);
   });
 });

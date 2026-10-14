@@ -15,9 +15,10 @@
 // author the whole file, only its `oauthAccount` block.
 
 import { readFile } from 'node:fs/promises';
+import { isDeepStrictEqual } from 'node:util';
 import type { ClaudeOauth, OauthAccount } from './types.js';
 import type { Paths } from './paths.js';
-import { atomicWriteFile } from './fsutil.js';
+import { atomicWriteFile, removeIfExists } from './fsutil.js';
 
 /** A record with arbitrary extra keys we must preserve when rewriting. */
 type JsonObject = Record<string, unknown>;
@@ -30,6 +31,9 @@ export interface LiveCredentialChannel {
   readLiveCredentials(): Promise<ClaudeOauth | undefined>;
   /** Replace the live token block, preserving any sibling data the CLI stores with it. */
   writeLiveCredentials(oauth: ClaudeOauth): Promise<void>;
+  /** Remove the live login, leaving "not logged in". Optional: a channel without it is cleared by
+   *  removing `.credentials.json` (see {@link CredentialStore.clearLiveCredentials}). */
+  clearLiveCredentials?(): Promise<void>;
   /** Diagnostic only: the exact identity this channel reads/writes, for channels that have one
    *  (KeychainCredentialChannel's service/account). Absent on channels a plain path already
    *  identifies (FileCredentialChannel) — callers reporting a target must read it from HERE,
@@ -52,6 +56,11 @@ export class FileCredentialChannel implements LiveCredentialChannel {
     const file = (await readJson(this.credentialsPath)) ?? {};
     file.claudeAiOauth = oauth;
     await atomicWriteFile(this.credentialsPath, JSON.stringify(file, null, 2));
+  }
+
+  /** Remove `.credentials.json` — an absent file is "not logged in". A no-op when already absent. */
+  async clearLiveCredentials(): Promise<void> {
+    await removeIfExists(this.credentialsPath);
   }
 }
 
@@ -79,6 +88,21 @@ export class CredentialStore {
     return this.channel.writeLiveCredentials(oauth);
   }
 
+  /**
+   * Remove the live login ("not logged in") wherever this platform keeps it — what undoing a switch
+   * into a slot that held no login before it has to leave behind.
+   *
+   * A channel that cannot clear itself falls back to removing `.credentials.json`, which is what
+   * every other seat-clearing path in the engine does. On macOS that leaves the Keychain item in
+   * place (macOS has no per-slot seats yet); the caller removes the identity block either way, so
+   * what can remain is a token with no identity statement, which Claude Code re-derives and cctl
+   * never adopts on the strength of the registry alone.
+   */
+  async clearLiveCredentials(): Promise<void> {
+    if (this.channel.clearLiveCredentials) await this.channel.clearLiveCredentials();
+    else await removeIfExists(this.paths.credentialsPath);
+  }
+
   /** The live `oauthAccount` block from `~/.claude.json`, if present. */
   async readOauthAccount(): Promise<OauthAccount | undefined> {
     const file = await readJson(this.paths.claudeJsonPath);
@@ -90,9 +114,16 @@ export class CredentialStore {
    * Replace the `oauthAccount` block in `~/.claude.json`, preserving every other key.
    * If the file does not exist yet it is created with just this block — the CLI fills in
    * the rest on next run.
+   *
+   * A block already equal to `account` is left as it is rather than rewritten. Beyond sparing a
+   * rewrite of the CLI's whole config, this keeps an undo from depending on a write it does not need:
+   * a switch whose identity write failed because another process holds `.claude.json` open still has
+   * the previous identity in place, so putting the previous login back must not need that same
+   * blocked write.
    */
   async writeOauthAccount(account: OauthAccount): Promise<void> {
     const file = (await readJson(this.paths.claudeJsonPath)) ?? {};
+    if (isDeepStrictEqual(file.oauthAccount, account)) return;
     file.oauthAccount = account;
     await atomicWriteFile(this.paths.claudeJsonPath, JSON.stringify(file));
   }

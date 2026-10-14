@@ -24,18 +24,30 @@ export interface ActivationWindow {
   startedAtMs: number;
   /** `null` while the interval is still open — it then covers every timestamp from its start on. */
   endedAtMs: number | null;
+  /** The slot this interval belongs to — `'global'` or `'group:<id>'`. `null`/absent reads as the
+   *  global slot (a legacy row, or a caller that predates slots). A turn is attributed against the
+   *  intervals of ITS session's slot only, so a group hop never claims a global turn. */
+  slot?: string | null;
 }
+
+/** The slot every turn/interval with no slot of its own belongs to. */
+const GLOBAL_SLOT = 'global';
 
 export interface AggregateTokenStatsOptions {
   scan: TranscriptScan;
-  /** Activation intervals in ANY order; sorted here so callers cannot break attribution by
-   *  handing over an unsorted set. */
+  /** Activation intervals in ANY order; sorted (and grouped by slot) here so callers cannot break
+   *  attribution by handing over an unsorted set. */
   intervals: readonly ActivationWindow[];
   windowStartMs: number;
   windowEndMs: number;
   /** accountId -> registry label. An id with no entry renders as the raw id rather than being
    *  hidden: an account removed from the registry still spent real tokens. */
   labelById: ReadonlyMap<string, string>;
+  /** sessionId -> slot (`'global'` / `'group:<id>'`). A turn whose session is here is attributed
+   *  against that slot's timeline; a turn with no session id, or a session absent from this map,
+   *  falls to the global timeline. Optional and empty by default, so a caller that does not track
+   *  slots gets exactly the pre-slot, global-only behavior. */
+  slotBySession?: ReadonlyMap<string, string>;
 }
 
 /** The label for turns no account can be claimed for. A visible bucket, never a silent drop —
@@ -107,7 +119,22 @@ function bucketRowsByTotal(totals: Map<string, TokenTotals>): TokenBucketRow[] {
 
 /** Aggregate one scan into the wire payload. Pure: same inputs, same output, no clock read. */
 export function aggregateTokenStats(options: AggregateTokenStatsOptions): TokenStatsSnapshot {
-  const sorted = [...options.intervals].sort((a, b) => a.startedAtMs - b.startedAtMs);
+  // One start-ascending interval list PER slot: a turn is attributed only against the timeline of
+  // its own slot, so a group hop never truncates or claims the global account's spend (and vice
+  // versa). A legacy/absent slot reads as the global slot.
+  const intervalsBySlot = new Map<string, ActivationWindow[]>();
+  for (const interval of options.intervals) {
+    const slot = interval.slot ?? GLOBAL_SLOT;
+    let list = intervalsBySlot.get(slot);
+    if (list === undefined) {
+      list = [];
+      intervalsBySlot.set(slot, list);
+    }
+    list.push(interval);
+  }
+  for (const list of intervalsBySlot.values()) list.sort((a, b) => a.startedAtMs - b.startedAtMs);
+  const noIntervals: ActivationWindow[] = [];
+  const slotBySession = options.slotBySession ?? new Map<string, string>();
 
   const overall = emptyTotals();
   // `null` keys the unattributed bucket. A Map (not two variables) so it sorts alongside the
@@ -118,7 +145,10 @@ export function aggregateTokenStats(options: AggregateTokenStatsOptions): TokenS
 
   for (const turn of options.scan.turns) {
     addTurn(overall, turn);
-    const accountId = accountAt(sorted, turn.tsMs);
+    // The turn's slot from its session; an unknown session (or no session id) is the global slot.
+    const slot =
+      turn.sessionId != null ? (slotBySession.get(turn.sessionId) ?? GLOBAL_SLOT) : GLOBAL_SLOT;
+    const accountId = accountAt(intervalsBySlot.get(slot) ?? noIntervals, turn.tsMs);
     addTurn(getOrCreate(byAccount, accountId), turn);
     addTurn(getOrCreate(byModel, turn.model), turn);
     addTurn(getOrCreate(byDay, localDayKey(turn.tsMs)), turn);

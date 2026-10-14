@@ -22,12 +22,18 @@ export interface AuditEntry {
     | 'quarantined'
     | 'recovered'
     | 'refresh_adopted'
+    | 'adoption_refused'
     | 'refreshed'
     | 'relogin_live_heal';
   fromAccountId: string | null;
   toAccountId: string | null;
   detail?: string;
   origin?: SwitchOrigin;
+  /** The slot this activation was for — `'global'` or `'group:<id>'`. Absent on every entry written
+   *  before slots existed (and on entries that never named one), which reads as the global slot.
+   *  Attribution derives one activation timeline PER slot from this field so a folder-bound group's
+   *  transcript turns are joined against the member live in THAT slot, not the global account. */
+  slot?: string;
 }
 
 /** Appends audit entries to `<vaultDir>/switch-audit.jsonl`. */

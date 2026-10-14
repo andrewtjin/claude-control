@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { decideAutoSwitch, hasUsableHeadroom, MIN_USABLE_HEADROOM_PCT } from './autoswitch.js';
+import { decideAutoSwitch } from './autoswitch.js';
+import { hasUsableHeadroom, MIN_USABLE_HEADROOM_PCT } from './availability.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
 
 const NOW = Date.parse('2026-07-16T12:00:00.000Z');
@@ -743,5 +744,167 @@ describe('decideAutoSwitch — the Fable weekly cap (weekly_scoped)', () => {
     expect(decision?.reason).toContain('80% weekly budget left');
     // The reset quoted is the shared weekly limit's (a day out), not the cap's six hours.
     expect(decision?.reason).toContain('in 1d');
+  });
+});
+
+describe('decideAutoSwitch — candidate id restriction', () => {
+  // The active account low-triggers; two spares are eligible. The restriction decides which
+  // (if any) may be the target — the slot's own pool, never the whole fleet.
+  function spare(id: string): AccountUsageInput {
+    return acct(id, {}, [{ kind: 'weekly_all', percent: 10, resetsAt: NOW + 24 * H }]);
+  }
+
+  it('chooses only from the id set when one is given', () => {
+    const accounts = [lowActive(), spare('member'), spare('outsider')];
+    // Unrestricted, the sort tie-breaks on label: 'member' < 'outsider'.
+    expect(decideAutoSwitch(accounts, NOW)?.targetAccountId).toBe('member');
+    // Restricted to the outsider, it is the only allowed target.
+    expect(
+      decideAutoSwitch(accounts, NOW, {}, { candidateIds: new Set(['outsider']) })?.targetAccountId,
+    ).toBe('outsider');
+  });
+
+  it('does nothing when the only eligible candidates are outside the id set', () => {
+    // A reserved account must never be chosen by the global decision even when it is the only
+    // healthy spare — the global pool (here just the active shared account) excludes it.
+    const accounts = [lowActive(), spare('reserved')];
+    expect(decideAutoSwitch(accounts, NOW, {}, { candidateIds: new Set(['hot']) })).toBeNull();
+  });
+
+  it('an empty id set allows no target (do nothing)', () => {
+    const accounts = [lowActive(), spare('a'), spare('b')];
+    expect(decideAutoSwitch(accounts, NOW, {}, { candidateIds: new Set() })).toBeNull();
+  });
+
+  it('never restricts the account being hopped away from', () => {
+    // The active account is not in the set, but the slot can still LEAVE it: the restriction
+    // gates targets only. A two-member group hops inside itself even though the wider fleet
+    // holds healthier accounts.
+    const active = acct('m1', { active: true }, [
+      { kind: 'session', percent: 96, resetsAt: NOW + 2 * H },
+      { kind: 'weekly_all', percent: 50, resetsAt: NOW + 48 * H },
+    ]);
+    const member = spare('m2');
+    const foreign = spare('global-healthy');
+    const decision = decideAutoSwitch(
+      [active, member, foreign],
+      NOW,
+      {},
+      { candidateIds: new Set(['m1', 'm2']) },
+    );
+    expect(decision?.targetAccountId).toBe('m2');
+  });
+
+  it('undefined id set behaves exactly as before (no restriction)', () => {
+    const accounts = [lowActive(), spare('a')];
+    expect(decideAutoSwitch(accounts, NOW, {}, {})?.targetAccountId).toBe('a');
+    expect(decideAutoSwitch(accounts, NOW)?.targetAccountId).toBe('a');
+  });
+});
+
+describe('decideAutoSwitch — a tiered pool (a folder rule: included accounts first)', () => {
+  // `inc*` are the folder's own included accounts, `sh*` the shared accounts it inherits.
+  const healthy = (id: string, weeklyPct: number, resetInH: number, active = false) =>
+    acct(id, { active }, [
+      { kind: 'session', percent: 10, resetsAt: NOW + 3 * H },
+      { kind: 'weekly_all', percent: weeklyPct, resetsAt: NOW + resetInH * H },
+    ]);
+  const spent = (id: string, active = false) =>
+    acct(id, { active }, [
+      { kind: 'session', percent: 99, resetsAt: NOW + 2 * H },
+      { kind: 'weekly_all', percent: 50, resetsAt: NOW + 48 * H },
+    ]);
+  const tiers = (preferred: string[], candidates?: string[]) => ({
+    preferredIds: new Set(preferred),
+    ...(candidates !== undefined ? { candidateIds: new Set(candidates) } : {}),
+  });
+
+  it('a low included account hops to another included one before any inherited account', () => {
+    // The inherited account resets far sooner, which would win in a flat pool.
+    const accounts = [spent('inc1', true), healthy('inc2', 30, 100), healthy('sh1', 30, 5)];
+    const decision = decideAutoSwitch(accounts, NOW, {}, tiers(['inc1', 'inc2']));
+    expect(decision?.targetAccountId).toBe('inc2');
+  });
+
+  it('falls back to the inherited pool only when no included account is a candidate', () => {
+    const accounts = [
+      spent('inc1', true),
+      spent('inc2'),
+      healthy('sh1', 30, 60),
+      healthy('sh2', 30, 20),
+    ];
+    const decision = decideAutoSwitch(accounts, NOW, {}, tiers(['inc1', 'inc2']));
+    // Among the inherited accounts, the usual ranking: soonest weekly reset.
+    expect(decision?.targetAccountId).toBe('sh2');
+  });
+
+  it('greedy never leaves the included tier for a sooner-resetting inherited account', () => {
+    const accounts = [healthy('inc1', 30, 100, true), healthy('sh1', 10, 5)];
+    expect(decideAutoSwitch(accounts, NOW, { greedy: true }, tiers(['inc1']))).toBeNull();
+    // ...while in a flat pool the same numbers are a greedy hop.
+    expect(decideAutoSwitch(accounts, NOW, { greedy: true })?.targetAccountId).toBe('sh1');
+  });
+
+  it('greedy still rotates WITHIN the included tier', () => {
+    const accounts = [healthy('inc1', 30, 100, true), healthy('inc2', 30, 5), healthy('sh1', 1, 1)];
+    expect(
+      decideAutoSwitch(accounts, NOW, { greedy: true }, tiers(['inc1', 'inc2']))?.targetAccountId,
+    ).toBe('inc2');
+  });
+
+  it('returns to an included account as soon as one can take work, however healthy the fallback', () => {
+    const accounts = [healthy('inc1', 40, 100), healthy('sh1', 1, 2, true)];
+    const decision = decideAutoSwitch(accounts, NOW, {}, tiers(['inc1']));
+    expect(decision?.targetAccountId).toBe('inc1');
+    expect(decision?.reason).toContain('inc1 can take work again — back from sh1');
+  });
+
+  it('does not return to an included account the gate would hop straight back off', () => {
+    // 95% weekly: at the trigger, so not a candidate; the slot stays on the inherited account.
+    const nearlyOut = acct('inc1', {}, [
+      { kind: 'weekly_all', percent: 95, resetsAt: NOW + 30 * H },
+    ]);
+    const accounts = [nearlyOut, healthy('sh1', 20, 50, true)];
+    expect(decideAutoSwitch(accounts, NOW, {}, tiers(['inc1']))).toBeNull();
+  });
+
+  it('in fallback with no included candidate, rotates among the inherited accounts', () => {
+    const accounts = [spent('inc1'), spent('sh1', true), healthy('sh2', 30, 40)];
+    expect(decideAutoSwitch(accounts, NOW, {}, tiers(['inc1']))?.targetAccountId).toBe('sh2');
+  });
+
+  it('never targets an account outside candidateIds, in either tier', () => {
+    // inc2 and sh1 are live in other slots, so neither is a candidate here.
+    const accounts = [
+      spent('inc1', true),
+      healthy('inc2', 30, 10),
+      healthy('sh1', 30, 10),
+      healthy('sh2', 30, 60),
+    ];
+    const decision = decideAutoSwitch(accounts, NOW, {}, tiers(['inc1', 'inc2'], ['inc1', 'sh2']));
+    expect(decision?.targetAccountId).toBe('sh2');
+    // And with nothing allowed in fallback either, it stays put.
+    expect(decideAutoSwitch(accounts, NOW, {}, tiers(['inc1', 'inc2'], ['inc1']))).toBeNull();
+  });
+
+  it('honors the exclusion flag the caller sets per account in both tiers', () => {
+    // The caller expresses "inclusion overrides the global exclusion" by clearing the flag on
+    // included accounts; an inherited excluded account keeps it and is never a target.
+    const excludedShared = { ...healthy('sh1', 10, 5), autoSwitchExcluded: true };
+    const accounts = [spent('inc1', true), spent('inc2'), excludedShared];
+    expect(decideAutoSwitch(accounts, NOW, {}, tiers(['inc1', 'inc2']))).toBeNull();
+    const included = { ...healthy('inc2', 30, 50), autoSwitchExcluded: false };
+    expect(
+      decideAutoSwitch(
+        [spent('inc1', true), included, excludedShared],
+        NOW,
+        {},
+        tiers(['inc1', 'inc2']),
+      )?.targetAccountId,
+    ).toBe('inc2');
+  });
+
+  it('does nothing with no active account', () => {
+    expect(decideAutoSwitch([healthy('inc1', 10, 10)], NOW, {}, tiers(['inc1']))).toBeNull();
   });
 });

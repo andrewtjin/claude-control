@@ -1,6 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -10,6 +10,14 @@ import {
   checkVaultProtection,
   checkNodeVersion,
   checkSessionRuntime,
+  checkSlots,
+  checkGuardSnapshot,
+  checkGuardHook,
+  checkFolderRules,
+  checkDaemonFolderRules,
+  checkVersionSkew,
+  checkPowerShellWrapper,
+  powerShellProfilePaths,
   healthUrlFromRelay,
   probeRelay,
   checkLiveLogin,
@@ -19,7 +27,14 @@ import {
   type DoctorCheck,
   type ProbeFetch,
 } from './doctor.js';
-import { sandboxPaths, type LiveCredentialChannel } from '@claude-control/switch-engine';
+import { renderShellInit } from './shellInit.js';
+import {
+  FileCredentialChannel,
+  InsecurePassthroughProtector,
+  SwitchEngine,
+  sandboxPaths,
+  type LiveCredentialChannel,
+} from '@claude-control/switch-engine';
 
 // This file lives at packages/cli/src/, so two levels up is packages/, where the publishable
 // bundle lives at cctl-publish/package.json (see dependencyClosure.test.ts for the same idiom).
@@ -35,6 +50,21 @@ describe('renderDoctor', () => {
     const out = renderDoctor(checks);
     expect(out).toContain('[ok] dpapi: works');
     expect(out).toContain('[!!] login: no credentials');
+  });
+
+  it('prints a detail carrying a stored label or path without its terminal controls', () => {
+    // A check detail quotes labels and folders straight out of the registry files, which an older
+    // build or a hand edit may have left carrying escape sequences.
+    const out = renderDoctor([
+      {
+        name: 'slots',
+        ok: false,
+        detail: 'non-member "work\u001b]0;pwned\u0007\u001b[2J\u001b[31mALL CHECKS OK" is live',
+      },
+    ]);
+    expect(out).not.toContain('\u001b');
+    expect(out).not.toContain('\u0007');
+    expect(out).toContain('ALL CHECKS OK');
   });
 });
 
@@ -275,5 +305,357 @@ describe('checkLiveLogin (darwin)', () => {
     expect(res.detail).toContain('service="Custom-Item"');
     expect(res.detail).toContain('account="alt-user"');
     expect(res.detail).not.toContain('Claude Code-credentials');
+  });
+});
+
+describe('checkSlots', () => {
+  it('passes when there are no violations', async () => {
+    const check = await checkSlots({ checkSlots: () => Promise.resolve([]) });
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('no slot invariant');
+  });
+
+  it('fails and names each violation', async () => {
+    const check = await checkSlots({
+      checkSlots: () =>
+        Promise.resolve([
+          { kind: 'reserved_live_in_global', detail: 'work@me.com is live in global' },
+        ]),
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('reserved_live_in_global');
+    expect(check.detail).toContain('work@me.com');
+  });
+
+  it('fails cleanly when the check throws', async () => {
+    const check = await checkSlots({
+      checkSlots: () => Promise.reject(new Error('lock busy')),
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('lock busy');
+  });
+});
+
+describe('checkGuardSnapshot', () => {
+  const baseGroups = [{ id: 'g1' }];
+
+  it('passes when there are no folder rules and no snapshot', async () => {
+    const check = await checkGuardSnapshot({
+      getGuardSnapshotFreshness: () =>
+        Promise.resolve({ present: false, fresh: false, enforce: 'block', generation: null }),
+      listRules: () => Promise.resolve([]),
+    });
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('nothing to enforce');
+  });
+
+  it('fails when folder rules exist but the snapshot is missing', async () => {
+    const check = await checkGuardSnapshot({
+      getGuardSnapshotFreshness: () =>
+        Promise.resolve({ present: false, fresh: false, enforce: 'block', generation: null }),
+      listRules: () => Promise.resolve(baseGroups as never),
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('no guard snapshot');
+  });
+
+  it('passes when the snapshot content matches the live registry', async () => {
+    const check = await checkGuardSnapshot({
+      getGuardSnapshotFreshness: () =>
+        Promise.resolve({ present: true, fresh: true, enforce: 'block', generation: 4 }),
+      listRules: () => Promise.resolve(baseGroups as never),
+    });
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('fresh');
+    // The mode says what it does: block refuses only what a folder's rule rules out.
+    expect(check.detail).toContain(
+      "enforce=block: refuses a session on an account a folder's rule rules out",
+    );
+  });
+
+  it('fails when the snapshot content lags the live registry', async () => {
+    const check = await checkGuardSnapshot({
+      getGuardSnapshotFreshness: () =>
+        Promise.resolve({ present: true, fresh: false, enforce: 'warn', generation: 2 }),
+      listRules: () => Promise.resolve(baseGroups as never),
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('STALE');
+  });
+});
+
+describe('checkGuardHook', () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cctl-guardhook-'));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('passes when the guard command is present in settings.json', async () => {
+    const { writeFile, mkdir } = await import('node:fs/promises');
+    const claudeDir = join(dir, 'claude');
+    await mkdir(claudeDir, { recursive: true });
+    await writeFile(
+      join(claudeDir, 'settings.json'),
+      JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [
+            { hooks: [{ type: 'command', command: '"node" "/data/bind-guard.cjs"' }] },
+          ],
+        },
+      }),
+    );
+    const check = checkGuardHook(sandboxPaths(dir), true);
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('installed');
+  });
+
+  it('fails when folder rules exist but the guard is not installed', () => {
+    const check = checkGuardHook(sandboxPaths(dir), true);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('NOT enforced');
+  });
+
+  it('does NOT read a foreign hook that merely mentions the filename as the guard', async () => {
+    // A foreign hook whose command references bind-guard.cjs as an unrelated argument (e.g. a config
+    // file) must not read as our enforcement guard: doctor must agree with the installer's exact-shape
+    // recognition, or it reports a security control installed when nothing enforces the folder rules.
+    const { writeFile, mkdir } = await import('node:fs/promises');
+    const claudeDir = join(dir, 'claude');
+    await mkdir(claudeDir, { recursive: true });
+    await writeFile(
+      join(claudeDir, 'settings.json'),
+      JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [
+            {
+              hooks: [{ type: 'command', command: 'node linter.js --config bind-guard.cjs.rc' }],
+            },
+          ],
+        },
+      }),
+    );
+    const check = checkGuardHook(sandboxPaths(dir), true);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('NOT enforced');
+  });
+
+  it('passes (optional) when there are no folder rules and no guard', () => {
+    const check = checkGuardHook(sandboxPaths(dir), false);
+    expect(check.ok).toBe(true);
+  });
+});
+
+describe('checkDaemonFolderRules', () => {
+  const alive = { state: 'alive', writtenAtMs: 1, ageMs: 1 } as const;
+  const stopped = { state: 'stopped', writtenAtMs: 1, stoppedAtMs: 2, ageMs: 1 } as const;
+  const report = (rows: { name: string; value: string }[]) => ({
+    startedAtMs: 1,
+    settings: rows.map((r) => ({ ...r, source: 'default' as const })),
+  });
+
+  it('fails while a live daemon reports no folder-rules row, naming the build and the fix', () => {
+    const check = checkDaemonFolderRules(
+      report([{ name: 'daemon build', value: 'v0.5.2' }]),
+      alive,
+    );
+    expect(check.name).toBe('daemon-folder-rules');
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('v0.5.2');
+    expect(check.detail).toContain('predates folder rules');
+    expect(check.detail).toContain('cctl daemon restart');
+  });
+
+  it('fails while a live daemon has written no readable report at all', () => {
+    expect(checkDaemonFolderRules(undefined, alive).ok).toBe(false);
+  });
+
+  it('passes when the live daemon reports that it honors folder rules', () => {
+    const check = checkDaemonFolderRules(
+      report([
+        { name: 'daemon build', value: 'v1.0.0' },
+        { name: 'folder rules', value: 'supported' },
+      ]),
+      alive,
+    );
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('honors folder rules');
+  });
+
+  it('passes with no running daemon, whatever its last report said', () => {
+    expect(checkDaemonFolderRules(report([]), stopped).ok).toBe(true);
+    expect(checkDaemonFolderRules(undefined, { state: 'never' }).ok).toBe(true);
+    const stale = { state: 'stale', writtenAtMs: 1, ageMs: 999_999 } as const;
+    expect(checkDaemonFolderRules(report([]), stale).ok).toBe(true);
+  });
+});
+
+describe('checkVersionSkew', () => {
+  it('passes when no daemon is running', () => {
+    expect(checkVersionSkew('1.0.0', undefined, false).ok).toBe(true);
+    expect(checkVersionSkew('1.0.0', '0.9.0', false).ok).toBe(true);
+  });
+
+  it('passes when the builds match', () => {
+    const check = checkVersionSkew('1.0.0', '1.0.0', true);
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('both 1.0.0');
+  });
+
+  it('passes when the same build differs only by the daemon report v-prefix', () => {
+    // The real caller passes the bare CLI VERSION while the daemon-build report row is stored
+    // 'v'-prefixed; an identical build must not read as a skew, matching what `cctl version` shows.
+    const check = checkVersionSkew('1.0.0', 'v1.0.0', true);
+    expect(check.ok).toBe(true);
+    expect(check.detail).toBe('CLI and daemon both 1.0.0');
+  });
+
+  it('fails on a live-daemon build mismatch with a restart hint', () => {
+    const check = checkVersionSkew('1.0.0', '0.9.0', true);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('0.9.0');
+    expect(check.detail).toContain('cctl daemon restart');
+  });
+
+  it('still detects a real skew across the v-prefix and normalizes both numbers', () => {
+    const check = checkVersionSkew('1.0.0', 'v0.9.0', true);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toBe(
+      'CLI is 1.0.0 but the running daemon is 0.9.0 — restart it so both match: cctl daemon restart',
+    );
+  });
+});
+
+describe('powerShellProfilePaths', () => {
+  it('returns nothing without a USERPROFILE', () => {
+    expect(powerShellProfilePaths({})).toEqual([]);
+    expect(powerShellProfilePaths({ USERPROFILE: '' })).toEqual([]);
+  });
+
+  it('covers both PowerShell editions under the home Documents folder', () => {
+    const paths = powerShellProfilePaths({ USERPROFILE: 'C:\\Users\\me' });
+    // Windows PowerShell 5.1 (WindowsPowerShell) and PowerShell 7 (PowerShell) both.
+    expect(paths.some((p) => p.includes('WindowsPowerShell'))).toBe(true);
+    expect(
+      paths.some((p) => p.includes(join('PowerShell', 'Microsoft.PowerShell_profile.ps1'))),
+    ).toBe(true);
+    expect(paths.every((p) => p.startsWith(join('C:\\Users\\me', 'Documents')))).toBe(true);
+  });
+
+  it('also covers a OneDrive-redirected Documents folder', () => {
+    const paths = powerShellProfilePaths({
+      USERPROFILE: 'C:\\Users\\me',
+      OneDrive: 'C:\\Users\\me\\OneDrive',
+    });
+    expect(paths.some((p) => p.startsWith(join('C:\\Users\\me\\OneDrive', 'Documents')))).toBe(
+      true,
+    );
+  });
+});
+
+describe('checkPowerShellWrapper', () => {
+  it('passes when no profile carries a wrapper', () => {
+    expect(checkPowerShellWrapper(undefined).ok).toBe(true);
+    expect(checkPowerShellWrapper('function foo { echo hi }\n').ok).toBe(true);
+  });
+
+  it('passes on the shim form (no embedded paths to go stale)', () => {
+    const check = checkPowerShellWrapper(renderShellInit('powershell'));
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('shim');
+  });
+
+  it('passes when the node-direct wrapper points at existing paths', () => {
+    const node = 'C:\\Program Files\\nodejs\\node.exe';
+    const entry = 'C:\\npm\\cctl\\dist\\bin.js';
+    const text = renderShellInit('powershell', { nodePath: node, cctlEntry: entry });
+    const check = checkPowerShellWrapper(text, (p) => p === node || p === entry);
+    expect(check.ok).toBe(true);
+  });
+
+  it('fails when the embedded node path no longer exists, naming it and the fix', () => {
+    const node = 'C:\\Program Files\\nodejs\\node.exe';
+    const entry = 'C:\\npm\\cctl\\dist\\bin.js';
+    const text = renderShellInit('powershell', { nodePath: node, cctlEntry: entry });
+    // Simulate a node move/upgrade: the entry still exists, the node binary does not.
+    const check = checkPowerShellWrapper(text, (p) => p === entry);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain(node);
+    expect(check.detail).toContain('cctl shell-init powershell');
+  });
+
+  it('fails when the embedded cctl entry no longer exists (reinstall/relocate)', () => {
+    const node = 'C:\\Program Files\\nodejs\\node.exe';
+    const entry = 'C:\\npm\\cctl\\dist\\bin.js';
+    const text = renderShellInit('powershell', { nodePath: node, cctlEntry: entry });
+    const check = checkPowerShellWrapper(text, (p) => p === node);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain(entry);
+  });
+});
+
+describe('checkFolderRules', () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'cctl-doctor-rules-'));
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  function sandboxEngine(): SwitchEngine {
+    const paths = sandboxPaths(root);
+    return new SwitchEngine({
+      paths,
+      protector: new InsecurePassthroughProtector(),
+      liveCredentialChannel: new FileCredentialChannel(paths.credentialsPath),
+      minSwitchIntervalMs: 0,
+      lockOptions: { timeoutMs: 2000, pollMs: 10 },
+    });
+  }
+
+  it('still runs every folder-rule check when groups.json was written by a newer build', async () => {
+    const paths = sandboxPaths(root);
+    await mkdir(paths.vaultDir, { recursive: true });
+    await writeFile(
+      join(paths.vaultDir, 'groups.json'),
+      JSON.stringify({ schemaVersion: 99, generation: 1, groups: [] }),
+    );
+
+    const out = await checkFolderRules(sandboxEngine(), paths);
+
+    // One failed check names the unreadable file; the rest still report instead of the whole doctor
+    // dying on the first read.
+    expect(out.map((c) => c.name)).toEqual([
+      'folder-rules',
+      'slots',
+      'guard-snapshot',
+      'guard-hook',
+    ]);
+    const rules = out.find((c) => c.name === 'folder-rules')!;
+    expect(rules.ok).toBe(false);
+    expect(rules.detail).toContain('schemaVersion');
+    // With the rules unknown, a missing guard is reported as the failure it may be.
+    expect(out.find((c) => c.name === 'guard-hook')!.ok).toBe(false);
+  });
+
+  it('reports a corrupt groups.json the same way', async () => {
+    const paths = sandboxPaths(root);
+    await mkdir(paths.vaultDir, { recursive: true });
+    await writeFile(join(paths.vaultDir, 'groups.json'), '{ not json');
+
+    const out = await checkFolderRules(sandboxEngine(), paths);
+
+    expect(out[0]).toMatchObject({ name: 'folder-rules', ok: false });
+    expect(out).toHaveLength(4);
+  });
+
+  it('adds no extra line when the rules read fine', async () => {
+    const out = await checkFolderRules(sandboxEngine(), sandboxPaths(root));
+
+    expect(out.map((c) => c.name)).toEqual(['slots', 'guard-snapshot', 'guard-hook']);
+    expect(out.every((c) => c.ok)).toBe(true);
   });
 });

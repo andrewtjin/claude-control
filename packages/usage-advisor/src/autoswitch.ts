@@ -51,6 +51,7 @@
 // still rotates windows across equal accounts once the active one genuinely nears the wall.
 
 import { humanizeDuration, roundPct } from './format.js';
+import { effectiveLimits, LIMIT_NOUN, policyLimits, worstLimit } from './limits.js';
 import { selectWeeklyBudget } from './weekly.js';
 import type { AccountUsageInput, LimitInput } from './types.js';
 
@@ -123,8 +124,16 @@ export interface AutoSwitchDecision {
  * thresholds, the stale-data tightening, which limits are visible, and the predicate itself.
  * Shared with the advisor through `isAutoSwitchCandidate`, so a greedy plan can only name an
  * account this executor would actually hop to.
+ *
+ * `candidateIds`, when given, restricts the hop TARGET pool to that id set — the daemon runs
+ * one decision per slot (global over the shared pool, each group over its own members), and a
+ * reserved account must never be chosen by the global decision, nor a foreign account by a
+ * group's. It gates only where a hop may GO: the active account (the one being hopped away
+ * from) is never filtered by it, so a slot can always leave its current account even when that
+ * account is not in the set. Absent = no restriction (every account is a potential target),
+ * so callers that predate the parameter behave exactly as before.
  */
-function candidateGate(now: number, policy: AutoSwitchPolicy) {
+function candidateGate(now: number, policy: AutoSwitchPolicy, candidateIds?: ReadonlySet<string>) {
   const triggerPercent = policy.triggerPercent ?? DEFAULT_TRIGGER_PERCENT;
   const minSessionHeadroomPct = policy.minSessionHeadroomPct ?? DEFAULT_MIN_SESSION_HEADROOM_PCT;
   const staleAfterMs = policy.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
@@ -145,12 +154,15 @@ function candidateGate(now: number, policy: AutoSwitchPolicy) {
   // the reason text — never on one side only, or the daemon would hop away from a Fable-capped
   // account and refuse to hop toward an identical one, or justify a hop by a budget it was
   // told to ignore. An account that reports nothing but the cap then reports nothing at all.
-  const countFableCap = policy.fableCapTriggers ?? true;
-  const visibleLimits = (a: AccountUsageInput): LimitInput[] =>
-    countFableCap ? a.limits : a.limits.filter((l) => l.kind !== 'weekly_scoped');
+  const visibleLimits = (a: AccountUsageInput): LimitInput[] => policyLimits(a.limits, policy);
   const weeklyResetAt = (a: AccountUsageInput) => weeklyBudget(visibleLimits(a), a, now)?.resetsAt;
   const isCandidate = (a: AccountUsageInput): boolean =>
     !a.active &&
+    // Outside the slot's target pool: a reserved account can never be a global hop target, nor
+    // a foreign account a group's — the id set is the only thing that keeps the two slots'
+    // rotations from crossing. Checked before health so an ineligible-and-foreign account is
+    // rejected for the honest reason.
+    (candidateIds === undefined || candidateIds.has(a.accountId)) &&
     !a.quarantined &&
     !a.autoSwitchExcluded &&
     100 - sessionUsedPct(a, now) >= minSessionHeadroomPct &&
@@ -164,6 +176,9 @@ function candidateGate(now: number, policy: AutoSwitchPolicy) {
   return { triggerPercent, snapshotAge, lowThreshold, visibleLimits, weeklyResetAt, isCandidate };
 }
 
+/** The resolved gate one decision reads (see {@link candidateGate}). */
+type CandidateGate = ReturnType<typeof candidateGate>;
+
 /** Whether `decideAutoSwitch` could pick this account as a hop target right now, under the
  *  same policy — for surfaces that describe what the executor will do (the greedy plan), so
  *  they never announce a hop the executor refuses. */
@@ -175,6 +190,17 @@ export function isAutoSwitchCandidate(
   return candidateGate(now, policy).isCandidate(account);
 }
 
+/** Options that shape a single decision beyond the policy knobs. */
+export interface DecideAutoSwitchOptions {
+  /** Restrict hop TARGETS to this id set (the slot's own pool: shared accounts for global,
+   *  the group's members for a group). The active account is never filtered by it, so a slot
+   *  can always leave its current account. Absent = no restriction. */
+  candidateIds?: ReadonlySet<string>;
+  /** The slot's PREFERRED accounts (a folder rule's included accounts): the decision is then
+   *  tiered (see {@link decideAutoSwitch}). Absent = one flat pool, exactly as before. */
+  preferredIds?: ReadonlySet<string>;
+}
+
 /**
  * Decide whether to auto-switch, and to which account. Returns `null` unless ALL of:
  * an active account exists, a trigger fires (its remaining quota is low, or greedy mode
@@ -182,20 +208,128 @@ export function isAutoSwitchCandidate(
  * exists. Limits whose reset time is already past are ignored everywhere — their
  * percents describe a window that no longer exists (stale cached snapshots routinely
  * carry them).
+ *
+ * `opts.candidateIds` restricts hop targets to a slot's own pool; see `candidateGate`.
+ *
+ * With `opts.preferredIds` the pool is TIERED, which is how a folder rule's slot uses its own
+ * included accounts first and the shared pool it inherits only as a fallback:
+ *   - on a preferred account, the slot rotates among the preferred ones exactly as a flat pool
+ *     would (greedy included); it falls back to the rest only on the low-quota trigger, when no
+ *     preferred account is a candidate. Greedy never leaves the preferred tier: a sooner weekly
+ *     reset on an inherited account is no reason to stop using the folder's own accounts;
+ *   - off the preferred tier (in fallback), the slot RETURNS to the best preferred candidate as
+ *     soon as there is one, whatever the active account's numbers say; until then it rotates
+ *     among the rest as a flat pool would.
+ * A candidate is judged by the same gate in every tier, so a return never lands on an account
+ * the low-quota trigger would hop straight back off.
  */
 export function decideAutoSwitch(
   accounts: AccountUsageInput[],
   now = Date.now(),
   policy: AutoSwitchPolicy = {},
+  opts: DecideAutoSwitchOptions = {},
 ): AutoSwitchDecision | null {
-  const gate = candidateGate(now, policy);
+  const preferred = opts.preferredIds;
+  if (preferred === undefined) return decideWithin(accounts, now, policy, opts.candidateIds);
+
+  const active = accounts.find((a) => a.active);
+  if (!active) return null;
+  const allowed = (id: string): boolean =>
+    opts.candidateIds === undefined || opts.candidateIds.has(id);
+  const ids = accounts.map((a) => a.accountId).filter(allowed);
+  const preferredTargets = new Set(ids.filter((id) => preferred.has(id)));
+  const fallbackTargets = new Set(ids.filter((id) => !preferred.has(id)));
+
+  if (!preferred.has(active.accountId)) {
+    return (
+      decideReturn(accounts, active, now, policy, preferredTargets) ??
+      decideWithin(accounts, now, policy, fallbackTargets)
+    );
+  }
+  return (
+    decideWithin(accounts, now, policy, preferredTargets) ??
+    decideWithin(accounts, now, { ...policy, greedy: false }, fallbackTargets)
+  );
+}
+
+/**
+ * The tiered decision's way back: off the preferred tier, hop to the best preferred candidate as
+ * soon as one exists, ranked like any other choice (see {@link rankCandidates}). `null` while no
+ * preferred account is a candidate.
+ */
+function decideReturn(
+  accounts: AccountUsageInput[],
+  active: AccountUsageInput,
+  now: number,
+  policy: AutoSwitchPolicy,
+  preferredTargets: ReadonlySet<string>,
+): AutoSwitchDecision | null {
+  const gate = candidateGate(now, policy, preferredTargets);
+  const target = rankCandidates(accounts.filter(gate.isCandidate), gate, now)[0];
+  if (target === undefined) return null;
+  return {
+    targetAccountId: target.accountId,
+    targetLabel: target.label,
+    reason:
+      `${target.label} can take work again — back from ${active.label} ` +
+      `(${targetBudgetText(target, gate, now)})`,
+  };
+}
+
+/**
+ * Order eligible candidates best first. Soonest weekly reset wins — weekly is the budget. On the
+ * same reset moment a REPORTED reset outranks a predicted one (live work goes to the account
+ * whose clock we can actually see), then the account with MORE weekly budget remaining (the
+ * larger expiring asset), then label so the decision is deterministic. The 5h window
+ * deliberately never ranks. Every candidate has a known weekly reset: the gate requires one.
+ */
+function rankCandidates(
+  candidates: AccountUsageInput[],
+  gate: CandidateGate,
+  now: number,
+): AccountUsageInput[] {
+  const { weeklyResetAt } = gate;
+  const weeklyUsedPct = (a: AccountUsageInput) =>
+    weeklyBudget(gate.visibleLimits(a), a, now)?.percent ?? 0;
+  const weeklyPredicted = (a: AccountUsageInput) =>
+    weeklyBudget(gate.visibleLimits(a), a, now)?.predicted ?? false;
+  return [...candidates].sort((a, b) => {
+    const resetDelta = (weeklyResetAt(a) as number) - (weeklyResetAt(b) as number);
+    if (resetDelta !== 0) return resetDelta;
+    const confidenceDelta = Number(weeklyPredicted(a)) - Number(weeklyPredicted(b));
+    if (confidenceDelta !== 0) return confidenceDelta;
+    const weeklyDelta = weeklyUsedPct(a) - weeklyUsedPct(b);
+    if (weeklyDelta !== 0) return weeklyDelta;
+    return a.label.localeCompare(b.label);
+  });
+}
+
+/** "in 2d 3h (predicted), 60% weekly budget left": the chosen target's budget as every reason
+ *  states it. The reason ships verbatim to the phone, so a derived reset is labelled there too —
+ *  a switch card must never present a prediction as something the endpoint reported. */
+function targetBudgetText(target: AccountUsageInput, gate: CandidateGate, now: number): string {
+  const budget = weeklyBudget(gate.visibleLimits(target), target, now);
+  const reset = gate.weeklyResetAt(target) as number;
+  return (
+    `in ${humanizeDuration(reset - now)}${budget?.predicted === true ? ' (predicted)' : ''}, ` +
+    `${roundPct(100 - (budget?.percent ?? 0))}% weekly budget left`
+  );
+}
+
+/** One flat-pool decision: the policy as the module header describes it, over the targets
+ *  `candidateIds` allows. */
+function decideWithin(
+  accounts: AccountUsageInput[],
+  now: number,
+  policy: AutoSwitchPolicy,
+  candidateIds: ReadonlySet<string> | undefined,
+): AutoSwitchDecision | null {
+  const gate = candidateGate(now, policy, candidateIds);
   const { triggerPercent, snapshotAge, lowThreshold, visibleLimits, weeklyResetAt } = gate;
 
   const active = accounts.find((a) => a.active);
   if (!active) return null;
 
-  const weeklyUsedPct = (a: AccountUsageInput) =>
-    weeklyBudget(visibleLimits(a), a, now)?.percent ?? 0;
   const weeklyPredicted = (a: AccountUsageInput) =>
     weeklyBudget(visibleLimits(a), a, now)?.predicted ?? false;
 
@@ -207,29 +341,10 @@ export function decideAutoSwitch(
   // since "97% used" alone cannot tell a full Fable cap from a spent weekly budget.
   const activeWall = `${roundPct(activeWorst)}% of its ${LIMIT_NOUN[activeLimit.kind]}`;
 
-  const candidates = accounts.filter(gate.isCandidate);
-  if (candidates.length === 0) return null;
-
-  // Soonest weekly reset wins — weekly is the budget. On the same reset moment a REPORTED
-  // reset outranks a predicted one (live work goes to the account whose clock we can actually
-  // see), then the account with MORE weekly budget remaining (the larger expiring asset), then
-  // label so the decision is deterministic. The 5h window deliberately never ranks.
-  candidates.sort((a, b) => {
-    const resetDelta = (weeklyResetAt(a) as number) - (weeklyResetAt(b) as number);
-    if (resetDelta !== 0) return resetDelta;
-    const confidenceDelta = Number(weeklyPredicted(a)) - Number(weeklyPredicted(b));
-    if (confidenceDelta !== 0) return confidenceDelta;
-    const weeklyDelta = weeklyUsedPct(a) - weeklyUsedPct(b);
-    if (weeklyDelta !== 0) return weeklyDelta;
-    return a.label.localeCompare(b.label);
-  });
-  const target = candidates[0] as AccountUsageInput;
+  const target = rankCandidates(accounts.filter(gate.isCandidate), gate, now)[0];
+  if (target === undefined) return null;
   const targetReset = weeklyResetAt(target) as number;
-  // The reason ships verbatim to the phone, so a derived reset is labelled there too — a
-  // switch card must never present a prediction as something the endpoint reported.
-  const targetBudget =
-    `in ${humanizeDuration(targetReset - now)}${weeklyPredicted(target) ? ' (predicted)' : ''}, ` +
-    `${roundPct(100 - weeklyUsedPct(target))}% weekly budget left`;
+  const targetBudget = targetBudgetText(target, gate, now);
 
   // Primary trigger: the active account is nearly out of quota. On a stale snapshot the
   // tightened threshold applies; a hop that ONLY the derate explains says so in its reason
@@ -280,68 +395,12 @@ export function decideAutoSwitch(
   return null;
 }
 
-/** Headroom at/below this is "effectively exhausted" — the one definition shared by the
- *  advisor's scoring (its `minUsableHeadroomPct` default) and the daemon's post-switch
- *  stalled-session kick, so "has usage left" can never mean two different things. */
-export const MIN_USABLE_HEADROOM_PCT = 2;
-
-/**
- * Does this account have usage left to run work on right now? Quarantined = no (dead
- * refresh token, unusable regardless of quota). No live limit data = YES: unknown is not
- * exhausted, and the account with no snapshot at all (dormant, never polled) is exactly the
- * one holding a full untouched allowance. Otherwise the binding (worst) live limit must
- * clear the exhausted bar. Same pure-function posture as `decideAutoSwitch`: the caller
- * supplies the snapshot and the moment.
- */
-export function hasUsableHeadroom(account: AccountUsageInput, now = Date.now()): boolean {
-  if (account.quarantined) return false;
-  const worst = worstPercent(account.limits, now);
-  return worst === undefined || 100 - worst >= MIN_USABLE_HEADROOM_PCT;
-}
-
-/** Limits that still describe a live window: reset time unknown, or still in the future. */
-function effectiveLimits(limits: LimitInput[], now: number): LimitInput[] {
-  return limits.filter((l) => l.resetsAt === undefined || l.resetsAt > now);
-}
-
-/** The binding constraint among `limits` — max percent used across the live ones. `undefined`
+/** The binding constraint's percent — max percent used across the live limits. `undefined`
  *  when nothing usable was reported: for the trigger that means "never act on ignorance", for
- *  a candidate "nothing known to be low". The caller decides which limits the policy may see
- *  (the Fable cap is dropped up front when opted out), so a snapshot carrying only an ignored
- *  limit honestly reports no data. */
+ *  a candidate "nothing known to be low". */
 function worstPercent(limits: LimitInput[], now: number): number | undefined {
   return worstLimit(limits, now)?.percent;
 }
-
-/** How a tie on percent is broken: the widest budget first. Only reached when two live limits
- *  report the SAME percent, and only the NAME the reason quotes is at stake (the percent is
- *  identical either way). Input order is the wrong answer there because the endpoint lists the
- *  5h window before the weekly ones: an account simultaneously out of its 5-hour window and out
- *  of its week would be reported as "at 100% of its 5-hour window", which reads as "back in a
- *  few hours" when in fact the week is gone. Naming the longest-lived constraint is the honest
- *  answer, and a total order keeps the pick deterministic. */
-const LIMIT_TIE_RANK: Record<LimitInput['kind'], number> = {
-  weekly_all: 3,
-  weekly_scoped: 2,
-  session: 1,
-};
-
-/** The limit behind `worstPercent`, so a reason can name it. */
-function worstLimit(limits: LimitInput[], now: number): LimitInput | undefined {
-  const live = effectiveLimits(limits, now);
-  if (live.length === 0) return undefined;
-  return live.reduce((worst, l) => {
-    if (l.percent !== worst.percent) return l.percent > worst.percent ? l : worst;
-    return LIMIT_TIE_RANK[l.kind] > LIMIT_TIE_RANK[worst.kind] ? l : worst;
-  });
-}
-
-/** How a reason names each limit kind — the words the usage table already uses for them. */
-const LIMIT_NOUN: Record<LimitInput['kind'], string> = {
-  session: '5-hour window',
-  weekly_all: 'weekly budget',
-  weekly_scoped: 'Fable weekly cap',
-};
 
 /** Percent of the 5h session window used. No live session limit = no open window = 0. */
 function sessionUsedPct(account: AccountUsageInput, now: number): number {

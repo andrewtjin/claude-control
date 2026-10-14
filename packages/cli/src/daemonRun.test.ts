@@ -9,8 +9,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { InsecurePassthroughProtector, noopLogger } from '@claude-control/switch-engine';
 import {
+  buildSdkQueryOptions,
+  type AgentSdkClient,
+  type AgentSdkQueryOptions,
+  type CreateAgentSdkClientDeps,
+} from '@claude-control/session-runtime';
+import {
   dpapiIdentityStore,
   makeAgentSdkClientFactory,
+  pollerAdvisorOptions,
   runShutdownSequence,
   type ShutdownSequence,
 } from './daemonRun.js';
@@ -74,6 +81,72 @@ describe('makeAgentSdkClientFactory', () => {
     expect(typeof first.end).toBe('function');
     // Remote approve/deny depends on the client exposing the permission-resolution seam.
     expect(typeof first.resolvePermission).toBe('function');
+  });
+
+  // Regression: a folder-bound managed spawn must run on its group's profile. The daemon computes
+  // the group's profile dir and passes it to this factory; the factory previously dropped that arg,
+  // so the SDK client never pinned CLAUDE_CONFIG_DIR and the session ran under the GLOBAL account
+  // instead of the bound member. These go through the SAME production factory the composition root
+  // wires (makeAgentSdkClientFactory), capturing the deps it hands the SDK-client constructor, then
+  // running the real options builder to prove the config-dir actually reaches the subprocess env.
+  describe('config-dir binding for folder-bound spawns', () => {
+    /** Capture the deps the factory builds without constructing the live SDK client. */
+    function capture(): {
+      deps: CreateAgentSdkClientDeps[];
+      create: (d: CreateAgentSdkClientDeps) => AgentSdkClient;
+    } {
+      const deps: CreateAgentSdkClientDeps[] = [];
+      const stub = {
+        query: () => ({ [Symbol.asyncIterator]: async function* () {} }),
+        interrupt: () => Promise.resolve(),
+        end: () => Promise.resolve(),
+        resolvePermission: () => 'unknown' as const,
+        resolveQuestion: () => 'unknown' as const,
+      } as unknown as AgentSdkClient;
+      return {
+        deps,
+        create: (d: CreateAgentSdkClientDeps) => {
+          deps.push(d);
+          return stub;
+        },
+      };
+    }
+
+    it('pins CLAUDE_CONFIG_DIR to the group profile when a config dir is passed', () => {
+      const { deps, create } = capture();
+      const profileDir = '/data/claude-control/profiles/g1';
+      makeAgentSdkClientFactory(noopLogger, create)(profileDir);
+
+      // The factory wired a resolver that answers the group's profile dir for any account.
+      expect(deps).toHaveLength(1);
+      expect(deps[0]?.configDirForAccount?.('member-1')).toBe(profileDir);
+
+      // End-to-end: a spawn carrying an accountId now produces an env pinned to that profile dir,
+      // so the subprocess reads the group's credentials rather than the global account's.
+      const opts: AgentSdkQueryOptions = { accountId: 'member-1' };
+      const shape = buildSdkQueryOptions(opts, deps[0] ?? {});
+      expect(shape.env?.CLAUDE_CONFIG_DIR).toBe(profileDir);
+    });
+
+    it('does not pin a config dir for a global spawn (no config dir passed)', () => {
+      const { deps, create } = capture();
+      let unbound: string | undefined;
+      const logger = { ...noopLogger, warn: () => {} };
+      makeAgentSdkClientFactory(logger, create)();
+
+      expect(deps).toHaveLength(1);
+      // No resolver is wired, so a global spawn is never redirected onto a profile.
+      expect(deps[0]?.configDirForAccount).toBeUndefined();
+      // A global spawn's accountId falls through loudly (attribution tag), env is left alone.
+      const onUnbound = deps[0]?.onUnboundAccountId;
+      onUnbound?.('member-1');
+      const shape = buildSdkQueryOptions(
+        { accountId: 'member-1' },
+        { ...(deps[0] ?? {}), onUnboundAccountId: (id) => (unbound = id) },
+      );
+      expect(unbound).toBe('member-1');
+      expect(shape.env).toBeUndefined();
+    });
   });
 });
 
@@ -141,4 +214,24 @@ describe('runShutdownSequence', () => {
       expect(order.slice(-2)).toEqual(['markStopped', 'flushHeartbeat']);
     },
   );
+});
+
+describe('pollerAdvisorOptions', () => {
+  const policy = { fableCapTriggers: false, triggerPercent: 90 };
+
+  it('hands the plan the policy even without greedy, so the Fable cap counts the same everywhere', () => {
+    expect(pollerAdvisorOptions({ autoSwitch: true, greedy: false, policy })).toEqual({
+      autoSwitchPolicy: policy,
+    });
+    expect(pollerAdvisorOptions({ autoSwitch: false, greedy: true, policy })).toEqual({
+      autoSwitchPolicy: policy,
+    });
+  });
+
+  it('describes the hops the daemon makes only when it runs greedy auto-switch', () => {
+    expect(pollerAdvisorOptions({ autoSwitch: true, greedy: true, policy })).toEqual({
+      autoSwitchPolicy: policy,
+      greedyAutoSwitch: true,
+    });
+  });
 });

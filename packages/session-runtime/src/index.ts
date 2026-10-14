@@ -52,6 +52,10 @@ export type { ApiFailureClassification, TransientFailureKind } from './apiFailur
 export { createAgentSdkClient } from './agentSdkClient.js';
 export type { CreateAgentSdkClientDeps } from './agentSdkClient.js';
 
+// Pure options builder — exported so the composition root's client-factory wiring (configDir →
+// CLAUDE_CONFIG_DIR bind) can be verified end-to-end without constructing the live SDK client.
+export { buildSdkQueryOptions } from './agentSdkMapping.js';
+
 export { findClaudeCodeBinary, AGENT_SDK_PACKAGE } from './claudeCodeBinary.js';
 export type { ClaudeCodeBinaryLookup, ClaudeCodeBinaryDeps } from './claudeCodeBinary.js';
 

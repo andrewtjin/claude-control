@@ -50,12 +50,409 @@ twice is merged onto one row (the active one, else the most recently captured), 
 logins under one label keep the earlier row's label while the later one becomes `jina25 (2)`.
 Each repair is printed above the listing it precedes.
 
+## Folder rules
+
+By default every Claude Code session on the machine runs on one live account, the
+_global_ account, drawn from the **shared pool** (every stored account), and a switch
+moves all of them at once. A **folder rule** gives a folder (and everything under it) its
+own say over that pool. The folder still **inherits the shared pool**; the rule adds two
+things on top:
+
+- **include**: accounts the folder uses **first**. An included account is **reserved**:
+  it leaves the shared pool, so no other folder, and not the global slot, can use it.
+  Including an account you excluded from auto-switch (`cctl accounts exclude`) makes it a
+  normal target inside that folder.
+- **exclude**: shared accounts the folder must not use. They stay usable everywhere else.
+
+A ruled folder runs in its **own slot** (its own login, in a profile dir cctl prepares),
+so its pool is: its included accounts first, then the rest of the shared pool minus what
+it excludes. Global exclusions and quarantined logins are honored as everywhere else.
+When every included account is out, the folder falls back to an inherited shared account,
+and it returns to an included one as soon as that has usage again. One account is live in
+one place at a time: a shared account live in another slot is skipped, and when two
+places want the last free account, the global slot keeps it and the folder waits (the
+phone gets an alert naming the folder). Memories, settings, skills, plugins, MCP servers
+and history stay shared; only the login differs.
+
+```
+cctl folder include <folder> <account>[,<account>...]   # reserve accounts to a folder, used there first
+cctl folder include <folder> <accounts> --label <name>  # ...naming the rule it creates (default: the folder)
+cctl folder exclude <folder> <account>[,<account>...]   # keep a folder off some shared accounts
+cctl folder exclude <folder> <accounts> --force         # ...even if that empties its slot while sessions run
+cctl folder reset <folder> <account>[,<account>...]     # take accounts back out of a folder's rule
+cctl folder reset <folder>                              # remove the folder's rule entirely
+cctl folders                                            # every rule: includes, excludes, live account, pool
+```
+
+Accounts are named by label, email or id, one or several separated by commas. **The
+account is never filled in for you**: `cctl folder include C:\work` with no account is a
+usage error. A default would silently reserve the account you are using right now, and
+every other project on it would stop.
+
+Every change says what it did:
+
+- `include` names each account that left the shared pool, every slot that was moved off
+  one of them (if the global slot was live on it, the global slot switches to the best
+  remaining shared account first, and the include is refused, with nothing changed, when
+  none is left), the account now live in the folder's slot, and any sessions already
+  running under the folder, which keep their old account until relaunched.
+- `exclude` says the accounts stay usable elsewhere, and, when an excluded account was live
+  in the folder's slot, that the slot moved off it. With nothing else free the slot would be
+  emptied; that is refused while sessions run under the folder unless you pass `--force`.
+- `reset` with accounts removes each from what the folder includes or excludes; an account
+  no folder includes any more returns to the shared pool. `reset` with no accounts removes
+  the rule: its included accounts return to the shared pool (unless another folder also
+  includes them), its profile's live login is cleared (the profile dir is kept for history),
+  and the folder goes back to the global slot, or to a parent folder's rule.
+
+Several folders may include the same account: they share it, and it is live in at most one
+of them at a time. A folder that only excludes still gets its own slot, so it can avoid the
+global live account when that is one it excludes.
+
+`cctl folders` lists every rule: its folder(s), what it includes and excludes, the account
+live in its slot (and whether that one is included or inherited), and the whole pool in
+order, with what limits each account: live elsewhere, quarantined, or not an auto-switch
+target. It ends with the global slot and the guard's state. `cctl usage` and `cctl timeline`
+end with a short per-folder section (the live account and the pool on one line), and
+`cctl accounts list` shows the reserved accounts in their own table, each with its email and
+the folders that include it.
+
+Nesting is allowed: a subfolder can have its own rule, and the **longest matching rule
+wins**, with no merging: a nested rule does not add to its parent's, it replaces it there.
+`cctl folder include|exclude` refuses a filesystem root, your home directory, and anything
+inside cctl's own data directories.
+
+**An older daemon must be restarted first.** A folder slot can hold a shared account, and
+a daemon built before folder rules would treat that account as free for the global slot,
+putting one login live in two places (the second copy logs itself out on the next refresh).
+So while such a daemon is running, every command that could leave a shared account live in a
+folder slot refuses and changes nothing: `cctl folder include` and `cctl folder exclude`,
+`cctl folder reset <folder> <accounts>` (removing the whole rule with `cctl folder reset
+<folder>` still works), `cctl switch` of a shared account into a folder's slot, and `cctl claude`
+in a ruled folder unless its slot already holds one of the folder's own included accounts:
+
+```
+error: the running daemon (v0.5.2) predates folder rules: it could put an account live in a
+folder and in the global slot at once. Restart it on this build first: cctl daemon restart.
+Nothing was changed.
+```
+
+`cctl doctor` flags the same mismatch (`daemon-folder-rules`). The check is made when a command
+runs: it cannot stop an older daemon started later (an older install's logon task, say). Before
+going back to an older build, remove every folder rule with `cctl folder reset <folder>`.
+
+### Switching a folder's slot by hand
+
+```
+cctl switch <account> --folder <folder>   # put the account in the slot that folder runs on
+```
+
+The folder's slot is the slot of the rule that applies there (or the global slot when none
+does). The slot may take one of its included accounts, or a shared account the folder does
+not exclude. The switch is refused, with nothing changed, when the folder's rule does not
+allow the account, when the account is live in another slot, or (without `--folder`) when
+several folders include the account and it is live in none of them: name the folder then.
+
+### Running Claude Code in a ruled folder
+
+A rule only takes effect for a session that launches on the folder's slot. That is what
+`cctl claude` does:
+
+```
+cctl claude                        # launch Claude Code on the folder's slot (or the global
+                                    # slot when no rule applies here)
+cctl claude --account <id|label>   # launch on a specific account for this one session
+cctl claude --override             # launch here on the global account, on purpose (see below)
+cctl claude -- <claude args...>    # everything after -- is passed through to claude
+cctl claude attach <id|name>       # open a background session on its folder's account (see
+cctl claude --resume <id|title>    # "Opening a background session" below)
+```
+
+`cctl claude` resolves which slot to use (an explicit `--account`, else the folder's
+rule, else global), makes sure an account is live there, prints a one-line banner naming
+the account and the rule, and hands off to the real `claude` executable. Its exit code is
+yours; Ctrl+C reaches Claude Code, not the wrapper.
+
+To make an ordinary `claude` do this automatically, install the wrapper for your shell:
+
+```
+cctl shell-init powershell   # prints a `claude` function that calls `cctl claude`
+cctl shell-init bash         # (also: zsh, fish)
+```
+
+For PowerShell, `cctl shell-init powershell` prints a function to add to your profile
+(`$PROFILE`); afterwards typing `claude` in any ruled folder starts on the right slot,
+and typing it anywhere else behaves exactly as before. The command prints where to put it.
+
+In **VS Code**, the Claude Code extension takes its environment from the
+`claudeCode.environmentVariables` setting (a list of `{ "name", "value" }` pairs). That
+setting is machine-scoped: VS Code reads it from **user** settings only and silently ignores
+it in a folder's `.vscode/settings.json`. So give each folder rule its own VS Code profile,
+and open the folder in it:
+
+1. `code --profile cctl-<label> <folder>` — creates the profile the first time; install or
+   enable the Claude Code extension in it.
+2. In that window, run **Preferences: Open User Settings (JSON)** and add the snippet
+   `cctl where` prints:
+
+   ```json
+   {
+     "claudeCode.environmentVariables": [
+       { "name": "CLAUDE_CONFIG_DIR", "value": "<the profile dir cctl where prints>" }
+     ]
+   }
+   ```
+
+3. Open the folder with the same `code --profile ...` command from then on. Windows in any
+   other profile keep the global slot.
+
+`cctl where` prints the exact command, quoted for your shell. A `claude` typed in VS Code's
+integrated terminal is covered by the shell wrapper above.
+
+Two VS Code specifics. The extension asks the model for a session title **in parallel with**
+your first prompt, so a prompt the guard blocks in a wrongly configured window has already
+sent its text, for that title, to the window's account; the guard cannot stop that request —
+routing the window correctly does. And a multi-root workspace runs its session in the FIRST
+folder; the other folders are added working directories that the guard does not judge, so
+keep a ruled folder in its own window.
+
+```
+cctl where              # explain how THIS folder resolves: the rule that matched, what it
+                        # includes and excludes, the live account, the pool in order, the env
+                        # line and a ready-to-paste VS Code settings snippet
+cctl where <folder>     # the same for another folder
+```
+
+### Enforcement: what a session on the wrong slot sees
+
+So a session does not silently run on an account its folder must not use, cctl installs a
+guard that checks each prompt against the folder's rule.
+
+**A plain `claude` in a ruled folder** (no wrapper) runs on the global slot. A ruled folder's
+pool inherits the shared pool, so the global slot's account is one the folder accepts, and
+the prompt goes through. When the rule includes accounts, the session is told once (on its
+first prompt, not on every one) that it is not on them:
+
+```
+cctl: C:\work has its own cctl folder rules (it uses A, B first). This session runs on C
+from the shared pool, which this folder also accepts. To use A, B here, exit and start it
+with: cctl claude   (or set up the claude wrapper: cctl shell-init powershell)
+```
+
+A background session (`claude --bg`) is told instead that cctl moves it: once one of the
+folder's included accounts is live in its slot and can take work, the daemon stops the
+session between turns and resumes it under the folder's slot, with the same session id and
+the same conversation (see below).
+
+**The global slot on an account the folder must not use** is refused: one the rule
+excludes, or one reserved to other folders.
+
+```
+cctl: C:\work has its own cctl folder rules (it uses A, B first) and excludes D, the
+account this session runs on. Exit and start it with: cctl claude   (or set up the claude
+wrapper: cctl shell-init powershell)
+```
+
+The guard tells which account the global slot holds from the identity Claude Code records
+for its login (`oauthAccount` in the main config's `.claude.json`), never from credentials.
+When it cannot tell (that file is missing or unreadable, or an excluded account has no
+recorded identity), a folder whose rule excludes accounts refuses the prompt — allowing it
+could run the folder on the very account it excludes — and a folder that excludes nothing
+lets it through with the notice.
+
+**A session on another folder's slot** is refused in a ruled folder, and a session on a
+folder's slot is refused outside that folder's folders, exactly as before. So is **a session
+on a config dir cctl does not manage** (a `CLAUDE_CONFIG_DIR` that is neither the main config
+dir nor a folder's profile, such as a second Claude Code config a shell exports, or the
+profile of a rule since removed): its login is its own, so the global slot's identity says
+nothing about which account it runs on. `--override` does not relax this one: it launches on
+the global slot, and such a session is not on it. Unset `CLAUDE_CONFIG_DIR`, or start the
+session with `cctl claude`, which puts it on the folder's slot.
+
+There are three enforcement modes, set with `cctl settings set bind-enforce <mode>`:
+
+- **block** (default) — refuses only the sessions above: an account the folder's rule rules
+  out, or a slot that is not the folder's. Every other account is allowed, with the
+  one-time notice.
+- **warn** — the same sessions are flagged on every prompt, but nothing is refused.
+- **off** — no check.
+
+### Background sessions move onto the folder's slot
+
+A running Claude Code session cannot change account: its account is the config dir it
+started with, and the global slot is shared by every plain session in every folder, so it
+cannot be switched for one folder. Background sessions are the exception. Claude Code hosts
+them in a background service of its own, one per config dir, and keeps their conversations
+in `projects/`, which every folder profile shares with the main config dir. So in each poll
+cycle, for every rule whose slot holds one of its included accounts with usage left, the
+daemon moves each background session the global slot's service hosts in that folder:
+
+1. it checks that the session is idle between turns (`claude agents` reports it idle) — a
+   session in a turn, or waiting on a permission prompt, is left for a later cycle — that it
+   holds no work between turns (a scheduled wakeup, a background task: Claude Code reports
+   such a session idle, but a stop would drop the work), and that no terminal has a
+   background session of that service open (`claude attach`, or the agent view). Claude Code
+   does not say which session a terminal has open, so while one is open, nothing moves;
+2. it stops the session (`claude stop`), and while the session runs nowhere it removes every
+   job row Claude Code keeps for it, in every config dir (`claude rm`, which deletes the row
+   and keeps the conversation);
+3. it resumes the session's current conversation by its full session id under the folder's
+   profile (`claude --bg --resume <id>`, with no prompt, so no turn is spent), from the
+   session's working directory, with every option the session was started with and Claude
+   Code saved (its model, permission mode, added directories, tool restrictions, settings,
+   budgets and the rest);
+4. it confirms the folder's service now hosts it, logs the move in the daemon log and sends
+   one phone notice.
+
+Why every row goes: each config dir keeps a job row for a session it ran, and Claude Code
+acts on a row under its own config dir whatever runs elsewhere. A row left under the global
+slot for a session that now runs on the folder's slot is a trap: a `claude attach`, an
+interactive `claude --resume` (by id, by title, or chosen in its picker), a `claude stop`,
+`claude rm` or `claude respawn`, or Enter or Ctrl+X in `claude agents`, run under that config
+dir, reaches the session where it runs and kills it there, in the middle of a turn too. So a
+background session keeps a job row only in the config dir where it runs or last ran.
+
+After `/clear` inside a background session, its job runs a new conversation; the move
+resumes that one (the job then shows up under the new conversation's short id). A row another
+config dir keeps of the job's earlier conversation, or of that conversation resumed as a job of
+its own, is not this session's and is left alone: it reaches only the old job id, which the moved
+session no longer runs under. When the session would keep its job id (no `/clear` since it
+started) and another config dir runs a different conversation under that id, nothing tells the
+two apart, so the session is not moved (one notice).
+
+Claude Code's `claude stop` returns a moment before the session has exited, so the move waits
+until the session is gone from Claude Code's session registry and from the service before it
+removes its rows and resumes it elsewhere (a resume while it still runs would start a copy).
+The daemon and `cctl claude` (below) never move one session at once: each takes the
+session's move lock, under cctl's data folder, on every id the session is known by (the id its
+job started with and, after `/clear`, the conversation it runs now, so the two always meet on
+one), and the daemon leaves a session alone while `cctl claude` holds it.
+
+A session moves at most once an hour, so one woken back onto the global slot by hand is not
+bounced every cycle. If a move fails, the session is resumed back on the global slot with its
+saved options (tried a few times, since Claude Code can count a session it just stopped as
+still open), the daemon logs it and sends one phone notice, and it does not try that session
+again until it restarts. When even that fails, the notice gives the command that brings it
+back as it was: `cctl claude --resume <id>`, in any shell, from any folder. A move saves how
+to bring the session back (where it ran, its folder and its saved options) before it touches
+anything; that command runs the move's own way back from it, then opens the session as below.
+The move drops what it saved once the session runs again, moved or put back; `cctl claude`
+drops it whenever it finds the session running, or finds the job row the way back would wake
+woken since by other means, and it is kept a week at most. One that names no config dir of
+cctl's, or options other than a move saves, is never used.
+
+A session that cannot move without changing is left where it is, with one notice: one
+started with an option this cctl does not know, or one that would act again at startup
+(`--file`, `--rewind-files`, `--session-id`, `--reply-on-resume`); one holding permission
+rules granted while it ran (they are kept in its job row, and no option carries them over);
+and one working in a git worktree Claude Code made for it (`claude --bg -w`): `claude rm`
+deletes such a worktree along with the row, so that session is never moved, and stays where
+it runs.
+
+Sessions in folders without a rule are never moved, and an exclude-only rule
+prefers no account, so its sessions stay where they are. The moves use the `claude` on the
+daemon's PATH (the one that started the background service). Not on macOS, where folder
+rules are not supported.
+
+An interactive session cannot be moved this way; it gets the relaunch notice above.
+
+### Opening a background session
+
+Claude Code runs one background service per config dir, so a background session runs either
+in the main config dir's service (the global slot) or in a folder profile's. A plain
+`claude attach` or `claude --resume` in a ruled folder runs on the folder's profile, and when
+the session runs in another service, a job row the profile still holds for it is the trap
+described above.
+
+`cctl claude attach <session>` and `cctl claude --resume <session>` (also after `--`, with
+other options around them, and in every spelling Claude Code reads as a resume: `-r <id>`,
+`-r<id>`, `-pr <id>`, `--resume=<id>`) find the session first:
+
+- by any full session id it has had (the id it started with, and the conversation it runs
+  after `/clear`);
+- for `attach`, by its short id or any shorter start of it (Claude Code reads one to eight
+  hex digits as the start of a job id, never as a name), else by its name, whole or in part;
+- for `--resume`, by its conversation title, among the sessions of this folder and of the
+  folder's git worktrees (Claude Code's own `.claude/worktrees` among them), as Claude Code
+  searches. A title more than one conversation there has is passed to Claude Code, whose
+  picker then opens, unless a job row on this slot could be chosen in it into the trap above:
+  then it is refused with their ids.
+
+A name that matches more than one session is refused with their ids. A session that is not a
+background session (no job row anywhere, no background service running it) is passed to
+Claude Code as typed. The session belongs to the slot of the folder it works in (an attach by
+id from another folder follows the session, not the folder you are in). Then:
+
+- **it runs where it belongs**: it is opened there;
+- **it runs on another account, idle between turns, holding no work, with no terminal on
+  that service**: cctl says it is moving it, moves it where it belongs by the same move the
+  daemon makes and on the same terms (the folder's slot holds one of its included accounts
+  with usage left, its saved options carry over, no git worktree), and then opens it there.
+  Ctrl-C from the moment it says it is moving does not cut the move off: the move finishes,
+  or puts the session back, and then nothing is opened (before that line, nothing has been
+  touched, and Ctrl-C ends `cctl claude` as usual). Closing the window is not waited on for
+  long: Windows ends a program a few seconds after its console closes. Should that, or
+  anything else, end `cctl claude` in the middle of a move, `cctl claude --resume <id>` (said
+  when you press Ctrl-C) brings the session back where it was. One line says it was moved,
+  and onto which account;
+- **it runs on another account and is in a turn, waiting on a prompt, holding work between
+  turns, watched from another terminal, in a git worktree, or cannot move** (or the move
+  failed and it was put back): it is opened where it runs, with one line saying it stays on
+  that account for now and why, and, when cctl's daemon is running and will do it, that the
+  daemon moves it between turns. A session left on the profile of a rule since removed has
+  no login there (every prompt fails with "Not logged in"), so it is moved onto its folder's
+  slot whenever it is idle, and otherwise opened there with that said plainly;
+- **it is open in a terminal** (an interactive session): nothing is touched, and cctl says
+  which process has it open;
+- **it runs nowhere**: `attach` opens it where it belongs, removing its rows elsewhere first,
+  restarting a failed row there, or, when the profile holds no row for it, starting it there
+  with the options its latest row saved (when those cannot carry over, or its row records a
+  git worktree, it is opened where that row is). `--resume` runs it in the foreground as
+  Claude Code does. When its rows record different conversations under one job id (its
+  conversation before `/clear` among them), `attach` cannot tell which is meant: it is refused
+  with each conversation's id and where its row is, to resume one by its id.
+
+A prompt given after the session (`cctl claude --resume <id> "<prompt>"`) is passed on as
+`claude --resume <id> "<prompt>"` under the config dir that runs it, where Claude Code sends it
+to the session and opens it.
+
+`cctl claude stop|kill|rm|respawn <session>` is run under the config dir whose service runs
+the session, by its job id there. Anything else `cctl claude` passes to Claude Code that can
+reach a job row — the `--resume` picker, `--continue`, the `agents` view (`agents --json`
+too), `logs`, a `respawn` of every session, an id or a title cctl does not find — is checked
+first against the job rows of the slot it runs on: one held there for a session running in
+another service refuses the command, naming the session, where it runs, and
+`cctl claude attach <short id>` to open it. So is anything cctl cannot tell is a plain new
+session: a short option cluster with `r` or `c` in it that is no plain resume (`-cr <id>`,
+which Claude Code runs as `--continue` whatever the id, or `-dr`), or `--from-pr`. Only
+arguments that are plainly a new session (a prompt and options, none of the above), a new
+background start (`--bg`) and a copy (`--fork-session`) are passed on without that check.
+So nothing `cctl claude` runs opens, stops or removes a session through a row under one
+config dir while it runs in another's service. `cctl claude` holds the session's move lock
+while it decides, and until the terminal it started shows up in the service's attach journal,
+so the daemon cannot move the session in between. With `--account` or `--override` the
+session is never moved, but it is still opened where it runs rather than taken from there.
+
+To run in a ruled folder on the global account _on purpose_ for one session, launch it
+with `cctl claude --override`; to run a reserved account in a folder that does not include
+it, launch with `cctl claude --account <that account>`. Both are honored by the guard for
+that session only. `--override` relaxes a session on the global slot only: from a shell whose
+`CLAUDE_CONFIG_DIR` names a config dir cctl does not manage, the session runs there and is
+refused as above.
+
+### macOS
+
+Folder rules are **not supported on macOS yet** — `cctl folder include|exclude` refuse
+there. The isolation relies on a per-slot credential store, and on macOS each store would
+prompt the Keychain. See `docs/PLATFORM.md`.
+
 ## Switching and recovery
 
 ```
-cctl switch <id|label>       # activate an account
+cctl switch <id|label>       # activate an account (a reserved account switches its folder's slot)
 cctl switch <id|label> --force   # bypass the switch-cadence guard
-cctl recover                 # recover from an interrupted switch (safe to run anytime)
+cctl recover                 # recover from an interrupted switch (safe to run anytime);
+                             # exits 1 with the reason when it cannot be settled yet
 ```
 
 ## Usage and timeline
@@ -67,7 +464,102 @@ cctl timeline   # 5h-session budget per account + when every limit resets, with 
 ```
 
 Both read the daemon's last-persisted snapshot, so they work whether or not the daemon
-is currently running.
+is currently running. While no account can take work, both lead with a line saying so, with
+since when once the daemon has recorded it and which account is expected back first when a
+reset time is known: one line for the global pool, and one for each folder rule whose pool is
+out (see below).
+
+Where folder rules exist, both end with a section per rule: its folders, the account live in its
+slot, and its pool in order (`cctl folders` has the full picture).
+
+## When every account is out of usage
+
+```
+cctl outages                   # every time no account could take work, newest first
+cctl outages --days 30         # only the times that started in the last 30 days (plus any still on)
+cctl outages --folder <folder> # only the times the pool <folder> runs under ran out
+cctl outages --json            # the same, as JSON (each episode carries its scope)
+```
+
+When auto-switch has walked every account and all of them are spent, the daemon records it.
+An account counts as out when one of its limits is more than 98% used (the endpoint reports
+whole percents, so in practice 99% or more): its 5-hour window, its weekly budget, or the
+Fable weekly cap unless `CCTL_AUTOSWITCH_ON_FABLE_CAP` is off. An account whose login has
+expired counts as out too. An account you excluded from auto-switch still counts as available
+while it has quota, and so does an account cctl has no numbers for yet. This bar is stricter
+than auto-switch's own: auto-switch stops hopping to an account at its 94% trigger, so it can
+run out of places to go a little before every account counts as out.
+
+Each time is one entry with when it started, why each account was out (every limit holding
+it out) and when each was due back, and the switches of the five hours before it (who made
+each and why). When an account comes back, the entry is closed with how long nothing could
+run and how it ended (a limit reset, a login restored, a new account, or numbers showing
+usage left again). The outage is measured to the reset that ended it, so a daemon that was
+stopped through the reset still records the right length; a reset the usage endpoint moves
+later while the outage is on moves the end with it.
+
+An account only counts as back on evidence: numbers showing it has usage left, or the
+resets of every limit it was last seen out on having passed. A usage poll that fails or
+comes back empty during an outage is not evidence, and neither is a login added mid-outage
+before its first successful poll, so neither ends it (or starts a second one).
+
+While an outage is open the daemon also adds a short `walls` line whenever what keeps an
+account out changes (it hits another limit, its login expires, a reset moves by more than five
+minutes, or an account joins), so a daemon restarted mid-outage judges every account by what was
+last seen, not only by what was true at the start.
+
+The phone gets a card when it starts and when it ends. The log is
+`exhaustion-log.jsonl` in the daemon's data folder (beside `daemon.db`), one JSON line per
+start, per end and per `walls` change, starts and ends each with a plain-English `summary`;
+`cctl outages` prints its path. A
+write that fails (the file held open by a scanner, a full disk) is retried every cycle and on
+shutdown, and the entry is in `daemon.log` either way.
+
+`cctl outages` marks the outage still open as `ongoing`, with the account expected back first
+by what was last seen. If the latest numbers already show
+an account back but no running daemon has recorded the end, it says so (`over by the latest
+numbers`) instead. A start whose end was never written is shown as `end not recorded`.
+
+### Per pool: the global pool and each folder rule
+
+Outages are kept per **scope**: the global pool (the shared accounts the global slot draws from)
+and each folder rule's pool (its included accounts plus the shared accounts it keeps). Each scope
+has its own episodes, cards and `walls` lines, side by side in the one log, so a folder can be
+out while the rest of the machine works, and the other way round.
+
+A scope is out when nothing in its pool can take work, where an account **live in another slot**
+does not count as available: one login is never live in two places, so that slot cannot have it.
+This holds for the global pool too: a shared account a folder is running on (its fallback while
+its own accounts are out) is not counted as the global pool's while the folder holds it. Such an
+account is listed as `live in <the slot>`, and when the other slot lets it go and its numbers
+show usage left, the outage ends as `another slot let it go`. Accounts reserved to a folder are
+never part of the global pool. A pool with nothing in it at all (a folder that excludes every
+shared account, or whose last one another folder reserved) is out too, and says its pool is
+empty; it ends once an account that can work joins it.
+
+The phone card names the folder (`<folder>: every account in its pool is out`, then `Usage is
+back in <folder>`), and the `usage` / `timeline` banner adds one line per folder that is out.
+While folder rules exist the global pool is not every account, so its card, log lines and banner
+name it too (`Every account in the global pool is out`, `No account in the global pool can take
+work`); with none they read as before. `cctl outages` labels each entry `[global]` or
+`[<folder>]` once any folder has an entry or a global one was recorded beside folder rules (a log
+with neither reads as before); `--folder` resolves a folder the way a session does, against the
+rules in force (the longest rule folder containing it), so a subfolder finds its rule's history,
+a rule made anew on the same folder shows only its own, and a folder no rule applies to shows
+the global pool's (with that of any removed rule that covered it), and
+`--json` gives every episode a `scope` (`{ "kind": "global" }` or `{ "kind": "folder",
+"ruleId", "folders", "label" }`) and lists each scope's open outage under `open`.
+
+Removing a folder rule while its pool is out ends that outage, recorded as `its folder rule was
+removed` (with an informational card), since there is no pool left to be out. Lines written
+before scopes existed carry no scope and read as the global pool's. A folder's lines are written
+as version 2, so an older cctl that knows only the global pool skips them rather than reading a
+folder's outage as the whole machine's.
+
+Separately from the log, the daemon alerts once (per episode, not per hour) when a folder's slot
+cannot move: its live account is out of usage and nothing else in its pool is free to take over,
+or its slot has no working account at all. A folder whose outage card has already gone out is not
+alerted on twice.
 
 ## Token stats
 
@@ -344,6 +836,7 @@ Every setting has a short alias for the command line (case and `-`/`_` do not ma
 | `probe-timeout`     | `CCTL_PROBE_TIMEOUT_MS`                  | milliseconds          |
 | `auto-continue`     | `CCTL_AUTO_CONTINUE`                     | on / off              |
 | `auto-continue-max` | `CCTL_AUTO_CONTINUE_MAX`                 | count                 |
+| `bind-enforce`      | `CCTL_BIND_ENFORCE`                      | block / warn / off    |
 
 A missing, corrupt, or wrong-shaped file is ignored rather than being a startup
 error, so a typo costs you the override, never the daemon (`cctl settings set` will

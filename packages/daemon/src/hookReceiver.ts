@@ -173,6 +173,11 @@ export interface SessionCommandBase {
 export interface SessionRegisterInput extends SessionCommandBase {
   /** Optional human label to set at registration time (equivalent to a follow-up `label`). */
   label?: string;
+  /** The session's launch-time `CLAUDE_CONFIG_DIR`, when the caller knows it (the shell wrapper
+   *  passes `process.env.CLAUDE_CONFIG_DIR`). The daemon maps it to a slot so a session registered
+   *  from a folder-bound config dir is attributed to that slot's live member rather than the global
+   *  account. Absent maps to the global slot. */
+  configDir?: string;
 }
 export interface SessionLabelInput extends SessionCommandBase {
   label: string;
@@ -1260,9 +1265,14 @@ export class HookReceiver {
     switch (path) {
       case '/cli/session/register': {
         const label = str(body.label);
+        // The forwarder tags every register with the session's launch-time CLAUDE_CONFIG_DIR (it
+        // sends `null` for the shared config dir). The daemon maps it to a slot so a session started
+        // in a folder-bound profile is attributed to that group's live member, not the global one.
+        const configDir = str(body.configDir);
         const result = await this.cliHandlers.registerSession({
           ...base,
           ...(label !== undefined ? { label } : {}),
+          ...(configDir !== undefined ? { configDir } : {}),
         });
         this.respondSessionCommand(res, result);
         return;

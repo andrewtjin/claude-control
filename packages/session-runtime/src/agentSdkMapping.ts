@@ -165,6 +165,13 @@ export interface BuildSdkQueryOptionsDeps {
    *  environment. The SDK REPLACES the subprocess env, so a real bind must start from
    *  process.env or the subprocess loses PATH/HOME/etc. */
   baseEnv?: Record<string, string | undefined>;
+  /** For a GLOBAL (unbound) spawn only: when true, emit an `env` built from `baseEnv` with any
+   *  inherited `CLAUDE_CONFIG_DIR` removed, so a session meant to run on the global account is not
+   *  silently redirected onto a group profile a `CLAUDE_CONFIG_DIR` the parent process inherited
+   *  happens to name. The caller decides truth here — it owns the profiles-root check — mirroring the
+   *  launcher's global-path config-dir drop (buildLaunchEnv). Ignored when a config dir is bound: that
+   *  path pins `CLAUDE_CONFIG_DIR` itself and so has nothing to inherit. */
+  scrubInheritedConfigDir?: boolean;
 }
 
 /**
@@ -195,11 +202,22 @@ export function buildSdkQueryOptions(
       // Legitimate mechanism: bind THIS session to THIS account's credentials via config dir.
       const baseEnv = deps.baseEnv ?? process.env;
       shape.env = { ...baseEnv, CLAUDE_CONFIG_DIR: configDir };
-    } else {
-      // Shared-config design: the account was (or must have been) activated globally already.
-      // Loud, never silent.
-      deps.onUnboundAccountId?.(opts.accountId);
+      // A bound config dir pins CLAUDE_CONFIG_DIR outright, so the global-path scrub below is moot.
+      return shape;
     }
+    // Shared-config design: the account was (or must have been) activated globally already.
+    // Loud, never silent.
+    deps.onUnboundAccountId?.(opts.accountId);
+  }
+
+  // Global (unbound) spawn: an inherited CLAUDE_CONFIG_DIR that points at a group profile would run
+  // this global session on that group's account. Drop it so the child falls back to the default
+  // config dir the global slot uses — the SDK analog of buildLaunchEnv's global-path drop. The SDK
+  // REPLACES the subprocess env, so the scrubbed env starts from baseEnv to keep PATH/HOME/etc.
+  if (deps.scrubInheritedConfigDir) {
+    const env: Record<string, string | undefined> = { ...(deps.baseEnv ?? process.env) };
+    delete env.CLAUDE_CONFIG_DIR;
+    shape.env = env;
   }
 
   return shape;

@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readTranscriptTurns } from './transcriptTokens.js';
+import { readTranscriptTurns, sessionIdForFile } from './transcriptTokens.js';
 
 // A directory listing failure has to be simulated rather than triggered with real OS
 // permissions: chmod does not reliably deny a folder's own owner on every platform CI runs on,
@@ -128,6 +128,9 @@ describe('readTranscriptTurns', () => {
     expect(scan.turns).toEqual([
       {
         tsMs: Date.parse(IN_WINDOW),
+        // The session id is the transcript's base name (`proj/session.jsonl`) — attribution maps it
+        // to the session's slot.
+        sessionId: 'session',
         model: 'claude-opus-5',
         inputTokens: 3,
         outputTokens: 5,
@@ -272,5 +275,32 @@ describe('readTranscriptTurns', () => {
     const scan = await readTranscriptTurns({ claudeDir, sinceMs: SINCE });
     expect(scan.turns).toHaveLength(1);
     expect(scan.malformedLines).toBe(0);
+  });
+
+  it("a sub-agent transcript's turns inherit the parent session id", async () => {
+    await writeTranscript('enc/sess-1/subagents/a/agent-9.jsonl', [
+      turnLine({ id: 'msg_sub', ts: IN_WINDOW }),
+    ]);
+    const scan = await readTranscriptTurns({ claudeDir, sinceMs: SINCE });
+    expect(scan.turns).toHaveLength(1);
+    // Not the file base name ('agent-9'): a sub-agent's spend belongs to the session that launched
+    // it, so it attributes against that session's slot.
+    expect(scan.turns[0]?.sessionId).toBe('sess-1');
+  });
+});
+
+describe('sessionIdForFile', () => {
+  it('reads the base name of a top-level session transcript', () => {
+    expect(sessionIdForFile('/root/projects/enc/9f2a-1234.jsonl')).toBe('9f2a-1234');
+    expect(sessionIdForFile('C:\\root\\projects\\enc\\9f2a-1234.jsonl')).toBe('9f2a-1234');
+  });
+
+  it('reads the parent session dir for a sub-agent transcript', () => {
+    expect(sessionIdForFile('/root/projects/enc/sess-1/subagents/x/agent-7.jsonl')).toBe('sess-1');
+  });
+
+  it('returns null for a name that is not a recognizable session id', () => {
+    expect(sessionIdForFile('/root/projects/enc/notes.txt')).toBeNull();
+    expect(sessionIdForFile('')).toBeNull();
   });
 });

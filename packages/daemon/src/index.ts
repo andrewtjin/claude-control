@@ -6,6 +6,7 @@
 
 export {
   Store,
+  slotBySessionMap,
   type StoreOptions,
   type UsageSnapshotRow,
   type ActivationIntervalRow,
@@ -54,6 +55,40 @@ export {
 } from './usageHistory.js';
 
 export { AttributionJournal, type AttributionJournalOptions } from './attributionJournal.js';
+
+export { globalSlotAccountIds } from './folderSlots.js';
+
+export {
+  describeScope,
+  episodesOf,
+  ExhaustionLog,
+  exhaustionLogPath,
+  firstBackSentence,
+  folderScopeKey,
+  GLOBAL_SCOPE,
+  judgeOutage,
+  judgeScope,
+  noAccountSentence,
+  openEpisodeFrom,
+  outageScopes,
+  recoveryText,
+  resumeOpenEpisode,
+  resumeOpenEpisodes,
+  scopeKey,
+  scopeOf,
+  SWITCH_CHAIN_WINDOW_WORDS,
+  trackedBackAt,
+  type ExhaustedAccount,
+  type ExhaustedRecord,
+  type ExhaustionEpisode,
+  type ExhaustionSwitch,
+  type OpenEpisode,
+  type OutageJudgement,
+  type OutageScope,
+  type RecoveredRecord,
+  type Recovery,
+  type ScopeView,
+} from './exhaustionLog.js';
 
 export {
   readTranscriptTurns,
@@ -120,6 +155,76 @@ export {
 export { hookForwarderPath, writeHookForwarder, HOOK_FORWARDER_SOURCE } from './hookForwarder.js';
 
 export {
+  bindGuardPath,
+  buildBindGuardCommand,
+  generateBindGuardSource,
+  writeBindGuard,
+  guardNoticesDir,
+  BIND_GUARD_MARKER,
+} from './bindGuard.js';
+
+export {
+  BackgroundMover,
+  DEFAULT_MOVE_INTERVAL_MS,
+  type BackgroundMoverOptions,
+  type MoveOutcome,
+  type MoveTarget,
+} from './backgroundMover.js';
+
+export {
+  DEFAULT_CONFIRM_TIMEOUT_MS,
+  JOB_ID_PATTERN,
+  SESSION_ID_PATTERN,
+  allRows,
+  bringBack,
+  confirmHosted,
+  conversationOf,
+  isMoveTarget,
+  lineageOf,
+  lockMove,
+  moveBackgroundSession,
+  moveLockIds,
+  reasonOf,
+  recoveryCommand,
+  rowsOf,
+  sameConfigDir,
+  sessionLabel,
+  settledWhere,
+  whereRuns,
+  type BackgroundSession,
+  type BackgroundSessionHost,
+  type JobRow,
+  type Lineage,
+  type LiveSession,
+  type LocatedRow,
+  type MoveEnd,
+  type MoveRequest,
+  type MoveResult,
+  type MoveTiming,
+  type NotMovedCause,
+  type ResumeRecovery,
+  type RowRead,
+  type SavedLaunch,
+  type SessionActivity,
+  type SessionLock,
+  type SessionWhere,
+} from './backgroundMove.js';
+
+export {
+  bindTokensDir,
+  mintBindToken,
+  removeBindToken,
+  cleanupBindTokens,
+  BIND_TOKEN_DIR_NAME,
+  BIND_TOKEN_MAX_AGE_MS,
+  BIND_TOKEN_PATTERN,
+  type BindTokenKind,
+  type BindTokenRecord,
+  type MintBindTokenOptions,
+  type CleanupBindTokensOptions,
+} from './bindToken.js';
+
+export {
   ControlPlaneClient,
   ControlPlaneRejectionError,
   type ConnectionState,
@@ -131,10 +236,17 @@ export {
 
 export {
   installHooks,
+  installBindGuard,
+  ensureBindGuard,
+  removeBindGuard,
   uninstallHooks,
+  isBindGuardInSettingsText,
   buildDaemonHookSpecs,
   type HookCommandSpec,
   type InstallHooksOptions,
+  type InstallBindGuardOptions,
+  type EnsureBindGuardOptions,
+  type RemoveBindGuardOptions,
   type UninstallHooksOptions,
   type BuildDaemonHookSpecsOptions,
 } from './hookInstaller.js';

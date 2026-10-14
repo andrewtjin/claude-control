@@ -19,6 +19,13 @@ export function humanizeDuration(ms: number): string {
   return `${minutes}m`;
 }
 
+/** How long something has lasted, for a span that has begun: never "now", which reads as "not at
+ *  all". An outage that started and ended in the same minute (or one measured zero by a clock
+ *  stepped back) lasted "<1m". */
+export function humanizeElapsed(ms: number): string {
+  return humanizeDuration(Math.max(ms, 1));
+}
+
 /** A fixed 24 hours. Deliberately NOT a calendar day: a countdown that spans a DST transition
  *  is 23 or 25 wall-clock hours long, so this under-reports by a day across a spring-forward
  *  boundary in a zone that observes one. Accepted, because the whole unit is a floor on the

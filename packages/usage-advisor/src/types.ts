@@ -76,6 +76,12 @@ export interface AdvisorOptions {
    *  accounts `decideAutoSwitch` would hop to under it (session headroom, not itself low, a
    *  known weekly reset). Absent = the executor's defaults. */
   autoSwitchPolicy?: AutoSwitchPolicy;
+  /** The accounts the plan's slot may switch to, when that is not every account given: with folder
+   *  rules the global slot never takes an account reserved to a folder or one live in a folder
+   *  slot, so the plan for it must not name one either. When set, the burn queue, the
+   *  recommendation and the reason read only these and the live account; the ranking and the
+   *  per-account advisories still cover every account. Absent = every account. */
+  slotAccountIds?: ReadonlySet<string>;
 }
 
 /** One account's place in the ranking. Higher `score` = better to use right now. */
