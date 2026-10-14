@@ -114,8 +114,8 @@ live in its slot (and whether that one is included or inherited), and the whole 
 order, with what limits each account: live elsewhere, quarantined, or not an auto-switch
 target. It ends with the global slot and the guard's state. `cctl usage` and `cctl timeline`
 end with a short per-folder section (the live account and the pool on one line), and
-`cctl accounts list` shows the reserved accounts in their own table, each with its email and
-the folders that include it.
+`cctl accounts list` shows the reserved accounts in their own table, each with its email, plan
+and billing (as the shared table shows them) and the folders that include it.
 
 Nesting is allowed: a subfolder can have its own rule, and the **longest matching rule
 wins**, with no merging: a nested rule does not add to its parent's, it replaces it there.

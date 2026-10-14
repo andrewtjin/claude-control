@@ -203,13 +203,15 @@ describe('renderReservedAccounts', () => {
     expect(renderReservedAccounts([])).toBe('');
   });
 
-  it('shows each reserved account with its email and the folders that include it', () => {
+  it('shows each reserved account with its email, plan, billing and the folders that include it', () => {
     const out = renderReservedAccounts(
       [
         {
           id: 'e-1',
           label: 'E',
           email: 'e@example.com',
+          plan: '5x',
+          billing: '~Oct 20 (est.)',
           quarantined: false,
           live: true,
           includedBy: ['C:\\repos\\research', 'C:\\repos\\labs'],
@@ -218,6 +220,8 @@ describe('renderReservedAccounts', () => {
           id: 'b-1',
           label: 'B',
           email: undefined,
+          plan: '?',
+          billing: 'unknown',
           quarantined: true,
           live: false,
           includedBy: ['C:\\repos\\research'],
@@ -226,21 +230,47 @@ describe('renderReservedAccounts', () => {
       PLAIN_PALETTE,
     );
     expect(out).toContain('Reserved to folder rules');
-    expect(out).toMatch(/EMAIL\s+STATUS\s+INCLUDED BY/);
+    expect(out).toMatch(/EMAIL\s+PLAN\s+BILLING\s+STATUS\s+INCLUDED BY/);
     const e = out.split('\n').find((l) => l.includes('e@example.com'))!;
     expect(e.startsWith('*')).toBe(true);
+    expect(e).toMatch(/e@example\.com\s+5x\s+~Oct 20 \(est\.\)\s+ok\s/);
     expect(e).toContain('C:\\repos\\research; C:\\repos\\labs');
     const b = out.split('\n').find((l) => l.includes('b-1'))!;
-    expect(b).toContain(' - ');
-    expect(b).toContain('quarantined');
+    expect(b).toMatch(/ - +\? +unknown +quarantined /);
   });
 
-  it('strips control sequences from a crafted label or email', () => {
+  it('starts every cell of a column at the same offset as its header', () => {
+    // Pad first, paint after: a plan or billing cell wider than its header must push every column
+    // after it right on every line, or the table reads as shifted.
+    const row = (id: string, plan: string, billing: string) => ({
+      id,
+      label: id.toUpperCase(),
+      email: `${id}@example.com`,
+      plan,
+      billing,
+      quarantined: false,
+      live: false,
+      includedBy: ['C:\\r'],
+    });
+    const out = renderReservedAccounts([row('e', '20x', 'trial->Nov 3'), row('f', '?', 'unknown')]);
+    const [, header, ...rows] = out.split('\n');
+    for (const col of ['PLAN', 'BILLING', 'STATUS', 'INCLUDED BY', 'ID']) {
+      const at = header!.indexOf(col);
+      for (const line of rows) {
+        expect(line.slice(at - 2, at)).toBe('  ');
+        expect(line[at]).not.toBe(' ');
+      }
+    }
+  });
+
+  it('strips control sequences from a crafted label, email or billing', () => {
     const out = renderReservedAccounts([
       {
         id: 'x',
         label: 'a\u001b[31m',
         email: 'e\u202e@x',
+        plan: '?',
+        billing: 'inv\u001b[2Joice',
         quarantined: false,
         live: false,
         includedBy: ['C:\\r\u0007'],

@@ -854,7 +854,9 @@ export class SwitchEngine {
   /** The sweep proper — see {@link backfillAccountMetadata}, which owns its no-throw contract. */
   private async sweepAccountMetadata(): Promise<number> {
     const now = this.clock();
-    const stale = (await this.vault.listAccounts()).filter((a) => needsMetadataBackfill(a, now));
+    // Every row, reserved ones included: `accounts list` renders PLAN/BILLING for both tables, and
+    // a reserved account is never in the shared list this would otherwise read.
+    const stale = (await this.vault.listAllAccounts()).filter((a) => needsMetadataBackfill(a, now));
     if (stale.length === 0) return 0;
     const repaired = await this.withCredentialLockIfFree(async () => {
       let count = 0;
