@@ -8,6 +8,8 @@ import {
   renderFolders,
   renderReservedAccounts,
   renderWhere,
+  resumeCommand,
+  resumeSessionCommand,
   shellQuote,
   vscodeProfileName,
   vscodeProfileNames,
@@ -16,6 +18,7 @@ import {
   type PoolEntryView,
 } from './folderRender.js';
 import { ANSI_PALETTE, PLAIN_PALETTE } from './ansi.js';
+import { shellQuoteArg } from '@claude-control/switch-engine';
 
 const entry = (over: Partial<PoolEntryView> & { label: string }): PoolEntryView => ({
   source: 'inherited',
@@ -381,6 +384,118 @@ describe('renderWhere', () => {
       'win32',
     );
     expect(out).toContain("code --profile 'cctl-my-app-r2' 'C:\\code\\my-app'");
+  });
+});
+
+describe('session alias rules in the folder views', () => {
+  const sessionRule: FolderRuleView = {
+    ...research,
+    label: 'session "Auth Work" in C:\\repos\\research',
+    folders: [],
+    aliases: [{ folder: 'C:\\repos\\research', alias: 'Auth Work' }],
+  };
+
+  it('renderFolderRule lists each alias scope under its rule', () => {
+    const out = renderFolderRule(sessionRule, PLAIN_PALETTE);
+    expect(out).toContain('  session:  "Auth Work" in C:\\repos\\research');
+    expect(out).not.toContain('  folder:');
+    expect(out).not.toContain('never matches');
+  });
+
+  it('flags an alias no session title can carry (too long, in code points, or ill-formed)', () => {
+    for (const alias of ['x'.repeat(201), 'ab\uD800cd']) {
+      const out = renderFolderRule(
+        { ...sessionRule, aliases: [{ folder: 'C:\\r', alias }] },
+        PLAIN_PALETTE,
+      );
+      expect(out).toContain('never matches');
+    }
+    // 200 code points, 205 UTF-16 units: Claude Code keeps it whole.
+    const fits = 'a'.repeat(195) + '\u{1F600}'.repeat(5);
+    expect(
+      renderFolderRule({ ...sessionRule, aliases: [{ folder: 'C:\\r', alias: fits }] }),
+    ).not.toContain('never matches');
+  });
+
+  it('strips terminal controls from an alias it prints', () => {
+    const out = renderFolderRule(
+      { ...sessionRule, aliases: [{ folder: 'C:\\r', alias: 'a\u001b[31mb' }] },
+      PLAIN_PALETTE,
+    );
+    expect(out).not.toContain('\u001b');
+  });
+
+  it('the compact section names the session beside the folders', () => {
+    const out = renderFolderRulesSection([sessionRule], PLAIN_PALETTE);
+    expect(out).toContain('session "Auth Work" in C:\\repos\\research');
+  });
+
+  it('cctl where lists the named sessions with a rule here, with how to start each', () => {
+    const out = renderWhere(
+      {
+        folder: 'C:\\repos\\research',
+        rule: null,
+        global: globalSlot,
+        aliases: [
+          {
+            alias: "it's here",
+            ruleLabel: 'Research',
+            include: ['E'],
+            exclude: ['D'],
+            liveLabel: 'E',
+          },
+        ],
+      },
+      PLAIN_PALETTE,
+      'win32',
+    );
+    expect(out).toContain('Named sessions with a rule of their own here');
+    expect(out).toContain('"it\'s here" -> Research (uses E first, excludes D), live: E');
+    expect(out).toContain("resume it with: cctl claude --resume 'it''s here'");
+    // --resume cannot start a new session; --name does.
+    expect(out).toContain("start it with:  cctl claude --name 'it''s here'");
+    expect(out).not.toContain('start or resume');
+    expect(out).not.toContain('cd ');
+  });
+
+  it('asked about another folder, prints commands that change to it first', () => {
+    const out = renderWhere(
+      {
+        folder: 'C:\\repo',
+        rule: null,
+        global: globalSlot,
+        aliases: [
+          { alias: 'auth work', ruleLabel: 'R', include: [], exclude: [], liveLabel: null },
+        ],
+        elsewhere: true,
+      },
+      PLAIN_PALETTE,
+      'win32',
+    );
+    expect(out).toContain("resume it with: cd 'C:\\repo'; cctl claude --resume 'auth work'");
+    expect(out).toContain("start it with:  cd 'C:\\repo'; cctl claude --name 'auth work'");
+  });
+
+  it('quotes exactly like the copy the enforcement guard embeds', () => {
+    for (const value of ["a'b", 'a\u2019b', 'x $(y) `z`', 'plain']) {
+      for (const platform of ['win32', 'linux'] as const) {
+        expect(shellQuote(value, platform)).toBe(shellQuoteArg(value, platform));
+      }
+    }
+  });
+
+  it('resumes ONE known session by its id, and an alias only when it can be pasted', () => {
+    const SID = 'aaaaaaaa-0000-4000-8000-000000000001';
+    expect(resumeSessionCommand(SID, 'Auth Work', 'win32')).toBe(`cctl claude --resume ${SID}`);
+    expect(resumeSessionCommand('not-an-id', 'Auth Work', 'win32')).toBe(
+      "cctl claude --resume 'Auth Work'",
+    );
+    expect(resumeCommand('  Auth Work ', { platform: 'linux' })).toBe(
+      "cctl claude --resume 'Auth Work'",
+    );
+    // A title a terminal could not show verbatim is never printed as an argument.
+    expect(resumeCommand('a\u001bb', { sessionId: SID })).toBe(`cctl claude --resume ${SID}`);
+    expect(resumeCommand('a\u001bb')).toBe('cctl claude --resume');
   });
 });
 

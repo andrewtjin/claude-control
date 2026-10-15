@@ -6,6 +6,11 @@
 // sanitizeForTerminal before it reaches the terminal (see ansi.ts): a label carrying an ANSI or bidi
 // escape can neither recolor the surface nor reorder a path.
 
+import {
+  CLAUDE_CODE_TITLE_MAX_LENGTH,
+  aliasFitsSessionTitle,
+  shellQuoteArg,
+} from '@claude-control/switch-engine';
 import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
 
 /** Where an account of a folder's pool comes from: the rule's own included accounts, or the shared
@@ -39,6 +44,8 @@ export interface SlotLiveView {
 export interface FolderRuleView {
   label: string;
   folders: string[];
+  /** Session-alias scopes (the alias as the rule holds it, in its exact folder); absent when none. */
+  aliases?: { folder: string; alias: string }[];
   /** Labels of the included (reserved) accounts, in preference order. */
   include: string[];
   /** Labels of the shared accounts the folder must not use. */
@@ -228,12 +235,31 @@ function ruleBodyLines(view: FolderRuleView, palette: Palette): string[] {
   ];
 }
 
-/** One rule in full: its folders, what it includes and excludes, the live account, the effective
- *  pool in order with availability, and its profile dir. */
+/** A rule's session-alias scope lines. An alias scope covers one named session recorded in exactly
+ *  that folder (not its subfolders). One no session title can carry — longer than Claude Code keeps
+ *  a session name, or not well-formed text (only a hand edit stores one) — can never match a
+ *  session: said so, since it silently applies to nothing. */
+function aliasScopeLines(view: Pick<FolderRuleView, 'aliases'>, palette: Palette): string[] {
+  return (view.aliases ?? []).map(
+    (a) =>
+      `  session:  "${sanitizeForTerminal(a.alias)}" in ${sanitizeForTerminal(a.folder)}` +
+      (aliasFitsSessionTitle(a.alias)
+        ? ''
+        : '  ' +
+          palette.yellow(
+            `(never matches: no session title can carry it — longer than ` +
+              `${CLAUDE_CODE_TITLE_MAX_LENGTH} characters, or not well-formed text; reset it)`,
+          )),
+  );
+}
+
+/** One rule in full: its folders and session aliases, what it includes and excludes, the live
+ *  account, the effective pool in order with availability, and its profile dir. */
 export function renderFolderRule(view: FolderRuleView, palette: Palette = PLAIN_PALETTE): string {
   return [
     palette.bold(sanitizeForTerminal(view.label)),
     ...view.folders.map((f) => `  folder:   ${sanitizeForTerminal(f)}`),
+    ...aliasScopeLines(view, palette),
     ...ruleBodyLines(view, palette),
     `  profile:  ${palette.dim(sanitizeForTerminal(view.profileDir))}`,
   ].join('\n');
@@ -285,10 +311,12 @@ export function renderFolderGuardFooter(
   return `${enforceLine}\n${freshness}`;
 }
 
-/** The hint every empty view ends on: both ways to give a folder a rule. */
+/** The hint every empty view ends on: both ways to give a folder a rule, and the way to give a named
+ *  session one. */
 export const ADD_FOLDER_RULE_HINT =
   'Add one with: cctl folder include <folder> <account>[,<account>...]\n' +
-  '          or: cctl folder exclude <folder> <account>[,<account>...]';
+  '          or: cctl folder exclude <folder> <account>[,<account>...]\n' +
+  'For one named session: cctl session include <alias> <account>[,<account>...]';
 
 /** The full `cctl folders` view: every rule, the global slot, then the guard footer. */
 export function renderFolders(
@@ -318,7 +346,12 @@ export function renderFolderRulesSection(
   const blocks = rules.map((r) =>
     [
       `${palette.bold(sanitizeForTerminal(r.label))}  ${palette.dim(
-        r.folders.map((f) => sanitizeForTerminal(f)).join(', '),
+        [
+          ...r.folders.map((f) => sanitizeForTerminal(f)),
+          ...(r.aliases ?? []).map(
+            (a) => `session "${sanitizeForTerminal(a.alias)}" in ${sanitizeForTerminal(a.folder)}`,
+          ),
+        ].join(', '),
       )}`,
       `  live: ${describeSlotLive(r.live, r.pool, ruleSlotKind(r), palette)}`,
       `  pool: ${poolInline(r.pool, palette)}`,
@@ -410,16 +443,122 @@ export interface WhereView {
    *  name its label alone gives). */
   rule: (FolderRuleView & { matchedFolder: string; vscodeProfile?: string }) | null;
   global: GlobalSlotView;
+  /** Named sessions with a rule of their own in EXACTLY this folder: they outrank the folder's rule
+   *  above. */
+  aliases?: WhereAliasView[];
+  /** The folder asked about is not the current directory. `cctl claude` finds a named session in
+   *  the folder it runs in, so a command printed for one here must change to this folder first. */
+  elsewhere?: boolean;
+}
+
+/** One named session with a rule of its own in the queried folder, for `cctl where`. */
+export interface WhereAliasView {
+  /** The alias as the rule holds it. */
+  alias: string;
+  ruleLabel: string;
+  /** Labels of the rule's included accounts. */
+  include: string[];
+  /** Labels of the shared accounts it excludes. */
+  exclude: string[];
+  /** The account live in the rule's slot, or null. */
+  liveLabel: string | null;
+}
+
+/** The `cctl where` section naming the sessions with a rule of their own in the folder, or [] when
+ *  none. */
+function whereAliasLines(view: WhereView, palette: Palette, platform: NodeJS.Platform): string[] {
+  const aliases = view.aliases ?? [];
+  if (aliases.length === 0) return [];
+  const cd =
+    view.elsewhere === true ? `cd ${shellQuote(sanitizeForTerminal(view.folder), platform)}; ` : '';
+  const lines = [
+    '',
+    'Named sessions with a rule of their own here (they outrank any folder rule):',
+  ];
+  for (const a of aliases) {
+    const alias = sanitizeForTerminal(a.alias);
+    const uses =
+      a.include.length > 0
+        ? `uses ${a.include.map((m) => sanitizeForTerminal(m)).join(', ')} first`
+        : 'uses the shared pool';
+    const excludes =
+      a.exclude.length > 0
+        ? `, excludes ${a.exclude.map((m) => sanitizeForTerminal(m)).join(', ')}`
+        : '';
+    const live = a.liveLabel ? sanitizeForTerminal(a.liveLabel) : 'none usable';
+    lines.push(
+      `  "${alias}" -> ${palette.bold(sanitizeForTerminal(a.ruleLabel))} (${uses}${excludes}), live: ${live}`,
+    );
+    lines.push(`    resume it with: ${cd}${resumeCommand(a.alias, { platform })}`);
+    const start = startCommand(a.alias, platform);
+    if (start !== null) lines.push(`    start it with:  ${cd}${start}`);
+  }
+  return lines;
+}
+
+/** The command that starts a NEW session under `alias` (`--resume` only opens an existing one), or
+ *  null for an alias a terminal could not show verbatim, which cannot be printed as a working
+ *  argument. */
+function startCommand(alias: string, platform: NodeJS.Platform): string | null {
+  const text = alias.trim();
+  return text !== '' && sanitizeForTerminal(text) === text
+    ? `cctl claude --name ${shellQuoteArg(text, platform)}`
+    : null;
 }
 
 /** Quote one argument so it pastes into the operator's shell as a single literal word: PowerShell
- *  single quotes (a `'` doubled) on Windows, POSIX single quotes (`'\''`) elsewhere. Single quotes
- *  because nothing inside them expands in either shell — a folder or label may hold `$`, a backtick
- *  or a double quote. */
+ *  single quotes (every single-quote character doubled) on Windows, POSIX single quotes (`'\''`)
+ *  elsewhere. Single quotes because nothing inside them expands in either shell — a folder, label or
+ *  session alias may hold `$`, a backtick or a double quote. The rule itself is switch-engine's
+ *  shellQuoteArg, the same function the enforcement guard embeds, so a command the CLI prints and one
+ *  the guard prints can never quote differently. */
 export function shellQuote(value: string, platform: NodeJS.Platform = process.platform): string {
-  return platform === 'win32'
-    ? `'${value.replace(/'/g, "''")}'`
-    : `'${value.replace(/'/g, "'\\''")}'`;
+  return shellQuoteArg(value, platform);
+}
+
+/**
+ * The command that resumes a named session on the accounts its rule names, safe to paste: the FULL
+ * alias as one single-quoted literal for the operator's shell (switch-engine's shellQuoteArg:
+ * PowerShell on Windows, POSIX elsewhere — the same quoting the enforcement guard prints), trimmed
+ * the way `claude --resume` trims it. Display text around it may be shortened; this never is. An
+ * alias a terminal could not show verbatim (one carrying a control or bidi character — a title read
+ * from a transcript, never an alias a rule holds, which the engine refuses) cannot be printed as a
+ * working argument, so the session id is used instead when the caller has it, else the bare picker
+ * form.
+ */
+export function resumeCommand(
+  alias: string,
+  opts: { sessionId?: string; platform?: NodeJS.Platform } = {},
+): string {
+  const platform = opts.platform ?? process.platform;
+  const text = alias.trim();
+  if (text !== '' && sanitizeForTerminal(text) === text) {
+    return `cctl claude --resume ${shellQuoteArg(text, platform)}`;
+  }
+  const id = opts.sessionId;
+  return id !== undefined && /^[0-9a-f-]{8,64}$/i.test(id)
+    ? `cctl claude --resume ${id}`
+    : 'cctl claude --resume';
+}
+
+/** A session id as Claude Code writes it (a UUID): paste-safe with no quoting at all. */
+const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The command that resumes ONE known session on its rule's accounts: by its id, which names exactly
+ * that conversation — its alias may be shared by other sessions Claude Code's title search reaches,
+ * and then `--resume <alias>` reopens the picker and the launcher can route the pick only by the
+ * folder rule. The enforcement guard prints the same form. Falls back to {@link resumeCommand} when
+ * the id is not a well-formed session id.
+ */
+export function resumeSessionCommand(
+  sessionId: string,
+  alias: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return SESSION_UUID.test(sessionId)
+    ? `cctl claude --resume ${sessionId}`
+    : resumeCommand(alias, { platform });
 }
 
 /** The VS Code profile name `cctl where` suggests for a folder rule: `cctl-<label>`, reduced to
@@ -491,6 +630,7 @@ export function renderWhere(
       // Quoted like the VS Code command below: these are pasted, and a folder may hold spaces.
       `Give this folder its own rule with: cctl folder include ${quoted} <account>[,<account>...]`,
       `                                or: cctl folder exclude ${quoted} <account>[,<account>...]`,
+      ...whereAliasLines(view, palette, platform),
     ].join('\n');
   }
   const r = view.rule;
@@ -525,5 +665,6 @@ export function renderWhere(
     '  2. in that window run "Preferences: Open User Settings (JSON)" and add:',
     vscodeSnippet,
     `  3. open this folder with the same command from then on. Other windows keep the global slot.`,
+    ...whereAliasLines(view, palette, platform),
   ].join('\n');
 }

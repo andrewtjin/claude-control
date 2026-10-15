@@ -12,6 +12,7 @@ export {
   type ActivationIntervalRow,
   type PendingPermissionRow,
   type SessionRow,
+  type SessionSlotSpanRow,
   type OutboxRow,
 } from './store.js';
 
@@ -55,6 +56,12 @@ export {
 } from './usageHistory.js';
 
 export { AttributionJournal, type AttributionJournalOptions } from './attributionJournal.js';
+export {
+  SessionSlotRecorder,
+  type SessionSlotRecorderOptions,
+  type SessionSighting,
+  type SlotForConfigDir,
+} from './sessionSlotRecorder.js';
 
 export { globalSlotAccountIds } from './folderSlots.js';
 
@@ -99,11 +106,16 @@ export {
 
 export {
   aggregateTokenStats,
+  buildSlotAt,
+  buildTurnAttributor,
   localDayKey,
   totalTokens,
   UNATTRIBUTED_LABEL,
   type ActivationWindow,
   type AggregateTokenStatsOptions,
+  type SessionSlotSpan,
+  type SlotAt,
+  type TurnAttributionInputs,
 } from './tokenStats.js';
 
 export {
@@ -295,3 +307,27 @@ export {
   type DaemonOptions,
   type SwitchEngineLike,
 } from './daemon.js';
+
+export {
+  readSessionCatalog,
+  sessionIdentities,
+  canonicalRecordedFolder,
+  aliasOf,
+  aliasKey,
+  projectDirMatches,
+  projectDirStem,
+  type SessionMeta,
+  type SessionCatalog,
+  type ReadSessionCatalogOptions,
+} from './sessionCatalog.js';
+
+export {
+  resolveSessionRef,
+  aliasedSessions,
+  accountsBySession,
+  sameFolder,
+  UNATTRIBUTED_SESSION_LABEL,
+  type SessionRefResolution,
+  type SessionAccountUse,
+  type SessionLookupFolder,
+} from './sessionLookup.js';

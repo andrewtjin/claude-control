@@ -36,7 +36,9 @@ import {
   exhaustionLogPath,
   HeartbeatWriter,
   HookReceiver,
+  SessionSlotRecorder,
   Store,
+  sessionIdentities,
   UsagePoller,
   bindGuardPath,
   buildDaemonHookSpecs,
@@ -453,6 +455,13 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // built after the receiver, so the route gets a slot the sequence is dropped into once it
   // exists — which happens in this same synchronous pass, before the receiver ever listens.
   let requestStop: () => void = () => {};
+  // Every hook event reports its session's config dir; recording the slot it maps to is what lets
+  // stats and `cctl session show` bill a hand-started ruled folder's session to the right account.
+  const sessionSlotRecorder = new SessionSlotRecorder({
+    store,
+    slotForConfigDir: (configDir) => engine.slotForConfigDir(configDir),
+    logger,
+  });
   const hookReceiver = new HookReceiver({
     store,
     secret: hookSecret,
@@ -470,6 +479,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     // report (persisted as the record's resume anchor on session_init).
     isManagedSession: (sessionId) =>
       sessionManager.list().some((r) => r.id === sessionId || r.resumeId === sessionId),
+    onSessionSeen: (sighting) => sessionSlotRecorder.observe(sighting),
     ...(config.values.permissionHoldMs !== undefined
       ? { permissionHoldMs: config.values.permissionHoldMs }
       : {}),
@@ -575,7 +585,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
         ownedCommandMarker: DEFAULT_SECRET_HEADER,
       });
       // Reconcile the enforcement guard beside the forwarder, keyed off whether any folder is bound.
-      // Without this the guard is never installed and folder bindings are recorded but never enforced
+      // Without this the guard is never installed and folder rules are recorded but never enforced
       // at prompt time. The snapshot it reads was refreshed just before this in Daemon.start(), so a
       // restart always leaves the guard consistent with the live registry. Fail-open with the rest of
       // this closure: a settings.json we cannot write only degrades enforcement, never daemon startup.
@@ -602,6 +612,11 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     // Real SDK adapter with the daemon's logger on the accountId fall-through — see
     // makeAgentSdkClientFactory for the shared-config/hot-swap tradeoff behind its deps.
     createAgentSdkClient: makeAgentSdkClientFactory(logger),
+    // A session's custom title and recorded folder, read from its one transcript under this config
+    // dir, so a phone spawn that resumes a NAMED session, and a named background session the mover
+    // considers, land on that alias's rule (see resolveSessionRuleFor).
+    sessionIdentityOf: async (sessionId) =>
+      (await sessionIdentities(paths.claudeDir, [sessionId])).get(sessionId.toLowerCase()) ?? null,
     // Present only when the operator hasn't opted out — the Daemon stamps it onto every
     // managed spawn/resume, and its absence IS the off switch (no policy, no retries).
     ...(config.values.autoContinue

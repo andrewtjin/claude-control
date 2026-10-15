@@ -14,6 +14,8 @@ import {
   checkGuardSnapshot,
   checkGuardHook,
   checkFolderRules,
+  checkRuleScopes,
+  checkDaemonAliasRules,
   checkDaemonFolderRules,
   checkVersionSkew,
   checkPowerShellWrapper,
@@ -33,6 +35,7 @@ import {
   InsecurePassthroughProtector,
   SwitchEngine,
   sandboxPaths,
+  type FolderRule,
   type LiveCredentialChannel,
 } from '@claude-control/switch-engine';
 
@@ -596,6 +599,68 @@ describe('checkPowerShellWrapper', () => {
   });
 });
 
+describe('checkRuleScopes', () => {
+  const rule = (over: Partial<FolderRule>): FolderRule => ({
+    id: 'r1',
+    label: 'Research',
+    folders: [],
+    include: [],
+    exclude: [],
+    activeId: null,
+    createdAtMs: 1,
+    updatedAtMs: 1,
+    ...over,
+  });
+
+  it('passes when every rule has a folder or a session alias', () => {
+    expect(
+      checkRuleScopes([
+        rule({ folders: ['C:\\a'] }),
+        rule({ aliases: [{ folder: 'C:\\a', alias: 'x' }] }),
+      ]),
+    ).toMatchObject({ name: 'rule-scopes', ok: true });
+  });
+
+  it('flags a rule that applies to nothing, naming it', () => {
+    const check = checkRuleScopes([rule({ label: 'Lost' })]);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('1 rule(s) apply to nothing');
+    expect(check.detail).toContain('Lost');
+  });
+
+  it('flags an alias no session can carry, with the command that removes it', () => {
+    for (const alias of ['y'.repeat(201), 'ab\uD800cd']) {
+      const check = checkRuleScopes([rule({ aliases: [{ folder: 'C:\\a', alias }] })]);
+      expect(check.ok).toBe(false);
+      expect(check.detail).toContain('never match a session');
+      expect(check.detail).toContain('cctl session reset ');
+    }
+    // Counted in code points: 200 of them (205 UTF-16 units) still fit.
+    const fits = 'a'.repeat(195) + '\u{1F600}'.repeat(5);
+    expect(checkRuleScopes([rule({ aliases: [{ folder: 'C:\\a', alias: fits }] })]).ok).toBe(true);
+  });
+});
+
+describe('checkDaemonAliasRules', () => {
+  const alive = { state: 'alive', writtenAtMs: 1, ageMs: 1 } as const;
+  const report = (rows: { name: string; value: string }[]) => ({
+    startedAtMs: 1,
+    settings: rows.map((r) => ({ ...r, source: 'default' as const })),
+  });
+
+  it('flags a live daemon that predates alias rules only when an alias rule exists', () => {
+    const older = report([{ name: 'folder rules', value: 'supported' }]);
+    expect(checkDaemonAliasRules(older, alive, true)).toMatchObject({
+      name: 'daemon-alias-rules',
+      ok: false,
+    });
+    expect(checkDaemonAliasRules(older, alive, false)).toMatchObject({ ok: true });
+    const current = report([{ name: 'session alias rules', value: 'supported' }]);
+    expect(checkDaemonAliasRules(current, alive, true)).toMatchObject({ ok: true });
+    expect(checkDaemonAliasRules(older, { state: 'never' }, true)).toMatchObject({ ok: true });
+  });
+});
+
 describe('checkFolderRules', () => {
   let root: string;
   beforeEach(async () => {
@@ -655,7 +720,12 @@ describe('checkFolderRules', () => {
   it('adds no extra line when the rules read fine', async () => {
     const out = await checkFolderRules(sandboxEngine(), sandboxPaths(root));
 
-    expect(out.map((c) => c.name)).toEqual(['slots', 'guard-snapshot', 'guard-hook']);
+    expect(out.map((c) => c.name)).toEqual([
+      'slots',
+      'rule-scopes',
+      'guard-snapshot',
+      'guard-hook',
+    ]);
     expect(out.every((c) => c.ok)).toBe(true);
   });
 });

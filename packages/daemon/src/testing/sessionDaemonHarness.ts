@@ -24,6 +24,7 @@ import type {
   Logger,
   RecoverResult,
   ReauthResult,
+  SessionIdentity,
   StoredAccount,
 } from '@claude-control/switch-engine';
 import type {
@@ -318,6 +319,9 @@ export interface HarnessOptions {
   /** The daemon passes the resolved config dir of a folder-bound spawn (undefined for a shared
    *  spawn); a test can capture it to assert the SDK client is bound to the group's profile dir. */
   createAgentSdkClient?: (configDir?: string) => AgentSdkClient;
+  /** The resumed-session identity seam (see DaemonOptions.sessionIdentityOf); absent = folder-only
+   *  routing. */
+  sessionIdentityOf?: (sessionId: string) => Promise<SessionIdentity | null>;
   autoContinue?: { maxAttempts?: number; schedule?: (fn: () => void, ms: number) => () => void };
   autoSwitcher?: AutoSwitcherLike;
   /** Effectively off by default: most tests drive exactly one cycle via start(). */
@@ -381,6 +385,9 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
     // that never let a real managed session run behind the daemon.
     createAgentSdkClient: options.createAgentSdkClient ?? (() => scriptedAgentSdkClient([])),
     ...(options.autoContinue !== undefined ? { autoContinue: options.autoContinue } : {}),
+    ...(options.sessionIdentityOf !== undefined
+      ? { sessionIdentityOf: options.sessionIdentityOf }
+      : {}),
     ...(options.autoSwitcher !== undefined ? { autoSwitcher: options.autoSwitcher } : {}),
     ...(options.logger !== undefined ? { logger: options.logger } : {}),
     pollIntervalMs: options.pollIntervalMs ?? 100_000,

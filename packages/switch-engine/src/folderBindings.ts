@@ -26,6 +26,7 @@ import type {
 import { createHash } from 'node:crypto';
 import { atomicWriteFile, readJsonIfExists } from './fsutil.js';
 import { VaultError } from './errors.js';
+import { scopedRuleOf } from './folderRules.js';
 
 /** Schema tag for `folder-bindings.json`. The guard treats an unknown value as "fail open"; this
  *  trusted reader treats it as a corrupt file and refuses it by name. */
@@ -54,6 +55,11 @@ export interface BuildSnapshotInput {
   /** Maps a rule id to its on-disk profile dir; the guard matches a session's config dir against
    *  the value. Injected so the vault's path convention stays in one place (see `paths.ts`). */
   profileDirOf: (ruleId: string) => string;
+  /** The path rules the rules' stored folders are canonicalized under: the platform the registry
+   *  was read under, which is the one the guard and the launcher compare folders on. Required, never
+   *  defaulted to the host's, so a registry read under one platform's rules is never rewritten under
+   *  another's (a Windows folder read as a POSIX path would gain a leading slash). */
+  platform: NodeJS.Platform;
 }
 
 /** The namespace every identity key is taken in, so a key is useless anywhere but here. The guard
@@ -80,8 +86,9 @@ function identityOf(a: StoredAccount): FolderBindingSnapshotIdentity {
 }
 
 /**
- * Build the guard snapshot from the folder rules. Pure: no IO, so it is trivially testable and the
- * caller decides when to persist it. Every rule becomes a row of {folders, profileDir, LABELS of its
+ * Build the guard snapshot from the folder rules. Pure: no IO (stored folders are canonicalized as
+ * strings, under `input.platform`), so it is trivially testable and the caller decides when to
+ * persist it. Every rule becomes a row of {folders, profileDir, LABELS of its
  * included accounts in include order, the identities of the shared accounts it excludes} — no tokens.
  * A rule that only excludes has an empty member list; the guard words its message for that case. An
  * excluded id naming no shared row is inert (see `FolderRule.exclude`) and is left out, exactly as
@@ -91,17 +98,32 @@ function identityOf(a: StoredAccount): FolderBindingSnapshotIdentity {
 export function buildFolderBindingSnapshot(input: BuildSnapshotInput): FolderBindingSnapshot {
   const labelOf = (id: string): string | undefined =>
     input.reserved.find((a) => a.id === id)?.label;
-  const groups: FolderBindingSnapshotGroup[] = input.rules.map((r) => ({
-    id: r.id,
-    label: r.label,
-    profileDir: input.profileDirOf(r.id),
-    folders: r.folders.slice(),
-    members: r.include.map(labelOf).filter((l): l is string => l !== undefined),
-    excluded: r.exclude
-      .map((id) => input.shared.find((a) => a.id === id))
-      .filter((a): a is StoredAccount => a !== undefined)
-      .map(identityOf),
-  }));
+  const groups: FolderBindingSnapshotGroup[] = input.rules.map((r) => {
+    // The rule's folders in their canonical spelling, as the launcher and `where` match them, so a
+    // hand-edited spelling cannot route a session onto a slot the guard then refuses. Each alias
+    // scope as its canonical folder and comparison key plus the alias as entered, which the guard
+    // only ever shows. Written only when the rule has one, so a snapshot without alias rules keeps
+    // the shape older guards read.
+    const scoped = scopedRuleOf(r, input.platform);
+    const stored = r.aliases ?? [];
+    const aliases = (scoped.aliases ?? []).map((a, i) => ({
+      folder: a.folder,
+      aliasKey: a.aliasKey,
+      alias: stored[i]?.alias ?? a.aliasKey,
+    }));
+    return {
+      id: r.id,
+      label: r.label,
+      profileDir: input.profileDirOf(r.id),
+      folders: scoped.folders.slice(),
+      members: r.include.map(labelOf).filter((l): l is string => l !== undefined),
+      excluded: r.exclude
+        .map((id) => input.shared.find((a) => a.id === id))
+        .filter((a): a is StoredAccount => a !== undefined)
+        .map(identityOf),
+      ...(aliases.length > 0 ? { aliases } : {}),
+    };
+  });
   const accounts: FolderBindingSnapshotAccount[] = [...input.shared, ...input.reserved].map(
     (a) => ({
       ...identityOf(a),
@@ -122,7 +144,7 @@ export function buildFolderBindingSnapshot(input: BuildSnapshotInput): FolderBin
 /**
  * Whether two snapshots are equal in the fields the guard actually reads — enforce mode, main config
  * dir and identity file, the stored accounts' identities, and every rule's
- * id/label/profileDir/folders/members/excluded. The `generation` is DELIBERATELY
+ * id/label/profileDir/folders/aliases/members/excluded. The `generation` is DELIBERATELY
  * ignored: it bumps on registry writes the guard never sees (a rule's live account, metadata), and
  * comparing it would report a snapshot as stale after a routine switch even though nothing the guard
  * enforces changed. Pure.
@@ -155,6 +177,8 @@ function guardRelevantKey(s: FolderBindingSnapshot): string {
       members: g.members,
       excluded:
         g.excluded?.map((e) => [e.label, e.accountKey ?? null, e.organizationKey ?? null]) ?? null,
+      // A snapshot written before alias rules existed has no field; it means "none".
+      aliases: g.aliases?.map((a) => [a.folder, a.aliasKey, a.alias ?? null]) ?? [],
     })),
   });
 }

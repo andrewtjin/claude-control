@@ -48,6 +48,60 @@ export interface AggregateTokenStatsOptions {
    *  falls to the global timeline. Optional and empty by default, so a caller that does not track
    *  slots gets exactly the pre-slot, global-only behavior. */
   slotBySession?: ReadonlyMap<string, string>;
+  /** Recorded slot spans (store `session_slot_spans`), any order. A turn inside a span of its
+   *  session is attributed against that span's slot; a turn before its session's first span (or of
+   *  a session with none) falls back to {@link slotBySession}. See {@link buildSlotAt}. */
+  slotSpans?: readonly SessionSlotSpan[];
+}
+
+/** One recorded span: from `startedAtMs` on, `sessionId` ran in `slot`. The store's
+ *  `SessionSlotSpanRow` satisfies it structurally. */
+export interface SessionSlotSpan {
+  sessionId: string;
+  slot: string;
+  startedAtMs: number;
+}
+
+/** Which slot a session's turn at `tsMs` ran in. */
+export type SlotAt = (sessionId: string | null | undefined, tsMs: number) => string;
+
+/**
+ * Build the turn -> slot resolver attribution uses, from the two records that know a session's
+ * slot: the recorded spans (every hook-reporting session, precise in time) and the sessions mirror
+ * (registered and daemon-spawned sessions, one slot each).
+ *
+ * The span in force at the turn's time wins. A turn BEFORE the session's first span keeps the
+ * mirror's answer (else global) rather than borrowing the first span's slot: an old session
+ * resumed under a group profile would otherwise bill its whole pre-binding history to the group,
+ * and the earlier run's config dir is simply not known. Pure.
+ */
+export function buildSlotAt(
+  spans: readonly SessionSlotSpan[],
+  slotBySession: ReadonlyMap<string, string> = new Map(),
+): SlotAt {
+  const bySession = new Map<string, SessionSlotSpan[]>();
+  for (const span of spans) {
+    let list = bySession.get(span.sessionId);
+    if (list === undefined) {
+      list = [];
+      bySession.set(span.sessionId, list);
+    }
+    list.push(span);
+  }
+  for (const list of bySession.values()) list.sort((a, b) => a.startedAtMs - b.startedAtMs);
+
+  return (sessionId, tsMs) => {
+    if (sessionId == null) return GLOBAL_SLOT;
+    const list = bySession.get(sessionId);
+    if (list !== undefined) {
+      // Latest span that started at or before the turn (lists are short: one per slot change).
+      for (let i = list.length - 1; i >= 0; i--) {
+        const span = list[i];
+        if (span !== undefined && span.startedAtMs <= tsMs) return span.slot;
+      }
+    }
+    return slotBySession.get(sessionId) ?? GLOBAL_SLOT;
+  };
 }
 
 /** The label for turns no account can be claimed for. A visible bucket, never a silent drop —
@@ -117,13 +171,28 @@ function bucketRowsByTotal(totals: Map<string, TokenTotals>): TokenBucketRow[] {
     .sort((a, b) => totalTokens(b.totals) - totalTokens(a.totals));
 }
 
-/** Aggregate one scan into the wire payload. Pure: same inputs, same output, no clock read. */
-export function aggregateTokenStats(options: AggregateTokenStatsOptions): TokenStatsSnapshot {
-  // One start-ascending interval list PER slot: a turn is attributed only against the timeline of
-  // its own slot, so a group hop never truncates or claims the global account's spend (and vice
-  // versa). A legacy/absent slot reads as the global slot.
+/** The records that decide which account a turn is billed to. */
+export interface TurnAttributionInputs {
+  /** Activation intervals in ANY order; sorted and grouped by slot here. */
+  intervals: readonly ActivationWindow[];
+  slotBySession?: ReadonlyMap<string, string>;
+  slotSpans?: readonly SessionSlotSpan[];
+}
+
+/**
+ * Build the turn -> account function every per-account view shares (`cctl stats`, the phone's
+ * stats card, `cctl session show`), so they can never disagree about who a turn belongs to.
+ *
+ * One start-ascending interval list PER slot: a turn is attributed only against the timeline of
+ * its own slot (at the turn's time, see {@link buildSlotAt}), so a group hop never truncates or
+ * claims the global account's spend (and vice versa). A legacy/absent interval slot reads as the
+ * global slot. `null` = no account can be claimed for the turn. Pure.
+ */
+export function buildTurnAttributor(
+  inputs: TurnAttributionInputs,
+): (turn: Pick<TranscriptTurn, 'sessionId' | 'tsMs'>) => string | null {
   const intervalsBySlot = new Map<string, ActivationWindow[]>();
-  for (const interval of options.intervals) {
+  for (const interval of inputs.intervals) {
     const slot = interval.slot ?? GLOBAL_SLOT;
     let list = intervalsBySlot.get(slot);
     if (list === undefined) {
@@ -134,7 +203,14 @@ export function aggregateTokenStats(options: AggregateTokenStatsOptions): TokenS
   }
   for (const list of intervalsBySlot.values()) list.sort((a, b) => a.startedAtMs - b.startedAtMs);
   const noIntervals: ActivationWindow[] = [];
-  const slotBySession = options.slotBySession ?? new Map<string, string>();
+  const slotAt = buildSlotAt(inputs.slotSpans ?? [], inputs.slotBySession);
+  return (turn) =>
+    accountAt(intervalsBySlot.get(slotAt(turn.sessionId, turn.tsMs)) ?? noIntervals, turn.tsMs);
+}
+
+/** Aggregate one scan into the wire payload. Pure: same inputs, same output, no clock read. */
+export function aggregateTokenStats(options: AggregateTokenStatsOptions): TokenStatsSnapshot {
+  const accountFor = buildTurnAttributor(options);
 
   const overall = emptyTotals();
   // `null` keys the unattributed bucket. A Map (not two variables) so it sorts alongside the
@@ -145,10 +221,7 @@ export function aggregateTokenStats(options: AggregateTokenStatsOptions): TokenS
 
   for (const turn of options.scan.turns) {
     addTurn(overall, turn);
-    // The turn's slot from its session; an unknown session (or no session id) is the global slot.
-    const slot =
-      turn.sessionId != null ? (slotBySession.get(turn.sessionId) ?? GLOBAL_SLOT) : GLOBAL_SLOT;
-    const accountId = accountAt(intervalsBySlot.get(slot) ?? noIntervals, turn.tsMs);
+    const accountId = accountFor(turn);
     addTurn(getOrCreate(byAccount, accountId), turn);
     addTurn(getOrCreate(byModel, turn.model), turn);
     addTurn(getOrCreate(byDay, localDayKey(turn.tsMs)), turn);

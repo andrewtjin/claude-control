@@ -15,11 +15,17 @@ import {
 } from '@claude-control/switch-engine';
 import { findClaudeCodeBinary, type ClaudeCodeBinaryDeps } from '@claude-control/session-runtime';
 import { isBindGuardInSettingsText, type HeartbeatReading } from '@claude-control/daemon';
-import type { SwitchEngine } from '@claude-control/switch-engine';
+import {
+  CLAUDE_CODE_TITLE_MAX_LENGTH,
+  aliasFitsSessionTitle,
+  shellQuoteArg,
+  type FolderRule,
+  type SwitchEngine,
+} from '@claude-control/switch-engine';
 import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
 import type { AutostartState } from './autostart.js';
 import { describeEnforceMode } from './folderRender.js';
-import { olderDaemonReason } from './folderRulesSupport.js';
+import { olderDaemonAliasReason, olderDaemonReason } from './folderRulesSupport.js';
 import { verifyManagedSettingsEffective } from './managedSettings.js';
 import type { SettingsReport } from './settings.js';
 import { parsePowerShellWrapper, POWERSHELL_WRAPPER_MARKER } from './shellInit.js';
@@ -399,34 +405,96 @@ export async function checkGuardSnapshot(
   }
 }
 
+/** A rule with no folder and no session alias applies to nothing (only a hand edit leaves one),
+ *  while the accounts it includes stay reserved to it — usable nowhere but with an explicit
+ *  `--account`. Also flagged: a session alias no session title can carry (longer than Claude Code
+ *  keeps a session's name, or not well-formed text; again only a hand edit stores one), which never
+ *  matches — with the command that removes it. Pure over the rules. */
+export function checkRuleScopes(rules: readonly FolderRule[]): DoctorCheck {
+  const scopeless = rules.filter((r) => r.folders.length === 0 && (r.aliases ?? []).length === 0);
+  const unmatchable = rules.flatMap((r) =>
+    (r.aliases ?? []).filter((a) => !aliasFitsSessionTitle(a.alias)),
+  );
+  if (scopeless.length === 0 && unmatchable.length === 0) {
+    return { name: 'rule-scopes', ok: true, detail: 'every rule has a folder or a session alias' };
+  }
+  const problems: string[] = [];
+  if (scopeless.length > 0) {
+    problems.push(
+      `${scopeless.length} rule(s) apply to nothing (no folder or session alias): ` +
+        scopeless.map((r) => r.label).join('; ') +
+        ' — their included accounts stay reserved to them; edit groups.json to give each a folder, ' +
+        'or remove it',
+    );
+  }
+  if (unmatchable.length > 0) {
+    problems.push(
+      `${unmatchable.length} session alias(es) never match a session (no session title can carry ` +
+        `them: longer than the ${CLAUDE_CODE_TITLE_MAX_LENGTH} characters Claude Code keeps of a ` +
+        'session name, or not well-formed text) — remove them: ' +
+        unmatchable
+          .map(
+            (a) =>
+              `cctl session reset ${shellQuoteArg(a.alias, process.platform)} --cwd ` +
+              shellQuoteArg(a.folder, process.platform),
+          )
+          .join('; '),
+    );
+  }
+  return { name: 'rule-scopes', ok: false, detail: problems.join('; and ') };
+}
+
+/** Whether the running daemon honors session alias rules, when one exists (see
+ *  folderRulesSupport.ts): a daemon built before them cannot read a rules file holding one. No alias
+ *  rule, no running daemon, or one that says it honors them, is a pass. Pure. */
+export function checkDaemonAliasRules(
+  report: SettingsReport | undefined,
+  heartbeat: HeartbeatReading,
+  hasAliasRules: boolean,
+): DoctorCheck {
+  const reason = hasAliasRules ? olderDaemonAliasReason(report, heartbeat) : undefined;
+  if (reason !== undefined) return { name: 'daemon-alias-rules', ok: false, detail: reason };
+  return {
+    name: 'daemon-alias-rules',
+    ok: true,
+    detail: !hasAliasRules
+      ? 'no session alias rule to check'
+      : heartbeat.state === 'alive'
+        ? 'the running daemon honors session alias rules'
+        : 'no running daemon to check',
+  };
+}
+
 /**
- * The folder-rule checks `cctl doctor` appends: slot invariants, guard snapshot freshness, guard
- * hook presence. They all read `groups.json`, and a doctor exists precisely for the day that file
- * cannot be read (corrupt, or written by a newer build) — so an unreadable registry is reported as
- * ONE failed `folder-rules` check naming the reason, and every other check still runs and reports,
- * instead of the whole command dying on the first read with nothing but that error. With the rules
- * unknown, the guard hook is judged as if rules exist: a missing guard may then be a real gap.
+ * The folder-rule checks `cctl doctor` appends: slot invariants, rules that apply to nothing (see
+ * {@link checkRuleScopes}), guard snapshot freshness, guard hook presence. They all read
+ * `groups.json`, and a doctor exists precisely for the day that file cannot be read (corrupt, or
+ * written by a newer build) — so an unreadable registry is reported as ONE failed `folder-rules`
+ * check naming the reason, and every other check still runs and reports, instead of the whole
+ * command dying on the first read with nothing but that error. The scope check is the one left out
+ * then: it has nothing to look at beyond the registry, and would only repeat that reason. With the
+ * rules unknown, the guard hook is judged as if rules exist: a missing guard may then be a real gap.
  */
 export async function checkFolderRules(
   engine: Pick<SwitchEngine, 'listRules' | 'checkSlots' | 'getGuardSnapshotFreshness'>,
   paths: Paths,
 ): Promise<DoctorCheck[]> {
   const out: DoctorCheck[] = [];
-  let hasRules: boolean;
+  let rules: FolderRule[] | undefined;
   try {
-    hasRules = (await engine.listRules()).length > 0;
+    rules = await engine.listRules();
   } catch (err) {
-    hasRules = true;
     out.push({
       name: 'folder-rules',
       ok: false,
       detail: `could not read the folder rules: ${(err as Error).message}`,
     });
   }
+  out.push(await checkSlots(engine));
+  if (rules !== undefined) out.push(checkRuleScopes(rules));
   out.push(
-    await checkSlots(engine),
     await checkGuardSnapshot(engine),
-    checkGuardHook(paths, hasRules),
+    checkGuardHook(paths, rules === undefined || rules.length > 0),
   );
   return out;
 }

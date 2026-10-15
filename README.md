@@ -69,7 +69,8 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
   live where. Memories, skills, plugins and settings stay shared, and a guard catches a
   session launched on an account the folder must not use before it runs. Background
   sessions started on the global account move onto the folder's own account between turns.
-  Windows and Linux; see `docs/CLI.md`.
+  `cctl session include <alias> <account>` gives one named session (its `/rename` title) a
+  rule of its own, ahead of its folder's. Windows and Linux; see `docs/CLI.md`.
 
 ## Local-only (no Discord)
 

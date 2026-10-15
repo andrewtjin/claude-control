@@ -767,6 +767,67 @@ describe('Daemon lifecycle', () => {
     expect(scanTranscripts).toHaveBeenCalledWith(pushed.payload.windowStartMs);
   });
 
+  it('bills a hand-started session in a ruled folder to its rule slot, from its recorded span', async () => {
+    const now = Date.now();
+    // acct-x holds the global slot; acct-y holds a rule's slot. The session was never registered:
+    // its recorded slot span is the only record that it ran in the rule's slot.
+    const activated = (toAccountId: string, slot: string): string =>
+      JSON.stringify({
+        ts: now - 60_000,
+        event: 'activated',
+        fromAccountId: null,
+        toAccountId,
+        slot,
+      });
+    await writeFile(
+      join(vaultDir, 'switch-audit.jsonl'),
+      activated('acct-x', 'global') + '\n' + activated('acct-y', 'group:g1') + '\n',
+      'utf8',
+    );
+    store.recordSessionSlot('hand-started', 'group:g1', now - 60_000);
+    const scanTranscripts = vi.fn(() =>
+      Promise.resolve({
+        turns: [
+          {
+            tsMs: now - 30_000,
+            model: 'claude-opus-5',
+            inputTokens: 10,
+            outputTokens: 0,
+            cacheCreationTokens: 0,
+            cacheReadTokens: 0,
+            sessionId: 'hand-started',
+          },
+        ],
+        filesScanned: 1,
+        filesSkippedByMtime: 0,
+        filesUnreadable: 0,
+        dirsUnreadable: 0,
+        malformedLines: 0,
+        duplicateTurns: 0,
+      }),
+    );
+    daemon = new Daemon({
+      store,
+      switchEngine,
+      sessionManager,
+      poller,
+      attributionJournal,
+      hookReceiver,
+      controlPlaneClient,
+      scanTranscripts,
+      createAgentSdkClient: () => fakeAgentSdkClient,
+      pollIntervalMs: 100_000,
+    });
+    await daemon.start();
+
+    await waitFor(() => relay.received.some((e) => e.type === 'stats.snapshot'));
+    const pushed = relay.received.find((e) => e.type === 'stats.snapshot');
+    if (pushed?.type !== 'stats.snapshot') throw new Error('unreachable');
+    expect(pushed.payload.byAccount.map((a) => [a.accountId, a.totals.turns])).toEqual([
+      ['acct-y', 1],
+    ]);
+  });
+
   it('pushes no stats.snapshot when no transcript scanner is wired', async () => {
     await daemon.start();
     await waitFor(() => relay.received.some((e) => e.type === 'usage.snapshot'));

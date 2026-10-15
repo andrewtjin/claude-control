@@ -36,6 +36,16 @@
 //     PowerShell -> native-process boundary, not of this launcher's own spawn (which is verbatim),
 //     and PowerShell 7.3+ fixes it with $PSNativeCommandArgumentPassing = 'Standard'. The wrapper
 //     text warns about both facets rather than silently corrupting the arguments.
+//   - Function argument binding (cannot be removed in-place, so documented). The wrapper is a
+//     PowerShell FUNCTION, and PowerShell binds a function's arguments before its body runs: a bare
+//     `--` is consumed as its end-of-parameters marker, an unquoted comma builds an array that
+//     splatting passes on as separate arguments, and `-name:value` splits at the colon. A direct
+//     claude.exe call keeps all three verbatim. Since the launcher routes by `--resume` / `--name`,
+//     these change which session opens: `claude -p -- --resume x` sends the prompt "--resume x"
+//     to claude.exe but RESUMES x through the wrapper (the launcher and Claude Code still agree with
+//     each other; it is the operator's intent that is lost). Recovering the typed text would mean
+//     re-parsing $MyInvocation.Line, which cannot map expressions and variables back to their
+//     values — so the wrapper states the quirk and its fix: quote such arguments, or run claude.exe.
 
 export type SupportedShell = 'powershell' | 'bash' | 'zsh' | 'fish';
 
@@ -89,6 +99,15 @@ function psSingleQuote(value: string): string {
 export function renderShellInit(shell: SupportedShell, target?: ShellInitTarget): string {
   switch (shell) {
     case 'powershell': {
+      // The function-binding caveat (see the file header) goes in BOTH headers: the wrapper is a
+      // function whichever way it then reaches cctl.
+      const bindingCaveat = [
+        "# CAVEAT (PowerShell binds a function's arguments before it runs): a bare -- is consumed,",
+        '# an unquoted comma splits one argument into several, and -name:value splits at the colon,',
+        '# so `claude -p -- --resume x` RESUMES x and `claude --resume=a,b` resumes "a" through this',
+        "# wrapper, unlike a direct claude.exe call. Quote such arguments ('--', '--resume=a,b',",
+        "# '-r:x') or run claude.exe directly.",
+      ];
       // `@args` (splatting) preserves argument boundaries so quoted args stay intact. When we know
       // the node entry, invoke it directly so PowerShell -> node.exe never passes through cmd.exe;
       // otherwise fall back to the shim and warn, since cmd.exe would then re-expand `%*`.
@@ -109,6 +128,7 @@ export function renderShellInit(shell: SupportedShell, target?: ShellInitTarget)
               '# those PowerShell versions pass native-command arguments in Legacy mode. Use PowerShell',
               "# 7.3+ ($PSNativeCommandArgumentPassing = 'Standard') for verbatim arguments. Piped stdin",
               '# is forwarded as UTF-8.',
+              ...bindingCaveat,
             ]
           : [
               `# ${POWERSHELL_WRAPPER_MARKER}.`,
@@ -118,6 +138,7 @@ export function renderShellInit(shell: SupportedShell, target?: ShellInitTarget)
               '# literal double quote (") is mangled and merges with the arguments after it, and an',
               '# empty-string argument ("") is dropped entirely. Use PowerShell 7.3+ for verbatim',
               '# arguments.',
+              ...bindingCaveat,
             ];
       // The invocation the two guard branches share (with vs. without piped stdin).
       const invoke =

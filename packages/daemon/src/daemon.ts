@@ -22,9 +22,11 @@ import type {
   SlotViolation,
   RepairResult,
   RuleLiveResult,
+  SessionIdentity,
 } from '@claude-control/switch-engine';
 import {
   allSlots,
+  recordedFolderFor,
   ruleIdOfSlot,
   ruleOfSlot,
   ruleSlotId,
@@ -172,6 +174,14 @@ export interface SwitchEngineLike {
   slotForConfigDir?(configDir: string | null | undefined): Promise<SlotId>;
   /** The folder rule a working directory runs under, or null for one on the global slot. */
   resolveFolderRule?(cwd: string): Promise<{ ruleId: string; folder: string } | null>;
+  /** The rule a session running in `folder` with custom title `title`, recorded in
+   *  `recordedFolder` (default: `folder`), runs under by the precedence rule (the alias rule of that
+   *  title for the recorded folder, else the folder rule of `folder`), or null = global. */
+  resolveSessionRule?(
+    folder: string,
+    title: string | null,
+    recordedFolder?: string | null,
+  ): Promise<{ ruleId: string; folder: string } | null>;
   /** Complete a phone/CLI re-login from a pasted authorization code (see reauthFlow.ts). */
   reauthenticate(
     id: string,
@@ -302,6 +312,12 @@ export interface DaemonOptions {
    *  the composition root owns where the data directory is — and optional so tests that are not
    *  about it never write a file; absent = nothing is tracked. */
   exhaustionLog?: ExhaustionLog;
+  /** What a Claude Code session's transcript records about it, by id: its CUSTOM title (null =
+   *  unnamed) and the folder it was recorded in; null when the session is unknown. A managed spawn
+   *  that RESUMES a named session, and a background session the mover considers, route by it: the
+   *  alias rule of that title for the session's recorded folder outranks the folder rule, exactly as
+   *  the launcher and the guard decide. Absent = both route by folder only. */
+  sessionIdentityOf?: (sessionId: string) => Promise<SessionIdentity | null>;
   /** Claude Code's background service, through which a background session in a ruled folder that
    *  runs on the global slot is moved onto the folder's own slot (see backgroundMover.ts). Injected
    *  — the composition root owns how Claude Code is found and run — and optional so tests that are
@@ -868,6 +884,9 @@ export class Daemon {
   private readonly exhaustionLog: ExhaustionLog | undefined;
   /** Moves background sessions in ruled folders off the global slot; absent without a host. */
   private readonly backgroundMover: BackgroundMover | undefined;
+  /** See {@link DaemonOptions.sessionIdentityOf}. */
+  private readonly sessionIdentityOf:
+    ((sessionId: string) => Promise<SessionIdentity | null>) | undefined;
   /** The exhaustion episodes open right now, one per scope at most (the global pool, or a folder
    *  rule's pool, where no account can take work), keyed by `scopeKey`. Read back from the log on
    *  the first cycle, so an outage that spans a daemon restart stays one episode with one pair of
@@ -970,16 +989,18 @@ export class Daemon {
     this.exhaustionLog = options.exhaustionLog;
     this.logger = options.logger ?? noopLogger;
     this.isProcessAlive = options.isProcessAlive ?? pidIsAlive;
+    this.sessionIdentityOf = options.sessionIdentityOf;
     const host = options.backgroundSessionHost;
     this.backgroundMover =
       host === undefined
         ? undefined
         : new BackgroundMover({
             host,
-            // Resolved by the engine exactly as a launch is, so a session moves to the slot `cctl
-            // claude` would have started it on; an engine without folder support resolves nothing.
-            resolveRule: async (cwd) =>
-              (await this.switchEngine.resolveFolderRule?.(cwd))?.ruleId ?? null,
+            // Resolved by the engine exactly as a launch is — the session's alias rule first, then
+            // its folder's — so a session moves to the slot `cctl claude` would have started it on;
+            // an engine without folder support resolves nothing.
+            resolveRule: async (session) =>
+              (await this.resolveSessionRuleFor(session.cwd, session.sessionId))?.ruleId ?? null,
             notify: (notice) =>
               this.sendEnvelope({
                 type: 'hook.notification',
@@ -2116,8 +2137,9 @@ export class Daemon {
       windowEndMs: this.clock(),
       labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
       // A folder-bound session's turns join against the member live in its group's slot, not the
-      // global account — so map each recorded session to its slot for the aggregator.
+      // global account — so map each recorded session to its slot (spans first, then the mirror).
       slotBySession: slotBySessionMap(this.store.listSessions()),
+      slotSpans: this.store.listSessionSlotSpans(),
     });
   }
 
@@ -3892,7 +3914,11 @@ export class Daemon {
     // group is made live; a refusal (§8's two forbidden cases) is answered before anything spawns.
     let spawnSlot: { slot: SlotId; accountId: string | undefined; configDir: string | undefined };
     try {
-      spawnSlot = await this.resolveSpawnSlot(cwd ?? undefined, accountId ?? undefined);
+      spawnSlot = await this.resolveSpawnSlot(
+        cwd ?? undefined,
+        accountId ?? undefined,
+        resumeSessionId ?? undefined,
+      );
     } catch (err) {
       if (err instanceof SpawnBindingError) {
         this.logger.warn({ requestId, err }, 'session.spawn refused: account/slot binding');
@@ -4014,7 +4040,9 @@ export class Daemon {
    *    global slot (a session cannot switch the global slot out from under others) — otherwise
    *    refused;
    *  - no account but a working directory with a folder rule → that rule's slot, spawned on whatever
-   *    account the slot holds (an included one, or an inherited one while they are all out);
+   *    account the slot holds (an included one, or an inherited one while they are all out) — where
+   *    the rule follows the precedence rule: a spawn that resumes a NAMED session whose alias has a
+   *    rule in the folder the session was recorded in goes to that alias rule, ahead of the folder's;
    *  - anything else → the global slot, inheriting the global live login (the historical model).
    * Returns the account to attribute/spawn, the config dir to bind (a rule profile, or undefined
    * for the shared config dir), and the slot to record.
@@ -4022,6 +4050,7 @@ export class Daemon {
   private async resolveSpawnSlot(
     cwd: string | undefined,
     accountId: string | undefined,
+    resumeRef?: string,
   ): Promise<{ slot: SlotId; accountId: string | undefined; configDir: string | undefined }> {
     const engine = this.switchEngine;
     // Folder support absent (older engine / lifecycle fake): the historical global behavior.
@@ -4067,15 +4096,16 @@ export class Daemon {
         }
       }
       // Shared (or unknown) account. A KNOWN shared account runs where it is already live: the
-      // global slot, or the slot of this session's folder when it is live there (as the folder's
-      // fallback, or in a folder that excludes the global account). A spawn never switches a slot
-      // out from under the sessions on it, so anywhere else it is refused. An unknown id keeps the
-      // legacy attribution-tag behavior.
+      // global slot, or the slot of the rule this session runs under when it is live there (as the
+      // rule's fallback, or under a rule that excludes the global account). That rule is the one
+      // the guard will require — the precedence rule, so a resumed named session's alias rule
+      // outranks the folder's. A spawn never switches a slot out from under the sessions on it, so
+      // anywhere else it is refused. An unknown id keeps the legacy attribution-tag behavior.
       const globalLive = await engine.getActiveId('global');
       if (acct !== undefined && accountId !== globalLive) {
         const match =
-          cwd !== undefined && engine.resolveFolderRule
-            ? await engine.resolveFolderRule(cwd)
+          cwd !== undefined
+            ? await this.resolveSessionRuleFor(cwd, this.spawnResumeAnchorOrNone(resumeRef))
             : null;
         if (match !== null) {
           const slot = ruleSlotId(match.ruleId);
@@ -4087,16 +4117,17 @@ export class Daemon {
         }
         throw new SpawnBindingError(
           `account "${acct.label}" is a shared account live neither in the global slot nor in ` +
-            `the slot of this session's folder; switch to it first (cctl switch ${acct.label}) ` +
+            `the slot of this session's rule; switch to it first (cctl switch ${acct.label}) ` +
             'or start the session without naming an account',
         );
       }
       return { slot: 'global', accountId, configDir: undefined };
     }
 
-    // No explicit account: resolve the working directory's folder rule.
+    // No explicit account: resolve the working directory's folder rule (and a resumed session's
+    // alias rule).
     if (cwd !== undefined && engine.resolveFolderRule) {
-      const match = await engine.resolveFolderRule(cwd);
+      const match = await this.resolveSessionRuleFor(cwd, this.spawnResumeAnchorOrNone(resumeRef));
       if (match !== null) {
         // Once the cwd is known to have a rule, the session MUST run in that rule's slot. Any
         // failure to place it there is a REFUSAL, never a fall-through to the global slot: a session
@@ -4130,6 +4161,54 @@ export class Daemon {
       }
     }
     return { slot: 'global', accountId: undefined, configDir: undefined };
+  }
+
+  /** The resume anchor of a spawn's `resumeRef` for routing, or undefined when it has none or it
+   *  cannot be resumed: the spawn path reports an unresumable ref itself. */
+  private spawnResumeAnchorOrNone(resumeRef: string | undefined): string | undefined {
+    try {
+      return this.resolveSpawnResumeAnchor(resumeRef);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The rule a Claude Code session in `cwd` runs under. A session with a CUSTOM title is judged by
+   * the precedence rule — the alias rule of that title for the folder the session was RECORDED in
+   * outranks the folder rule of `cwd` — so a resumed spawn, or a moved background session, lands on
+   * the slot the guard will require of it (a session reports its title on every prompt, and the guard
+   * keys the alias on the same recorded folder). Otherwise, and whenever the title cannot be learned
+   * (no catalog seam, no session id, an unknown session, a read failure), the folder rule decides;
+   * the guard still judges the real title.
+   */
+  private async resolveSessionRuleFor(
+    cwd: string,
+    sessionId: string | undefined,
+  ): Promise<{ ruleId: string; folder: string } | null> {
+    const engine = this.switchEngine;
+    if (
+      sessionId !== undefined &&
+      this.sessionIdentityOf !== undefined &&
+      engine.resolveSessionRule !== undefined &&
+      // No transcript is read while no rule holds a session alias: no title could change the answer.
+      (await this.loadRules()).some((r) => (r.aliases?.length ?? 0) > 0)
+    ) {
+      const identity = await this.sessionIdentityOf(sessionId).catch(() => null);
+      const title = identity?.unreadable === true ? null : (identity?.customTitle ?? null);
+      if (identity !== null && title !== null && title.trim() !== '') {
+        // The recorded folder as every other reader decides it: the trusted one, else `cwd` when
+        // the transcript's project directory can stand for it, else none (null: no alias rule
+        // applies).
+        const recorded = recordedFolderFor(
+          { folder: identity.folder, dirName: identity.dirName ?? '' },
+          { spelled: cwd, canonical: cwd },
+          (f) => f,
+        );
+        return engine.resolveSessionRule(cwd, title, recorded);
+      }
+    }
+    return engine.resolveFolderRule ? engine.resolveFolderRule(cwd) : null;
   }
 
   /**

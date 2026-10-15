@@ -397,7 +397,43 @@ describe('buildProgram', () => {
   it('nests session subcommands', () => {
     const session = buildProgram().commands.find((c) => c.name() === 'session');
     const subs = session?.commands.map((c) => c.name()).sort();
-    expect(subs).toEqual(['label', 'register', 'status', 'unregister', 'watch']);
+    expect(subs).toEqual([
+      'aliases',
+      'exclude',
+      'include',
+      'label',
+      'register',
+      'reset',
+      'show',
+      'status',
+      'unregister',
+      'watch',
+    ]);
+  });
+
+  it('offers the session rule verbs with their alias, accounts and flags', () => {
+    const session = buildProgram().commands.find((c) => c.name() === 'session');
+    const sub = (name: string) => session?.commands.find((c) => c.name() === name);
+    const args = (name: string) =>
+      sub(name)?.registeredArguments.map((a) => `${a.name()}:${a.required ? 'req' : 'opt'}`);
+    const flags = (name: string) => sub(name)?.options.map((o) => o.long);
+    // The alias and the accounts are always named: nothing stands in for either.
+    expect(args('include')).toEqual(['alias:req', 'accounts:req']);
+    expect(args('exclude')).toEqual(['alias:req', 'accounts:req']);
+    expect(args('reset')).toEqual(['alias:req', 'accounts:opt']);
+    expect(flags('include')).toEqual(['--cwd', '--label']);
+    expect(flags('exclude')).toEqual(['--cwd', '--label', '--force']);
+    expect(flags('reset')).toEqual(['--cwd', '--force']);
+  });
+
+  it('offers the alias lookup flags on session show and session aliases', () => {
+    const session = buildProgram().commands.find((c) => c.name() === 'session');
+    const flags = (name: string) =>
+      session?.commands.find((c) => c.name() === name)?.options.map((o) => o.long);
+    expect(flags('show')).toEqual(expect.arrayContaining(['--cwd', '--json']));
+    expect(flags('aliases')).toEqual(
+      expect.arrayContaining(['--cwd', '--all', '--auto', '--json']),
+    );
   });
 
   it('offers --session on the register/label/watch/unregister session commands', () => {

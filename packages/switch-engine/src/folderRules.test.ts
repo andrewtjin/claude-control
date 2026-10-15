@@ -9,12 +9,18 @@ import {
   allSlots,
   assignDistinct,
   availableInOrder,
+  describeRuleScopes,
+  exactAliasRule,
   exactFolderRule,
   legitimateOccupancy,
   liveElsewhere,
   resolveFolderRule,
+  resolveSessionRule,
   ruleOfSlot,
+  ruleScopeCount,
+  ruleScopes,
   rulesIncluding,
+  scopedRuleOf,
   slotMayHold,
   slotMembers,
   slotPool,
@@ -321,6 +327,79 @@ describe('folder -> rule resolution', () => {
     expect(exactFolderRule('C:\\work', rules, 'win32')?.id).toBe('outer');
     expect(exactFolderRule('c:/WORK', rules, 'win32')?.id).toBe('outer');
     expect(exactFolderRule('C:\\work\\client\\src', rules, 'win32')).toBeUndefined();
+  });
+});
+
+describe('session -> rule resolution (the precedence rule over rules)', () => {
+  const rules = [
+    rule('folder', { folders: ['C:\\work'] }),
+    rule('alias', { aliases: [{ folder: 'C:\\work', alias: 'Auth Work' }] }),
+    rule('sub', { aliases: [{ folder: 'C:\\work\\sub', alias: 'Auth Work' }] }),
+  ];
+
+  it('the alias rule of the recorded folder wins over the longest folder rule', () => {
+    expect(resolveSessionRule('C:\\work', ' auth WORK ', rules, 'win32')).toMatchObject({
+      rule: { id: 'alias' },
+      via: 'alias',
+      folder: 'C:\\work',
+      aliasKey: 'auth work',
+    });
+    // Another title, or none, falls to the folder rule.
+    expect(resolveSessionRule('C:\\work', 'other', rules, 'win32')).toMatchObject({
+      rule: { id: 'folder' },
+      via: 'folder',
+    });
+    expect(resolveSessionRule('C:\\work', null, rules, 'win32')?.rule.id).toBe('folder');
+    expect(resolveSessionRule('C:\\work', '   ', rules, 'win32')?.rule.id).toBe('folder');
+  });
+
+  it('keys on the RECORDED folder, exactly (never a subfolder)', () => {
+    // Resumed from C:\\work, recorded in C:\\work\\sub: the sub folder's alias rule.
+    expect(
+      resolveSessionRule('C:\\work', 'Auth Work', rules, 'win32', 'C:\\work\\sub')?.rule.id,
+    ).toBe('sub');
+    // Running in a deeper folder with no alias rule of its own: the folder rule.
+    expect(resolveSessionRule('C:\\work\\sub\\x', 'Auth Work', rules, 'win32')?.rule.id).toBe(
+      'folder',
+    );
+    // Recorded in no folder an alias rule can name: only the folder rule applies.
+    expect(resolveSessionRule('C:\\work', 'Auth Work', rules, 'win32', null)?.rule.id).toBe(
+      'folder',
+    );
+  });
+
+  it('exactAliasRule matches by folder key and alias key', () => {
+    expect(exactAliasRule('c:/WORK', 'AUTH work ', rules, 'win32')?.id).toBe('alias');
+    expect(exactAliasRule('C:\\work', 'other', rules, 'win32')).toBeUndefined();
+    expect(exactAliasRule('C:\\work\\sub\\x', 'Auth Work', rules, 'win32')).toBeUndefined();
+  });
+
+  it('scopedRuleOf keys aliases and spells stored folders canonically', () => {
+    const hand = rule('h', {
+      folders: ['c:/Work/'],
+      aliases: [{ folder: 'C:/work/sub/', alias: ' Mixed Case ' }],
+    });
+    expect(scopedRuleOf(hand, 'win32')).toEqual({
+      id: 'h',
+      // The drive letter is upper-cased, the separators and trailing one normalized.
+      folders: ['C:\\Work'],
+      aliases: [{ folder: 'C:\\work\\sub', aliasKey: 'mixed case' }],
+    });
+    // A hand-edited spelling still resolves.
+    expect(resolveSessionRule('C:\\work\\sub', 'mixed case', [hand], 'win32')?.via).toBe('alias');
+  });
+
+  it('counts and names scopes: folders, then session aliases, falling back to the label', () => {
+    const both = rule('b', {
+      label: 'B',
+      folders: ['C:\\a'],
+      aliases: [{ folder: 'C:\\a', alias: 'x' }],
+    });
+    expect(ruleScopeCount(both)).toBe(2);
+    expect(ruleScopes(both)).toEqual(['C:\\a', 'session "x" in C:\\a']);
+    expect(describeRuleScopes(both)).toBe('C:\\a, session "x" in C:\\a');
+    expect(describeRuleScopes(rule('none', { label: 'Lone' }))).toBe('Lone');
+    expect(ruleScopeCount(rule('none'))).toBe(0);
   });
 });
 

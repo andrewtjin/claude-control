@@ -23,11 +23,23 @@ import type {
   Registry,
   RulesFile,
   StoredAccount,
+  StoredAliasScope,
 } from './types.js';
 import type { FolderBindingSnapshot } from './types.js';
 import type { Protector } from './dpapi.js';
-import { folderUniquenessKey } from './folderPath.js';
-import { rulesIncluding, slotMayHold, type RulesPicture } from './folderRules.js';
+import {
+  CLAUDE_CODE_TITLE_MAX_LENGTH,
+  aliasFitsSessionTitle,
+  aliasKey,
+  aliasScopeUniquenessKey,
+  folderUniquenessKey,
+} from './folderPath.js';
+import {
+  describeRuleScopes,
+  rulesIncluding,
+  slotMayHold,
+  type RulesPicture,
+} from './folderRules.js';
 import { sanitizeTerminalText } from './terminalSafe.js';
 import {
   buildFolderBindingSnapshot,
@@ -65,8 +77,12 @@ export interface RegistryPicture extends RulesPicture {
 
 /** What a new folder rule is made of ({@link Vault.createRule}). */
 export interface NewRuleOptions {
-  /** Canonical folders the rule applies to (the engine always passes exactly one). */
+  /** Canonical folders the rule applies to (the engine passes exactly one, or none for an alias
+   *  rule). */
   folders: readonly string[];
+  /** Session-alias scopes (the engine passes exactly one for an alias rule, none for a folder
+   *  rule). */
+  aliases?: readonly StoredAliasScope[];
   /** Accounts to include, in preference order. */
   include?: readonly string[];
   /** Shared accounts to exclude. */
@@ -75,10 +91,9 @@ export interface NewRuleOptions {
   label?: string;
 }
 
-/** The folders of some rules as a display list, for "reserved to <folders>" messages. */
+/** The scopes of some rules as a display list, for "reserved to <folders>" messages. */
 function describeRuleFolders(rules: readonly FolderRule[]): string {
-  const folders = rules.flatMap((r) => (r.folders.length > 0 ? r.folders : [r.label]));
-  return folders.length > 0 ? folders.join(', ') : 'a folder rule';
+  return rules.length > 0 ? rules.map(describeRuleScopes).join(', ') : 'a folder rule';
 }
 
 /** Refuse a label another row already answers to (any case) or that spells an account id:
@@ -197,6 +212,14 @@ function emptyRegistry(): Registry {
 const ACCOUNTS_SCHEMA_VERSION = 2;
 /** Schema tag `groups.json` is written with: folder rules over the inherited pool. */
 const RULES_SCHEMA_VERSION = 2;
+/** Schema tag of a `groups.json` in which some rule carries a session-alias scope. A build that
+ *  knows only folder rules refuses any tag but 1 and 2 (failing closed on every command) — which is
+ *  the point: such a build would otherwise load the file, keep the `aliases` it does not know as an
+ *  opaque field, and route every alias-bound session by its folder alone (an alias-only rule would
+ *  apply to nothing while still holding its reserved accounts). So a file is stamped 3 exactly while
+ *  an alias scope exists, and 2 again once none is left, which those builds read as before. This
+ *  build reads both. */
+const RULES_SCHEMA_VERSION_ALIASES = 3;
 /** Schema tag of the set-bound groups `groups.json` held before folder rules. Still READ, and
  *  migrated to {@link RULES_SCHEMA_VERSION} in memory (written back as such on the next write). Any
  *  other value fails closed rather than being read as a shape this build does not understand. */
@@ -214,6 +237,15 @@ export const MAX_RULES = 64;
 /** Per rule, the most accounts its include list may name, and separately its exclude list. */
 export const MAX_RULE_ACCOUNTS = 32;
 export const MAX_RULE_FOLDERS = 256;
+/** Alias scopes per rule — same order of magnitude as folders, same reasoning. */
+export const MAX_RULE_ALIASES = 256;
+/** Longest alias a rules file may carry when LOADED. A session title is free text, and every alias
+ *  is copied into the guard snapshot the hook reads on each prompt, so an unbounded one would let a
+ *  single pasted blob bloat every prompt's read. A NEW alias rule is held to Claude Code's own title
+ *  length (CLAUDE_CODE_TITLE_MAX_LENGTH), since a longer alias can never match a session; this larger
+ *  cap only keeps a hand-edited file loadable, so its rule can be seen (flagged as never matching)
+ *  and reset. */
+export const MAX_ALIAS_LENGTH = 512;
 /** The most reserved rows `groups.json` may hold across all rules. */
 export const MAX_RESERVED_ACCOUNTS = 256;
 
@@ -356,7 +388,10 @@ function parseRulesFile(
   if (value.schemaVersion === LEGACY_GROUPS_SCHEMA_VERSION) {
     return migrateLegacyGroups(validateLegacyGroups(value, platform), value.generation);
   }
-  if (value.schemaVersion !== RULES_SCHEMA_VERSION) {
+  if (
+    value.schemaVersion !== RULES_SCHEMA_VERSION &&
+    value.schemaVersion !== RULES_SCHEMA_VERSION_ALIASES
+  ) {
     throw new VaultError(
       `groups.json has an unsupported schemaVersion (${JSON.stringify(value.schemaVersion)}); ` +
         'a newer build wrote it — this one refuses to read it rather than drop the rules it holds',
@@ -409,8 +444,13 @@ function validateRulesFile(
     throw new VaultError(`groups.json holds ${rawRules.length} rules (max ${MAX_RULES})`);
   }
   const seenFolderKeys = new Set<string>();
+  const seenAliasKeys = new Set<string>();
   const rules: FolderRule[] = [];
-  const extras: RulesExtras = { top: unownedFields(value, RULES_FILE_KEYS), byRule: new Map() };
+  const extras: RulesExtras = {
+    top: unownedFields(value, RULES_FILE_KEYS),
+    byRule: new Map(),
+    byAliasScope: new Map(),
+  };
   for (let i = 0; i < rawRules.length; i += 1) {
     const where = `rules[${i}]`;
     const r = validateEntryBase(rawRules[i], where);
@@ -418,6 +458,13 @@ function validateRulesFile(
     const ruleExtras = unownedFields(r, RULE_KEYS);
     if (Object.keys(ruleExtras).length > 0) extras.byRule.set(r.id, ruleExtras);
     const folders = validateFolders(r.folders, `${where} (${r.id})`, seenFolderKeys, platform);
+    const aliases = validateAliasScopes(
+      r.aliases,
+      `${where} (${r.id})`,
+      platform,
+      seenAliasKeys,
+      extras.byAliasScope,
+    );
     const include = validateIdList(r.include, `${where} (${r.id})`, 'include');
     const exclude = validateIdList(r.exclude, `${where} (${r.id})`, 'exclude');
     for (const id of include) {
@@ -436,6 +483,8 @@ function validateRulesFile(
       id: r.id,
       label: r.label,
       folders,
+      // Kept only when non-empty, so a rule without alias scopes keeps the older file shape.
+      ...(aliases.length > 0 ? { aliases } : {}),
       include,
       exclude,
       activeId,
@@ -450,13 +499,76 @@ function validateRulesFile(
   }
   return {
     file: {
-      schemaVersion: RULES_SCHEMA_VERSION,
+      schemaVersion: rulesSchemaVersionFor(rules),
       generation: value.generation as number,
       reserved,
       rules,
     },
     extras,
   };
+}
+
+/** The schema tag a `groups.json` holding `rules` is written with (see
+ *  {@link RULES_SCHEMA_VERSION_ALIASES}). */
+function rulesSchemaVersionFor(rules: readonly FolderRule[]): RulesFile['schemaVersion'] {
+  return rules.some((r) => (r.aliases?.length ?? 0) > 0)
+    ? RULES_SCHEMA_VERSION_ALIASES
+    : RULES_SCHEMA_VERSION;
+}
+
+/**
+ * Validate one rule's optional `aliases` list, failing CLOSED like the rest of the file. Absent
+ * reads as none. Each entry must be a plain object (no forbidden key) with a non-empty string folder
+ * and a string alias whose {@link aliasKey} is non-empty and which is no longer than
+ * {@link MAX_ALIAS_LENGTH}; its (folder, alias key) pair must not already be claimed by any rule —
+ * `seen` carries the pairs across the whole file, keyed by {@link aliasScopeUniquenessKey}, the SAME
+ * key the write guards use (so a write can never persist a file the next load rejects). An entry's
+ * fields this build does not own go into `extras` under that key (see {@link RulesExtras}).
+ */
+function validateAliasScopes(
+  raw: unknown,
+  where: string,
+  platform: NodeJS.Platform,
+  seen: Set<string>,
+  extras: Map<string, Record<string, unknown>>,
+): StoredAliasScope[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) throw new VaultError(`${where} aliases is not an array`);
+  if (raw.length > MAX_RULE_ALIASES) {
+    throw new VaultError(`${where} holds ${raw.length} session aliases (max ${MAX_RULE_ALIASES})`);
+  }
+  const out: StoredAliasScope[] = [];
+  for (let k = 0; k < raw.length; k += 1) {
+    const entry: unknown = raw[k];
+    const at = `${where} aliases[${k}]`;
+    if (!isPlainObject(entry)) throw new VaultError(`${at} is not an object`);
+    assertNoForbiddenKeys(entry, at);
+    const { folder, alias } = entry;
+    if (typeof folder !== 'string' || folder === '') {
+      throw new VaultError(`${at} has no string folder`);
+    }
+    if (typeof alias !== 'string' || aliasKey(alias) === '') {
+      throw new VaultError(`${at} has no alias`);
+    }
+    if (alias.length > MAX_ALIAS_LENGTH) {
+      throw new VaultError(`${at} alias is longer than ${MAX_ALIAS_LENGTH} characters`);
+    }
+    // The uniqueness key joins the two halves with a NUL, so a NUL inside either would let two
+    // different scopes produce one key. The write path never stores one (the engine refuses control
+    // characters); a hand-edited file carrying one is refused rather than keyed ambiguously.
+    if (folder.includes('\u0000') || alias.includes('\u0000')) {
+      throw new VaultError(`${at} contains a NUL character`);
+    }
+    const key = aliasScopeUniquenessKey(folder, alias, platform);
+    if (seen.has(key)) {
+      throw new VaultError(`session alias "${alias}" in ${folder} has more than one rule`);
+    }
+    seen.add(key);
+    const entryExtras = unownedFields(entry, ALIAS_SCOPE_KEYS);
+    if (Object.keys(entryExtras).length > 0) extras.set(key, entryExtras);
+    out.push({ folder, alias });
+  }
+  return out;
 }
 
 /** A schema-1 group: a set of reserved rows bound to a set of folders. Only read, to migrate. */
@@ -504,7 +616,11 @@ function validateLegacyGroups(
   const seenAccountUuids = new Set<string>();
   const seenFolderKeys = new Set<string>();
   const groups: LegacyGroup[] = [];
-  const extras: RulesExtras = { top: unownedFields(value, LEGACY_FILE_KEYS), byRule: new Map() };
+  const extras: RulesExtras = {
+    top: unownedFields(value, LEGACY_FILE_KEYS),
+    byRule: new Map(),
+    byAliasScope: new Map(),
+  };
   for (let i = 0; i < rawGroups.length; i += 1) {
     const where = `groups[${i}]`;
     const g = validateEntryBase(rawGroups[i], where);
@@ -608,6 +724,9 @@ function migrateLegacyGroups(
 interface RulesExtras {
   top: Record<string, unknown>;
   byRule: Map<string, Record<string, unknown>>;
+  /** By the scope's {@link aliasScopeUniquenessKey} (unique across the file), so an entry's fields
+   *  follow the scope wherever this build writes it. */
+  byAliasScope: Map<string, Record<string, unknown>>;
 }
 
 /** The top-level keys of `groups.json` this build writes itself. */
@@ -617,11 +736,17 @@ const RULES_FILE_KEYS: ReadonlySet<string> = new Set([
   'reserved',
   'rules',
 ]);
-/** The keys of one rule this build writes itself (see {@link FolderRule}). */
+/** The keys of one alias scope entry this build writes itself (see {@link StoredAliasScope}). */
+const ALIAS_SCOPE_KEYS: ReadonlySet<string> = new Set(['folder', 'alias']);
+
+/** The keys of one rule this build writes itself (see {@link FolderRule}). `aliases` is one of them
+ *  although it is optional: this build owns it, so a rule whose last alias scope is removed loses the
+ *  field — it must never be written back from the carried-forward extras. */
 const RULE_KEYS: ReadonlySet<string> = new Set([
   'id',
   'label',
   'folders',
+  'aliases',
   'include',
   'exclude',
   'activeId',
@@ -965,7 +1090,11 @@ export class Vault {
               reserved: [],
               rules: [],
             } satisfies RulesFile,
-            extras: { top: {}, byRule: new Map<string, Record<string, unknown>>() },
+            extras: {
+              top: {},
+              byRule: new Map<string, Record<string, unknown>>(),
+              byAliasScope: new Map<string, Record<string, unknown>>(),
+            },
           }
         : parseRulesFile(rawRules, this.platform);
 
@@ -1035,8 +1164,8 @@ export class Vault {
     await atomicWriteFile(this.registryPath(), JSON.stringify(out, null, 2));
   }
 
-  /** Persist the reserved side and the rules, always as schema 2 (a migrated schema-1 file is
-   *  rewritten here), incrementing `generation` (the guard snapshot carries it, so a bump is what
+  /** Persist the reserved side and the rules, as schema 2 — or 3 while an alias scope exists (see
+   *  {@link RULES_SCHEMA_VERSION_ALIASES}); a migrated schema-1 file is rewritten here — incrementing `generation` (the guard snapshot carries it, so a bump is what
    *  lets a stale snapshot be detected). Mutates `st.generation` to the value written so a caller
    *  that then writes the snapshot reports the right number. Fields this build does not own are
    *  written back where they were read (see {@link RulesExtras}); this build's own fields are spread
@@ -1044,7 +1173,7 @@ export class Vault {
   private async saveRules(st: RegistryState): Promise<void> {
     st.generation += 1;
     const file: RulesFile = {
-      schemaVersion: RULES_SCHEMA_VERSION,
+      schemaVersion: rulesSchemaVersionFor(st.rules),
       generation: st.generation,
       reserved: st.reserved,
       rules: st.rules,
@@ -1052,7 +1181,20 @@ export class Vault {
     const out = {
       ...st.rulesExtras.top,
       ...file,
-      rules: st.rules.map((r) => ({ ...st.rulesExtras.byRule.get(r.id), ...r })),
+      rules: st.rules.map((r) => ({
+        ...st.rulesExtras.byRule.get(r.id),
+        ...r,
+        ...(r.aliases !== undefined
+          ? {
+              aliases: r.aliases.map((a) => ({
+                ...st.rulesExtras.byAliasScope.get(
+                  aliasScopeUniquenessKey(a.folder, a.alias, this.platform),
+                ),
+                ...a,
+              })),
+            }
+          : {}),
+      })),
     };
     await atomicWriteFile(this.rulesPath(), JSON.stringify(out, null, 2));
   }
@@ -1153,14 +1295,19 @@ export class Vault {
     // Stored terminal-safe, exactly as an account label is (see addAccount): the rule label is
     // rendered on the CLI, in the doctor, in the guard's decision text and in phone alerts, and an
     // operator types it freely. A label with nothing printable left falls back to the default.
+    const firstAlias = plan.aliases[0];
     const label =
       sanitizeTerminalText(opts.label ?? '').trim() ||
-      sanitizeTerminalText(plan.folders[0] ?? '').trim() ||
+      sanitizeTerminalText(
+        plan.folders[0] ??
+          (firstAlias !== undefined ? `session "${firstAlias.alias}" in ${firstAlias.folder}` : ''),
+      ).trim() ||
       'folder rule';
     const rule: FolderRule = {
       id: randomUUID(),
       label,
       folders: plan.folders,
+      ...(plan.aliases.length > 0 ? { aliases: plan.aliases } : {}),
       include: plan.include,
       exclude: plan.exclude,
       activeId: null,
@@ -1193,7 +1340,13 @@ export class Vault {
   private planNewRule(
     st: RegistryState,
     opts: NewRuleOptions,
-  ): { folders: string[]; include: string[]; exclude: string[]; moved: StoredAccount[] } {
+  ): {
+    folders: string[];
+    aliases: StoredAliasScope[];
+    include: string[];
+    exclude: string[];
+    moved: StoredAccount[];
+  } {
     if (st.rules.length >= MAX_RULES) {
       throw new VaultError(`cannot create another folder rule (max ${MAX_RULES})`);
     }
@@ -1203,10 +1356,11 @@ export class Vault {
       throw new VaultError('a folder rule needs at least one account to include or exclude');
     }
     const folders = this.checkNewFolders(st, opts.folders, null);
+    const aliases = this.checkNewAliases(st, opts.aliases ?? []);
     const draft: Pick<FolderRule, 'include' | 'exclude'> = { include: [], exclude: [] };
     const inc = this.planInclude(st, draft, include);
     this.checkExcludable(st, { ...draft, include }, exclude);
-    return { folders, include, exclude, moved: inc.moved };
+    return { folders, aliases, include, exclude, moved: inc.moved };
   }
 
   /**
@@ -1403,6 +1557,35 @@ export class Vault {
     );
   }
 
+  /** Remove an alias scope from a rule, matched by (folder key, alias key). Refuses the rule's LAST
+   *  scope — removing it is {@link removeRule}, a separate decision. Drops the field entirely when
+   *  the rule has no alias left, keeping the older file shape. */
+  async removeAliasFromRule(ruleId: string, scope: StoredAliasScope): Promise<FolderRule> {
+    const st = await this.loadState();
+    const rule = this.mustRule(st, ruleId);
+    const key = aliasScopeUniquenessKey(scope.folder, scope.alias, this.platform);
+    const before = rule.aliases ?? [];
+    const kept = before.filter(
+      (a) => aliasScopeUniquenessKey(a.folder, a.alias, this.platform) !== key,
+    );
+    if (kept.length === before.length) {
+      throw new VaultError(
+        `session alias "${scope.alias}" in ${scope.folder} is not in folder rule ${ruleId}`,
+      );
+    }
+    if (kept.length === 0 && rule.folders.length === 0) {
+      throw new VaultError(
+        `session alias "${scope.alias}" in ${scope.folder} is the last scope of folder rule ` +
+          `${ruleId}; remove the rule instead`,
+      );
+    }
+    if (kept.length > 0) rule.aliases = kept;
+    else delete rule.aliases;
+    rule.updatedAtMs = this.clock();
+    await this.saveRules(st);
+    return rule;
+  }
+
   /** Remove another (already-canonical) folder from a rule, compared by key. A rule left with no
    *  folders stays in place — removing it is {@link removeRule}, a separate decision. */
   async removeFolderFromRule(ruleId: string, folder: string): Promise<FolderRule> {
@@ -1481,6 +1664,54 @@ export class Vault {
     }
     if (out.length > MAX_RULE_FOLDERS) {
       throw new VaultError(`a folder rule cannot hold more than ${MAX_RULE_FOLDERS} folders`);
+    }
+    return out;
+  }
+
+  /** Validate NEW alias scopes against the current rules, mirroring {@link checkNewFolders}: each
+   *  needs a non-empty folder and an alias with a non-empty {@link aliasKey}, whose trimmed text fits
+   *  Claude Code's title length (a longer one never matches a session), no NUL, unique within the
+   *  set, and not already held by any rule. Keys on {@link aliasScopeUniquenessKey}, the SAME key
+   *  {@link validateRulesFile} enforces at load. Returns copies of the scopes. */
+  private checkNewAliases(
+    st: RegistryState,
+    scopes: readonly StoredAliasScope[],
+  ): StoredAliasScope[] {
+    const held = new Set<string>();
+    for (const r of st.rules) {
+      for (const a of r.aliases ?? []) {
+        held.add(aliasScopeUniquenessKey(a.folder, a.alias, this.platform));
+      }
+    }
+    const seen = new Set<string>();
+    const out: StoredAliasScope[] = [];
+    for (const scope of scopes) {
+      if (typeof scope.folder !== 'string' || scope.folder === '') {
+        throw new VaultError('a session alias needs a folder');
+      }
+      if (typeof scope.alias !== 'string' || aliasKey(scope.alias) === '') {
+        throw new VaultError('a session alias cannot be empty');
+      }
+      if (scope.alias.length > MAX_ALIAS_LENGTH || !aliasFitsSessionTitle(scope.alias)) {
+        throw new VaultError(
+          `a session alias cannot be longer than ${CLAUDE_CODE_TITLE_MAX_LENGTH} characters ` +
+            '(Claude Code keeps only that much of a session name)',
+        );
+      }
+      if (scope.folder.includes('\u0000') || scope.alias.includes('\u0000')) {
+        throw new VaultError('a session alias cannot contain a NUL character');
+      }
+      const key = aliasScopeUniquenessKey(scope.folder, scope.alias, this.platform);
+      const name = `session alias "${scope.alias}" in ${scope.folder}`;
+      if (held.has(key)) throw new VaultError(`${name} already has a folder rule`);
+      if (seen.has(key)) throw new VaultError(`${name} is listed twice`);
+      seen.add(key);
+      out.push({ folder: scope.folder, alias: scope.alias });
+    }
+    if (out.length > MAX_RULE_ALIASES) {
+      throw new VaultError(
+        `a folder rule cannot hold more than ${MAX_RULE_ALIASES} session aliases`,
+      );
     }
     return out;
   }
@@ -1974,6 +2205,9 @@ export class Vault {
       mainConfigDir: opts.mainConfigDir,
       mainIdentityFile: opts.mainIdentityFile,
       profileDirOf: (ruleId) => groupProfileDir(this.vaultDir, ruleId),
+      // The rules were validated under the vault's platform; their folders are canonicalized under
+      // the same one.
+      platform: this.platform,
     });
     await writeFolderBindingSnapshot(folderBindingsPath(this.vaultDir), snapshot);
     return snapshot;

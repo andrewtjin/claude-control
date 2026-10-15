@@ -546,7 +546,10 @@ describe('bind guard script', () => {
       expect(JSON.parse(other.stdout)).toEqual({
         systemMessage: noticeFor('Carol from the shared pool', RELAUNCH_TAIL),
       });
-      expect((await readdir(guardNoticesDir(snapshotPath))).sort()).toEqual(['sess-a', 'sess-b']);
+      expect((await readdir(guardNoticesDir(snapshotPath))).sort()).toEqual([
+        'sess-a.group-1',
+        'sess-b.group-1',
+      ]);
     });
 
     it('a background session is told cctl moves it between turns', async () => {
@@ -843,7 +846,7 @@ describe('bind guard script', () => {
           ...baseEnv(),
           CLAUDE_PROJECT_DIR: boundFolder,
         });
-        expect((await readdir(dir)).sort()).toEqual(['new-session', 'recent-session']);
+        expect((await readdir(dir)).sort()).toEqual(['new-session.group-1', 'recent-session']);
       });
 
       it('a marker dir that cannot be written shows the notice every time rather than lose it', async () => {
@@ -893,6 +896,7 @@ describe('bind guard script', () => {
         mainConfigDir: canon(root),
         mainIdentityFile: identityFile,
         profileDirOf: () => profileDir,
+        platform: process.platform,
       });
       await writeFile(snapshotPath, JSON.stringify(snapshot), 'utf8');
       const env = { ...baseEnv(), CLAUDE_PROJECT_DIR: boundFolder };

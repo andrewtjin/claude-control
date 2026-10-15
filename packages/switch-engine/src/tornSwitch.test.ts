@@ -469,6 +469,38 @@ describe('a process that dies between the credentials and identity writes', () =
     expect(await e.checkSlots()).toEqual([]);
   });
 
+  it('an alias rule including the target right after the crash moves it off the global slot first', async () => {
+    const h = await harness();
+    const { T } = await seed(h);
+    await expect(h.mk(dieBetweenWrites).activate(T.id, { force: true })).rejects.toThrow(
+      'process died',
+    );
+
+    const e = h.mk();
+    await e.includeInAlias(await h.folder('repo'), 'feature', [T.id]);
+
+    expect((await h.global.readLiveCredentials())?.refreshToken).not.toBe('rt-T');
+    expect(await e.checkSlots()).toEqual([]);
+  });
+
+  it('an alias rule excluding the target right after the crash settles the global slot first', async () => {
+    const h = await harness();
+    const { P, T } = await seed(h);
+    await expect(h.mk(dieBetweenWrites).activate(T.id, { force: true })).rejects.toThrow(
+      'process died',
+    );
+
+    const e = h.mk();
+    await e.excludeInAlias(await h.folder('repo'), 'feature', [T.id]);
+
+    // The switch the crash left was settled before the rule read any slot: both live files of the
+    // global slot name one account again, and no account is live in two slots.
+    const live = await globalLive(h);
+    expect(live.creds).toBe(live.identity);
+    expect(await storedTokens(h, { P: P.id, T: T.id })).toEqual({ P: 'rt-P', T: 'rt-T' });
+    expect(await e.checkSlots()).toEqual([]);
+  });
+
   it('recover() leaves both live files naming one account, and the registry agreeing', async () => {
     const h = await harness();
     const { P, T } = await seed(h);

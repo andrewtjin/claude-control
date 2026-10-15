@@ -11,6 +11,7 @@ import { execFileSync } from 'node:child_process';
 import {
   RefreshError,
   SlotError,
+  projectDirStem,
   SwitchEngineError,
   sandboxPaths,
   type AccountView,
@@ -523,6 +524,25 @@ describe('cctl where', () => {
     expect(r.out).toContain('CLAUDE_CONFIG_DIR=');
     expect(r.out).toContain('claudeCode.environmentVariables');
   });
+
+  it("prints a named session's commands to run from its folder when asked from another", async () => {
+    engine.listRules.mockResolvedValue([
+      ruleOn('', { id: 'r2', folders: [], aliases: [{ folder: research, alias: 'x' }] }),
+    ]);
+    const other = join(sandbox.root, 'other');
+    await mkdir(other);
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(realpathSync.native(other));
+    try {
+      const away = await runCli(['where', research]);
+      expect(away.out).toContain(`resume it with: cd '${research}'; cctl claude --resume 'x'`);
+      cwdSpy.mockReturnValue(research);
+      const here = await runCli(['where', research]);
+      expect(here.out).toContain("resume it with: cctl claude --resume 'x'");
+      expect(here.out).not.toContain('cd ');
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
 });
 
 describe('cctl switch --folder', () => {
@@ -840,6 +860,99 @@ describe('cctl claude', () => {
     rulesLiveOn('e', ruleOn(research, { include: ['e'], activeId: 'e' }));
     const onIncluded = await launch([], research);
     expect(onIncluded.exited).toBe(false);
+  });
+});
+
+// A named session whose alias has a rule of its own in the folder, beside that folder's rule: an
+// explicit shared --account must be judged against the rule the guard will require (the alias
+// rule), never the folder's.
+describe('cctl claude --account of a shared account for a session with an alias rule', () => {
+  const SID = 'bbbbbbbb-0000-4000-8000-000000000001';
+  const aliasRule: FolderRule = {
+    ...ruleOn('', { id: 'r2', label: 'x', folders: [], exclude: ['a'] }),
+  };
+
+  /** A transcript of session "x" recorded in the research folder, as Claude Code writes it. */
+  function recordSession(): void {
+    const dir = join(sandboxPaths(sandbox.root).claudeDir, 'projects', projectDirStem(research));
+    mkdirSync(dir, { recursive: true });
+    const lines = [
+      { type: 'custom-title', customTitle: 'x', sessionId: SID },
+      { type: 'user', message: { role: 'user', content: 'hi' }, cwd: research, sessionId: SID },
+      { type: 'assistant', message: { role: 'assistant', content: 'OK' }, cwd: research },
+    ];
+    writeFileSync(join(dir, `${SID}.jsonl`), lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  }
+
+  /** The folder rule r1 and the alias rule r2 on research, with each slot's live account. */
+  function rulesLive(r1: string, r2: string): void {
+    const rules = [
+      ruleOn(research, { exclude: ['a'], activeId: r1 }),
+      { ...aliasRule, aliases: [{ folder: research, alias: 'x' }], activeId: r2 },
+    ];
+    engine.listRules.mockResolvedValue(rules);
+    const live = new Map([
+      ['global', 'a'],
+      ['group:r1', r1],
+      ['group:r2', r2],
+    ]);
+    engine.liveSlots.mockResolvedValue(live);
+    engine.getActiveId.mockImplementation((slot?: string) =>
+      Promise.resolve(live.get(slot ?? 'global') ?? null),
+    );
+  }
+
+  async function launch(args: string[]) {
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(research);
+    launcher.spawnClaude.mockClear();
+    try {
+      const r = await runCli(['claude', ...args]);
+      return { ...r, env: launcher.spawnClaude.mock.calls[0]?.[0]?.env };
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  }
+
+  it('runs on the alias rule slot when the account is live there', async () => {
+    recordSession();
+    const C = account('c', { label: 'C' });
+    engine.listAllAccounts.mockResolvedValue([A, B, C, E]);
+    rulesLive('c', 'b');
+    const r = await launch(['--account', 'B', '--resume', 'x']);
+    expect(r.exited).toBe(false);
+    expect(r.env?.CLAUDE_CONFIG_DIR).toContain('r2');
+    expect(r.err).not.toContain('--account in effect');
+  });
+
+  it('is refused, never launched on the folder rule slot the guard would refuse', async () => {
+    recordSession();
+    const C = account('c', { label: 'C' });
+    engine.listAllAccounts.mockResolvedValue([A, B, C, E]);
+    rulesLive('b', 'c');
+    const r = await launch(['--account', 'B', '--resume', 'x']);
+    expect(r.exited).toBe(true);
+    expect(launcher.spawnClaude).not.toHaveBeenCalled();
+    expect(r.err).toContain(`slot of session "x"'s rule`);
+    expect(r.err).toContain('Omit --account');
+  });
+
+  it('an unnamed launch in the folder still runs on the folder rule slot', async () => {
+    rulesLive('b', 'c');
+    const r = await launch(['--account', 'B']);
+    expect(r.exited).toBe(false);
+    expect(r.env?.CLAUDE_CONFIG_DIR).toContain('r1');
+  });
+
+  it('a reserved account an alias rule includes is announced as reserved to its rule', async () => {
+    const R = account('r', { label: 'R', ruleIds: ['r2'] });
+    engine.listAllAccounts.mockResolvedValue([A, B, E, R]);
+    const rule = { ...aliasRule, include: ['r'], aliases: [{ folder: research, alias: 'x' }] };
+    engine.listRules.mockResolvedValue([rule]);
+    engine.getRule.mockResolvedValue(rule);
+    engine.activate.mockResolvedValue({} as ActivateResult);
+    const r = await launch(['--account', 'R']);
+    expect(r.exited).toBe(false);
+    expect(r.err).toContain('R is reserved to its rule; running it in');
   });
 });
 

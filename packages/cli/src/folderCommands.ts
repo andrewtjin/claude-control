@@ -1,6 +1,8 @@
 // The folder-rule command surface: `folder include|exclude|reset`, `folders`, `where`, `shell-init`
 // and `claude`, plus the folder sections other commands print (`usage`, `timeline`, `accounts list`)
-// and the slot choice behind `switch --folder`.
+// and the slot choice behind `switch --folder`. A session alias's rule (`cctl session include`, see
+// sessionRules.ts) is a rule like any other: its reports come from here too, and `cctl claude`
+// launches a named session on it (see launchRouting.ts).
 //
 // A folder rule applies to its folder and everything under it (the longest matching rule wins, with
 // no merging). It includes accounts — reserved to the folders that include them, and used there
@@ -17,12 +19,16 @@ import {
   SlotError,
   SwitchEngineError,
   canonicalizeFolder,
+  describeRuleScopes,
   exactFolderRule,
   folderBindingsPath,
   folderKey,
+  folderUniquenessKey,
   profilesRoot,
   resolveAccountRef,
+  recordedFolderFor,
   resolveFolderRule,
+  resolveSessionRule,
   ruleIdOfSlot,
   ruleSlotId,
   rulesIncluding,
@@ -33,6 +39,8 @@ import {
   type Paths,
   type PoolEntry,
   type ResetResult,
+  type RunningSession,
+  type SessionIdentity,
   type ResolveResult,
   type RuleLiveResult,
   type SlotId,
@@ -49,6 +57,7 @@ import {
   mintBindToken,
   readHeartbeat,
   removeBindToken,
+  sessionIdentities,
 } from '@claude-control/daemon';
 import {
   billingLabel,
@@ -82,14 +91,22 @@ import {
   renderReservedAccounts,
   renderWhere,
   nothingUsableReason,
+  resumeCommand,
   vscodeProfileNames,
   type FolderRuleView,
   type GlobalSlotView,
   type PoolEntryView,
   type ReservedAccountView,
   type SlotLiveView,
+  type WhereAliasView,
 } from './folderRender.js';
-import { olderDaemonReason } from './folderRulesSupport.js';
+import {
+  launchSessionContext,
+  resolveLaunchRule,
+  type LaunchRuleDecision,
+} from './launchRouting.js';
+import { canonicalOrRaw } from './sessionAliases.js';
+import { olderDaemonAliasReason, olderDaemonReason } from './folderRulesSupport.js';
 import { daemonHeartbeatPath, daemonSettingsPath, readSettingsReport } from './settings.js';
 import {
   bannerContextForLaunch,
@@ -138,14 +155,21 @@ function labelsOf(accounts: readonly StoredAccount[], ids: readonly string[]): s
   return ids.map((id) => labelOf(accounts, id)).join(', ');
 }
 
-/** A slot in words: "the global slot", or the folder slot named by its rule's folders. */
+/** A slot in words: "the global slot", or the folder slot named by its rule's folders (and session
+ *  aliases). */
 export function slotName(slot: SlotId, rules: readonly FolderRule[]): string {
   const ruleId = ruleIdOfSlot(slot);
   if (ruleId === undefined) return 'the global slot';
   const rule = rules.find((r) => r.id === ruleId);
   return rule === undefined
     ? 'a folder slot whose rule no longer exists'
-    : `the folder slot of ${rule.folders.join(', ')}`;
+    : `the folder slot of ${describeRuleScopes(rule)}`;
+}
+
+/** Whether a rule applies to a session alias only (no folder of its own): its reports speak of the
+ *  session, not of a folder. */
+export function isAliasRule(rule: FolderRule): boolean {
+  return rule.folders.length === 0 && (rule.aliases?.length ?? 0) > 0;
 }
 
 /** Install (or, once the last rule is gone, remove) the enforcement guard hook so a rule change takes
@@ -208,10 +232,19 @@ export function resolveAccountRefOrEmail(accounts: StoredAccount[], ref: string)
 
 /** Resolve a comma-separated account argument across the WHOLE registry (shared and reserved rows)
  *  to distinct ids in the order given, failing on the first ref that does not resolve. */
-async function resolveAccountArg(engine: Engine, verb: string, arg: string): Promise<string[]> {
+export async function resolveAccountArg(
+  engine: Engine,
+  verb: string,
+  arg: string,
+  command: 'folder' | 'session' = 'folder',
+): Promise<string[]> {
   const refs = parseAccountList(arg);
   if (refs.length === 0) {
-    fail(`folder ${verb} needs at least one account, e.g. cctl folder ${verb} . work@example.com`);
+    const scope = command === 'folder' ? '.' : '<alias>';
+    fail(
+      `${command} ${verb} needs at least one account, e.g. cctl ${command} ${verb} ${scope} ` +
+        'work@example.com',
+    );
   }
   const all = await engine.listAllAccounts();
   const ids: string[] = [];
@@ -268,6 +301,18 @@ function liveSource(
   if (rule === undefined) return shared ? 'inherited' : 'outside';
   if (rule.include.includes(accountId)) return 'include';
   return shared && !rule.exclude.includes(accountId) ? 'inherited' : 'outside';
+}
+
+/** Refuse a session-alias rule edit while a daemon that predates alias rules runs (see
+ *  folderRulesSupport.ts): such a daemon cannot read a rules file holding one. Checked before
+ *  anything is resolved or written, so a refusal changes nothing. */
+export async function refuseOnOlderDaemonForAliases(): Promise<void> {
+  const [report, heartbeat] = await Promise.all([
+    readSettingsReport(daemonSettingsPath()),
+    readHeartbeat(daemonHeartbeatPath()),
+  ]);
+  const reason = olderDaemonReason(report, heartbeat) ?? olderDaemonAliasReason(report, heartbeat);
+  if (reason !== undefined) fail(`${reason}. Nothing was changed.`);
 }
 
 /** The live view of a slot from its reconciled live account id. */
@@ -367,12 +412,51 @@ async function buildRuleView(
   return {
     label: rule.label,
     folders: rule.folders,
+    ...((rule.aliases ?? []).length > 0 ? { aliases: rule.aliases } : {}),
     include: rule.include.map((id) => labelOf(picture.accounts, id)),
     exclude: rule.exclude.map((id) => labelOf(picture.accounts, id)),
     live: buildLiveView(liveId, rule, picture.accounts),
     pool: await rulePoolView(engine, rule, picture),
     profileDir: ruleProfilePath(defaultPaths().vaultDir, rule.id),
   };
+}
+
+/** The named sessions with a rule of their own in exactly `folder` (canonical), for `cctl where`:
+ *  they outrank the folder's rule, so the operator has to see them to know where a resumed session
+ *  runs. */
+export function whereAliasViews(
+  folder: string,
+  picture: Pick<Awaited<ReturnType<typeof readFolderPicture>>, 'rules' | 'live' | 'accounts'>,
+  platform: NodeJS.Platform = process.platform,
+): WhereAliasView[] {
+  const here = folderKey(folder, platform);
+  const out: WhereAliasView[] = [];
+  for (const rule of picture.rules) {
+    for (const a of scopedAliasesOf(rule, platform)) {
+      if (folderKey(a.folder, platform) !== here) continue;
+      const liveId = picture.live.get(ruleSlotId(rule.id)) ?? null;
+      out.push({
+        alias: a.alias,
+        ruleLabel: rule.label,
+        include: rule.include.map((id) => labelOf(picture.accounts, id)),
+        exclude: rule.exclude.map((id) => labelOf(picture.accounts, id)),
+        liveLabel: liveId === null ? null : labelOf(picture.accounts, liveId),
+      });
+    }
+  }
+  return out;
+}
+
+/** A rule's alias scopes with their folders in canonical spelling (as the guard compares them),
+ *  each with the alias as entered. */
+function scopedAliasesOf(
+  rule: FolderRule,
+  platform: NodeJS.Platform,
+): { folder: string; alias: string }[] {
+  return (rule.aliases ?? []).map((a) => ({
+    folder: canonicalOrRaw(a.folder, { platform, cwd: process.cwd() }),
+    alias: a.alias,
+  }));
 }
 
 /** The global slot's view: its live account and the shared pool. */
@@ -421,7 +505,7 @@ export function buildReservedViews(
         billing: billingLabel(a, nowMs),
         quarantined: a.quarantined,
         live: including.some((r) => live.get(ruleSlotId(r.id)) === a.id),
-        includedBy: including.map((r) => r.folders.join(', ')),
+        includedBy: including.map((r) => describeRuleScopes(r)),
       };
     });
 }
@@ -453,15 +537,23 @@ export interface ChangeContext {
   pools?: ReadonlyMap<string, PoolEntryView[]>;
 }
 
-/** The lines every rule change ends on: who is live in the folder's slot now, and the running
- *  sessions that keep their old account until relaunched. */
+/** How a report names a rule's slot: the folder's, or — for a session alias's rule — the
+ *  session's. */
+function slotNoun(rule: FolderRule): string {
+  return isAliasRule(rule) ? "the session's slot" : "the folder's slot";
+}
+
+/** The lines every rule change ends on: who is live in the rule's slot now, and the running sessions
+ *  that keep their old account until relaunched (resumed, for a session alias's rule — those whose
+ *  title could not be learned are counted apart, since they only MAY be that session). */
 function liveAndSessionLines(
   rule: FolderRule,
   live: Pick<RuleLiveResult, 'liveAccount' | 'noWorkingAccount'>,
-  runningSessions: number,
+  sessions: readonly RunningSession[],
   ctx: ChangeContext,
 ): string[] {
   const lines: string[] = [];
+  const slot = slotNoun(rule);
   if (live.liveAccount === null) {
     const pool = ctx.pools?.get(rule.id);
     const why =
@@ -469,7 +561,7 @@ function liveAndSessionLines(
         ? nothingUsableReason(pool)
         : 'every account it may use is quarantined, live in another slot or excluded ' +
           '(cctl folders shows which)';
-    lines.push(ctx.palette.red(`  the folder's slot has no working account: ${why}`));
+    lines.push(ctx.palette.red(`  ${slot} has no working account: ${why}`));
   } else {
     const label = sanitizeForTerminal(labelOf(ctx.accounts, live.liveAccount));
     const source = liveSource(live.liveAccount, rule, ctx.accounts);
@@ -482,17 +574,43 @@ function liveAndSessionLines(
     lines.push(
       live.noWorkingAccount
         ? ctx.palette.red(
-            `  live in the folder's slot: ${label}, which is quarantined; re-login it: ` +
+            `  live in ${slot}: ${label}, which is quarantined; re-login it: ` +
               `cctl accounts relogin ${label}`,
           )
-        : `  live in the folder's slot: ${label} (${why})`,
+        : `  live in ${slot}: ${label} (${why})`,
     );
   }
-  if (runningSessions > 0) {
+  const alias = isAliasRule(rule) ? rule.aliases?.[0] : undefined;
+  if (alias === undefined) {
+    if (sessions.length > 0) {
+      lines.push(
+        ctx.palette.yellow(
+          `  ${sessions.length} running session(s) under this folder keep their current account ` +
+            'until relaunched with: cctl claude',
+        ),
+      );
+    }
+    return lines;
+  }
+  const named = sessions.filter((s) => s.unidentified !== true).length;
+  const unknown = sessions.length - named;
+  const resume = resumeCommand(alias.alias);
+  if (named > 0) {
     lines.push(
       ctx.palette.yellow(
-        `  ${runningSessions} running session(s) under this folder keep their current account ` +
-          'until relaunched with: cctl claude',
+        `  ${named} running session(s) named "${sanitizeForTerminal(alias.alias)}" keep their ` +
+          `current account until resumed with: ${resume}`,
+      ),
+    );
+  }
+  if (unknown > 0) {
+    // Their titles could not be learned (an unreadable transcript, or no prompt sent yet): any of
+    // them may be this session, and would keep its account the same way.
+    lines.push(
+      ctx.palette.yellow(
+        `  ${unknown} running session(s) in ${sanitizeForTerminal(alias.folder)} could not be ` +
+          'identified (a transcript that cannot be read, or no prompt sent yet); if one of them is ' +
+          `this session, it keeps its current account until resumed with: ${resume}`,
       ),
     );
   }
@@ -517,9 +635,24 @@ function profileOf(name: string | undefined): { vscodeProfile?: string } {
   return name === undefined ? {} : { vscodeProfile: name };
 }
 
-/** The rule's folders as one phrase. */
+/** The rule's folders (and session aliases) as one phrase. */
 function foldersOf(rule: FolderRule): string {
-  return sanitizeForTerminal(rule.folders.join(', '));
+  return sanitizeForTerminal(describeRuleScopes(rule));
+}
+
+/** A rule as a report names it: "the folder rule on <folders>", or "the rule for session "<alias>"
+ *  in <folder>". */
+function ruleName(rule: FolderRule): string {
+  return isAliasRule(rule)
+    ? `the rule for ${foldersOf(rule)}`
+    : `the folder rule on ${foldersOf(rule)}`;
+}
+
+/** "Created ..." for a new rule: "a folder rule on <folders>" or "a rule for session ...". */
+function newRuleName(rule: FolderRule): string {
+  return isAliasRule(rule)
+    ? `a rule for ${foldersOf(rule)}`
+    : `a folder rule on ${foldersOf(rule)}`;
 }
 
 /** `cctl folder include`'s report: the rule, every account that left the shared pool, every slot
@@ -535,8 +668,8 @@ export function describeInclude(
   const names = sanitizeForTerminal(labelsOf(ctx.accounts, requested));
   const lines = [
     result.created
-      ? `Created a folder rule on ${foldersOf(rule)}: it uses ${names} first, then the shared pool.`
-      : `Included ${names} in the folder rule on ${foldersOf(rule)}.`,
+      ? `Created ${newRuleName(rule)}: it uses ${names} first, then the shared pool.`
+      : `Included ${names} in ${ruleName(rule)}.`,
     ...labelNotApplied(result, label),
   ];
   if (result.reserved.length > 0) {
@@ -552,7 +685,7 @@ export function describeInclude(
     if (others.length === 0) continue;
     lines.push(
       `  ${sanitizeForTerminal(labelOf(ctx.accounts, id))} is also included by ` +
-        `${sanitizeForTerminal(others.map((r) => r.folders.join(', ')).join('; '))}; ` +
+        `${sanitizeForTerminal(others.map((r) => describeRuleScopes(r)).join('; '))}; ` +
         'those folders share it, live in one of them at a time.',
     );
   }
@@ -568,7 +701,7 @@ export function describeInclude(
         `${sanitizeForTerminal(labelOf(ctx.accounts, h.to))}.`,
     );
   }
-  lines.push(...liveAndSessionLines(rule, result.live, result.runningSessions.length, ctx));
+  lines.push(...liveAndSessionLines(rule, result.live, result.runningSessions, ctx));
   lines.push(`  profile: ${sanitizeForTerminal(ruleProfilePath(ctx.vaultDir, rule.id))}`);
   return lines.join('\n');
 }
@@ -585,9 +718,9 @@ export function describeExclude(
   const names = sanitizeForTerminal(labelsOf(ctx.accounts, requested));
   const lines = [
     result.created
-      ? `Created a folder rule on ${foldersOf(rule)} that excludes ${names}; it uses the rest of ` +
+      ? `Created ${newRuleName(rule)} that excludes ${names}; it uses the rest of ` +
         'the shared pool, in its own slot.'
-      : `Excluded ${names} from the folder rule on ${foldersOf(rule)}.`,
+      : `Excluded ${names} from ${ruleName(rule)}.`,
     ...labelNotApplied(result, label),
     `  ${names} ${requested.length === 1 ? 'stays' : 'stay'} usable everywhere else.`,
   ];
@@ -596,12 +729,12 @@ export function describeExclude(
     lines.push(
       result.live.liveAccount === null
         ? ctx.palette.yellow(
-            `  the folder's slot was cleared off ${from}: nothing else in its pool is available.`,
+            `  ${slotNoun(rule)} was cleared off ${from}: nothing else in its pool is available.`,
           )
-        : `  the folder's slot switched off ${from}.`,
+        : `  ${slotNoun(rule)} switched off ${from}.`,
     );
   }
-  lines.push(...liveAndSessionLines(rule, result.live, result.runningSessions.length, ctx));
+  lines.push(...liveAndSessionLines(rule, result.live, result.runningSessions, ctx));
   return lines.join('\n');
 }
 
@@ -616,6 +749,11 @@ export function describeReset(
   requested: readonly string[] | undefined,
 ): string {
   const folder = sanitizeForTerminal(result.folder);
+  // A session alias's rule is named by the session; what it falls back to is the rule of its folder.
+  const subject =
+    result.alias !== undefined
+      ? `session "${sanitizeForTerminal(result.alias)}" in ${folder}`
+      : folder;
   const released =
     result.released.length > 0
       ? [
@@ -635,7 +773,9 @@ export function describeReset(
 
   if (result.dissolved) {
     const lines = [
-      `Removed the folder rule on ${before ? foldersOf(before) : folder}. ${folder} now uses ${nowRunsOn()}.`,
+      result.alias !== undefined
+        ? `Removed the rule for ${subject}. That session now uses ${nowRunsOn()}.`
+        : `Removed the folder rule on ${before ? foldersOf(before) : folder}. ${folder} now uses ${nowRunsOn()}.`,
       ...released,
     ];
     const stillReserved = (before?.include ?? []).filter((id) => !result.released.includes(id));
@@ -648,8 +788,11 @@ export function describeReset(
     if (result.runningSessions.length > 0) {
       lines.push(
         ctx.palette.yellow(
-          `  ${result.runningSessions.length} running session(s) under it lost the folder's ` +
-            'login; relaunch them with: cctl claude',
+          result.alias !== undefined
+            ? `  ${result.runningSessions.length} running session(s) of it lost the session's ` +
+                `login; resume them with: ${resumeCommand(result.alias)}`
+            : `  ${result.runningSessions.length} running session(s) under it lost the folder's ` +
+                'login; relaunch them with: cctl claude',
         ),
       );
     }
@@ -660,8 +803,8 @@ export function describeReset(
   if (requested === undefined || rule === undefined) {
     // One of several folders left a rule that keeps the others.
     return [
-      `${folder} left its folder rule, which stays on ${rule ? foldersOf(rule) : 'its other folders'}.`,
-      `  ${folder} now uses ${nowRunsOn()}.`,
+      `${subject} left its folder rule, which stays on ${rule ? foldersOf(rule) : 'its other folders'}.`,
+      `  ${result.alias !== undefined ? 'That session' : folder} now uses ${nowRunsOn()}.`,
     ].join('\n');
   }
 
@@ -677,7 +820,7 @@ export function describeReset(
   if (wasExcluded.length > 0) {
     lines.push(
       `Removed ${sanitizeForTerminal(labelsOf(ctx.accounts, wasExcluded))} from what ` +
-        `${foldersOf(rule)} excludes: the folder may use ${wasExcluded.length === 1 ? 'it' : 'them'} again.`,
+        `${foldersOf(rule)} excludes: the ${isAliasRule(rule) ? 'session' : 'folder'} may use ${wasExcluded.length === 1 ? 'it' : 'them'} again.`,
     );
   }
   lines.push(...released);
@@ -691,22 +834,26 @@ export function describeReset(
     ...liveAndSessionLines(
       rule,
       { liveAccount: liveAfter, noWorkingAccount: liveAfter === null },
-      result.runningSessions.length,
+      result.runningSessions,
       ctx,
     ),
   );
   return lines.join('\n');
 }
 
-/** Read the registry after a change, for the describe* helpers. */
-async function changeContext(engine: Engine): Promise<ChangeContext> {
+/** Read the registry after a change, for the describe* helpers. `vaultDir` names the profiles the
+ *  reports print (default: this machine's). */
+export async function changeContext(
+  engine: Engine,
+  vaultDir: string = defaultPaths().vaultDir,
+): Promise<ChangeContext> {
   const picture = await readFolderPicture(engine);
   const pools = new Map<string, PoolEntryView[]>();
   for (const rule of picture.rules) pools.set(rule.id, await rulePoolView(engine, rule, picture));
   return {
     accounts: picture.accounts,
     rules: picture.rules,
-    vaultDir: defaultPaths().vaultDir,
+    vaultDir,
     palette: detectPalette(),
     pools,
   };
@@ -714,7 +861,7 @@ async function changeContext(engine: Engine): Promise<ChangeContext> {
 
 /** Run a rule change: an engine refusal is the whole error line (it already says what is wrong and
  *  that nothing moved); anything else escapes as a real failure. */
-async function engineCall<T>(body: () => Promise<T>): Promise<T> {
+export async function engineCall<T>(body: () => Promise<T>): Promise<T> {
   try {
     return await body();
   } catch (err) {
@@ -767,10 +914,12 @@ export function describeSlotRefusal(err: SlotError, accountLabel: string): strin
 export async function describeSwitchedGroup(
   engine: Engine,
   accountId: string,
-): Promise<{ label: string; folders: string[] } | null> {
+): Promise<{ label: string; folders: string[]; scopes: string } | null> {
   const [rules, live] = await Promise.all([engine.listRules(), engine.liveSlots()]);
   const rule = rules.find((r) => live.get(ruleSlotId(r.id)) === accountId);
-  return rule ? { label: rule.label, folders: rule.folders } : null;
+  return rule
+    ? { label: rule.label, folders: rule.folders, scopes: describeRuleScopes(rule) }
+    : null;
 }
 
 /** The slot `cctl switch` asserts for an account named without `--folder`: the global slot for a
@@ -949,8 +1098,22 @@ export function buildFolderCommands(program: Command): void {
               matchedFolder: match.folder,
               ...profileOf(vscodeProfileNames(picture.rules).get(match.rule.id)),
             };
+      const aliases = whereAliasViews(canonical, picture);
+      const elsewhere =
+        folderArg !== undefined &&
+        folderUniquenessKey(canonical, process.platform) !==
+          folderUniquenessKey(canonicalizeCliFolder(process.cwd()), process.platform);
       process.stdout.write(
-        renderWhere({ folder: canonical, rule, global }, detectPalette()) + '\n',
+        renderWhere(
+          {
+            folder: canonical,
+            rule,
+            global,
+            ...(aliases.length > 0 ? { aliases } : {}),
+            ...(elsewhere ? { elsewhere } : {}),
+          },
+          detectPalette(),
+        ) + '\n',
       );
     });
 
@@ -1003,19 +1166,22 @@ export function buildFolderCommands(program: Command): void {
  * systemMessage in a headless (`-p` / SDK) run, where the guard warning would otherwise be invisible;
  * this line is the reliable signal in every mode. It names the actual session cwd, where the
  * relaxation applies, rather than the account's own folder. Both inputs pass sanitizeForTerminal
- * at this sink so a crafted label/path cannot inject terminal control sequences.
+ * at this sink so a crafted label/path cannot inject terminal control sequences. `reservedTo` words
+ * an --account launch the way the guard's own notice does: an account whose rule holds a session
+ * alias is reserved to its rule, one whose rule holds only folders to its folders.
  */
 export function relaxationBannerLine(
   kind: 'override' | 'explicit',
   label: string,
   cwd: string,
+  reservedTo: 'folders' | 'rule' = 'folders',
 ): string {
   const safeLabel = sanitizeForTerminal(label);
   const safeCwd = sanitizeForTerminal(cwd);
   return kind === 'override'
     ? `cctl: --override in effect: allowing ${safeLabel} in ${safeCwd}, whose folder rule runs ` +
         `on a different slot.\n`
-    : `cctl: --account in effect: ${safeLabel} is reserved to its folders; running it in ` +
+    : `cctl: --account in effect: ${safeLabel} is reserved to its ${reservedTo}; running it in ` +
         `${safeCwd} on purpose.\n`;
 }
 
@@ -1167,6 +1333,7 @@ function routeContext(
   host: ClaudeBackgroundHost,
   daemonRunning: boolean,
   shield: RouteContext['shield'],
+  launchRule: () => Promise<LaunchRuleDecision>,
 ): RouteContext {
   const platform = process.platform;
   const profileOf = (ruleId: string): string => ruleProfilePath(paths.vaultDir, ruleId);
@@ -1176,21 +1343,15 @@ function routeContext(
     platform,
     sameFolder: (a, b) => folderKeyOf(a, platform) === folderKeyOf(b, platform),
     titleFolders,
+    // The rule the launch itself runs under — the same decision the launch makes below (a named
+    // session's alias rule first), so what is checked for trap rows is where it really opens.
     async launchConfigDir() {
-      const match = resolveFolderRule(
-        canonicalizeCliFolder(process.cwd()),
-        await engine.listRules(),
-        platform,
-      );
+      const { match } = await launchRule();
       return match === null ? null : profileOf(match.rule.id);
     },
     shield,
-    async homeOf(cwd) {
-      const match = resolveFolderRule(
-        canonicalOrSpelled(cwd, platform),
-        await engine.listRules(),
-        platform,
-      );
+    async homeOf(cwd, sessionId) {
+      const match = await ruleOfSession(engine, cwd, sessionId, platform);
       if (match === null) return { configDir: null, movable: false };
       const rule = match.rule;
       const configDir = profileOf(rule.id);
@@ -1259,12 +1420,43 @@ function routeContext(
 
 /** A folder's canonical path, or the path as spelled when it has none. */
 function canonicalOrSpelled(folder: string, platform: NodeJS.Platform): string {
-  const r = canonicalizeFolder(folder, {
-    platform,
-    cwd: process.cwd(),
-    realpath: (p) => realpathSync.native(p),
-  });
-  return r.ok ? r.path : folder;
+  return canonicalOrRaw(folder, { platform, cwd: process.cwd() });
+}
+
+/**
+ * The rule a Claude Code session working in `cwd` runs under: with a session id whose transcript
+ * records a custom title, the alias rule of that title in the folder the conversation was recorded
+ * in (decided as the guard decides it), else the folder rule of `cwd`. Leniently canonicalized; a
+ * transcript that cannot be read leaves the folder rule deciding (the guard still judges the real
+ * title).
+ */
+async function ruleOfSession(
+  engine: Engine,
+  cwd: string,
+  sessionId: string | undefined,
+  platform: NodeJS.Platform,
+): Promise<{ rule: FolderRule; folder: string } | null> {
+  const rules = await engine.listRules();
+  const folder = canonicalOrSpelled(cwd, platform);
+  if (sessionId !== undefined && rules.some((r) => (r.aliases ?? []).length > 0)) {
+    const paths = defaultPaths();
+    const identity = (
+      await sessionIdentities(paths.claudeDir, [sessionId]).catch(
+        () => new Map<string, SessionIdentity>(),
+      )
+    ).get(sessionId.toLowerCase());
+    const title = identity?.unreadable === true ? null : (identity?.customTitle ?? null);
+    if (identity !== undefined && title !== null && title.trim() !== '') {
+      const recorded = recordedFolderFor(
+        { folder: identity.folder, dirName: identity.dirName ?? '' },
+        { spelled: cwd, canonical: folder },
+        (f) => canonicalOrSpelled(f, platform),
+      );
+      const match = resolveSessionRule(folder, title, rules, platform, recorded);
+      return match === null ? null : { rule: match.rule, folder: match.folder };
+    }
+  }
+  return resolveFolderRule(folder, rules, platform);
 }
 
 /** The launch slot for a config dir the routing chose: its account and slot for the banner, and the
@@ -1305,6 +1497,27 @@ async function runClaude(opts: {
   const platform = process.platform;
   const profRoot = profilesRoot(paths.vaultDir);
 
+  // The rule a launch with no explicit account runs under (THE precedence rule over the session
+  // Claude Code's own arguments open), decided once: the background routing's trap check and the
+  // slot choice below must agree on it, and its note is printed once.
+  let launchRuleMemo: Promise<LaunchRuleDecision> | undefined;
+  const launchRule = (): Promise<LaunchRuleDecision> =>
+    (launchRuleMemo ??= (async () => {
+      const decision = await resolveLaunchRule({
+        ...launchSessionContext({
+          cwd: process.cwd(),
+          claudeDir: paths.claudeDir,
+          platform,
+          canonicalLaunch: canonicalizeCliFolder,
+        }),
+        args: opts.args,
+        rules: await engine.listRules(),
+        platform,
+      });
+      if (decision.note !== null) process.stderr.write(decision.note);
+      return decision;
+    })());
+
   // Folder profiles never exist on macOS (folder rules are refused there), so nothing is routed.
   const request = platform === 'darwin' ? undefined : parseBackgroundRequest(opts.args);
   let routing: { ctx: RouteContext; decision: RouteDecision } | undefined;
@@ -1317,6 +1530,7 @@ async function runClaude(opts: {
       launcherBackgroundHost(paths),
       await daemonIsRunning(),
       guard.shield,
+      launchRule,
     );
     const decision = await routeBackgroundLaunch(request!, ctx, mode);
     if (guard.interrupted()) {
@@ -1345,6 +1559,8 @@ async function runClaude(opts: {
 
   let slot: LaunchSlot;
   let explicit = false;
+  // What an explicit reserved account is reserved to, for the --account banner.
+  let reservedTo: 'folders' | 'rule' = 'folders';
 
   if (opts.account !== undefined) {
     explicit = true;
@@ -1381,32 +1597,42 @@ async function runClaude(opts: {
         kind: 'group',
         profileDir: ruleProfilePath(paths.vaultDir, rule.id),
         label: acct.label,
-        context: `explicit account, ${rule.folders.join(', ')}`,
+        context: `explicit account, ${describeRuleScopes(rule)}`,
       };
+      reservedTo = (rule.aliases?.length ?? 0) > 0 ? 'rule' : 'folders';
     } else {
-      // A shared account runs where it is already live: the global slot, or the slot of this
-      // folder's rule when it is live there (the folder's fallback, or a folder that excludes the
-      // global account). A launch never switches a slot out from under the sessions on it, so
-      // anywhere else --account of a shared account is refused.
+      // A shared account runs where it is already live: the global slot, or the slot of the rule
+      // this launch runs under when it is live there (the rule's fallback, or a rule that excludes
+      // the global account). That rule is the one the guard will require: THE precedence rule over
+      // the session the arguments open, so a named session's alias rule outranks the folder's. A
+      // launch never switches a slot out from under the sessions on it, so anywhere else --account
+      // of a shared account is refused.
       const globalLive = await engine.getActiveId('global');
-      const match = resolveFolderRule(
-        canonicalizeCliFolder(process.cwd()),
-        await engine.listRules(),
-        platform,
-      );
+      const { match, alias } =
+        acct.id === globalLive ? { match: null, alias: null } : await launchRule();
       const liveHere =
         match !== null && (await engine.liveSlots()).get(ruleSlotId(match.rule.id)) === acct.id;
       if (acct.id === globalLive) {
         slot = { kind: 'global', label: acct.label, context: 'global (shared account)' };
       } else if (match !== null && liveHere) {
-        // The folder's own slot on the account it holds: no relaxation is involved.
+        // The rule's own slot on the account it holds: no relaxation is involved.
         explicit = false;
         slot = {
           kind: 'group',
           profileDir: ruleProfilePath(paths.vaultDir, match.rule.id),
           label: acct.label,
-          context: `${match.folder} folder rule`,
+          context:
+            match.via === 'alias'
+              ? `session "${alias ?? ''}" in ${match.folder} rule`
+              : `${match.folder} folder rule`,
         };
+      } else if (match !== null && match.via === 'alias') {
+        // No command switches an alias rule's slot to a chosen account; without --account the
+        // launch runs on whichever account that slot holds.
+        fail(
+          `${acct.label} is a shared account live neither in the global slot nor in the slot of ` +
+            `session "${sanitizeForTerminal(alias ?? '')}"'s rule. Omit --account to run it on that rule's account.`,
+        );
       } else {
         fail(
           `${acct.label} is a shared account live neither in the global slot nor in this folder's ` +
@@ -1416,12 +1642,22 @@ async function runClaude(opts: {
       }
     }
   } else {
-    // No explicit account: the cwd's folder rule decides, unless --override asks for the global
-    // account here on purpose (the guard honors that launch's token for this session).
-    const canonical = canonicalizeCliFolder(process.cwd());
-    const rules = await engine.listRules();
-    const match = opts.override ? null : resolveFolderRule(canonical, rules, platform);
+    // No explicit account: THE precedence rule decides — the alias rule of the session Claude Code's
+    // own arguments open (matched in the folder that session is recorded in), else the cwd's folder
+    // rule, else global — unless --override asks for the global account here on purpose (the guard
+    // honors that launch's token for this session). The argv is only read here; it is passed to the
+    // child untouched below.
+    let match: { rule: FolderRule; folder: string; via: 'alias' | 'folder' } | null = null;
+    let alias: string | null = null;
+    if (!opts.override) {
+      const decision = await launchRule();
+      match = decision.match;
+      alias = decision.alias;
+    }
     if (match !== null) {
+      // How the rule is named: the folder, or the named session in its folder.
+      const scope =
+        match.via === 'alias' ? `session "${alias ?? ''}" in ${match.folder}` : match.folder;
       const rule = match.rule;
       await refuseSeatingUnderOlderDaemon(engine, rule);
       let live;
@@ -1434,14 +1670,17 @@ async function runClaude(opts: {
       if (live.noWorkingAccount || live.liveAccount === null) {
         const picture = await readFolderPicture(engine);
         const why = nothingUsableReason(await rulePoolView(engine, rule, picture));
-        fail(`${match.folder} has a folder rule, but no account it may use is usable: ${why}.`);
+        fail(
+          `${sanitizeForTerminal(scope)} has ${match.via === 'alias' ? 'a rule' : 'a folder rule'}, ` +
+            `but no account it may use is usable: ${why}.`,
+        );
       }
       const liveLabel = labelOf(await engine.listAllAccounts(), live.liveAccount);
       slot = {
         kind: 'group',
         profileDir: ruleProfilePath(paths.vaultDir, rule.id),
         label: liveLabel,
-        context: `${match.folder} folder rule`,
+        context: `${scope} ${match.via === 'alias' ? 'rule' : 'folder rule'}`,
       };
     } else {
       const globalLive = await engine.getActiveId('global');
@@ -1472,6 +1711,7 @@ async function runClaude(opts: {
     launchOnSlot({
       slot,
       explicit,
+      reservedTo,
       override: opts.override,
       args: opts.args,
       paths,
@@ -1547,6 +1787,8 @@ async function launchRouted(
 async function launchOnSlot(input: {
   slot: LaunchSlot;
   explicit: boolean;
+  /** What an explicit account is reserved to (see relaxationBannerLine). */
+  reservedTo: 'folders' | 'rule';
   override: boolean;
   args: string[];
   paths: Paths;
@@ -1606,7 +1848,9 @@ async function launchOnSlot(input: {
     process.stderr.write(relaxationBannerLine('override', slot.label, process.cwd()));
   }
   if (explicitToken !== undefined) {
-    process.stderr.write(relaxationBannerLine('explicit', slot.label, process.cwd()));
+    process.stderr.write(
+      relaxationBannerLine('explicit', slot.label, process.cwd(), input.reservedTo),
+    );
   }
 
   try {

@@ -11,7 +11,15 @@
 // without a vault, and shared verbatim by the engine's mutations, its invariant checker and the
 // daemon-facing pool read.
 
-import { exactBinding, resolveBinding } from './folderPath.js';
+import {
+  aliasKey,
+  canonicalStoredFolder,
+  exactAliasBinding,
+  exactBinding,
+  resolveBinding,
+  resolveSessionBinding,
+  type ScopedGroup,
+} from './folderPath.js';
 import { ruleIdOfSlot, ruleSlotId } from './types.js';
 import type { FolderRule, PoolEntry, SlotId, StoredAccount } from './types.js';
 
@@ -191,16 +199,109 @@ export function assignDistinct(
 }
 
 /** The rule a folder runs under: the longest rule folder that contains it wins, with no merging
- *  between nested rules; `null` means the global slot. `folder` must be canonical. */
+ *  between nested rules; `null` means the global slot. `folder` must be canonical. Stored folders
+ *  are compared in their canonical spelling (`scopedRuleOf`), exactly as `resolveSessionRule` and
+ *  the guard snapshot compare them. */
 export function resolveFolderRule(
   folder: string,
   rules: readonly FolderRule[],
   platform: NodeJS.Platform,
 ): { rule: FolderRule; folder: string } | null {
-  const match = resolveBinding(folder, rules, platform);
+  const match = resolveBinding(
+    folder,
+    rules.map((r) => scopedRuleOf(r, platform)),
+    platform,
+  );
   if (match === null) return null;
   const rule = rules.find((r) => r.id === match.groupId);
   return rule === undefined ? null : { rule, folder: match.folder };
+}
+
+/** A rule's scopes as the precedence rule (`resolveSessionBinding`) reads them: its folders and alias
+ *  folders in their canonical spelling (`canonicalStoredFolder`: a hand-edited `C:/x` is the same
+ *  folder as `C:\x`), and its alias scopes reduced to their comparison keys. The one place a stored
+ *  scope is turned into what matching compares, so the guard snapshot, the launcher and `where`
+ *  cannot key it differently. Pure. */
+export function scopedRuleOf(
+  rule: FolderRule,
+  platform: NodeJS.Platform = process.platform,
+): ScopedGroup {
+  return {
+    id: rule.id,
+    folders: rule.folders.map((f) => canonicalStoredFolder(f, platform)),
+    aliases: (rule.aliases ?? []).map((a) => ({
+      folder: canonicalStoredFolder(a.folder, platform),
+      aliasKey: aliasKey(a.alias),
+    })),
+  };
+}
+
+/** How many scopes (folders + alias scopes) a rule holds — the count that decides whether removing
+ *  one removes the rule. */
+export function ruleScopeCount(rule: FolderRule): number {
+  return rule.folders.length + (rule.aliases?.length ?? 0);
+}
+
+/** A rule's scopes in words: its folders, then `session "<alias>" in <folder>` per alias scope. */
+export function ruleScopes(rule: FolderRule): string[] {
+  return [
+    ...rule.folders,
+    ...(rule.aliases ?? []).map((a) => `session "${a.alias}" in ${a.folder}`),
+  ];
+}
+
+/** A rule's scopes as one display phrase, falling back to its label for a rule with none (only a
+ *  hand edit leaves one). What refusals, alerts and the phone name a rule by. Unsanitized: every
+ *  caller that prints it to a terminal passes it through its own sink sanitizer. */
+export function describeRuleScopes(rule: FolderRule): string {
+  const parts = ruleScopes(rule);
+  return parts.length > 0 ? parts.join(', ') : rule.label;
+}
+
+/** Which rule a session runs under, and by which scope. */
+export type SessionRuleMatch =
+  | { rule: FolderRule; via: 'alias'; folder: string; aliasKey: string }
+  | { rule: FolderRule; via: 'folder'; folder: string };
+
+/**
+ * THE precedence rule for a session, over folder rules: the alias rule of the session's RECORDED
+ * folder and custom title, else the longest folder rule containing the folder it runs in, else
+ * `null` (the global slot). See `resolveSessionBinding` (folderPath.ts) for the inputs:
+ * `recordedFolder` absent = the folder it runs in, `null` = recorded in no folder an alias rule can
+ * name; `title` null/blank = unnamed. `folder` must be canonical.
+ */
+export function resolveSessionRule(
+  folder: string,
+  title: string | null | undefined,
+  rules: readonly FolderRule[],
+  platform: NodeJS.Platform,
+  recordedFolder?: string | null,
+): SessionRuleMatch | null {
+  const match = resolveSessionBinding(
+    folder,
+    title,
+    rules.map((r) => scopedRuleOf(r, platform)),
+    platform,
+    recordedFolder,
+  );
+  if (match === null) return null;
+  const rule = rules.find((r) => r.id === match.groupId);
+  if (rule === undefined) return null;
+  return match.via === 'alias'
+    ? { rule, via: 'alias', folder: match.folder, aliasKey: match.aliasKey }
+    : { rule, via: 'folder', folder: match.folder };
+}
+
+/** The rule holding the alias scope (`folder`, `alias`) — same folder by the store's uniqueness key,
+ *  same alias key — if any. */
+export function exactAliasRule(
+  folder: string,
+  alias: string,
+  rules: readonly FolderRule[],
+  platform: NodeJS.Platform,
+): FolderRule | undefined {
+  const ruleId = exactAliasBinding(folder, alias, rules, platform);
+  return ruleId === null ? undefined : rules.find((r) => r.id === ruleId);
 }
 
 /** The rule holding this EXACT folder (compared by the store's uniqueness key), if any. A nested

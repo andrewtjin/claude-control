@@ -1,14 +1,26 @@
 import { describe, it, expect } from 'vitest';
 import {
+  aliasKey,
+  aliasScopeUniquenessKey,
   canonicalizeFolder,
+  canonicalStoredFolder,
+  projectDirMatches,
+  projectDirStem,
+  shellQuoteArg,
+  checkAliasFolder,
+  exactAliasBinding,
   folderKey,
   isWithin,
   resolveBinding,
+  resolveSessionBinding,
   exactBinding,
   checkBindTarget,
   embeddableFolderPathSource,
+  embedFunctionAs,
   type CanonicalizeDeps,
   type CanonicalizeResult,
+  type ScopedGroup,
+  type SessionBinding,
 } from './folderPath.js';
 
 /** Build a fake `realpath.native`: paths present in `map` resolve to their canonical form (this is
@@ -461,5 +473,415 @@ describe('embeddableFolderPathSource', () => {
     expect(embedded.folderKey('C:\\Foo', 'win32')).toBe('c:\\foo');
     expect(embedded.isWithin('C:\\a\\b', 'C:\\a', 'win32')).toBe(true);
     expect(embedded.isWithin('C:\\ab', 'C:\\a', 'win32')).toBe(false);
+  });
+
+  it('survives a bundler renaming a function and its sibling calls (binds both names)', () => {
+    // What esbuild does on a top-level name collision: the declaration AND every call site are
+    // renamed (helper -> helper2). Embedding under the source name alone would leave `user`
+    // calling an undefined helper2.
+    function helper2(x: number): number {
+      return x + 1;
+    }
+    function user(x: number): number {
+      return helper2(x) * 10;
+    }
+    const src = [embedFunctionAs(helper2, 'helper'), embedFunctionAs(user, 'user')].join('\n');
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    const factory = new Function(`${src}\nreturn { helper, user };`);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+    const embedded = factory() as { helper: (x: number) => number; user: (x: number) => number };
+    expect(embedded.helper(1)).toBe(2);
+    expect(embedded.user(1)).toBe(20);
+    // An un-renamed function is emitted once, under its own name.
+    expect(embedFunctionAs(aliasKey, 'aliasKey').startsWith('const aliasKey = ')).toBe(true);
+    expect(embedFunctionAs(aliasKey, 'aliasKey').split('const ')).toHaveLength(2);
+  });
+
+  it('embeds aliasKey and resolveSessionBinding, agreeing with the live ones on the whole table', () => {
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    const factory = new Function(
+      `${embeddableFolderPathSource()}\nreturn { aliasKey, resolveSessionBinding };`,
+    );
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+    const embedded = factory() as {
+      aliasKey: typeof aliasKey;
+      resolveSessionBinding: typeof resolveSessionBinding;
+    };
+    for (const c of PRECEDENCE_CASES) {
+      expect(
+        embedded.resolveSessionBinding(c.folder, c.title, c.groups, c.platform, c.aliasFolder),
+      ).toEqual(resolveSessionBinding(c.folder, c.title, c.groups, c.platform, c.aliasFolder));
+    }
+    expect(embedded.aliasKey('  Auth WORK ')).toBe(aliasKey('  Auth WORK '));
+  });
+
+  it('embeds the project-dir naming and the shell quoting, agreeing with the live ones', () => {
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    const factory = new Function(
+      `${embeddableFolderPathSource()}\nreturn { projectDirStem, projectDirMatches, shellQuoteArg };`,
+    );
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+    const embedded = factory() as {
+      projectDirStem: typeof projectDirStem;
+      projectDirMatches: typeof projectDirMatches;
+      shellQuoteArg: typeof shellQuoteArg;
+    };
+    const long = 'C:\\' + 'deep\\'.repeat(50) + 'x';
+    for (const cwd of ['C:\\Users\\me\\proj', '/home/me/a_b', 'C:\\émoji😀', long]) {
+      expect(embedded.projectDirStem(cwd)).toBe(projectDirStem(cwd));
+      expect(embedded.projectDirMatches(projectDirStem(cwd), cwd)).toBe(true);
+      expect(embedded.projectDirMatches(projectDirStem(cwd) + '-abc', cwd)).toBe(
+        projectDirMatches(projectDirStem(cwd) + '-abc', cwd),
+      );
+    }
+    for (const text of QUOTE_CASES) {
+      for (const platform of ['win32', 'linux'] as const) {
+        expect(embedded.shellQuoteArg(text, platform)).toBe(shellQuoteArg(text, platform));
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The precedence rule: alias scope (exact folder) > longest folder binding > global
+// ---------------------------------------------------------------------------
+
+/** One row of the precedence table: a session in `folder` titled `title`, and the binding the rule
+ *  must pick (null = the global slot). Shared by the live test and the embedded-copy test so the
+ *  guard's copy is held to exactly the same answers. */
+interface PrecedenceCase {
+  name: string;
+  folder: string;
+  title: string | null | undefined;
+  /** The session's RECORDED folder, when it differs from where it runs (absent = the same). */
+  aliasFolder?: string | null;
+  groups: ScopedGroup[];
+  platform: NodeJS.Platform;
+  want: SessionBinding | null;
+}
+
+const WIN_GROUPS: ScopedGroup[] = [
+  // A folder binding of C:\work (and so of every subfolder).
+  { id: 'outer', folders: ['C:\\work'] },
+  // A nested folder binding.
+  { id: 'inner', folders: ['C:\\work\\client'] },
+  // An alias-only group: "auth work" in C:\work, and "ops" in C:\work\client.
+  {
+    id: 'alias',
+    folders: [],
+    aliases: [
+      { folder: 'C:\\work', aliasKey: 'auth work' },
+      { folder: 'C:\\work\\client', aliasKey: 'ops' },
+    ],
+  },
+  // A group with BOTH kinds: folder C:\research and alias "notes" in C:\elsewhere.
+  {
+    id: 'both',
+    folders: ['C:\\research'],
+    aliases: [{ folder: 'C:\\elsewhere', aliasKey: 'notes' }],
+  },
+];
+
+const POSIX_GROUPS: ScopedGroup[] = [
+  { id: 'outer', folders: ['/home/me/work'] },
+  { id: 'alias', folders: [], aliases: [{ folder: '/home/me/work', aliasKey: 'auth work' }] },
+];
+
+const PRECEDENCE_CASES: PrecedenceCase[] = [
+  {
+    name: 'no groups: global',
+    folder: 'C:\\work',
+    title: 'Auth Work',
+    groups: [],
+    platform: 'win32',
+    want: null,
+  },
+  {
+    name: 'unbound folder, unnamed: global',
+    folder: 'C:\\other',
+    title: null,
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: null,
+  },
+  {
+    name: 'folder binding, unnamed session',
+    folder: 'C:\\work\\x',
+    title: undefined,
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'outer', via: 'folder', folder: 'C:\\work' },
+  },
+  {
+    name: 'nested folder binding wins by length',
+    folder: 'C:\\work\\client\\deep',
+    title: null,
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'inner', via: 'folder', folder: 'C:\\work\\client' },
+  },
+  {
+    name: 'alias in the exact folder outranks the folder binding of that folder',
+    folder: 'C:\\work',
+    title: 'Auth Work',
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'alias', via: 'alias', folder: 'C:\\work', aliasKey: 'auth work' },
+  },
+  {
+    name: 'alias match is case-insensitive and trims (the claude --resume rule)',
+    folder: 'C:\\work',
+    title: '   AUTH work\t',
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'alias', via: 'alias', folder: 'C:\\work', aliasKey: 'auth work' },
+  },
+  {
+    name: 'alias folder compared case-insensitively on win32',
+    folder: 'c:\\WORK',
+    title: 'auth work',
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'alias', via: 'alias', folder: 'C:\\work', aliasKey: 'auth work' },
+  },
+  {
+    name: 'an alias scope is EXACT-folder: the same title in a subfolder falls to the folder rule',
+    folder: 'C:\\work\\sub',
+    title: 'Auth Work',
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'outer', via: 'folder', folder: 'C:\\work' },
+  },
+  {
+    name: 'alias in a nested bound folder outranks the nested folder binding',
+    folder: 'C:\\work\\client',
+    title: 'OPS',
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'alias', via: 'alias', folder: 'C:\\work\\client', aliasKey: 'ops' },
+  },
+  {
+    name: 'a different title falls to the folder rule',
+    folder: 'C:\\work',
+    title: 'something else',
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'outer', via: 'folder', folder: 'C:\\work' },
+  },
+  {
+    name: 'a blank title never matches an alias',
+    folder: 'C:\\work',
+    title: '   ',
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'outer', via: 'folder', folder: 'C:\\work' },
+  },
+  {
+    name: 'alias scope of a group that ALSO has folders, in an otherwise unbound folder',
+    folder: 'C:\\elsewhere',
+    title: 'Notes',
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'both', via: 'alias', folder: 'C:\\elsewhere', aliasKey: 'notes' },
+  },
+  {
+    name: 'the same group’s folder scope still applies to unnamed sessions',
+    folder: 'C:\\research\\x',
+    title: null,
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'both', via: 'folder', folder: 'C:\\research' },
+  },
+  {
+    name: 'the alias rule keys on the RECORDED folder: a subfolder session resumed from its parent',
+    folder: 'C:\\work',
+    aliasFolder: 'C:\\work\\client',
+    title: 'OPS',
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'alias', via: 'alias', folder: 'C:\\work\\client', aliasKey: 'ops' },
+  },
+  {
+    name: 'a same-titled session recorded in another folder does not take the launch folder’s alias',
+    folder: 'C:\\work',
+    aliasFolder: 'C:\\work-other',
+    title: 'Auth Work',
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: { groupId: 'outer', via: 'folder', folder: 'C:\\work' },
+  },
+  {
+    name: 'no recorded folder (null) skips the alias rule; the folder rule still applies',
+    folder: 'C:\\elsewhere',
+    aliasFolder: null,
+    title: 'Notes',
+    groups: WIN_GROUPS,
+    platform: 'win32',
+    want: null,
+  },
+  {
+    name: 'posix: alias in the exact folder',
+    folder: '/home/me/work',
+    title: 'auth WORK',
+    groups: POSIX_GROUPS,
+    platform: 'linux',
+    want: { groupId: 'alias', via: 'alias', folder: '/home/me/work', aliasKey: 'auth work' },
+  },
+  {
+    name: 'posix: folders are case-SENSITIVE, so a case variant is another (unbound) folder',
+    folder: '/home/me/Work',
+    title: 'auth work',
+    groups: POSIX_GROUPS,
+    platform: 'linux',
+    want: null,
+  },
+  {
+    name: 'posix: subfolder with the alias falls to the folder binding',
+    folder: '/home/me/work/sub',
+    title: 'auth work',
+    groups: POSIX_GROUPS,
+    platform: 'linux',
+    want: { groupId: 'outer', via: 'folder', folder: '/home/me/work' },
+  },
+  {
+    name: 'defensive: malformed rows (as an untrusted snapshot may carry) are skipped, never thrown',
+    folder: 'C:\\work',
+    title: 'auth work',
+    groups: [
+      null,
+      { id: 'bad1', folders: 'nope', aliases: 'nope' },
+      { id: 'bad2', folders: [7], aliases: [null, { folder: 7, aliasKey: 'auth work' }] },
+      { id: 'good', folders: ['C:\\work'] },
+    ] as unknown as ScopedGroup[],
+    platform: 'win32',
+    want: { groupId: 'good', via: 'folder', folder: 'C:\\work' },
+  },
+];
+
+describe('resolveSessionBinding (the precedence table)', () => {
+  it.each(PRECEDENCE_CASES.map((c) => [c.name, c] as const))('%s', (_name, c) => {
+    expect(resolveSessionBinding(c.folder, c.title, c.groups, c.platform, c.aliasFolder)).toEqual(
+      c.want,
+    );
+  });
+
+  it('resolveBinding is its folder half (no title)', () => {
+    expect(resolveBinding('C:\\work', WIN_GROUPS, 'win32')).toEqual({
+      groupId: 'outer',
+      folder: 'C:\\work',
+    });
+  });
+});
+
+describe('aliasKey', () => {
+  it('lower-cases and trims, exactly the claude --resume comparison', () => {
+    expect(aliasKey('  Probe Alias ')).toBe('probe alias');
+    expect(aliasKey('\tX\n')).toBe('x');
+    // Inner whitespace is significant.
+    expect(aliasKey('a  b')).not.toBe(aliasKey('a b'));
+  });
+});
+
+describe('exactAliasBinding', () => {
+  const groups = [
+    { id: 'g1', aliases: [{ folder: 'C:\\repo', alias: 'Auth Work' }] },
+    { id: 'g2', aliases: [{ folder: 'C:\\other', alias: 'Auth Work' }] },
+    { id: 'g3' },
+  ];
+  it('finds the group by folder key + alias key, whatever the spelling', () => {
+    expect(exactAliasBinding('c:/REPO/', ' auth WORK', groups, 'win32')).toBe('g1');
+    expect(exactAliasBinding('C:\\other', 'auth work', groups, 'win32')).toBe('g2');
+  });
+  it('does not match another folder, a subfolder, or another alias', () => {
+    expect(exactAliasBinding('C:\\repo\\sub', 'auth work', groups, 'win32')).toBeNull();
+    expect(exactAliasBinding('C:\\repo', 'auth', groups, 'win32')).toBeNull();
+    expect(exactAliasBinding('C:\\nowhere', 'auth work', groups, 'win32')).toBeNull();
+  });
+  it('uses a composite key that keeps the two halves apart', () => {
+    expect(aliasScopeUniquenessKey('C:\\a', 'b', 'win32')).toBe('c:\\a\u0000b');
+  });
+});
+
+describe('checkAliasFolder', () => {
+  const base = {
+    platform: 'win32' as const,
+    isDirectory: () => true,
+    homeDir: 'C:\\Users\\me',
+    vaultDir: 'C:\\Users\\me\\AppData\\Local\\claude-control\\vault',
+    profilesRoot: 'C:\\Users\\me\\AppData\\Local\\claude-control\\profiles',
+    mainConfigDir: 'C:\\Users\\me\\.claude',
+  };
+  it('allows the home dir and a volume root (an alias scope never captures subfolders)', () => {
+    expect(checkAliasFolder('C:\\Users\\me', base)).toEqual({ ok: true });
+    expect(checkAliasFolder('C:\\', base)).toEqual({ ok: true });
+  });
+  it('refuses a missing folder and anything inside cctl state or the main config dir', () => {
+    expect(checkAliasFolder('C:\\nope', { ...base, isDirectory: () => false }).ok).toBe(false);
+    expect(checkAliasFolder(base.vaultDir, base).ok).toBe(false);
+    expect(checkAliasFolder(base.profilesRoot + '\\g1', base).ok).toBe(false);
+    expect(checkAliasFolder(base.mainConfigDir + '\\projects', base).ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Claude Code's project-dir naming, stored-folder canonicalization, shell quoting
+// ---------------------------------------------------------------------------
+
+/** Texts a printed command must carry through a shell unchanged. */
+const QUOTE_CASES = [
+  'Auth Work',
+  "it's here",
+  'don\u2019t \u2018x\u2019 \u201ay\u201b',
+  'Deploy $(calc) "now" `id` $HOME %PATH% & | ;',
+  '',
+];
+
+describe('projectDirStem / projectDirMatches (Claude Code’s project-dir naming)', () => {
+  it('replaces every non-alphanumeric UTF-16 unit with a dash', () => {
+    expect(projectDirStem('C:\\Users\\me\\a_b.c')).toBe('C--Users-me-a-b-c');
+    expect(projectDirStem('/home/me/proj')).toBe('-home-me-proj');
+    // A surrogate pair is two units: two dashes, as Claude Code's own regex yields.
+    expect(projectDirStem('C:\\x😀')).toBe('C--x--');
+  });
+
+  it('matches its own name case-insensitively, and a long name with the hash suffix', () => {
+    expect(projectDirMatches('c--users-ME-proj', 'C:\\Users\\me\\proj')).toBe(true);
+    expect(projectDirMatches('C--Users-me-proj-other', 'C:\\Users\\me\\proj')).toBe(false);
+    const long = '/' + 'a'.repeat(300);
+    const stem = projectDirStem(long);
+    expect(stem).toHaveLength(200);
+    expect(projectDirMatches(stem + '-1abcd', long)).toBe(true);
+    expect(projectDirMatches(stem, long)).toBe(true);
+  });
+});
+
+describe('canonicalStoredFolder', () => {
+  it('collapses another spelling of a stored folder with no filesystem access', () => {
+    expect(canonicalStoredFolder('c:/Repo/sub/', 'win32')).toBe('C:\\Repo\\sub');
+    expect(canonicalStoredFolder('/home//me/./work/', 'linux')).toBe('/home/me/work');
+    // A path with no canonical form is kept as spelled (still compared, never thrown).
+    expect(canonicalStoredFolder('C:\\a:b', 'win32')).toBe('C:\\a:b');
+    // Memoized: the same answer on a second call.
+    expect(canonicalStoredFolder('c:/Repo/sub/', 'win32')).toBe('C:\\Repo\\sub');
+  });
+
+  it('canonicalizeFolder without a realpath never resolves against the filesystem', () => {
+    const r = canonicalizeFolder('relative/x', { platform: 'linux', cwd: '/base' });
+    expect(r).toEqual({ ok: true, path: '/base/relative/x' });
+  });
+});
+
+describe('shellQuoteArg', () => {
+  it('PowerShell: one single-quoted literal, every single-quote character doubled', () => {
+    expect(shellQuoteArg('Auth Work', 'win32')).toBe("'Auth Work'");
+    expect(shellQuoteArg("it's", 'win32')).toBe("'it''s'");
+    expect(shellQuoteArg('don\u2019t', 'win32')).toBe("'don\u2019\u2019t'");
+    expect(shellQuoteArg('$(calc) "x"', 'win32')).toBe(`'$(calc) "x"'`);
+  });
+
+  it('POSIX: one single-quoted literal, a single quote closed, escaped and reopened', () => {
+    expect(shellQuoteArg('Auth Work', 'linux')).toBe("'Auth Work'");
+    expect(shellQuoteArg("it's", 'darwin')).toBe("'it'\\''s'");
+    expect(shellQuoteArg('$(calc) `id` "x"', 'linux')).toBe(`'$(calc) \`id\` "x"'`);
   });
 });

@@ -2342,6 +2342,137 @@ describe('HookReceiver', () => {
     });
   });
 
+  describe('session sightings (onSessionSeen)', () => {
+    // Every hook POST the forwarder sends carries the session's launch-time config dir; the receiver
+    // hands (session, configDir) to onSessionSeen so the daemon can record the session's slot. The
+    // contract under test: which bodies count as a sighting, and that a sighting never changes how
+    // the hook itself is answered.
+    let sightings: { sessionId: string; configDir: string | null }[];
+    let warns: unknown[];
+    let sightingStore: Store;
+    let sightingReceiver: HookReceiver;
+    let sightingPort: number;
+    let throwFromHandler: boolean;
+
+    beforeEach(async () => {
+      sightings = [];
+      warns = [];
+      throwFromHandler = false;
+      sightingStore = new Store(':memory:');
+      sightingReceiver = new HookReceiver({
+        store: sightingStore,
+        secret: SECRET,
+        emit: () => {},
+        daemonId: () => 'daemon-1',
+        clock: () => 1_000_000,
+        logger: {
+          debug: () => {},
+          info: () => {},
+          warn: (obj) => warns.push(obj),
+          error: () => {},
+        },
+        onSessionSeen: (sighting) => {
+          if (throwFromHandler) throw new Error('recorder exploded');
+          sightings.push(sighting);
+        },
+      });
+      sightingPort = await sightingReceiver.listen(0);
+    });
+
+    afterEach(async () => {
+      await sightingReceiver.close();
+      sightingStore.close();
+    });
+
+    const send = (body: Record<string, unknown>) =>
+      post(sightingPort, '/', body, { 'x-claude-control-secret': SECRET });
+
+    it('reports a stamped config dir with the session it came from', async () => {
+      const res = await send({
+        hook_event_name: 'Stop',
+        session_id: 'sess-a',
+        configDir: 'C:/data/claude-control/profiles/g1',
+      });
+      expect(res.status).toBe(200);
+      expect(sightings).toEqual([
+        { sessionId: 'sess-a', configDir: 'C:/data/claude-control/profiles/g1' },
+      ]);
+    });
+
+    it('reports a null stamp as the shared config dir', async () => {
+      await send({ hook_event_name: 'Stop', session_id: 'sess-a', configDir: null });
+      expect(sightings).toEqual([{ sessionId: 'sess-a', configDir: null }]);
+    });
+
+    it('reads an empty-string stamp as the shared config dir too', async () => {
+      await send({ hook_event_name: 'Stop', session_id: 'sess-a', configDir: '' });
+      expect(sightings).toEqual([{ sessionId: 'sess-a', configDir: null }]);
+    });
+
+    it('accepts the camelCase sessionId alias internal senders use', async () => {
+      await send({ event: 'Stop', sessionId: 'sess-camel', configDir: null });
+      expect(sightings).toEqual([{ sessionId: 'sess-camel', configDir: null }]);
+    });
+
+    it('reports a sighting for an event the receiver does not otherwise handle', async () => {
+      // Any event proves the session ran under that config dir, whether or not it makes a card.
+      const res = await send({
+        hook_event_name: 'SessionStart',
+        session_id: 'sess-a',
+        configDir: 'D:/profiles/g2',
+      });
+      expect(res.status).toBe(400);
+      expect(sightings).toEqual([{ sessionId: 'sess-a', configDir: 'D:/profiles/g2' }]);
+    });
+
+    it('says nothing when the body has no configDir key at all', async () => {
+      // An older forwarder or an internal sender: absence is "unknown", not "the shared dir".
+      const res = await send({ hook_event_name: 'Stop', session_id: 'sess-a' });
+      expect(res.status).toBe(200);
+      expect(sightings).toEqual([]);
+    });
+
+    it('ignores a configDir that is neither a string nor null', async () => {
+      await send({ hook_event_name: 'Stop', session_id: 'sess-a', configDir: 42 });
+      await send({ hook_event_name: 'Stop', session_id: 'sess-a', configDir: { path: 'x' } });
+      await send({ hook_event_name: 'Stop', session_id: 'sess-a', configDir: ['x'] });
+      expect(sightings).toEqual([]);
+    });
+
+    it('ignores a stamp that names no session', async () => {
+      await send({ hook_event_name: 'Stop', configDir: null });
+      await send({ hook_event_name: 'Stop', session_id: 7, configDir: null });
+      // An empty id is no session either: nothing could ever be attributed to it.
+      await send({ hook_event_name: 'Stop', session_id: '', configDir: null });
+      expect(sightings).toEqual([]);
+    });
+
+    it('ignores a body with no event name, which is refused before anything else runs', async () => {
+      const res = await send({ session_id: 'sess-a', configDir: null });
+      expect(res.status).toBe(400);
+      expect(sightings).toEqual([]);
+    });
+
+    it('a throwing handler is logged and the hook is still answered normally', async () => {
+      throwFromHandler = true;
+      const res = await send({ hook_event_name: 'Stop', session_id: 'sess-boom', configDir: null });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ ok: true });
+      expect(warns.some((w) => (w as { sessionId?: string }).sessionId === 'sess-boom')).toBe(true);
+    });
+
+    it('is optional: a receiver without the option serves stamped hooks as before', async () => {
+      // The shared harness receiver has no onSessionSeen.
+      const res = await post(
+        port,
+        '/',
+        { hook_event_name: 'Stop', session_id: 'sess-a', configDir: 'C:/x' },
+        { 'x-claude-control-secret': SECRET },
+      );
+      expect(res.status).toBe(200);
+    });
+  });
+
   describe('getPort', () => {
     it('reports the same port listen() resolved with', () => {
       expect(receiver.getPort()).toBe(port);

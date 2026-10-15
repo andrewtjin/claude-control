@@ -10,19 +10,22 @@ import {
   readFolderBindingSnapshot,
   snapshotIdentityKey,
 } from './folderBindings.js';
+import { resolveFolderRule, resolveSessionRule } from './folderRules.js';
+import { resolveSessionBinding } from './folderPath.js';
 import { folderBindingsPath, groupProfileDir } from './paths.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { VaultError } from './errors.js';
 import type { CredentialBundle, FolderRule, StoredAccount } from './types.js';
 
 let dirs: string[] = [];
-async function vaultAt() {
+/** A temp vault whose rules are read under `platform`'s path rules (Windows unless a test says). */
+async function vaultAt(platform: NodeJS.Platform = 'win32') {
   const dir = await mkdtemp(join(tmpdir(), 'ce-fb-'));
   dirs.push(dir);
   let t = 1000;
   const vaultDir = join(dir, 'vault');
   return {
-    v: new Vault(vaultDir, new InsecurePassthroughProtector(), () => t++, undefined, 'win32'),
+    v: new Vault(vaultDir, new InsecurePassthroughProtector(), () => t++, undefined, platform),
     vaultDir,
     snapshotPath: folderBindingsPath(vaultDir),
   };
@@ -75,6 +78,7 @@ describe('buildFolderBindingSnapshot (pure)', () => {
       mainConfigDir: 'C:\\Users\\me\\.claude',
       mainIdentityFile: ID_FILE,
       profileDirOf: (id) => `C:\\profiles\\${id}`,
+      platform: 'win32',
     });
     expect(snapshot).toEqual({
       schemaVersion: 1,
@@ -115,6 +119,7 @@ describe('buildFolderBindingSnapshot (pure)', () => {
       mainConfigDir: 'C:\\m',
       mainIdentityFile: ID_FILE,
       profileDirOf: (id) => id,
+      platform: 'win32',
     });
     expect(snapshot.groups[0]?.excluded).toEqual([
       {
@@ -158,6 +163,7 @@ describe('buildFolderBindingSnapshot (pure)', () => {
       mainConfigDir: 'C:\\m',
       mainIdentityFile: ID_FILE,
       profileDirOf: (id) => id,
+      platform: 'win32',
     });
     expect(snapshot.groups[0]?.members).toEqual(['B', 'A']);
   });
@@ -174,6 +180,7 @@ describe('buildFolderBindingSnapshot (pure)', () => {
       mainConfigDir: 'C:\\m',
       mainIdentityFile: ID_FILE,
       profileDirOf: (id) => `C:\\profiles\\${id}`,
+      platform: 'win32',
     });
     expect(snapshot.groups).toEqual([
       {
@@ -197,6 +204,7 @@ describe('buildFolderBindingSnapshot (pure)', () => {
       mainConfigDir: 'C:\\m',
       mainIdentityFile: ID_FILE,
       profileDirOf: (id) => id,
+      platform: 'win32',
     });
     expect(snapshot.groups[0]?.members).toEqual(['A']);
   });
@@ -212,6 +220,7 @@ describe('buildFolderBindingSnapshot (pure)', () => {
       mainConfigDir: 'C:\\m',
       mainIdentityFile: ID_FILE,
       profileDirOf: (id) => id,
+      platform: 'win32',
     });
     expect(snapshot.groups.map((g) => g.members)).toEqual([['A'], ['A', 'B']]);
   });
@@ -227,6 +236,7 @@ describe('buildFolderBindingSnapshot (pure)', () => {
       mainConfigDir: 'C:\\m',
       mainIdentityFile: ID_FILE,
       profileDirOf: (id) => id,
+      platform: 'win32',
     });
     expect(snapshot.groups[0]?.members).toEqual(['A']);
   });
@@ -251,6 +261,7 @@ describe('buildFolderBindingSnapshot (pure)', () => {
         mainConfigDir: 'C:\\m',
         mainIdentityFile: ID_FILE,
         profileDirOf: (id) => id,
+        platform: 'win32',
       }),
     );
     expect(text).not.toContain('secret-id');
@@ -275,6 +286,7 @@ describe('folderBindingSnapshotContentEqual (pure)', () => {
       mainConfigDir: 'C:\\main',
       mainIdentityFile: ID_FILE,
       profileDirOf: (id) => `C:\\profiles\\${id}`,
+      platform: 'win32',
     });
 
   it('is equal when ONLY the generation differs (a routine rule-slot switch bumps generation)', () => {
@@ -334,6 +346,105 @@ describe('folderBindingSnapshotContentEqual (pure)', () => {
   });
 });
 
+describe('buildFolderBindingSnapshot — session alias rules', () => {
+  const aliasRule = (): FolderRule => ({
+    ...rule('a1', ['m1'], [], []),
+    aliases: [{ folder: 'C:/work/', alias: ' Auth Work ' }],
+  });
+
+  it('carries each alias scope as its canonical folder, its key and the alias as entered', () => {
+    const snapshot = buildFolderBindingSnapshot({
+      shared: [],
+      rules: [aliasRule(), rule('f1', [])],
+      reserved: [row('m1', 'A')],
+      generation: 1,
+      enforce: 'block',
+      mainConfigDir: 'C:\\main',
+      mainIdentityFile: ID_FILE,
+      profileDirOf: (id) => `C:\\profiles\\${id}`,
+      platform: 'win32',
+    });
+    expect(snapshot.groups[0]).toMatchObject({
+      id: 'a1',
+      folders: [],
+      members: ['A'],
+      aliases: [{ folder: 'C:\\work', aliasKey: 'auth work', alias: ' Auth Work ' }],
+    });
+    // A rule with no alias scope carries no field: the shape older guards read.
+    expect('aliases' in snapshot.groups[1]!).toBe(false);
+  });
+
+  it('is unequal when an alias scope is added, changed or removed (the guard enforces it)', () => {
+    const build = (rules: FolderRule[]) =>
+      buildFolderBindingSnapshot({
+        shared: [],
+        rules,
+        reserved: [row('m1', 'A')],
+        generation: 1,
+        enforce: 'block',
+        mainConfigDir: 'C:\\main',
+        mainIdentityFile: ID_FILE,
+        profileDirOf: (id) => `C:\\profiles\\${id}`,
+        platform: 'win32',
+      });
+    const plain = build([rule('a1', ['m1'])]);
+    const withAlias = build([aliasRule()]);
+    expect(folderBindingSnapshotContentEqual(plain, withAlias)).toBe(false);
+    const renamed = build([{ ...aliasRule(), aliases: [{ folder: 'C:/work', alias: 'Other' }] }]);
+    expect(folderBindingSnapshotContentEqual(withAlias, renamed)).toBe(false);
+    expect(folderBindingSnapshotContentEqual(withAlias, build([aliasRule()]))).toBe(true);
+  });
+
+  it('reads a snapshot written before alias rules existed as having none', () => {
+    const now = buildFolderBindingSnapshot({
+      shared: [],
+      rules: [rule('g1', ['m1'])],
+      reserved: [row('m1', 'A')],
+      generation: 1,
+      enforce: 'block',
+      mainConfigDir: 'C:\\main',
+      mainIdentityFile: ID_FILE,
+      profileDirOf: (id) => `C:\\profiles\\${id}`,
+      platform: 'win32',
+    });
+    const older = structuredClone(now);
+    for (const g of older.groups) delete g.aliases;
+    expect(folderBindingSnapshotContentEqual(now, older)).toBe(true);
+  });
+});
+
+describe('a hand-edited folder spelling', () => {
+  // groups.json is operator-editable and its loader accepts any spelling of a folder, so the
+  // launcher, `where`, the daemon and the guard must all compare the one canonical spelling.
+  const handEdited = (): FolderRule => rule('r1', ['m1'], [], ['C:/work/']);
+  const snapshotOf = (rules: FolderRule[]) =>
+    buildFolderBindingSnapshot({
+      shared: [],
+      rules,
+      reserved: [row('m1', 'A')],
+      generation: 1,
+      enforce: 'block',
+      mainConfigDir: 'C:\\main',
+      mainIdentityFile: ID_FILE,
+      profileDirOf: (id) => `C:\\profiles\\${id}`,
+      platform: 'win32',
+    });
+
+  it('is written to the guard snapshot canonically', () => {
+    expect(snapshotOf([handEdited()]).groups[0]?.folders).toEqual(['C:\\work']);
+  });
+
+  it('routes the same rule for the launcher, `where` and the guard', () => {
+    const rules = [handEdited()];
+    const guardRows = snapshotOf(rules).groups;
+    for (const folder of ['C:\\work', 'C:\\work\\sub']) {
+      expect(resolveSessionRule(folder, null, rules, 'win32')?.rule.id).toBe('r1');
+      expect(resolveFolderRule(folder, rules, 'win32')?.rule.id).toBe('r1');
+      expect(resolveSessionBinding(folder, null, guardRows, 'win32')?.groupId).toBe('r1');
+    }
+  });
+});
+
 describe('Vault.writeFolderBindings / readFolderBindings', () => {
   it('writes the snapshot beside the vault and reads it back with the live generation', async () => {
     const { v, vaultDir, snapshotPath } = await vaultAt();
@@ -363,6 +474,26 @@ describe('Vault.writeFolderBindings / readFolderBindings', () => {
     expect(readBack).toEqual(written);
     // The file really is at the sibling location, not inside the vault dir.
     expect(await readFile(snapshotPath, 'utf8')).toContain('"schemaVersion": 1');
+  });
+
+  it("writes rule folders under the vault's own path rules, whatever the host", async () => {
+    // One vault per platform: whichever host runs this, one of them reads its rules under another
+    // platform's path rules, so a snapshot canonicalized under the host's rules would respell its
+    // folder (C:\work read as a POSIX path becomes /C:\work).
+    for (const [platform, folder] of [
+      ['win32', 'C:\\work'],
+      ['linux', '/srv/work'],
+    ] as const) {
+      const { v } = await vaultAt(platform);
+      const a = await v.addAccount('a', bundle('a'));
+      await v.createRule({ folders: [folder], include: [a.id] });
+      const written = await v.writeFolderBindings({
+        enforce: 'block',
+        mainConfigDir: platform === 'win32' ? 'C:\\main' : '/main',
+        mainIdentityFile: ID_FILE,
+      });
+      expect(written.groups[0]?.folders).toEqual([folder]);
+    }
   });
 
   it('returns undefined when the snapshot was never written', async () => {
