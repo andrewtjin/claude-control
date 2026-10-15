@@ -730,10 +730,12 @@ export function buildProgram(): Command {
       const report = await readSettingsReport(daemonSettingsPath());
       const heartbeat = await readHeartbeat(daemonHeartbeatPath());
       const daemonBuild = report?.settings.find((r) => r.name === 'daemon build')?.value;
+      // The folder-rule checks read the rules first: an unreadable registry is theirs to report.
+      const folderChecks = await checkFolderRules(engine, paths, cliLeaseProbe(paths));
       const rules = await engine.listRules().catch(() => [] as FolderRule[]);
       const hasLeases = rules.some(isLeaseRule);
       checks.push(
-        ...(await checkFolderRules(engine, paths, cliLeaseProbe(paths))),
+        ...folderChecks,
         checkDaemonFolderRules(report, heartbeat),
         checkDaemonAliasRules(
           report,

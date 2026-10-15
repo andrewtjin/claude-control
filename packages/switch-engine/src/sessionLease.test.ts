@@ -779,7 +779,7 @@ describe('releaseLease', () => {
 });
 
 describe('sweepLeases', () => {
-  it('two phases: a holder added between them survives', async () => {
+  it('two passes: a holder added between them survives', async () => {
     const h = await harness();
     const { B } = await seed(h);
     const me = launcher(h, 4120);
@@ -787,7 +787,7 @@ describe('sweepLeases', () => {
     h.alive.delete(4120);
     const late = launcher(h, 5120);
     const probe: LeaseOccupancyProbe = async () => {
-      // Runs in phase 1, without the lock: another terminal joins meanwhile.
+      // Runs in the first pass, without the lock: another terminal joins meanwhile.
       await h.engine.claimSessionSlot(B.id, late, { launchRuleId: null });
       return [];
     };
@@ -822,14 +822,14 @@ describe('sweepLeases', () => {
     expect(report.deferred.map((d) => d.reason)).toEqual(['no_probe']);
   });
 
-  it('a lease left with no holder by a concurrent release uses its phase-1 probe', async () => {
+  it('a lease left with no holder by a concurrent release uses its first-pass roster read', async () => {
     const h = await harness();
     const { B } = await seed(h);
     const one = launcher(h, 4120);
     const two = launcher(h, 5120);
     await h.engine.claimSessionSlot(B.id, one, { launchRuleId: null });
     await h.engine.claimSessionSlot(B.id, two, { launchRuleId: null });
-    // Terminal two was killed: phase 1 judges it dead.
+    // Terminal two was killed: the first pass judges it dead.
     h.alive.delete(5120);
     const worker: LeaseHolder = {
       pid: 6000,
@@ -839,7 +839,7 @@ describe('sweepLeases', () => {
       role: 'background',
     };
     const probe: LeaseOccupancyProbe = async () => {
-      // Terminal one exits between the phases and releases its own holder; two is left on disk.
+      // Terminal one exits between the passes and releases its own holder; two is left on disk.
       await h.engine.releaseLease(leaseRuleId(B.id), [one], noWorkers);
       return [worker];
     };

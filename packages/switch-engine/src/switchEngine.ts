@@ -2969,7 +2969,12 @@ export class SwitchEngine {
         await this.writeSnapshotLocked();
         return { ...nothing, remaining: workers.length, deferredToBackground: true };
       }
-      if (this.platform === 'linux' && this.processesOnProfile(profileDir).length > 0) {
+      // This process is the departing launcher: a shell that inherited the profile's config dir
+      // (a cctl started from inside the session) must not keep its own session alive.
+      if (
+        this.platform === 'linux' &&
+        this.processesOnProfile(profileDir).some((pid) => pid !== process.pid)
+      ) {
         return { ...nothing, deferred: 'unrecorded_child' };
       }
       const torn = await this.teardownRuleSlotLocked(rule, { lease: true });
@@ -2986,9 +2991,9 @@ export class SwitchEngine {
   /**
    * Drop the holders of parallel sessions whose processes are gone, record processes found running on
    * a session's profile that no holder records (full mode), and end the sessions left with none.
-   * Two phases: everything that needs a process query or a roster read runs first without the lock;
+   * Two passes: everything that needs a process query or a roster read runs first without the lock;
    * then, under it, each session is re-read and written at most once. A process judged dead stays
-   * dead, so a holder added between the phases (not in the dead set) survives. A session reaching no
+   * dead, so a holder added between the passes (not in the dead set) survives. A session reaching no
    * holder is ended only on positive evidence: in quick mode not while a dead launcher's Claude Code
    * was never recorded (only a full check can see it), not while its roster is unreadable or was not
    * read, and not while its slot's switch cannot be settled.
@@ -3007,7 +3012,7 @@ export class SwitchEngine {
     );
     if (leases.length === 0) return report;
 
-    // Phase 1, no lock.
+    // First pass, without the lock.
     const evidence = await this.holderEvidence(opts.mode, opts);
     // `probe` undefined: the roster read itself failed, so there is no result to decide on.
     const judged = new Map<
@@ -3030,7 +3035,7 @@ export class SwitchEngine {
       judged.set(rule.id, { dead, adopted, probe });
     }
 
-    // Phase 2, under the lock: re-read each session, decide in memory, write at most once.
+    // Second pass, under the lock: re-read each session, decide in memory, write at most once.
     await this.withCredentialLock(async () => {
       let changed = false;
       for (const seen of leases) {
