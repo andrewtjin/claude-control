@@ -233,16 +233,21 @@ interface JsonOut {
   sessions: JsonSession[];
 }
 
-/** A session named "linked" recorded in a real folder (Claude Code records the resolved path), and
- *  a junction to that folder. */
-async function linkedSession(): Promise<{ link: string; id: string }> {
+/** A real folder, a junction to it, and a session named `title` recorded under one of the two
+ *  spellings. Claude Code records the folder as it was spelled at launch: the real path for a
+ *  session started there, the link for one started through it. */
+async function linkedSession(
+  recordedUnder: 'target' | 'link',
+  title = 'linked',
+): Promise<{ target: string; link: string; id: string }> {
   const id = 'dddddddd-0000-4000-8000-000000000001';
   await mkdir(join(root, 'target'), { recursive: true });
   const target = realpathSync.native(join(root, 'target'));
   const link = join(root, 'link');
   symlinkSync(target, link, 'junction');
-  await writeSession(target, id, [userLine(target, T0), customTitle('linked')], T0 + HOUR);
-  return { link, id };
+  const recorded = recordedUnder === 'target' ? target : link;
+  await writeSession(recorded, id, [userLine(recorded, T0), customTitle(title)], T0 + HOUR);
+  return { target, link, id };
 }
 
 /** A session's per-account use as [label, turns, tokens] triples, in first-use order. */
@@ -358,12 +363,33 @@ describe('runSessionShow', () => {
   });
 
   it('follows a --cwd junction to the folder it points at', async () => {
-    const { link, id } = await linkedSession();
+    const { link, id } = await linkedSession('target');
     const h = harness();
     await runSessionShow('linked', { cwd: link, json: true }, h.deps);
     const out = h.json();
     expect(out).toMatchObject({ matchedBy: 'alias', inScope: true });
     expect(out.sessions.map((x) => x.sessionId)).toEqual([id]);
+  });
+
+  describe('a session recorded under a junction', () => {
+    it('is in scope when run from the junction', async () => {
+      const { link, id } = await linkedSession('link', 'plinked');
+      const h = harness({ cwd: link });
+      await runSessionShow('plinked', { json: true }, h.deps);
+      const out = h.json();
+      expect(out).toMatchObject({ matchedBy: 'alias', inScope: true });
+      expect(out.sessions.map((x) => x.sessionId)).toEqual([id]);
+      expect(h.notes.join('\n')).not.toContain('Searching every project');
+    });
+
+    it('is in scope from the folder the junction points at', async () => {
+      const { target, id } = await linkedSession('link', 'plinked');
+      const h = harness({ cwd: target });
+      await runSessionShow('plinked', { json: true }, h.deps);
+      const out = h.json();
+      expect(out).toMatchObject({ matchedBy: 'alias', inScope: true });
+      expect(out.sessions.map((x) => x.sessionId)).toEqual([id]);
+    });
   });
 
   describe('an alias used in several other folders', () => {
@@ -486,10 +512,44 @@ describe('runSessionAliases', () => {
   });
 
   it('lists the folder a --cwd junction points at', async () => {
-    const { link, id } = await linkedSession();
+    const { link, id } = await linkedSession('target');
     const h = harness();
     await runSessionAliases({ cwd: link, json: true }, h.deps);
     expect(h.json().sessions.map((s) => s.sessionId)).toEqual([id]);
+  });
+
+  describe('a session recorded under a junction', () => {
+    it('is listed for a --cwd naming the junction', async () => {
+      const { link, id } = await linkedSession('link', 'plinked');
+      const h = harness();
+      await runSessionAliases({ cwd: link, json: true }, h.deps);
+      expect(h.json().sessions.map((s) => s.sessionId)).toEqual([id]);
+    });
+
+    it('is listed when run from the junction', async () => {
+      const { link, id } = await linkedSession('link', 'plinked');
+      const h = harness({ cwd: link });
+      await runSessionAliases({ json: true }, h.deps);
+      expect(h.json().sessions.map((s) => s.sessionId)).toEqual([id]);
+    });
+
+    it('is listed only where its project directory is, as claude --resume scopes it, while show still finds it', async () => {
+      const { target, id } = await linkedSession('link', 'plinked');
+      // From the folder the junction points at, the listing reads only the project directories
+      // named after that folder; the junction's directory is not one of them.
+      const fromTarget = harness({ cwd: target });
+      await runSessionAliases({ json: true }, fromTarget.deps);
+      expect(fromTarget.json().sessions).toEqual([]);
+      const withCwd = harness();
+      await runSessionAliases({ cwd: target, json: true }, withCwd.deps);
+      expect(withCwd.json().sessions).toEqual([]);
+      // `session show` widens to every project on a miss, and then counts the session as here.
+      const show = harness({ cwd: target });
+      await runSessionShow('plinked', { json: true }, show.deps);
+      const out = show.json();
+      expect(out).toMatchObject({ matchedBy: 'alias', inScope: true });
+      expect(out.sessions.map((x) => x.sessionId)).toEqual([id]);
+    });
   });
 
   it('renders a table in text mode, and a hint for a folder with no named sessions', async () => {

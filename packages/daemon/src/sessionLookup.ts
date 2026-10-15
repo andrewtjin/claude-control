@@ -21,35 +21,48 @@ export function sameFolder(a: string, b: string, platform: NodeJS.Platform): boo
   return folderUniquenessKey(a, platform) === folderUniquenessKey(b, platform);
 }
 
-/** The folder a session's conversation belongs to, looked at from `folder` (the one a lookup runs
- *  in): its trusted recorded folder, else `folder` when the session's project directory can stand
- *  for it, else null — the fallback every reader of an alias rule's folder applies
+/**
+ * The folder a lookup runs in. A session records its folder as Claude Code spelled it — through a
+ * junction or symlink, when that is where it was launched — so a recorded folder is compared only
+ * after `canonicalize` puts it in the same canonical form as {@link canonical}; compared as written,
+ * a session recorded under a link would never be found from the folder the link points at, nor
+ * from the link itself.
+ */
+export interface SessionLookupFolder {
+  /** The folder as given, made absolute: a project directory may be named after this spelling. */
+  spelled: string;
+  /** The same folder canonically (realpath when it exists): what folders are compared on. */
+  canonical: string;
+  /** Puts a recorded folder in canonical form by the caller's rule (the one folder rules use). */
+  canonicalize: (folder: string) => string;
+}
+
+/** The folder a session's conversation belongs to, canonically, looked at from `here`: its trusted
+ *  recorded folder, else `here` when the session's project directory can stand for it (by either
+ *  spelling), else null — the fallback every reader of an alias rule's folder applies
  *  (switch-engine recordedFolderFor). */
-function folderSeenFrom(s: SessionMeta, folder: string): string | null {
-  return recordedFolderFor(
-    { folder: s.folder, dirName: s.projectDir },
-    { spelled: folder, canonical: folder },
-    (f) => f,
-  );
+function folderSeenFrom(s: SessionMeta, here: SessionLookupFolder): string | null {
+  return recordedFolderFor({ folder: s.folder, dirName: s.projectDir }, here, here.canonicalize);
 }
 
 /**
- * Resolve `ref` against the catalog from `folder` (normally the cwd).
+ * Resolve `ref` against the catalog from `here` (normally the cwd).
  *
  * 1. An exact session id wins (case-insensitive: ids are UUIDs, and a pasted id may be upper-case).
  * 2. Otherwise `ref` is an alias, compared the way `claude --resume` compares titles. Sessions in
- *    `folder` win outright — that is what `claude --resume <alias>` would search from here.
- * 3. No match in `folder`: if every match lives in ONE other folder, that folder's sessions are the
+ *    `here` win outright — that is what `claude --resume <alias>` would search from here.
+ * 3. No match in `here`: if every match lives in ONE other folder, that folder's sessions are the
  *    answer (flagged `inScope: false` so the caller says where they are); matches spread over
  *    several folders are ambiguous, and the working directory is what picks between them.
  *
- * A session with no trusted folder counts for `folder` when its project directory can stand for
- * it (the shared fallback); otherwise it can match by id only.
+ * A session with no trusted folder counts for `here` when its project directory can stand for
+ * it (the shared fallback); otherwise it can match by id only. Folders are compared canonically
+ * ({@link SessionLookupFolder}), and reported in their canonical spelling.
  */
 export function resolveSessionRef(
   catalog: readonly SessionMeta[],
   ref: string,
-  folder: string,
+  here: SessionLookupFolder,
   platform: NodeJS.Platform,
 ): SessionRefResolution {
   const trimmed = ref.trim();
@@ -59,15 +72,25 @@ export function resolveSessionRef(
   if (byId !== undefined) return { kind: 'id', session: byId };
 
   const key = aliasKey(trimmed);
-  const matches = catalog.filter((s) => {
+  // Each alias match with the folder it belongs to, worked out once.
+  const matches: { session: SessionMeta; folder: string }[] = [];
+  for (const s of catalog) {
     const alias = aliasOf(s);
-    return alias !== null && folderSeenFrom(s, folder) !== null && aliasKey(alias) === key;
-  });
+    if (alias === null || aliasKey(alias) !== key) continue;
+    const folder = folderSeenFrom(s, here);
+    if (folder !== null) matches.push({ session: s, folder });
+  }
   if (matches.length === 0) return { kind: 'none' };
 
-  const here = matches.filter((s) => sameFolder(folderSeenFrom(s, folder)!, folder, platform));
-  if (here.length > 0)
-    return { kind: 'alias', folder, sessions: sortByRecent(here), inScope: true };
+  const inHere = matches.filter((m) => sameFolder(m.folder, here.canonical, platform));
+  if (inHere.length > 0) {
+    return {
+      kind: 'alias',
+      folder: here.canonical,
+      sessions: sortByRecent(inHere.map((m) => m.session)),
+      inScope: true,
+    };
+  }
 
   const groups = groupByFolder(matches, platform);
   const only = groups[0];
@@ -77,19 +100,20 @@ export function resolveSessionRef(
   return { kind: 'ambiguous', folders: groups };
 }
 
-/** Every aliased session in `folder`, or in all folders when `folder` is `null`, most recent
- *  first. Sessions with no alias are left out: this is the alias listing. */
+/** Every aliased session in `here`, or in all folders when `here` is `null`, most recent first.
+ *  Sessions with no alias are left out: this is the alias listing. Folders are compared
+ *  canonically ({@link SessionLookupFolder}). */
 export function aliasedSessions(
   catalog: readonly SessionMeta[],
-  folder: string | null,
+  here: SessionLookupFolder | null,
   platform: NodeJS.Platform,
 ): SessionMeta[] {
   return sortByRecent(
     catalog.filter((s) => {
       if (aliasOf(s) === null) return false;
-      if (folder === null) return s.folder !== null;
-      const seen = folderSeenFrom(s, folder);
-      return seen !== null && sameFolder(seen, folder, platform);
+      if (here === null) return s.folder !== null;
+      const seen = folderSeenFrom(s, here);
+      return seen !== null && sameFolder(seen, here.canonical, platform);
     }),
   );
 }
@@ -98,20 +122,21 @@ function sortByRecent(sessions: SessionMeta[]): SessionMeta[] {
   return [...sessions].sort((a, b) => b.lastActivityMs - a.lastActivityMs);
 }
 
+/** Alias matches grouped by the (canonical) folder each belongs to, so one folder recorded under
+ *  two spellings is one group; groups ordered by their most recent session. */
 function groupByFolder(
-  sessions: readonly SessionMeta[],
+  matches: readonly { session: SessionMeta; folder: string }[],
   platform: NodeJS.Platform,
 ): { folder: string; sessions: SessionMeta[] }[] {
   const groups = new Map<string, { folder: string; sessions: SessionMeta[] }>();
-  for (const s of sessions) {
-    if (s.folder === null) continue;
-    const k = folderUniquenessKey(s.folder, platform);
+  for (const m of matches) {
+    const k = folderUniquenessKey(m.folder, platform);
     let g = groups.get(k);
     if (g === undefined) {
-      g = { folder: s.folder, sessions: [] };
+      g = { folder: m.folder, sessions: [] };
       groups.set(k, g);
     }
-    g.sessions.push(s);
+    g.sessions.push(m.session);
   }
   return [...groups.values()]
     .map((g) => ({ folder: g.folder, sessions: sortByRecent(g.sessions) }))

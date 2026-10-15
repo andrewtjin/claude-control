@@ -19,6 +19,7 @@ import {
   resolveSessionRef,
   slotBySessionMap,
   type SessionAccountUse,
+  type SessionLookupFolder,
   type SessionMeta,
   type SessionRefResolution,
   type SessionSlotSpanRow,
@@ -162,7 +163,7 @@ function customTitleOf(meta: SessionMeta): string | null {
 async function withBindings(
   deps: SessionAliasDeps,
   read: AccountsRead,
-  folder: LookupFolder,
+  folder: SessionLookupFolder,
 ): Promise<SessionView[]> {
   if (read.views.length === 0) return read.views;
   const engine = deps.engine ?? buildEngine(deps.paths);
@@ -186,8 +187,10 @@ async function withBindings(
   return read.views.map((view) => {
     const m = view.meta;
     const title = customTitleOf(m);
-    const recorded = recordedFolderFor({ folder: m.folder, dirName: m.projectDir }, folder, (f) =>
-      canonicalOrRaw(f, deps),
+    const recorded = recordedFolderFor(
+      { folder: m.folder, dirName: m.projectDir },
+      folder,
+      folder.canonicalize,
     );
     const required =
       recorded === null ? null : resolveSessionRule(recorded, title, rules, deps.platform);
@@ -234,28 +237,30 @@ export function canonicalOrRaw(
   return r.ok ? r.path : folder;
 }
 
-/** The folder a lookup is about, as given (made absolute against the current directory) and
- *  canonical (realpath when it exists). */
-interface LookupFolder {
-  spelled: string;
-  canonical: string;
-}
-
 /**
  * The folder `--cwd` names, or the current directory: a relative path is taken against the current
  * directory, and a junction or link is resolved, as every other folder input is. Both spellings are
- * kept, since Claude Code may have named a project directory after either. Fails on a path with no
+ * kept, since Claude Code may have named a project directory after either. A session's recorded
+ * folder is canonicalized the same way before it is compared (`canonicalize`): Claude Code records
+ * the folder as it was spelled at launch, a junction or link included. Fails on a path with no
  * canonical form, rather than silently looking in another folder.
  */
-function lookupFolderOf(cwdOpt: string | undefined, deps: SessionAliasDeps): LookupFolder {
+function lookupFolderOf(cwdOpt: string | undefined, deps: SessionAliasDeps): SessionLookupFolder {
   const input = cwdOpt ?? deps.cwd;
   const spelled = canonicalizeFolder(input, { platform: deps.platform, cwd: deps.cwd });
   if (!spelled.ok) fail(`cannot use folder "${sanitizeForTerminal(input)}": ${spelled.reason}`);
-  return { spelled: spelled.path, canonical: canonicalOrRaw(spelled.path, deps) };
+  const canonicalize = (f: string): string => canonicalOrRaw(f, deps);
+  return { spelled: spelled.path, canonical: canonicalize(spelled.path), canonicalize };
 }
 
-/** Whether project directory `name` can hold sessions launched in `folder`, by either spelling. */
-function projectDirMatchesFolder(name: string, folder: LookupFolder): boolean {
+/**
+ * Whether project directory `name` can hold sessions launched in `folder`, by either spelling of
+ * `folder` itself. Claude Code names a project directory after the folder as spelled at launch, so
+ * a session started through a junction lives in the junction's directory: it is read from the
+ * junction, but not from the folder the junction points at, whose spellings name another
+ * directory. That mirrors `claude --resume`, which scopes by the same directory.
+ */
+function projectDirMatchesFolder(name: string, folder: SessionLookupFolder): boolean {
   return projectDirMatches(name, folder.canonical) || projectDirMatches(name, folder.spelled);
 }
 
@@ -283,7 +288,7 @@ export async function runSessionShow(
       claudeDir: deps.paths.claudeDir,
       sessionIds: new Set([target.trim()]),
     });
-    resolution = resolveSessionRef(byId.sessions, target, folder, deps.platform);
+    resolution = resolveSessionRef(byId.sessions, target, lookup, deps.platform);
   }
   // Then cheap: only the project directories this folder's sessions can live in. A miss there
   // widens to every folder, because an alias used elsewhere can be anywhere.
@@ -292,12 +297,12 @@ export async function runSessionShow(
       claudeDir: deps.paths.claudeDir,
       projectDirFilter: (name) => projectDirMatchesFolder(name, lookup),
     });
-    resolution = resolveSessionRef(inScope.sessions, target, folder, deps.platform);
+    resolution = resolveSessionRef(inScope.sessions, target, lookup, deps.platform);
   }
   if (resolution.kind === 'none' || (resolution.kind === 'alias' && !resolution.inScope)) {
     deps.note(`Searching every project under ${deps.paths.claudeDir} ...`);
     const everywhere = await readSessionCatalog({ claudeDir: deps.paths.claudeDir });
-    resolution = resolveSessionRef(everywhere.sessions, target, folder, deps.platform);
+    resolution = resolveSessionRef(everywhere.sessions, target, lookup, deps.platform);
   }
 
   if (resolution.kind === 'none') {
@@ -345,7 +350,13 @@ export async function runSessionShow(
   deps.write(renderSessionDetails(views, { ...context, folder }, detectPalette()) + '\n');
 }
 
-/** `cctl session aliases`. */
+/**
+ * `cctl session aliases`: the named sessions of one folder (the current directory or `--cwd`), or
+ * of every folder with `--all`. Only the project directories named after the folder's own spellings
+ * are read ({@link projectDirMatchesFolder}), as `claude --resume` reads them: a session recorded
+ * under a junction is listed from the junction, but not from the folder it points at. `session
+ * show <alias>` still finds it there, since a miss widens its search to every project.
+ */
 export async function runSessionAliases(
   options: SessionAliasesOptions,
   deps: SessionAliasDeps,
@@ -359,7 +370,7 @@ export async function runSessionAliases(
       ? { projectDirFilter: (name: string) => projectDirMatchesFolder(name, lookup) }
       : {}),
   });
-  const sessions = aliasedSessions(catalog.sessions, folder, deps.platform).filter(
+  const sessions = aliasedSessions(catalog.sessions, lookup, deps.platform).filter(
     (s) => options.auto === true || (s.customTitle !== null && s.customTitle.trim() !== ''),
   );
   const { views } = await withAccounts(deps, sessions);

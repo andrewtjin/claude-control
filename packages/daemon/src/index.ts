@@ -329,4 +329,5 @@ export {
   UNATTRIBUTED_SESSION_LABEL,
   type SessionRefResolution,
   type SessionAccountUse,
+  type SessionLookupFolder,
 } from './sessionLookup.js';

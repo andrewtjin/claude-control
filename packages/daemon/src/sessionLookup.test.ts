@@ -13,6 +13,7 @@ import {
   resolveSessionRef,
   sameFolder,
   UNATTRIBUTED_SESSION_LABEL,
+  type SessionLookupFolder,
 } from './sessionLookup.js';
 import type { TranscriptTurn } from './transcriptTokens.js';
 
@@ -35,6 +36,20 @@ const HERE = 'C:\\work\\app';
 const ELSEWHERE = 'C:\\work\\other';
 const THIRD = 'D:\\scratch';
 
+/** A lookup from `folder`, on a machine with no links: every folder is already canonical. */
+function at(folder: string): SessionLookupFolder {
+  return { spelled: folder, canonical: folder, canonicalize: (f) => f };
+}
+
+// A machine where C:\link is a junction to C:\work\app: canonicalizing resolves it.
+const LINK = 'C:\\link';
+const resolveLink = (f: string): string =>
+  f.toLowerCase().startsWith(LINK.toLowerCase()) ? HERE + f.slice(LINK.length) : f;
+/** A lookup from `folder` on that machine, as given and resolved. */
+function viaLink(folder: string): SessionLookupFolder {
+  return { spelled: folder, canonical: resolveLink(folder), canonicalize: resolveLink };
+}
+
 describe('sameFolder', () => {
   it('treats Windows spellings of one folder as the same, across case and separators', () => {
     expect(sameFolder('C:\\Work\\App', 'c:/work/app', 'win32')).toBe(true);
@@ -53,7 +68,7 @@ describe('sameFolder', () => {
 describe('resolveSessionRef', () => {
   it('matches a session id exactly, ignoring case', () => {
     const catalog = [session({ sessionId: 'abc-123', folder: ELSEWHERE })];
-    const res = resolveSessionRef(catalog, 'ABC-123', HERE, 'win32');
+    const res = resolveSessionRef(catalog, 'ABC-123', at(HERE), 'win32');
     // An id is global: it resolves even though the session lives in another folder.
     expect(res).toEqual({ kind: 'id', session: catalog[0] });
   });
@@ -63,26 +78,26 @@ describe('resolveSessionRef', () => {
       session({ sessionId: 'named', folder: HERE, customTitle: 'abc-123', lastActivityMs: 9 }),
       session({ sessionId: 'abc-123', folder: ELSEWHERE }),
     ];
-    const res = resolveSessionRef(catalog, 'abc-123', HERE, 'win32');
+    const res = resolveSessionRef(catalog, 'abc-123', at(HERE), 'win32');
     expect(res.kind).toBe('id');
     expect(res.kind === 'id' && res.session.sessionId).toBe('abc-123');
   });
 
   it('finds nothing for an empty or blank reference', () => {
     const catalog = [session({ sessionId: 's', folder: HERE, customTitle: '' })];
-    expect(resolveSessionRef(catalog, '', HERE, 'win32')).toEqual({ kind: 'none' });
-    expect(resolveSessionRef(catalog, '   ', HERE, 'win32')).toEqual({ kind: 'none' });
+    expect(resolveSessionRef(catalog, '', at(HERE), 'win32')).toEqual({ kind: 'none' });
+    expect(resolveSessionRef(catalog, '   ', at(HERE), 'win32')).toEqual({ kind: 'none' });
   });
 
   it('compares aliases the way claude --resume does: lower-cased and trimmed', () => {
     const catalog = [session({ sessionId: 's', folder: HERE, customTitle: '  Auth Work ' })];
-    const res = resolveSessionRef(catalog, 'auth work  ', HERE, 'win32');
+    const res = resolveSessionRef(catalog, 'auth work  ', at(HERE), 'win32');
     expect(res).toMatchObject({ kind: 'alias', inScope: true, folder: HERE });
   });
 
   it('matches a generated title when no custom title was set', () => {
     const catalog = [session({ sessionId: 's', folder: HERE, aiTitle: 'Fix login' })];
-    expect(resolveSessionRef(catalog, 'fix login', HERE, 'win32').kind).toBe('alias');
+    expect(resolveSessionRef(catalog, 'fix login', at(HERE), 'win32').kind).toBe('alias');
   });
 
   it('does not match the generated title of a session whose custom title is blank', () => {
@@ -90,7 +105,7 @@ describe('resolveSessionRef', () => {
     const catalog = [
       session({ sessionId: 's', folder: HERE, customTitle: '', aiTitle: 'Fix login' }),
     ];
-    expect(resolveSessionRef(catalog, 'fix login', HERE, 'win32')).toEqual({ kind: 'none' });
+    expect(resolveSessionRef(catalog, 'fix login', at(HERE), 'win32')).toEqual({ kind: 'none' });
   });
 
   it('prefers the matches in the working folder, however that folder is spelled', () => {
@@ -104,7 +119,7 @@ describe('resolveSessionRef', () => {
       }),
       session({ sessionId: 'near-new', folder: HERE, customTitle: 'API', lastActivityMs: 5 }),
     ];
-    const res = resolveSessionRef(catalog, 'api', HERE, 'win32');
+    const res = resolveSessionRef(catalog, 'api', at(HERE), 'win32');
     expect(res.kind).toBe('alias');
     if (res.kind !== 'alias') return;
     expect(res.inScope).toBe(true);
@@ -119,7 +134,7 @@ describe('resolveSessionRef', () => {
       // The same folder spelled differently still counts as ONE other folder on Windows.
       session({ sessionId: 'b', folder: 'c:/WORK/other', customTitle: 'api', lastActivityMs: 2 }),
     ];
-    const res = resolveSessionRef(catalog, 'api', HERE, 'win32');
+    const res = resolveSessionRef(catalog, 'api', at(HERE), 'win32');
     expect(res.kind).toBe('alias');
     if (res.kind !== 'alias') return;
     expect(res.inScope).toBe(false);
@@ -132,7 +147,7 @@ describe('resolveSessionRef', () => {
       session({ sessionId: 'y1', folder: THIRD, customTitle: 'api', lastActivityMs: 30 }),
       session({ sessionId: 'x2', folder: ELSEWHERE, customTitle: 'api', lastActivityMs: 20 }),
     ];
-    const res = resolveSessionRef(catalog, 'api', HERE, 'win32');
+    const res = resolveSessionRef(catalog, 'api', at(HERE), 'win32');
     expect(res.kind).toBe('ambiguous');
     if (res.kind !== 'ambiguous') return;
     expect(res.folders.map((f) => [f.folder, f.sessions.map((s) => s.sessionId)])).toEqual([
@@ -156,11 +171,11 @@ describe('resolveSessionRef', () => {
         lastActivityMs: 2,
       }),
     ];
-    const res = resolveSessionRef(catalog, 'api', '/home/me/app', 'linux');
+    const res = resolveSessionRef(catalog, 'api', at('/home/me/app'), 'linux');
     // Only the exact-case folder is "here"; on Windows both would be.
     expect(res).toMatchObject({ kind: 'alias', inScope: true });
     expect(res.kind === 'alias' && res.sessions.map((s) => s.sessionId)).toEqual(['lower']);
-    const elsewhere = resolveSessionRef(catalog, 'api', '/home/me/APP', 'linux');
+    const elsewhere = resolveSessionRef(catalog, 'api', at('/home/me/APP'), 'linux');
     expect(elsewhere.kind).toBe('ambiguous');
     const win = resolveSessionRef(
       catalog.map((s) => ({
@@ -168,7 +183,7 @@ describe('resolveSessionRef', () => {
         folder: s.folder === null ? null : `C:${s.folder.replace(/\//g, '\\')}`,
       })),
       'api',
-      'C:\\home\\me\\APP',
+      at('C:\\home\\me\\APP'),
       'win32',
     );
     expect(win.kind === 'alias' && win.sessions).toHaveLength(2);
@@ -176,13 +191,13 @@ describe('resolveSessionRef', () => {
 
   it('matches a session with no recorded folder by id only, never by alias', () => {
     const catalog = [session({ sessionId: 'nofolder', folder: null, customTitle: 'api' })];
-    expect(resolveSessionRef(catalog, 'api', HERE, 'win32')).toEqual({ kind: 'none' });
-    expect(resolveSessionRef(catalog, 'nofolder', HERE, 'win32').kind).toBe('id');
+    expect(resolveSessionRef(catalog, 'api', at(HERE), 'win32')).toEqual({ kind: 'none' });
+    expect(resolveSessionRef(catalog, 'nofolder', at(HERE), 'win32').kind).toBe('id');
   });
 
   it('finds nothing when no id or alias matches', () => {
     const catalog = [session({ sessionId: 's', folder: HERE, customTitle: 'api' })];
-    expect(resolveSessionRef(catalog, 'web', HERE, 'win32')).toEqual({ kind: 'none' });
+    expect(resolveSessionRef(catalog, 'web', at(HERE), 'win32')).toEqual({ kind: 'none' });
   });
 });
 
@@ -194,19 +209,66 @@ describe('a session with no trusted recorded folder', () => {
 
   it('is found by alias from the folder its project directory can stand for', () => {
     const catalog = [untrusted('C--work-app')];
-    expect(resolveSessionRef(catalog, 'auth work', HERE, 'win32')).toMatchObject({
+    expect(resolveSessionRef(catalog, 'auth work', at(HERE), 'win32')).toMatchObject({
       kind: 'alias',
       folder: HERE,
       inScope: true,
     });
-    expect(aliasedSessions(catalog, HERE, 'win32').map((s) => s.sessionId)).toEqual(['s-u']);
+    expect(aliasedSessions(catalog, at(HERE), 'win32').map((s) => s.sessionId)).toEqual(['s-u']);
   });
 
   it('is found from nowhere else, and never in the every-folder listing', () => {
     const catalog = [untrusted('C--work-app')];
-    expect(resolveSessionRef(catalog, 'auth work', ELSEWHERE, 'win32')).toEqual({ kind: 'none' });
-    expect(aliasedSessions(catalog, ELSEWHERE, 'win32')).toEqual([]);
+    expect(resolveSessionRef(catalog, 'auth work', at(ELSEWHERE), 'win32')).toEqual({
+      kind: 'none',
+    });
+    expect(aliasedSessions(catalog, at(ELSEWHERE), 'win32')).toEqual([]);
     expect(aliasedSessions(catalog, null, 'win32')).toEqual([]);
+  });
+});
+
+describe('a session recorded under a junction', () => {
+  // Claude Code records the folder as it was spelled at launch: a session launched in C:\link is
+  // recorded there, though the folder it is in is C:\work\app.
+  const linked = session({
+    sessionId: 's-link',
+    folder: LINK,
+    projectDir: 'C--link',
+    customTitle: 'plinked',
+    lastActivityMs: 2,
+  });
+
+  it('is found by alias from the link and from the folder it points at', () => {
+    for (const from of [viaLink(LINK), viaLink(HERE)]) {
+      expect(resolveSessionRef([linked], 'plinked', from, 'win32')).toMatchObject({
+        kind: 'alias',
+        folder: HERE,
+        inScope: true,
+      });
+    }
+  });
+
+  it('is listed from the link and from the folder it points at', () => {
+    for (const from of [viaLink(LINK), viaLink(HERE)]) {
+      expect(aliasedSessions([linked], from, 'win32').map((s) => s.sessionId)).toEqual(['s-link']);
+    }
+  });
+
+  it('shares one folder with a session recorded under the resolved spelling', () => {
+    const direct = session({
+      sessionId: 's-direct',
+      folder: HERE,
+      customTitle: 'plinked',
+      lastActivityMs: 1,
+    });
+    // Looked up from another folder: one folder holds both, so the answer is that folder, never
+    // a choice between two spellings of it.
+    const res = resolveSessionRef([linked, direct], 'plinked', viaLink(ELSEWHERE), 'win32');
+    expect(res).toMatchObject({ kind: 'alias', folder: HERE, inScope: false });
+    expect(res.kind === 'alias' && res.sessions.map((s) => s.sessionId)).toEqual([
+      's-link',
+      's-direct',
+    ]);
   });
 });
 
@@ -227,7 +289,7 @@ describe('aliasedSessions', () => {
   ];
 
   it('lists the aliased sessions of one folder, most recent first', () => {
-    expect(aliasedSessions(catalog, HERE, 'win32').map((s) => s.sessionId)).toEqual([
+    expect(aliasedSessions(catalog, at(HERE), 'win32').map((s) => s.sessionId)).toEqual([
       'here-auto',
       'here-custom',
     ]);
