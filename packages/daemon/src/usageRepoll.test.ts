@@ -46,6 +46,14 @@ describe('planUsageRepoll', () => {
     ]);
   });
 
+  it('while poll cycles are failing, answers a due account as such and a held one as held', () => {
+    expect(planUsageRepoll(undefined, FLEET, readiness, { cyclesFailing: true })).toEqual([
+      { id: 'due-1', outcome: 'skipped', reason: 'cycle_failed' },
+      { id: 'floor-1', outcome: 'skipped', reason: 'floor', dueAtMs: 1_000 },
+      { id: 'backoff-1', outcome: 'skipped', reason: 'backoff', dueAtMs: 9_000 },
+    ]);
+  });
+
   it('answers an empty list with nothing, not with every account', () => {
     expect(planUsageRepoll([], FLEET, readiness)).toEqual([]);
   });

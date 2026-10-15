@@ -2202,6 +2202,12 @@ describe('HookReceiver', () => {
       expect(asked).toEqual([]);
     });
 
+    it('answers 503 when the daemon is stopping and scheduled nothing', async () => {
+      receiver.setUsageHandlers({ repollUsage: () => Promise.resolve('stopping' as const) });
+      const res = await post(port, '/cli/usage/repoll', {}, auth);
+      expect(res).toEqual({ status: 503, body: { ok: false, error: 'daemon is shutting down' } });
+    });
+
     it('answers 500 rather than hanging when the daemon side throws', async () => {
       receiver.setUsageHandlers({ repollUsage: () => Promise.reject(new Error('registry gone')) });
       const res = await post(port, '/cli/usage/repoll', {}, auth);

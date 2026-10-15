@@ -619,4 +619,99 @@ describe('usage refresh on demand (POST /cli/usage/repoll)', () => {
     // Two refreshes during one cycle still make one follow-up cycle, not two, and no loop.
     expect(pollSpy).toHaveBeenCalledTimes(2);
   });
+
+  it('does not follow a running cycle that went on to poll every account the refresh named', async () => {
+    const rig = await createRig({ bodyFor: weekly });
+    const realPollAll = rig.poller.pollAll.bind(rig.poller);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // The first cycle waits just before pollAll, so the refresh finds every account due; then it
+    // polls them for real.
+    const pollSpy = vi
+      .spyOn(rig.poller, 'pollAll')
+      .mockImplementationOnce((accounts) => gate.then(() => realPollAll(accounts)));
+    await rig.start();
+    await waitFor(() => pollSpy.mock.calls.length === 1);
+
+    const res = await repoll(rig, {});
+    expect(res.body).toMatchObject({
+      results: [{ outcome: 'scheduled' }, { outcome: 'scheduled' }],
+    });
+
+    release();
+    await waitFor(() => rig.autoSwitchInputs.length >= 1);
+    await settle();
+    // The running cycle already served the refresh; a second one would only re-run every
+    // per-cycle side effect (and spend retry budgets counted in cycles) to poll nothing.
+    expect(pollSpy).toHaveBeenCalledTimes(1);
+    expect(rig.autoSwitchInputs).toHaveLength(1);
+    expect([...rig.fetched].sort()).toEqual(['acct-1', 'acct-2']);
+  });
+
+  it('starts no cycle once the daemon is stopping, and says so', async () => {
+    let now = NOW;
+    const rig = await createRig({ bodyFor: weekly, clock: () => now });
+    const pollSpy = await startAndSettle(rig);
+    now += POLL_FLOOR_MS + POLL_JITTER_MS; // every account is due again
+    const internals = rig.daemon as unknown as {
+      repollUsage(ids: string[] | undefined): Promise<unknown>;
+    };
+    // One refresh is still reading the fleet when stop() begins; another arrives after it.
+    const inFlight = internals.repollUsage(undefined);
+    const stopping = rig.daemon.stop();
+    const late = internals.repollUsage(undefined);
+    expect(await inFlight).toBe('stopping');
+    expect(await late).toBe('stopping');
+    await stopping;
+    await settle();
+    expect(pollSpy).toHaveBeenCalledTimes(1);
+    expect(rig.logLines).not.toContain('requested poll cycle failed');
+  });
+
+  it('starts no cycle while cycles keep failing before they poll, and says why', async () => {
+    let now = NOW;
+    // The audit log is unreadable, so every cycle dies before it reaches the usage endpoint and
+    // no account ever gets poll state for the floor to hold.
+    const sync = vi
+      .spyOn(AttributionJournal.prototype, 'sync')
+      .mockRejectedValue(new Error('EISDIR: illegal operation on a directory, read'));
+    try {
+      const rig = await createRig({ bodyFor: weekly, clock: () => now });
+      await rig.start();
+      await waitFor(() => rig.logLines.includes('initial poll cycle failed'));
+
+      for (let i = 0; i < 5; i += 1) {
+        expect((await repoll(rig, {})).body).toEqual({
+          ok: true,
+          results: [
+            { id: 'acct-1', outcome: 'skipped', reason: 'cycle_failed' },
+            { id: 'acct-2', outcome: 'skipped', reason: 'cycle_failed' },
+          ],
+        });
+      }
+      await settle();
+      // Only the initial cycle ran: the refreshes added none, so none failed.
+      expect(sync).toHaveBeenCalledTimes(1);
+      expect(rig.logLines).not.toContain('requested poll cycle failed');
+      expect(rig.fetched).toEqual([]);
+
+      // Once a cycle gets through again, a refresh schedules as before.
+      sync.mockResolvedValue(undefined);
+      await (rig.daemon as unknown as { runPollCycle(): Promise<void> }).runPollCycle();
+      expect([...rig.fetched].sort()).toEqual(['acct-1', 'acct-2']);
+      now += POLL_FLOOR_MS + POLL_JITTER_MS;
+      expect((await repoll(rig, {})).body).toEqual({
+        ok: true,
+        results: [
+          { id: 'acct-1', outcome: 'scheduled' },
+          { id: 'acct-2', outcome: 'scheduled' },
+        ],
+      });
+      await waitFor(() => rig.fetched.length === 4);
+    } finally {
+      sync.mockRestore();
+    }
+  });
 });

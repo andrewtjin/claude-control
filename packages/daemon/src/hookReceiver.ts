@@ -1352,7 +1352,8 @@ export class HookReceiver {
 
   /** `POST /cli/usage/repoll { ids? }`: ask the poller to refresh these accounts (every stored
    *  account when `ids` is absent) as soon as their floor and backoff allow. The 200 body is the
-   *  per-account verdict list (see usageRepoll.ts). `ids`, when present, must be a list of
+   *  per-account verdict list (see usageRepoll.ts); a daemon that is stopping answers 503 and
+   *  schedules nothing. `ids`, when present, must be a list of
    *  non-empty strings — anything else is a client bug, refused rather than read as "all". */
   private async handleUsageRepoll(
     body: Record<string, unknown>,
@@ -1373,7 +1374,14 @@ export class HookReceiver {
       }
       ids = body.ids;
     }
-    this.respond(res, 200, await this.usageHandlers.repollUsage(ids));
+    const answer = await this.usageHandlers.repollUsage(ids);
+    // The receiver keeps listening while the daemon drains its sessions on the way down; a refresh
+    // in that window started nothing, and must not read as scheduled.
+    if (answer === 'stopping') {
+      this.respond(res, 503, { ok: false, error: 'daemon is shutting down' });
+      return;
+    }
+    this.respond(res, 200, answer);
   }
 
   /** Map a {@link SessionCommandResult} onto an HTTP response: success → 200 (with the echoed
