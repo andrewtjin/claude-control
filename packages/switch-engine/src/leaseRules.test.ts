@@ -25,13 +25,7 @@ import { InsecurePassthroughProtector } from './dpapi.js';
 import { buildFolderBindingSnapshot, folderBindingSnapshotContentEqual } from './folderBindings.js';
 import { LeaseHolderCapError, LeaseHoldersEmptyError, RulesWriteRefusedError } from './errors.js';
 import { ruleSlotId } from './types.js';
-import type {
-  CredentialBundle,
-  FolderRule,
-  LeaseHolder,
-  SlotId,
-  StoredAccount,
-} from './types.js';
+import type { CredentialBundle, FolderRule, LeaseHolder, SlotId, StoredAccount } from './types.js';
 
 const row = (id: string, over: Partial<StoredAccount> = {}): StoredAccount => ({
   id,
@@ -288,8 +282,7 @@ describe('the vault: a lease that does not validate is refused on read', () => {
   it('with no holders', () => refusedAfter((f) => (lease(f).holders = []), /has no holders/));
   it('with 33 holders', () =>
     refusedAfter(
-      (f) =>
-        (lease(f).holders = Array.from({ length: 33 }, (_, i) => ({ ...holder(100 + i) }))),
+      (f) => (lease(f).holders = Array.from({ length: 33 }, (_, i) => ({ ...holder(100 + i) }))),
       /33 processes/,
     ));
   it('with a bad role', () =>

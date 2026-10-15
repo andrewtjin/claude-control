@@ -743,4 +743,7 @@ export interface LeaseView {
   profileDir: string;
   startedAtMs: number;
   holders: Array<LeaseHolder & { state: LeaseHolderState; reused?: boolean }>;
+  /** Full mode, when no recorded holder runs: processes running on the profile that no holder
+   *  records (the next full sweep records them). */
+  unrecorded?: number[];
 }

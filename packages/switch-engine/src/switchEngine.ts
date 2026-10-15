@@ -3111,7 +3111,12 @@ export class SwitchEngine {
     const leases = (await this.vault.listRules()).filter(isLeaseRule);
     if (leases.length === 0) return [];
     const evidence = await this.holderEvidence(opts.mode, {});
-    return leases.map((rule) => this.leaseView(rule, evidence));
+    return leases.map((rule) => {
+      const view = this.leaseView(rule, evidence);
+      if (opts.mode !== 'full' || view.holders.some((h) => h.state !== 'dead')) return view;
+      const unrecorded = this.unrecordedProcesses(rule, evidence).map((h) => h.pid);
+      return unrecorded.length > 0 ? { ...view, unrecorded } : view;
+    });
   }
 
   /** The parallel session holding an account, if any (one rules read, a quick judgment of its
