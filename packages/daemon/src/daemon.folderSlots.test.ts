@@ -29,8 +29,13 @@ import {
   type ActivateOptions,
   type ActivateResult,
   type FolderRule,
+  type LeaseOccupancyProbe,
+  type LeaseSweepOptions,
+  type LeaseSweepReport,
+  type LeaseView,
   type RuleLiveResult,
   type SessionIdentity,
+  type SessionLease,
   type Logger,
   type RecoverResult,
   type RepairResult,
@@ -157,6 +162,8 @@ interface TestGroup {
   exclude?: string[];
   /** Session-alias scopes (default none). */
   aliases?: { folder: string; alias: string }[];
+  /** Makes it a parallel session (default none). */
+  lease?: SessionLease;
 }
 
 /** The rule a {@link TestGroup} fixture stands for. */
@@ -171,6 +178,7 @@ function ruleOf(g: TestGroup): FolderRule {
     activeId: g.activeId,
     createdAtMs: g.createdAtMs,
     updatedAtMs: g.updatedAtMs,
+    ...(g.lease !== undefined ? { lease: g.lease } : {}),
   };
 }
 
@@ -185,6 +193,9 @@ interface FakeEngineControls {
   checkSlotsCalls: number;
   repairSlotsCalls: number;
   liveSlots: Map<SlotId, string | null>;
+  /** The order the cycle's maintenance calls arrived in ('sweep', 'refreshSnapshotIfStale'). */
+  order: string[];
+  sweepCalls: LeaseSweepOptions[];
 }
 
 function fakeEngine(opts: {
@@ -212,6 +223,8 @@ function fakeEngine(opts: {
   /** Seat each activation in the slot it named, so the next cycle sees the hop (default: the live
    *  slots never move, as for a single-cycle case). */
   applyActivations?: boolean;
+  /** The parallel session holding an account (default: the lease rule including it, if any). */
+  leaseOf?: (accountId: string) => LeaseView | undefined;
 }): FakeEngineControls {
   const controls: FakeEngineControls = {
     activateCalls: [],
@@ -221,7 +234,23 @@ function fakeEngine(opts: {
     checkSlotsCalls: 0,
     repairSlotsCalls: 0,
     liveSlots: opts.live,
+    order: [],
+    sweepCalls: [],
     engine: undefined as unknown as SwitchEngineLike,
+  };
+  const leaseViewOf = (accountId: string): LeaseView | undefined => {
+    if (opts.leaseOf) return opts.leaseOf(accountId);
+    const g = opts.groups.find((x) => x.lease !== undefined && x.members[0]?.id === accountId);
+    return g === undefined
+      ? undefined
+      : {
+          ruleId: g.id,
+          accountId,
+          label: g.members[0]!.label,
+          profileDir: `/profiles/${g.id}`,
+          startedAtMs: 0,
+          holders: g.lease!.holders.map((h) => ({ ...h, state: 'alive' as const })),
+        };
   };
   const memberIds = new Set(opts.groups.flatMap((g) => g.members.map((m) => m.id)));
   controls.engine = {
@@ -300,8 +329,22 @@ function fakeEngine(opts: {
     },
     refreshSnapshotIfStale: (): Promise<boolean> => {
       controls.refreshSnapshotIfStaleCalls++;
+      controls.order.push('refreshSnapshotIfStale');
       return Promise.resolve(opts.snapshotStale === true);
     },
+    sweepLeases: (sweep: LeaseSweepOptions): Promise<LeaseSweepReport> => {
+      controls.sweepCalls.push(sweep);
+      controls.order.push('sweep');
+      return Promise.resolve({
+        droppedHolders: 0,
+        adoptedHolders: 0,
+        ended: [],
+        deferred: [],
+        adopted: [],
+      });
+    },
+    leaseOf: (accountId: string): Promise<LeaseView | undefined> =>
+      Promise.resolve(leaseViewOf(accountId)),
     reauthenticate: () => Promise.reject(new Error('unused')),
   };
   return controls;
@@ -362,6 +405,8 @@ async function createRig(opts: {
   backgroundMoveConfirmMs?: number;
   /** What a session's transcript records (its custom title and recorded folder). */
   sessionIdentityOf?: (sessionId: string) => Promise<SessionIdentity | null>;
+  /** The background workers of a parallel session's profile (the daemon sweeps only with one). */
+  leaseOccupancyProbe?: LeaseOccupancyProbe;
 }): Promise<Rig> {
   const relay = new SteadyRelay();
   const relayPort = await relay.listen();
@@ -433,6 +478,9 @@ async function createRig(opts: {
       ? { backgroundMoveConfirmMs: opts.backgroundMoveConfirmMs }
       : {}),
     ...(opts.sessionIdentityOf !== undefined ? { sessionIdentityOf: opts.sessionIdentityOf } : {}),
+    ...(opts.leaseOccupancyProbe !== undefined
+      ? { leaseOccupancyProbe: opts.leaseOccupancyProbe }
+      : {}),
   });
 
   cleanups.push(async () => {
@@ -2079,5 +2127,177 @@ describe('daemon folder-bound slots — background sessions move onto their fold
 
     expect(calls).toEqual(['list null']);
     expect(movedNotices(rig.relay)).toEqual([]);
+  });
+});
+
+describe('daemon and parallel sessions', () => {
+  // A shared account s1 (live global), a folder rule g1 on m1, and the parallel session of w.
+  function withLease(opts: { wLive?: string | null } = {}): {
+    accounts: AccountView[];
+    groups: TestGroup[];
+    live: Map<SlotId, string | null>;
+  } {
+    const base = twoAccountGroup();
+    const w = view('w', 'Work', 'session-w');
+    const lease: TestGroup = {
+      id: 'session-w',
+      label: 'Work',
+      members: [w],
+      activeId: 'w',
+      folders: [],
+      createdAtMs: 0,
+      updatedAtMs: 0,
+      lease: {
+        holders: [{ pid: 4120, start: 1, host: 'BOX', platform: 'win32', role: 'launcher' }],
+        startedAtMs: 0,
+      },
+    };
+    const live = new Map(base.live);
+    live.set(ruleSlotId('session-w'), opts.wLive === undefined ? 'w' : opts.wLive);
+    return { accounts: [...base.accounts, w], groups: [...base.groups, lease], live };
+  }
+  const OUT = {
+    limits: [
+      { kind: 'session', percent: 100, resets_at: iso(NOW + HOUR_MS) },
+      { kind: 'weekly_all', percent: 100, resets_at: iso(NOW + DAY_MS) },
+    ],
+  };
+  const noWorkers: LeaseOccupancyProbe = () => Promise.resolve([]);
+
+  it('sweeps parallel sessions (full) before the snapshot check, and never self-heals or alerts on one', async () => {
+    const { accounts, groups, live } = withLease({ wLive: null });
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      // The session's slot has nothing seated: a folder in that state would be alerted on.
+      ensureRuleLiveImpl: (ruleId) =>
+        Promise.resolve({ ruleId, liveAccount: null, activated: false, noWorkingAccount: true }),
+    });
+    const rig = await createRig({
+      controls,
+      bodyFor: () => ({ limits: [] }),
+      leaseOccupancyProbe: noWorkers,
+      slotAlertWindowMs: 60 * 60_000,
+    });
+    await rig.start();
+    await waitFor(() => controls.sweepCalls.length > 0 && countUsageSnapshots(rig.relay) > 0);
+    expect(controls.sweepCalls[0]).toMatchObject({ mode: 'full' });
+    expect(controls.order.indexOf('sweep')).toBeLessThan(
+      controls.order.indexOf('refreshSnapshotIfStale'),
+    );
+    expect(controls.ensureRuleLiveCalls).not.toContain('session-w');
+    expect(slotAlerts(rig.relay).some((a) => a.body.includes('Work'))).toBe(false);
+  });
+
+  it('never evaluates the auto-switch for a parallel session, and raises no stuck alert for it', async () => {
+    const { accounts, groups, live } = withLease();
+    const controls = fakeEngine({ accounts, groups, live, applyActivations: true });
+    const rig = await createRig({
+      controls,
+      // Every account out: a folder slot in this state is stuck and alerted on.
+      bodyFor: () => OUT,
+      withAutoSwitcher: true,
+      leaseOccupancyProbe: noWorkers,
+      slotAlertWindowMs: 60 * 60_000,
+    });
+    await rig.start();
+    await waitFor(() => countUsageSnapshots(rig.relay) > 0);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(controls.activateCalls.some((c) => c.options?.slot === ruleSlotId('session-w'))).toBe(
+      false,
+    );
+    expect(controls.activateCalls.some((c) => c.id === 'w')).toBe(false);
+    expect(slotAlerts(rig.relay).some((a) => a.body.includes('Work'))).toBe(false);
+  });
+
+  it('tells an older phone the account runs a parallel session', async () => {
+    const { accounts, groups, live } = withLease();
+    const controls = fakeEngine({ accounts, groups, live });
+    const rig = await createRig({ controls, bodyFor: () => ({ limits: [] }) });
+    await rig.start();
+    await waitFor(() => countUsageSnapshots(rig.relay) > 0);
+    const w = lastUsageSnapshot(rig.relay).accounts.find((a) => a.accountId === 'w');
+    expect(w?.groupLabel).toBe('parallel session');
+  });
+
+  it('refuses a phone spawn naming the account, and spawns nothing', async () => {
+    const { accounts, groups, live } = withLease();
+    const spawnCalls = { count: 0 };
+    const controls = fakeEngine({ accounts, groups, live });
+    const rig = await createRig({ controls, bodyFor: () => ({ limits: [] }), spawnCalls });
+    await rig.start();
+    rig.relay.push({
+      daemonId: 'd',
+      type: 'session.spawn',
+      payload: { requestId: 'r-w', prompt: 'go', idempotencyKey: 'k-w', accountId: 'w' },
+    });
+    await waitFor(() => errorFrames(rig.relay).some((e) => e.relatesTo !== undefined));
+    const err = errorFrames(rig.relay)[0];
+    expect(err?.message).toContain(
+      'account "Work" is in use by a parallel session in a terminal; it rejoins the pool when that session exits',
+    );
+    expect(spawnCalls.count).toBe(0);
+  });
+
+  it('a phone switch of the account never names the parallel session slot', async () => {
+    const { accounts, groups, live } = withLease();
+    const controls = fakeEngine({ accounts, groups, live });
+    const rig = await createRig({ controls, bodyFor: () => ({ limits: [] }) });
+    await rig.start();
+    rig.relay.push({
+      daemonId: 'd',
+      type: 'switch.command',
+      payload: {
+        requestId: 'rq-w',
+        targetAccountId: 'Work',
+        reason: 'manual',
+        idempotencyKey: 'ik-w',
+      },
+    });
+    await waitFor(() => switchResults(rig.relay).some((r) => r.requestId === 'rq-w'));
+    // The engine refuses the account itself; what matters here is the slot the daemon named.
+    expect(controls.activateCalls.map((c) => c.options?.slot)).not.toContain(
+      ruleSlotId('session-w'),
+    );
+  });
+
+  it('never moves a background session onto a parallel session', async () => {
+    const { accounts, groups, live } = withLease();
+    const controls = fakeEngine({ accounts, groups, live });
+    const rig = await createRig({ controls, bodyFor: () => ({ limits: [] }) });
+    const targets = (
+      rig.daemon as unknown as {
+        backgroundMoveTargets(
+          rules: FolderRule[],
+          inputs: Array<{ accountId: string }>,
+          accounts: AccountView[],
+          live: ReadonlyMap<SlotId, string | null>,
+        ): Map<string, unknown>;
+      }
+    ).backgroundMoveTargets(groups.map(ruleOf), [], accounts, live);
+    expect([...targets.keys()]).not.toContain('session-w');
+  });
+
+  it('never resumes parked sessions into a parallel session when its account changes', async () => {
+    const { accounts, groups, live } = withLease();
+    const controls = fakeEngine({ accounts, groups, live });
+    const rig = await createRig({ controls, bodyFor: () => ({ limits: [] }) });
+    const daemon = rig.daemon as unknown as {
+      noticeGroupActiveChanges(
+        rules: FolderRule[],
+        live: Map<SlotId, string | null>,
+        accounts: AccountView[],
+      ): void;
+      resumeUsageStalledSessions(accountId: string, label: string, slot: SlotId): void;
+    };
+    const resumed: SlotId[] = [];
+    daemon.resumeUsageStalledSessions = (_id, _label, slot) => void resumed.push(slot);
+    daemon.noticeGroupActiveChanges(groups.map(ruleOf), live, accounts);
+    const moved = new Map(live);
+    moved.set(ruleSlotId('session-w'), 's1');
+    moved.set(ruleSlotId('g1'), 'm2');
+    daemon.noticeGroupActiveChanges(groups.map(ruleOf), moved, accounts);
+    expect(resumed).toEqual([ruleSlotId('g1')]);
   });
 });

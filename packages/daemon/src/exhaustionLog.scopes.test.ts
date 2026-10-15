@@ -510,3 +510,34 @@ describe('a folder whose pool is empty', () => {
     expect(judgeScope([], none, undefined, T0, {}).on).toBe(false);
   });
 });
+
+describe('outageScopes and parallel sessions', () => {
+  it('a parallel session is no scope: the pools are the global one and the folder rules', () => {
+    const lease: FolderRule = {
+      id: 'session-W',
+      label: 'W',
+      folders: [],
+      include: ['W'],
+      exclude: [],
+      activeId: 'W',
+      createdAtMs: 0,
+      updatedAtMs: 0,
+      lease: {
+        holders: [{ pid: 4120, start: 1, host: 'BOX', platform: 'win32', role: 'launcher' }],
+        startedAtMs: 0,
+      },
+    };
+    const scopes = outageScopes({
+      accounts: [view('A'), view('W', ['session-W'])],
+      rules: [lease],
+      liveSlots: new Map<SlotId, string | null>([
+        ['global', 'A'],
+        [ruleSlotId('session-W'), 'W'],
+      ]),
+    });
+    expect(scopes.map((s) => s.key)).toEqual(['global']);
+    // With no operator rule, the global pool reads as the whole fleet's, as it did before.
+    expect(scopes[0]?.scope).toEqual(GLOBAL_SCOPE);
+    expect(scopes[0]?.accountIds).toEqual(['A']);
+  });
+});

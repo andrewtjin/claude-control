@@ -510,6 +510,12 @@ function run(input) {
     }
   }
 
+  // A parallel session (cctl claude --account) runs wherever it was started, on purpose: an explicit
+  // --account outranks every rule, and the session record is the authority, so no token is needed
+  // (a token's honor dies with the launcher that minted it, while this session may outlive a killed
+  // launcher). Allowed in every folder, for every session title, silently.
+  if (sessionGroup && sessionGroup.kind === 'lease') process.exit(0);
+
   var groups = snapshot.groups;
 
   // The session's alias: the prompt payload's session_title, which Claude Code sets to the session's

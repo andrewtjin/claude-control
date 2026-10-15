@@ -23,9 +23,14 @@ import type {
   RepairResult,
   RuleLiveResult,
   SessionIdentity,
+  LeaseOccupancyProbe,
+  LeaseSweepOptions,
+  LeaseSweepReport,
+  LeaseView,
 } from '@claude-control/switch-engine';
 import {
   allSlots,
+  isLeaseRule,
   recordedFolderFor,
   ruleIdOfSlot,
   ruleOfSlot,
@@ -182,6 +187,11 @@ export interface SwitchEngineLike {
     title: string | null,
     recordedFolder?: string | null,
   ): Promise<{ ruleId: string; folder: string } | null>;
+  /** End the parallel sessions (`cctl claude --account`) whose processes are gone, recording any
+   *  process found running on one's profile; run first in every maintenance cycle. */
+  sweepLeases?(opts: LeaseSweepOptions): Promise<LeaseSweepReport>;
+  /** The parallel session holding an account, if any: no managed session is placed on it. */
+  leaseOf?(accountId: string): Promise<LeaseView | undefined>;
   /** Complete a phone/CLI re-login from a pasted authorization code (see reauthFlow.ts). */
   reauthenticate(
     id: string,
@@ -223,6 +233,10 @@ export interface DaemonOptions {
   controlPlaneClient: ControlPlaneClient;
   /** Opt-in: evaluated after every poll cycle; absent = auto-switching disabled. */
   autoSwitcher?: AutoSwitcherLike;
+  /** The background workers a parallel session's profile hosts (see `LeaseOccupancyProbe`). The
+   *  cycle's sweep of parallel sessions never ends one whose service still hosts some. Absent: no
+   *  sweep runs (a session whose holders are gone is then ended by the CLI's own checks). */
+  leaseOccupancyProbe?: LeaseOccupancyProbe;
   /** Opt-in: given the accounts whose weekly clock this cycle could not resolve, so it can
    *  eagerly activate one and make it reachable by auto-switch. Consulted ONLY when
    *  `autoSwitcher` is also present — spending quota to widen a target pool nothing is going to
@@ -386,6 +400,17 @@ const DEFAULT_SLOT_ALERT_WINDOW_MS = 30 * 60_000;
  *  message the spawn handler relays to the phone; distinct from a generic spawn failure so the
  *  handler can answer with the refusal reason rather than a raw error string. */
 class SpawnBindingError extends Error {}
+
+/** Why a managed spawn or resume naming an account a parallel session holds is refused. */
+function leasedSpawnRefusal(label: string): string {
+  return (
+    `account "${label}" is in use by a parallel session in a terminal; it rejoins the pool when ` +
+    'that session exits'
+  );
+}
+
+/** How often the same deferral of a parallel session's end is logged again. */
+const LEASE_DEFER_LOG_MS = 60 * 60_000;
 
 /**
  * Operator-facing body for an alert about a slot invariant `repairSlots` just corrected. The
@@ -754,6 +779,10 @@ export class Daemon {
   private readonly hookReceiver: HookReceiver;
   private readonly controlPlaneClient: ControlPlaneClient;
   private readonly autoSwitcher: AutoSwitcherLike | undefined;
+  /** See {@link DaemonOptions.leaseOccupancyProbe}. */
+  private readonly leaseOccupancyProbe: LeaseOccupancyProbe | undefined;
+  /** When each deferred parallel session was last logged as deferred, by account and reason. */
+  private readonly leaseDeferLogged = new Map<string, number>();
   private readonly accountProbe: AccountProbeLike | undefined;
   private readonly autoSwitchPolicy: AutoSwitchPolicy;
   private readonly settingsReport: PayloadOf<'settings.snapshot'> | undefined;
@@ -956,6 +985,7 @@ export class Daemon {
     this.hookReceiver = options.hookReceiver;
     this.controlPlaneClient = options.controlPlaneClient;
     this.autoSwitcher = options.autoSwitcher;
+    this.leaseOccupancyProbe = options.leaseOccupancyProbe;
     this.accountProbe = options.accountProbe;
     // Falls back to the poller's copy rather than to the defaults: the composition root hands
     // the SAME policy object to the executor and to the plan, so reading it back off the plan
@@ -1628,8 +1658,38 @@ export class Daemon {
    * A breach the self-heal itself clears is caught by a check taken before it, and alerted on the
    * same way as one repairSlots fixes.
    */
+  /**
+   * One full sweep of the parallel sessions (see the engine's `sweepLeases`), logging what it ended,
+   * which processes it found running on a session's profile, and each deferral at most once an hour.
+   * No phone alert: a terminal closing is no news. A failure is a warning, never a failed cycle.
+   */
+  private async sweepParallelSessions(): Promise<void> {
+    const sweep = this.switchEngine.sweepLeases?.bind(this.switchEngine);
+    if (sweep === undefined || this.leaseOccupancyProbe === undefined) return;
+    try {
+      const report = await sweep({ mode: 'full', probe: this.leaseOccupancyProbe });
+      const now = this.clock();
+      for (const d of report.deferred) {
+        const key = `${d.accountId}\u0000${d.reason}`;
+        const last = this.leaseDeferLogged.get(key);
+        if (last !== undefined && now - last < LEASE_DEFER_LOG_MS) continue;
+        this.leaseDeferLogged.set(key, now);
+        this.logger.info(
+          { accountId: d.accountId, reason: d.reason },
+          `parallel session of ${d.label} has no running holder but was not ended yet (${d.reason})`,
+        );
+      }
+    } catch (err) {
+      this.logger.warn({ err }, 'could not check the parallel sessions');
+    }
+  }
+
   private async maintainSlots(rules: FolderRule[]): Promise<Map<string, string>> {
     const poolsOut = new Map<string, string>();
+    // Parallel sessions first: one whose terminals are gone (a closed window, a killed process) is
+    // ended here, its rotation adopted, so its account rejoins the pool before anything below reads
+    // the slots. A full check: the daemon can afford the process query.
+    await this.sweepParallelSessions();
     // Every rule mutation writes the guard snapshot LAST, so a crash between the registry write and
     // the snapshot write leaves the snapshot stale while every slot is legal — nothing below would
     // notice, and the guard would keep enforcing the old binding set (fail-open for a new binding,
@@ -1664,6 +1724,9 @@ export class Daemon {
     const ensureRuleLive = this.switchEngine.ensureRuleLive?.bind(this.switchEngine);
     if (ensureRuleLive) {
       for (const rule of rules) {
+        // A parallel session is seated by its own terminal and never by the self-heal; it is no
+        // folder that can run out of accounts either.
+        if (isLeaseRule(rule)) continue;
         try {
           const result = await ensureRuleLive(rule.id);
           if (result.noWorkingAccount) {
@@ -1766,7 +1829,10 @@ export class Daemon {
       };
       if (ruleIds === undefined || ruleIds.length === 0) return { ...row, ...live };
       const ruleId = ruleIds.find((id) => liveSlots.get(ruleSlotId(id)) === a.id) ?? ruleIds[0]!;
-      const groupLabel = ruleById.get(ruleId)?.label;
+      const groupRule = ruleById.get(ruleId);
+      // An older phone shows this beside the label: "work (parallel session)".
+      const groupLabel =
+        groupRule !== undefined && isLeaseRule(groupRule) ? 'parallel session' : groupRule?.label;
       return {
         ...row,
         ...live,
@@ -1817,6 +1883,9 @@ export class Daemon {
 
     for (const slot of allSlots(rules)) {
       const rule = ruleOfSlot(slot, rules);
+      // A parallel session runs the one account its terminal chose: never evaluated, never stuck
+      // (at a usage limit it stops as any session does), and its hop record is never kept.
+      if (rule !== undefined && isLeaseRule(rule)) continue;
       const liveId = live.get(slot) ?? null;
       const slotInputs: AccountUsageInput[] = [];
       for (const entry of slotMembers(slot, picture)) {
@@ -1879,6 +1948,8 @@ export class Daemon {
     const now = this.clock();
     const targets = new Map<string, MoveTarget>();
     for (const rule of rules) {
+      // Nothing is moved onto a parallel session: its slot belongs to one terminal.
+      if (isLeaseRule(rule)) continue;
       const slot = ruleSlotId(rule.id);
       const liveId = live.get(slot) ?? null;
       const input = inputs.find((i) => i.accountId === liveId);
@@ -1947,6 +2018,7 @@ export class Daemon {
       if (!out.has(ruleId)) this.poolOutRules.delete(ruleId);
     }
     for (const rule of rules) {
+      if (isLeaseRule(rule)) continue;
       const message = out.get(rule.id);
       if (message === undefined || this.poolOutRules.has(rule.id)) continue;
       this.poolOutRules.add(rule.id);
@@ -2745,6 +2817,8 @@ export class Daemon {
     accounts: AccountView[],
   ): void {
     for (const rule of rules) {
+      // No managed session runs on a parallel session, so none is resumed into one.
+      if (isLeaseRule(rule)) continue;
       const slot = ruleSlotId(rule.id);
       const live = liveSlots.get(slot) ?? null;
       const previous = this.lastObservedGroupActiveId.get(slot);
@@ -3035,6 +3109,23 @@ export class Daemon {
             message:
               `prompt.inject: session '${sessionId}' cannot be re-attached because its working ` +
               `directory ${problem} (${record.cwd})`,
+            relatesTo: msg.id,
+          },
+        });
+        return;
+      }
+    }
+    // An account a parallel session holds runs in that terminal only: checked before the config dir
+    // is resolved, which refuses it too, so its refusal cannot fall through to a global resume.
+    if (record.accountId !== undefined && this.switchEngine.leaseOf !== undefined) {
+      const lease = await this.switchEngine.leaseOf(record.accountId).catch(() => undefined);
+      if (lease !== undefined) {
+        this.logger.warn({ sessionId }, 'resume refused: its account runs a parallel session');
+        this.sendEnvelope({
+          type: 'error',
+          payload: {
+            code: 'resume_failed',
+            message: leasedSpawnRefusal(lease.label),
             relatesTo: msg.id,
           },
         });
@@ -4020,13 +4111,23 @@ export class Daemon {
    */
   private async switchSlotFor(account: AccountView | undefined): Promise<SlotId | undefined> {
     if (account === undefined) return 'global';
-    const ruleIds = account.ruleIds ?? [];
+    // A parallel session's slot is never a switch or spawn target: its rules are left out of both
+    // the account's rules and the live scan. (A switch of the account it holds is then refused by
+    // the engine, with its own words.)
+    const leaseSlots = new Set(
+      ((await this.switchEngine.listRules?.()) ?? [])
+        .filter(isLeaseRule)
+        .map((r) => ruleSlotId(r.id)),
+    );
+    const ruleIds = (account.ruleIds ?? []).filter((id) => !leaseSlots.has(ruleSlotId(id)));
     if (ruleIds.length === 1) return ruleSlotId(ruleIds[0]!);
     const live = this.switchEngine.liveSlots
       ? await this.switchEngine.liveSlots()
       : new Map<SlotId, string | null>();
     if (ruleIds.length === 0) {
-      const inFolder = [...live].find(([slot, id]) => slot !== 'global' && id === account.id);
+      const inFolder = [...live].find(
+        ([slot, id]) => slot !== 'global' && !leaseSlots.has(slot) && id === account.id,
+      );
       return inFolder?.[0] ?? 'global';
     }
     return ruleIds.map((id) => ruleSlotId(id)).find((slot) => live.get(slot) === account.id);
@@ -4059,6 +4160,9 @@ export class Daemon {
     }
 
     if (accountId !== undefined) {
+      // An account a parallel session holds runs in that terminal only: nothing is spawned on it.
+      const lease = await engine.leaseOf?.(accountId);
+      if (lease !== undefined) throw new SpawnBindingError(leasedSpawnRefusal(lease.label));
       const acct = (await engine.listAllAccounts()).find((a) => a.id === accountId);
       if (acct?.ruleIds !== undefined && acct.ruleIds.length > 0) {
         // Reserved account: make its rule's slot live before the spawn reads the profile's

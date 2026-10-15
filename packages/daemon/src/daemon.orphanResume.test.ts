@@ -9,6 +9,7 @@ import type { SessionRecord } from '@claude-control/session-runtime';
 import {
   createHarness,
   fakeSessionManager,
+  fakeSwitchEngine,
   waitFor,
   type Harness,
 } from './testing/sessionDaemonHarness.js';
@@ -131,5 +132,43 @@ describe('Daemon: reporting what startup recovery found', () => {
           (e.payload as { notificationType?: string }).notificationType === 'usage_stall_lost',
       ),
     ).toEqual([]);
+  });
+});
+
+describe('Daemon: re-attaching a session whose account runs a parallel session', () => {
+  it('refuses with the reason, and never re-attaches it on the global slot', async () => {
+    const manager = fakeSessionManager();
+    const cwd = await sandbox();
+    manager.records.push(orphanRecord({ cwd, accountId: 'acct-y' }));
+    const engine = fakeSwitchEngine();
+    engine.leaseOf = (id: string) =>
+      Promise.resolve(
+        id === 'acct-y'
+          ? {
+              ruleId: 'session-acct-y',
+              accountId: id,
+              label: 'spare',
+              profileDir: '/profiles/session-acct-y',
+              startedAtMs: 0,
+              holders: [],
+            }
+          : undefined,
+      );
+    harness = await createHarness({ sessionManager: manager, switchEngine: engine });
+    const h = harness;
+    await h.daemon.start();
+
+    inject(h, 's1', 'pick it up');
+    await waitFor(() => h.sent.some((e) => e.type === 'error'));
+
+    const payload = h.sent.find((e) => e.type === 'error')?.payload as {
+      code?: string;
+      message?: string;
+    };
+    expect(payload.code).toBe('resume_failed');
+    expect(payload.message).toContain(
+      'account "spare" is in use by a parallel session in a terminal',
+    );
+    expect(manager.resumeOrphanCalls).toEqual([]);
   });
 });
