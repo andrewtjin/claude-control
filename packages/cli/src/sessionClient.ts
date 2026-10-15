@@ -1,4 +1,5 @@
-// Client for the daemon's loopback `cctl session` endpoints.
+// Client for the daemon's loopback CLI endpoints: the `cctl session` commands and the on-demand
+// usage refresh.
 //
 // `cctl session register|label|watch` talk to the RUNNING daemon over the same 127.0.0.1
 // HookReceiver server the CLI hooks use, guarded by the SAME `x-claude-control-secret`. Two
@@ -26,6 +27,8 @@ import {
   hookSecretPath,
   loadHookSecret,
   readHookEndpoint,
+  type UsageRepollResult,
+  type UsageRepollVerdict,
 } from '@claude-control/daemon';
 
 /** A tracked session as echoed back by the daemon (compact view). */
@@ -51,9 +54,9 @@ export interface SessionCommandSuccess {
 /** The verbs the daemon exposes as mutating loopback endpoints. */
 export type SessionVerb = 'register' | 'label' | 'watch' | 'unregister';
 
-/** Every failure the CLI can surface for a session command carries a human-actionable message;
- *  a dedicated class lets the command action print it cleanly (via `fail`) without leaking a
- *  stack trace or guessing whether an Error was expected. */
+/** Every failure the CLI can surface for a daemon call (a session command, a usage refresh)
+ *  carries a human-actionable message; a dedicated class lets the command action print it cleanly
+ *  (via `fail`) without leaking a stack trace or guessing whether an Error was expected. */
 export class SessionClientError extends Error {
   constructor(message: string) {
     super(message);
@@ -98,17 +101,29 @@ function dataDirOf(deps: SessionClientDeps, paths: Paths): string {
   return deps.dataDir ?? dirname(paths.vaultDir);
 }
 
+/** The daemon's JSON answer, loosely typed: each caller narrows the fields it reads. */
+interface DaemonReply {
+  ok?: unknown;
+  message?: string;
+  error?: string;
+  [field: string]: unknown;
+}
+
 /**
- * POST one session command to the running daemon. Reads the secret (read-only) and the
- * published port, then hits the loopback endpoint. Throws a {@link SessionClientError} with an
- * actionable message for every "can't reach the daemon" condition (no secret, no endpoint,
- * connection refused) and for any non-2xx daemon response (surfacing the daemon's own body).
+ * POST one JSON body to a loopback CLI route of the running daemon and return its parsed answer.
+ * Reads the secret (read-only) and the published port first. Throws a {@link SessionClientError}
+ * with an actionable message for every "can't reach the daemon" condition (no secret, no
+ * endpoint, connection refused) and for any non-2xx answer (surfacing the daemon's own words).
+ * One path for every CLI route, so they all fail the same way.
  */
-export async function callDaemonSession(
-  verb: SessionVerb,
+async function postToDaemon(
+  route: string,
   payload: Record<string, unknown>,
-  deps: SessionClientDeps = {},
-): Promise<SessionCommandSuccess> {
+  deps: SessionClientDeps,
+  // A route can put a refusal status in better words than the daemon's own (a daemon too old to
+  // know the route, for one); undefined falls through to the daemon's message.
+  explainRefusal: (status: number) => string | undefined = () => undefined,
+): Promise<DaemonReply | undefined> {
   const paths = defaultPaths();
   const dataDir = dataDirOf(deps, paths);
   const protector = deps.protector ?? defaultProtector();
@@ -129,7 +144,7 @@ export async function callDaemonSession(
 
   let res: Awaited<ReturnType<typeof fetch>>;
   try {
-    res = await fetch(`http://127.0.0.1:${endpoint.port}/cli/session/${verb}`, {
+    res = await fetch(`http://127.0.0.1:${endpoint.port}${route}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-claude-control-secret': secret },
       body: JSON.stringify(payload),
@@ -142,16 +157,32 @@ export async function callDaemonSession(
     );
   }
 
-  const body = (await res.json().catch(() => undefined)) as
-    | { ok?: boolean; status?: string; session?: SessionView; message?: string; error?: string }
-    | undefined;
+  const body = (await res.json().catch(() => undefined)) as DaemonReply | undefined;
   if (!res.ok) {
     // 4xx/5xx from the daemon: surface its explanation (unknown_session message, validation
     // error) verbatim so the user sees exactly what to fix.
     throw new SessionClientError(
-      body?.message ?? body?.error ?? `daemon returned HTTP ${res.status}`,
+      explainRefusal(res.status) ??
+        body?.message ??
+        body?.error ??
+        `daemon returned HTTP ${res.status}`,
     );
   }
+  return body;
+}
+
+/**
+ * POST one session command to the running daemon. Every failure is a {@link SessionClientError}
+ * with an actionable message (see {@link postToDaemon}), including a 2xx answer that does not
+ * carry the session it should.
+ */
+export async function callDaemonSession(
+  verb: SessionVerb,
+  payload: Record<string, unknown>,
+  deps: SessionClientDeps = {},
+): Promise<SessionCommandSuccess> {
+  const body = (await postToDaemon(`/cli/session/${verb}`, payload, deps)) as
+    (DaemonReply & { status?: string; session?: SessionView }) | undefined;
   if (!body || body.ok !== true || body.session === undefined) {
     throw new SessionClientError(body?.message ?? body?.error ?? 'unexpected daemon response');
   }
@@ -163,4 +194,38 @@ export async function callDaemonSession(
         : 'applied',
     session: body.session,
   };
+}
+
+/**
+ * Ask the running daemon to refresh usage now for these accounts (every stored account when `ids`
+ * is absent). The daemon honors each account's poll floor and 429 backoff, so the answer is a
+ * verdict per account: `scheduled`, or `skipped` with the reason (and, for a held account, when it
+ * is next due). Fails with a {@link SessionClientError} like every other daemon call, and in plain
+ * words when the running daemon predates the route.
+ */
+export async function callDaemonUsageRepoll(
+  ids?: readonly string[],
+  deps: SessionClientDeps = {},
+): Promise<UsageRepollResult> {
+  // Checked here so a refusal from the daemon can only mean it does not know the route: the
+  // daemon refuses a malformed list with the same 400 an older daemon gives every unknown route.
+  if (ids !== undefined && ids.some((id) => id.length === 0)) {
+    throw new SessionClientError('an account id to refresh is empty');
+  }
+  const body = await postToDaemon(
+    '/cli/usage/repoll',
+    ids === undefined ? {} : { ids: [...ids] },
+    deps,
+    (status) =>
+      // A daemon from before this route reads it as a session command missing its session (400)
+      // or an unknown CLI endpoint (404).
+      status === 400 || status === 404
+        ? 'the running daemon is older than this cctl and cannot refresh usage on demand - ' +
+          'restart it with `cctl daemon restart`'
+        : undefined,
+  );
+  if (!body || body.ok !== true || !Array.isArray(body.results)) {
+    throw new SessionClientError(body?.message ?? body?.error ?? 'unexpected daemon response');
+  }
+  return { ok: true, results: body.results as UsageRepollVerdict[] };
 }

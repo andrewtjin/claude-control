@@ -110,6 +110,7 @@ import {
   type PollAccount,
   type RegistryFacts,
 } from './usagePoller.js';
+import { planUsageRepoll, type UsageRepollResult } from './usageRepoll.js';
 import { readFleetHistory, RESET_LOOKBACK_MS } from './usageHistory.js';
 import type { AttributionJournal } from './attributionJournal.js';
 import type { TranscriptScan } from './transcriptTokens.js';
@@ -945,6 +946,9 @@ export class Daemon {
    *  duplicate snapshot pushes to the phone, and a last-write-wins race on
    *  {@link latestAdvisorInputs} decided by whichever cycle happened to finish second. */
   private pollCycleInFlight = false;
+  /** Set when a usage refresh needs a cycle while one is already running; the running cycle
+   *  starts one more when it ends (see {@link runPollCycle}). */
+  private pollCycleRequested = false;
   private started = false;
 
   constructor(options: DaemonOptions) {
@@ -1094,6 +1098,8 @@ export class Daemon {
     // …and for live channels: the receiver owns the sockets and the held polls, this class owns
     // the queue and where a reply is routed.
     this.hookReceiver.setChannelHandlers(this.channelHandlers());
+    // …and for an on-demand usage refresh: the receiver owns the route, this class owns the poller.
+    this.hookReceiver.setUsageHandlers({ repollUsage: (ids) => this.repollUsage(ids) });
 
     const hookPort = await this.hookReceiver.listen(0);
 
@@ -1380,7 +1386,45 @@ export class Daemon {
       await this.pollCycle();
     } finally {
       this.pollCycleInFlight = false;
+      // A refresh asked for while this cycle ran may have named an account the cycle had already
+      // passed; one more cycle polls it now instead of at the next tick. Only once, however many
+      // refreshes arrived, whether or not this cycle failed, and never after stop().
+      if (this.pollCycleRequested && this.started) {
+        this.pollCycleRequested = false;
+        this.startPollCycleNow();
+      }
     }
+  }
+
+  /** Start a poll cycle outside the interval, for a usage refresh. Not awaited: the caller is
+   *  answering a request (or finishing a cycle), and the cycle reports its own failure. */
+  private startPollCycleNow(): void {
+    this.runPollCycle().catch((err: unknown) => {
+      this.logger.error({ err }, 'requested poll cycle failed');
+    });
+  }
+
+  /**
+   * Refresh usage for these accounts (every stored account when `ids` is absent) as soon as the
+   * poller allows, and say per account what will happen.
+   *
+   * Each account's floor and 429 backoff are honored, never released: an account they hold is
+   * reported skipped with the time it is next due. When at least one account is due, a cycle is
+   * started now rather than at the next tick; one already running is followed by another, so a
+   * "scheduled" answer is never left waiting on the interval.
+   */
+  private async repollUsage(ids: string[] | undefined): Promise<UsageRepollResult> {
+    const { accounts } = await this.loadFleet();
+    const results = planUsageRepoll(
+      ids,
+      accounts.map((a) => a.id),
+      (id) => this.poller.pollReadiness(id),
+    );
+    if (results.some((r) => r.outcome === 'scheduled')) {
+      if (this.pollCycleInFlight) this.pollCycleRequested = true;
+      else this.startPollCycleNow();
+    }
+    return { ok: true, results };
   }
 
   /** One poll cycle's actual work — see {@link runPollCycle}, which owns the one-at-a-time

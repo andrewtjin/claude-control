@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
+import { createServer } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,9 +13,15 @@ import {
   type HookReceiverCliHandlers,
   type SessionCommandResult,
   type TrackedSessionView,
+  type UsageRepollVerdict,
 } from '@claude-control/daemon';
 import { InsecurePassthroughProtector, type Protector } from '@claude-control/switch-engine';
-import { callDaemonSession, resolveSessionId, SessionClientError } from './sessionClient.js';
+import {
+  callDaemonSession,
+  callDaemonUsageRepoll,
+  resolveSessionId,
+  SessionClientError,
+} from './sessionClient.js';
 
 // resolveSessionId is pure — no server needed.
 describe('resolveSessionId', () => {
@@ -229,5 +236,92 @@ describe('callDaemonSession', () => {
         { dataDir: h.dataDir, protector: h.protector },
       ),
     ).rejects.toThrowError(SessionClientError);
+  });
+});
+
+describe('callDaemonUsageRepoll', () => {
+  /** A real receiver with the session harness's secret and endpoint, whose usage refresh records
+   *  what it was asked and answers with `results`. */
+  async function usageHarness(
+    results: UsageRepollVerdict[],
+  ): Promise<{ deps: { dataDir: string; protector: Protector }; asked: unknown[] }> {
+    const h = await harness(() => ({ ok: true, status: 'applied', session: view }));
+    const asked: unknown[] = [];
+    h.receiver.setUsageHandlers({
+      repollUsage: (ids) => {
+        asked.push(ids);
+        return Promise.resolve({ ok: true, results });
+      },
+    });
+    return { deps: { dataDir: h.dataDir, protector: h.protector }, asked };
+  }
+
+  it('asks for every account when given no ids and returns the verdicts', async () => {
+    const results: UsageRepollVerdict[] = [
+      { id: 'a', outcome: 'scheduled' },
+      { id: 'b', outcome: 'skipped', reason: 'floor', dueAtMs: 123 },
+    ];
+    const h = await usageHarness(results);
+    expect(await callDaemonUsageRepoll(undefined, h.deps)).toEqual({ ok: true, results });
+    expect(h.asked).toEqual([undefined]);
+  });
+
+  it('passes the named ids through', async () => {
+    const h = await usageHarness([{ id: 'ghost', outcome: 'skipped', reason: 'unknown' }]);
+    const answer = await callDaemonUsageRepoll(['ghost'], h.deps);
+    expect(answer.results).toEqual([{ id: 'ghost', outcome: 'skipped', reason: 'unknown' }]);
+    expect(h.asked).toEqual([['ghost']]);
+  });
+
+  it('refuses an empty id without asking the daemon', async () => {
+    const h = await usageHarness([]);
+    await expect(callDaemonUsageRepoll([''], h.deps)).rejects.toThrow(
+      'an account id to refresh is empty',
+    );
+    expect(h.asked).toEqual([]);
+  });
+
+  it('fails with the actionable message when the daemon has never run', async () => {
+    const h = await harness(() => ({ ok: true, status: 'applied', session: view }), {
+      writeSecret: false,
+    });
+    const err = await callDaemonUsageRepoll(undefined, {
+      dataDir: h.dataDir,
+      protector: h.protector,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SessionClientError);
+    expect((err as Error).message).toMatch(/never run on this machine/);
+  });
+
+  it('says a daemon from before the route cannot refresh, instead of its session complaint', async () => {
+    // A daemon from before the route reads it as a session command: no usage handler, and the
+    // session-shape check refuses it with a 400.
+    const h = await harness(() => ({ ok: true, status: 'applied', session: view }));
+    const older = createServer((_req, res) => {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'sessionId and idempotencyKey are required' }));
+    });
+    await new Promise<void>((resolve) => older.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = older.address();
+      if (address === null || typeof address === 'string') throw new Error('no address');
+      await writeHookEndpoint(hookEndpointPath(h.dataDir), { port: address.port });
+      await expect(
+        callDaemonUsageRepoll(undefined, { dataDir: h.dataDir, protector: h.protector }),
+      ).rejects.toThrow(
+        'the running daemon is older than this cctl and cannot refresh usage on demand - ' +
+          'restart it with `cctl daemon restart`',
+      );
+    } finally {
+      await new Promise<void>((resolve) => older.close(() => resolve()));
+    }
+  });
+
+  it("surfaces the daemon's own words for any other refusal", async () => {
+    // No usage handler installed: the receiver answers 503 while the daemon is starting.
+    const h = await harness(() => ({ ok: true, status: 'applied', session: view }));
+    await expect(
+      callDaemonUsageRepoll(undefined, { dataDir: h.dataDir, protector: h.protector }),
+    ).rejects.toThrow('daemon is starting; retry in a moment');
   });
 });

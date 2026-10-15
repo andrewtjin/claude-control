@@ -39,7 +39,16 @@ export {
   type AccountPollResult,
   type PollCycleResult,
   type SnapshotResult,
+  type PollReadiness,
 } from './usagePoller.js';
+
+export {
+  planUsageRepoll,
+  type HookReceiverUsageHandlers,
+  type UsageRepollResult,
+  type UsageRepollSkipReason,
+  type UsageRepollVerdict,
+} from './usageRepoll.js';
 
 export {
   readFleetHistory,

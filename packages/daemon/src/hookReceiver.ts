@@ -25,6 +25,7 @@ import { classifyStopFailureType, isStopFailureType } from '@claude-control/sess
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import { CHANNEL_POLL_MS, type TakeSource } from './channelRegistry.js';
 import type { Store } from './store.js';
+import type { HookReceiverUsageHandlers } from './usageRepoll.js';
 
 /** The structured questions carried on a `question.request` envelope. Aliased from the wire
  *  schema so the receiver's defensive parser produces exactly what the envelope needs. */
@@ -517,6 +518,9 @@ export class HookReceiver {
   /** Installed by the daemon — see {@link setChannelHandlers}. Undefined until then, so a channel
    *  server that races daemon startup gets the same clean 503 a `cctl session` command would. */
   private channelHandlers: HookReceiverChannelHandlers | undefined;
+  /** Installed by the daemon — see {@link setUsageHandlers}. Undefined until then, so a refresh
+   *  that races daemon startup gets the same clean 503 a `cctl session` command would. */
+  private usageHandlers: HookReceiverUsageHandlers | undefined;
   /** `/cli/channel/next` polls currently held open, keyed by attachId.
    *
    *  These are open connections exactly like {@link heldPermissions}, and they carry the same
@@ -622,6 +626,12 @@ export class HookReceiver {
   /** Install the live-channel logic (same late-binding contract as {@link setCliHandlers}). */
   setChannelHandlers(handlers: HookReceiverChannelHandlers): void {
     this.channelHandlers = handlers;
+  }
+
+  /** Install the on-demand usage refresh (same late-binding contract as {@link setCliHandlers}):
+   *  the receiver owns the route and its validation, the daemon owns the poller it asks. */
+  setUsageHandlers(handlers: HookReceiverUsageHandlers): void {
+    this.usageHandlers = handlers;
   }
 
   /**
@@ -1254,6 +1264,11 @@ export class HookReceiver {
       this.handleStopRequest(res);
       return;
     }
+    // Same for the usage refresh: it names accounts, not a session.
+    if (path === '/cli/usage/repoll') {
+      await this.handleUsageRepoll(body, res);
+      return;
+    }
     if (!this.cliHandlers) {
       // Raced daemon startup (handlers installed just before listen); tell the CLI to retry.
       this.respond(res, 503, { ok: false, error: 'daemon is starting; retry in a moment' });
@@ -1333,6 +1348,32 @@ export class HookReceiver {
     this.respond(res, 200, { ok: true, pid: process.pid });
     const stop = this.requestStop;
     setImmediate(() => stop());
+  }
+
+  /** `POST /cli/usage/repoll { ids? }`: ask the poller to refresh these accounts (every stored
+   *  account when `ids` is absent) as soon as their floor and backoff allow. The 200 body is the
+   *  per-account verdict list (see usageRepoll.ts). `ids`, when present, must be a list of
+   *  non-empty strings — anything else is a client bug, refused rather than read as "all". */
+  private async handleUsageRepoll(
+    body: Record<string, unknown>,
+    res: ServerResponse,
+  ): Promise<void> {
+    if (!this.usageHandlers) {
+      this.respond(res, 503, { ok: false, error: 'daemon is starting; retry in a moment' });
+      return;
+    }
+    let ids: string[] | undefined;
+    if (body.ids !== undefined) {
+      if (
+        !Array.isArray(body.ids) ||
+        !body.ids.every((id): id is string => typeof id === 'string' && id.length > 0)
+      ) {
+        this.respond(res, 400, { ok: false, error: 'ids must be a list of account ids' });
+        return;
+      }
+      ids = body.ids;
+    }
+    this.respond(res, 200, await this.usageHandlers.repollUsage(ids));
   }
 
   /** Map a {@link SessionCommandResult} onto an HTTP response: success → 200 (with the echoed

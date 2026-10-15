@@ -2132,6 +2132,83 @@ describe('HookReceiver', () => {
     });
   });
 
+  describe('usage refresh endpoint (/cli/usage/repoll)', () => {
+    const auth = { 'x-claude-control-secret': SECRET };
+
+    /** Install handlers that record what they were asked and answer every id as scheduled. */
+    function recordRepolls(): Array<string[] | undefined> {
+      const asked: Array<string[] | undefined> = [];
+      receiver.setUsageHandlers({
+        repollUsage: (ids) => {
+          asked.push(ids);
+          return Promise.resolve({
+            ok: true,
+            results: (ids ?? ['all-1']).map((id) => ({ id, outcome: 'scheduled' as const })),
+          });
+        },
+      });
+      return asked;
+    }
+
+    it('refuses a request with no secret, or the wrong one, before asking the daemon', async () => {
+      const asked = recordRepolls();
+      expect((await post(port, '/cli/usage/repoll', {})).status).toBe(401);
+      const wrong = await post(port, '/cli/usage/repoll', {}, { 'x-claude-control-secret': 'x' });
+      expect(wrong).toEqual({ status: 401, body: { ok: false, error: 'invalid secret' } });
+      expect(asked).toEqual([]);
+    });
+
+    it('answers 503 while the daemon has not installed its handler yet', async () => {
+      const res = await post(port, '/cli/usage/repoll', {}, auth);
+      expect(res).toEqual({
+        status: 503,
+        body: { ok: false, error: 'daemon is starting; retry in a moment' },
+      });
+    });
+
+    it('asks for every account when no ids are given, without demanding session fields', async () => {
+      const asked = recordRepolls();
+      const res = await post(port, '/cli/usage/repoll', {}, auth);
+      expect(res).toEqual({
+        status: 200,
+        body: { ok: true, results: [{ id: 'all-1', outcome: 'scheduled' }] },
+      });
+      expect(asked).toEqual([undefined]);
+    });
+
+    it('passes the named ids through and returns the verdicts as the body', async () => {
+      const asked = recordRepolls();
+      const res = await post(port, '/cli/usage/repoll', { ids: ['a', 'b'] }, auth);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        ok: true,
+        results: [
+          { id: 'a', outcome: 'scheduled' },
+          { id: 'b', outcome: 'scheduled' },
+        ],
+      });
+      expect(asked).toEqual([['a', 'b']]);
+    });
+
+    it('refuses an ids field that is not a list of account ids', async () => {
+      const asked = recordRepolls();
+      for (const ids of ['a', [1], [''], null, { a: 1 }]) {
+        const res = await post(port, '/cli/usage/repoll', { ids }, auth);
+        expect(res).toEqual({
+          status: 400,
+          body: { ok: false, error: 'ids must be a list of account ids' },
+        });
+      }
+      expect(asked).toEqual([]);
+    });
+
+    it('answers 500 rather than hanging when the daemon side throws', async () => {
+      receiver.setUsageHandlers({ repollUsage: () => Promise.reject(new Error('registry gone')) });
+      const res = await post(port, '/cli/usage/repoll', {}, auth);
+      expect(res).toEqual({ status: 500, body: { ok: false, error: 'internal error' } });
+    });
+  });
+
   describe('CLI session endpoints (/cli/session/*)', () => {
     // A configurable, call-recording set of CLI handlers — the receiver owns transport; the
     // daemon (faked here) owns the registry logic, so these tests assert only the boundary.

@@ -35,7 +35,12 @@ import type {
 } from '@claude-control/switch-engine';
 import type { SessionManager, SessionRecord } from '@claude-control/session-runtime';
 import { Store } from './store.js';
-import { UsagePoller, type FetchLikeResponse } from './usagePoller.js';
+import {
+  POLL_FLOOR_MS,
+  POLL_JITTER_MS,
+  UsagePoller,
+  type FetchLikeResponse,
+} from './usagePoller.js';
 import { parseUsageEndpointResponse } from './usageParse.js';
 import { AttributionJournal } from './attributionJournal.js';
 import { HookReceiver } from './hookReceiver.js';
@@ -192,9 +197,9 @@ function capturingLogger(): { logger: Logger; lines: string[] } {
   };
 }
 
-const jsonResponse = (body: unknown): FetchLikeResponse => ({
-  ok: true,
-  status: 200,
+const jsonResponse = (body: unknown, status = 200): FetchLikeResponse => ({
+  ok: status >= 200 && status < 300,
+  status,
   json: () => Promise.resolve(body),
 });
 
@@ -208,6 +213,9 @@ interface Rig {
   /** One entry per probe call: the candidates the cycle judged unplaceable on a weekly clock. */
   probed: ProbeCandidate[][];
   logLines: string[];
+  hookReceiver: HookReceiver;
+  /** The account each usage-endpoint request was for, in order. */
+  fetched: string[];
   start: () => Promise<void>;
 }
 
@@ -218,6 +226,10 @@ async function createRig(options: {
   advisorOptions?: AdvisorOptions;
   seed?: (store: Store) => void;
   pollIntervalMs?: number;
+  /** The usage endpoint's HTTP status per account; 200 when absent. */
+  statusFor?: (accountId: string) => number;
+  /** The clock the poller and the daemon read; fixed at NOW when absent. */
+  clock?: () => number;
 }): Promise<Rig> {
   const relay = new SteadyRelay();
   const relayPort = await relay.listen();
@@ -225,18 +237,21 @@ async function createRig(options: {
   options.seed?.(store);
   const vaultDir = await mkdtemp(join(tmpdir(), 'daemon-pollcycle-'));
 
+  const clock = options.clock ?? (() => NOW);
+  const fetched: string[] = [];
   const poller = new UsagePoller({
     // The token names the account, so one fetch can answer differently per account without
     // knowing anything about the poller's internals.
-    fetch: (_url, init) =>
-      Promise.resolve(
-        jsonResponse(
-          options.bodyFor((init.headers.authorization ?? '').replace('Bearer tok-', '')),
-        ),
-      ),
+    fetch: (_url, init) => {
+      const accountId = (init.headers.authorization ?? '').replace('Bearer tok-', '');
+      fetched.push(accountId);
+      return Promise.resolve(
+        jsonResponse(options.bodyFor(accountId), options.statusFor?.(accountId) ?? 200),
+      );
+    },
     getToken: (accountId: string) => Promise.resolve(`tok-${accountId}`),
     getCachedUsage: () => Promise.resolve(undefined),
-    clock: () => NOW,
+    clock,
     ...(options.advisorOptions !== undefined ? { advisorOptions: options.advisorOptions } : {}),
   });
 
@@ -288,7 +303,7 @@ async function createRig(options: {
     autoSwitcher,
     accountProbe,
     logger,
-    clock: () => NOW,
+    clock,
     // Effectively off unless a case wants the interval itself under test.
     pollIntervalMs: options.pollIntervalMs ?? 100_000,
   });
@@ -307,6 +322,8 @@ async function createRig(options: {
     autoSwitchInputs,
     probed,
     logLines: lines,
+    hookReceiver,
+    fetched,
     start: () => daemon.start(),
   };
 }
@@ -465,5 +482,141 @@ describe('poll cycle — probe candidates match what the policy can see', () => 
     // observed through the cycle that ran: wait for the snapshot it pushes, then assert.
     await waitFor(() => rig.relay.received.some((e) => e.type === 'usage.snapshot'));
     expect(rig.probed).toEqual([]);
+  });
+});
+
+describe('usage refresh on demand (POST /cli/usage/repoll)', () => {
+  const weekly = () => ({ limits: [{ kind: 'weekly_all', percent: 10 }] });
+
+  /** Ask the running daemon for a refresh over its real loopback route. */
+  async function repoll(
+    rig: Rig,
+    body: Record<string, unknown>,
+    // null sends no secret header at all.
+    secret: string | null = 'shh',
+  ): Promise<{ status: number; body: unknown }> {
+    const res = await fetch(`http://127.0.0.1:${rig.hookReceiver.getPort()}/cli/usage/repoll`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(secret !== null ? { 'x-claude-control-secret': secret } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, body: await res.json() };
+  }
+
+  /** Start the rig and wait until its first cycle has polled both accounts and finished. */
+  async function startAndSettle(rig: Rig) {
+    const pollSpy = vi.spyOn(rig.poller, 'pollAll');
+    await rig.start();
+    await waitFor(() => rig.autoSwitchInputs.length === 1);
+    expect(pollSpy).toHaveBeenCalledTimes(1);
+    return pollSpy;
+  }
+
+  /** Long enough for a cycle the request should NOT have started to show up if it had. */
+  const settle = () => new Promise((r) => setTimeout(r, 150));
+
+  it('is refused without the secret, and starts nothing', async () => {
+    const rig = await createRig({ bodyFor: weekly });
+    const pollSpy = await startAndSettle(rig);
+    expect((await repoll(rig, {}, null)).status).toBe(401);
+    expect((await repoll(rig, {}, 'wrong')).status).toBe(401);
+    await settle();
+    expect(pollSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('honors the floor: just-polled accounts are skipped with when they are due', async () => {
+    const rig = await createRig({ bodyFor: weekly });
+    const pollSpy = await startAndSettle(rig);
+    const res = await repoll(rig, {});
+    expect(res.status).toBe(200);
+    const results = (res.body as { results: Array<Record<string, unknown>> }).results;
+    expect(results.map((r) => [r.id, r.outcome, r.reason])).toEqual([
+      ['acct-1', 'skipped', 'floor'],
+      ['acct-2', 'skipped', 'floor'],
+    ]);
+    for (const r of results) {
+      expect(r.dueAtMs).toBeGreaterThanOrEqual(NOW + POLL_FLOOR_MS);
+      expect(r.dueAtMs).toBeLessThanOrEqual(NOW + POLL_FLOOR_MS + POLL_JITTER_MS);
+    }
+    await settle();
+    expect(pollSpy).toHaveBeenCalledTimes(1);
+    expect(rig.fetched).toHaveLength(2);
+  });
+
+  it('honors a 429 backoff: the account is skipped as backed off', async () => {
+    const rig = await createRig({
+      bodyFor: weekly,
+      statusFor: (id) => (id === 'acct-2' ? 429 : 200),
+    });
+    const pollSpy = await startAndSettle(rig);
+    const res = await repoll(rig, { ids: ['acct-2'] });
+    expect(res.body).toMatchObject({
+      ok: true,
+      results: [{ id: 'acct-2', outcome: 'skipped', reason: 'backoff' }],
+    });
+    await settle();
+    expect(pollSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers an unknown id as unknown and starts nothing', async () => {
+    const rig = await createRig({ bodyFor: weekly });
+    const pollSpy = await startAndSettle(rig);
+    const res = await repoll(rig, { ids: ['ghost'] });
+    expect(res.body).toEqual({
+      ok: true,
+      results: [{ id: 'ghost', outcome: 'skipped', reason: 'unknown' }],
+    });
+    await settle();
+    expect(pollSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('schedules every account once the floor has passed, and polls them now', async () => {
+    let now = NOW;
+    const rig = await createRig({ bodyFor: weekly, clock: () => now });
+    const pollSpy = await startAndSettle(rig);
+    now += POLL_FLOOR_MS + POLL_JITTER_MS;
+    const res = await repoll(rig, {});
+    expect(res.body).toEqual({
+      ok: true,
+      results: [
+        { id: 'acct-1', outcome: 'scheduled' },
+        { id: 'acct-2', outcome: 'scheduled' },
+      ],
+    });
+    // Polled now, not at the next tick (the rig's interval is far away).
+    await waitFor(() => rig.fetched.length === 4);
+    expect(pollSpy).toHaveBeenCalledTimes(2);
+    expect(rig.fetched.slice(2).sort()).toEqual(['acct-1', 'acct-2']);
+  });
+
+  it('follows a cycle already running with exactly one more', async () => {
+    const rig = await createRig({ bodyFor: weekly });
+    let release: () => void = () => {};
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // The first cycle hangs inside pollAll, so nothing is polled yet and every account is due.
+    const pollSpy = vi
+      .spyOn(rig.poller, 'pollAll')
+      .mockImplementationOnce(() => blocked.then(() => ({ results: [], accounts: [] })));
+    await rig.start();
+    await waitFor(() => pollSpy.mock.calls.length === 1);
+
+    const first = await repoll(rig, {});
+    const second = await repoll(rig, { ids: ['acct-1'] });
+    expect(first.body).toMatchObject({
+      results: [{ outcome: 'scheduled' }, { outcome: 'scheduled' }],
+    });
+    expect(second.body).toMatchObject({ results: [{ outcome: 'scheduled' }] });
+    expect(pollSpy).toHaveBeenCalledTimes(1);
+
+    release();
+    await waitFor(() => pollSpy.mock.calls.length === 2);
+    await settle();
+    // Two refreshes during one cycle still make one follow-up cycle, not two, and no loop.
+    expect(pollSpy).toHaveBeenCalledTimes(2);
   });
 });
