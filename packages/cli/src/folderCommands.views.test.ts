@@ -206,7 +206,8 @@ describe('buildReservedViews', () => {
         ['global', 'a'],
         ['group:r2', 'e'],
       ]),
-      Date.parse('2026-10-14T12:00:00Z'),
+      // Far from the real clock, so a builder that reads Date.now() instead of nowMs fails.
+      Date.parse('2027-03-01T12:00:00Z'),
     );
     expect(views).toEqual([
       {
@@ -214,7 +215,7 @@ describe('buildReservedViews', () => {
         label: 'E',
         email: 'e@example.com',
         plan: '5x',
-        billing: '~Oct 20 (est.)',
+        billing: '~Mar 20 (est.)',
         quarantined: false,
         live: true,
         includedBy: [F('r1'), F('r2')],
