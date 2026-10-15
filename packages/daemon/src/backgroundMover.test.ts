@@ -62,7 +62,7 @@ function harness(opts: { minIntervalMs?: number; confirmTimeoutMs?: number } = {
   const noop = (): void => {};
   const mover = new BackgroundMover({
     host,
-    resolveRule: (cwd) =>
+    resolveRule: ({ cwd }) =>
       Promise.resolve(
         cwd.startsWith('C:/research') ? 'rule-1' : cwd.startsWith('C:/other') ? 'rule-2' : null,
       ),

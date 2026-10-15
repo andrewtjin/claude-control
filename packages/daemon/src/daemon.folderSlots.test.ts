@@ -30,6 +30,7 @@ import {
   type ActivateResult,
   type FolderRule,
   type RuleLiveResult,
+  type SessionIdentity,
   type Logger,
   type RecoverResult,
   type RepairResult,
@@ -154,6 +155,8 @@ interface TestGroup {
   updatedAtMs: number;
   /** Shared accounts the folder must not use (default none). */
   exclude?: string[];
+  /** Session-alias scopes (default none). */
+  aliases?: { folder: string; alias: string }[];
 }
 
 /** The rule a {@link TestGroup} fixture stands for. */
@@ -164,6 +167,7 @@ function ruleOf(g: TestGroup): FolderRule {
     folders: g.folders,
     include: g.members.map((m) => m.id),
     exclude: g.exclude ?? [],
+    ...(g.aliases !== undefined ? { aliases: g.aliases } : {}),
     activeId: g.activeId,
     createdAtMs: g.createdAtMs,
     updatedAtMs: g.updatedAtMs,
@@ -191,6 +195,12 @@ function fakeEngine(opts: {
   repair?: RepairResult;
   /** Give a cwd a folder rule so a spawn resolves into its slot (default: no folder has one). */
   cwdBinding?: (cwd: string) => { groupId: string } | null;
+  /** The precedence rule for a session with a title (default: the folder rule of `cwd`). */
+  sessionRule?: (
+    cwd: string,
+    title: string | null,
+    recorded: string | null | undefined,
+  ) => { groupId: string } | null;
   /** The profile dir for a reserved account (default: `/profiles/<accountId>` for members). */
   configDirFor?: (accountId: string) => string | undefined;
   /** Override ensureRuleLive to model a rule slot that cannot be made live (throws or no account). */
@@ -250,6 +260,18 @@ function fakeEngine(opts: {
       slotId === 'global' ? undefined : `/profiles/${slotId}`,
     resolveFolderRule: (cwd: string): Promise<{ ruleId: string; folder: string } | null> => {
       const match = opts.cwdBinding ? opts.cwdBinding(cwd) : null;
+      return Promise.resolve(match === null ? null : { ruleId: match.groupId, folder: cwd });
+    },
+    resolveSessionRule: (
+      cwd: string,
+      title: string | null,
+      recorded?: string | null,
+    ): Promise<{ ruleId: string; folder: string } | null> => {
+      const match = opts.sessionRule
+        ? opts.sessionRule(cwd, title, recorded)
+        : opts.cwdBinding
+          ? opts.cwdBinding(cwd)
+          : null;
       return Promise.resolve(match === null ? null : { ruleId: match.groupId, folder: cwd });
     },
     ensureRuleLive: (ruleId: string): Promise<RuleLiveResult> => {
@@ -338,6 +360,8 @@ async function createRig(opts: {
   backgroundSessionHost?: BackgroundSessionHost;
   /** How long a moved session may take to show up where it was resumed. */
   backgroundMoveConfirmMs?: number;
+  /** What a session's transcript records (its custom title and recorded folder). */
+  sessionIdentityOf?: (sessionId: string) => Promise<SessionIdentity | null>;
 }): Promise<Rig> {
   const relay = new SteadyRelay();
   const relayPort = await relay.listen();
@@ -408,6 +432,7 @@ async function createRig(opts: {
     ...(opts.backgroundMoveConfirmMs !== undefined
       ? { backgroundMoveConfirmMs: opts.backgroundMoveConfirmMs }
       : {}),
+    ...(opts.sessionIdentityOf !== undefined ? { sessionIdentityOf: opts.sessionIdentityOf } : {}),
   });
 
   cleanups.push(async () => {
@@ -1855,6 +1880,84 @@ describe('daemon folder-bound slots — background sessions move onto their fold
     const [notice] = movedNotices(rig.relay);
     expect(notice?.level).toBe('info');
     expect(notice?.body).toContain('"pods" (1ee43a2b) in C:/work onto Member One');
+  });
+
+  it('moves a NAMED session onto the slot of its alias rule, whatever its folder runs under', async () => {
+    const base = twoAccountGroup();
+    const { accounts, live } = base;
+    // g1 is the rule of the session alias "Pods" in C:/elsewhere (no folder of its own).
+    const groups = base.groups.map((g) => ({
+      ...g,
+      folders: [],
+      aliases: [{ folder: 'C:/elsewhere', alias: 'Pods' }],
+    }));
+    const asked: Array<[string, string | null, string | null | undefined]> = [];
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      // The folder itself has no rule; the session's title has one (g1) in the folder it was
+      // recorded in.
+      cwdBinding: () => null,
+      sessionRule: (cwd, title, recorded) => {
+        asked.push([cwd, title, recorded]);
+        return title === 'Pods' ? { groupId: 'g1' } : null;
+      },
+    });
+    const { host, calls } = recordingHost('C:/elsewhere');
+    const rig = await createRig({
+      controls,
+      bodyFor: () => HEALTHY,
+      backgroundSessionHost: host,
+      sessionIdentityOf: (id) =>
+        Promise.resolve(id === SID ? { customTitle: 'Pods', folder: 'C:/elsewhere' } : null),
+    });
+    await rig.start();
+    await waitFor(() => movedNotices(rig.relay).length > 0);
+
+    expect(asked).toContainEqual(['C:/elsewhere', 'Pods', 'C:/elsewhere']);
+    expect(calls).toContainEqual(
+      expect.stringMatching(new RegExp(`^resume /profiles/${ruleSlotId('g1')} ${SID} `)),
+    );
+  });
+
+  it('leaves a named session in a ruled folder alone when its alias rule is another one', async () => {
+    const base = twoAccountGroup();
+    const { accounts, live } = base;
+    // Another rule holds the session alias "Pods" there (not a move target this cycle).
+    const groups = [
+      ...base.groups,
+      {
+        ...base.groups[0]!,
+        id: 'other-rule',
+        label: 'Other',
+        members: [],
+        activeId: null,
+        folders: [],
+        aliases: [{ folder: 'C:/work/app', alias: 'Pods' }],
+      },
+    ];
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      cwdBinding: (cwd) => (cwd.startsWith('C:/work') ? { groupId: 'g1' } : null),
+      // Its title has a rule of its own (not a move target this cycle), outranking the folder's.
+      sessionRule: (_cwd, title) => (title === 'Pods' ? { groupId: 'other-rule' } : null),
+    });
+    const { host, calls } = recordingHost('C:/work/app');
+    const rig = await createRig({
+      controls,
+      bodyFor: () => HEALTHY,
+      backgroundSessionHost: host,
+      sessionIdentityOf: () => Promise.resolve({ customTitle: 'Pods', folder: 'C:/work/app' }),
+    });
+    await rig.start();
+    await waitFor(() => countUsageSnapshots(rig.relay) >= 1);
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(calls.filter((c) => c.startsWith('stop') || c.startsWith('resume'))).toEqual([]);
+    expect(movedNotices(rig.relay)).toEqual([]);
   });
 
   it('leaves it alone while the included account live in the folder slot is out of usage', async () => {

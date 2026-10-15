@@ -186,6 +186,30 @@ describe('resolveSessionRef', () => {
   });
 });
 
+describe('a session with no trusted recorded folder', () => {
+  // Its first cwd lay past the head window, or disagreed with its project directory's name: the
+  // shared fallback counts it for the folder a lookup runs in when that directory can stand for it.
+  const untrusted = (dir: string) =>
+    session({ sessionId: 's-u', customTitle: 'Auth Work', folder: null, projectDir: dir });
+
+  it('is found by alias from the folder its project directory can stand for', () => {
+    const catalog = [untrusted('C--work-app')];
+    expect(resolveSessionRef(catalog, 'auth work', HERE, 'win32')).toMatchObject({
+      kind: 'alias',
+      folder: HERE,
+      inScope: true,
+    });
+    expect(aliasedSessions(catalog, HERE, 'win32').map((s) => s.sessionId)).toEqual(['s-u']);
+  });
+
+  it('is found from nowhere else, and never in the every-folder listing', () => {
+    const catalog = [untrusted('C--work-app')];
+    expect(resolveSessionRef(catalog, 'auth work', ELSEWHERE, 'win32')).toEqual({ kind: 'none' });
+    expect(aliasedSessions(catalog, ELSEWHERE, 'win32')).toEqual([]);
+    expect(aliasedSessions(catalog, null, 'win32')).toEqual([]);
+  });
+});
+
 describe('aliasedSessions', () => {
   const catalog = [
     session({ sessionId: 'here-custom', folder: HERE, customTitle: 'one', lastActivityMs: 1 }),

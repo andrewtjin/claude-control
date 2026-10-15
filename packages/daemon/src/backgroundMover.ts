@@ -65,8 +65,10 @@ export interface MoveOutcome {
 
 export interface BackgroundMoverOptions {
   host: BackgroundSessionHost;
-  /** The folder rule a working directory runs under (longest match), or null for none. */
-  resolveRule: (cwd: string) => Promise<string | null>;
+  /** The rule a background session runs under — the alias rule of its title in the folder its
+   *  conversation was recorded in, else the folder rule of its working directory (longest match) —
+   *  or null for none. */
+  resolveRule: (session: Pick<BackgroundSession, 'cwd' | 'sessionId'>) => Promise<string | null>;
   /** One operator notice: the log line is written here; this reaches the phone. */
   notify: (notice: { title: string; body: string; level: 'info' | 'warn' }) => void;
   logger?: Logger;
@@ -91,7 +93,7 @@ const GLOBAL_SLOT = 'the global slot';
 
 export class BackgroundMover {
   private readonly host: BackgroundSessionHost;
-  private readonly resolveRule: (cwd: string) => Promise<string | null>;
+  private readonly resolveRule: BackgroundMoverOptions['resolveRule'];
   private readonly notify: BackgroundMoverOptions['notify'];
   private readonly logger: Logger;
   private readonly clock: () => number;
@@ -140,7 +142,7 @@ export class BackgroundMover {
       if (this.gaveUp.has(session.sessionId)) continue;
       const last = this.lastAttemptAt.get(session.sessionId);
       if (last !== undefined && this.clock() - last < this.minIntervalMs) continue;
-      const ruleId = await this.resolveRule(session.cwd).catch(() => null);
+      const ruleId = await this.resolveRule(session).catch(() => null);
       if (ruleId === null) continue;
       const target = targets.get(ruleId);
       if (target !== undefined) candidates.push({ session, target });

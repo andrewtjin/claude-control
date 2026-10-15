@@ -1875,7 +1875,7 @@ describe('routeBackgroundLaunch and the daemon on one session after /clear', () 
   function daemonOf(w: World): { run: () => Promise<MoveOutcome[]> } {
     const mover = new BackgroundMover({
       host: w.host,
-      resolveRule: (cwd) =>
+      resolveRule: ({ cwd }) =>
         Promise.resolve(cwd.toLowerCase().startsWith('c:/work') ? 'rule-x' : null),
       notify: () => {},
       clock: () => 0,
