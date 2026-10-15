@@ -50,6 +50,70 @@ twice is merged onto one row (the active one, else the most recently captured), 
 logins under one label keep the earlier row's label while the later one becomes `jina25 (2)`.
 Each repair is printed above the listing it precedes.
 
+## Moving accounts to another machine
+
+```
+cctl export <file>                  # write every account, its folder and session rules, and
+                                    # the persisted settings to a passphrase-sealed file
+cctl export <file> --accounts work,home
+                                    # only these accounts (labels, emails or ids)
+cctl export <file> --no-tokens      # leave the logins out: each account is logged in
+                                    # again on the other machine
+cctl export <file> --move           # remove the exported accounts here once the file is
+                                    # written and read back (asks first; --yes skips that)
+cctl import <file>                  # add what the file holds to this machine
+cctl import <file> --dry-run        # print what an import would do, and change nothing
+cctl import <file> --replace        # also replace a stored account's tokens when the file's
+                                    # are newer or the stored login is quarantined
+```
+
+The vault is sealed to the machine that wrote it (DPAPI on Windows, a local key file on
+Linux), so a copy of the vault never opens anywhere else. `cctl export` reads each account's
+credentials, seals them under a passphrase you choose (scrypt and AES-256-GCM), and writes one
+file; `cctl import` opens it and stores the accounts in this machine's vault. There is no
+plaintext mode. The passphrase comes from `--passphrase-file <file>` (its first line), else
+`CCTL_EXPORT_PASSPHRASE`, else a prompt (asked twice on export; at least 8 characters). Use
+`-` as the file to write to standard output or read from standard input; an import from
+standard input needs the passphrase from a file or the env var. An export never overwrites an
+existing file.
+
+**A login works on one machine at a time.** Refresh tokens are single-use: once either machine
+refreshes a login, the other machine's copy stops working. Keep each account on one machine,
+either by exporting with `--move` or by removing it on the other side
+(`cctl accounts remove <account>`). Every run that carries tokens ends with this reminder.
+
+What travels: each account's label, login, email, auto-switch exclusion and (unless
+`--no-tokens`) its credentials, freshest copy first (a rotation a running session made is
+adopted before it is read); the folder and session rules, with members named by login; and the
+settings `cctl settings set` persisted. What never travels: the relay pairing, the hook
+secret, the vault key, switch recovery files, the guard snapshot, profiles, the daemon's
+database (sessions, prompts, cards) and usage history. A setting that names a path
+(`CCTL_LOG_FILE`) is left out, as is a quarantined account's dead login (the account travels
+and waits for a login on the other side).
+
+What an import does with each part, printed in full by `--dry-run`:
+
+- **An account whose login is already stored here** is left as it is. With `--replace` its
+  tokens are replaced when the file's are newer (a later expiry) or the stored login is
+  quarantined; the account keeps its id and usage history.
+- **A label already taken here by another login** gets a number, `work (2)`, the same way
+  duplicate repair numbers labels.
+- **An account without tokens** is stored waiting for a login (quarantined until then); the
+  output lists `cctl accounts relogin <label>` for each, and that re-login must be the same
+  account.
+- **Rules** are rebuilt one rule per folder or session scope, with the same included and
+  excluded accounts. A scope is skipped, and listed, when its folder does not exist here, this
+  machine already has a rule on it, or none of its accounts came along. Folder rules are not
+  created on macOS, nor while a daemon older than this build runs (`cctl daemon restart`).
+- **Settings** are checked the way `cctl settings set` checks them and saved the same way;
+  when one changed, the output ends with `cctl daemon restart`.
+
+An import is safe to run twice: everything already in place is reported as such and left
+alone. A wrong passphrase, a file changed after it was written, or one cut short is refused
+before anything is imported. `--move` refuses an account that is the live login of this
+machine's main config (switch to another account first: `cctl switch <account>`), and
+removes nothing unless the written file reads back and opens with the same passphrase.
+
 ## Folder rules
 
 By default every Claude Code session on the machine runs on one live account, the
