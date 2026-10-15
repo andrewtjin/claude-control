@@ -4,8 +4,14 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  CadenceError,
+  QuarantineError,
   RefreshError,
+  SharedTokenError,
+  SlotError,
   SwitchFailedError,
+  UnknownAccountError,
+  UnsettledSwitchError,
   VaultError,
   type ActivateResult,
   type DedupeReport,
@@ -1909,5 +1915,144 @@ describe('the banner and the plan agree with the running daemon', () => {
     const r = await runCli(['outages']);
     expect(r.exited).toBe(false);
     expect(r.out).toContain('ongoing');
+  });
+});
+
+// Exact bytes for every account-command outcome, success lines and refusals alike. These commands
+// are thin wrappers over accountActions.ts, and a full-screen UI calls the same actions, so what a
+// terminal user reads must not drift when the action behind it changes shape.
+describe('account commands print exactly what they always have', () => {
+  const work: StoredAccount = {
+    id: 'id-1',
+    label: 'Work',
+    quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+  };
+
+  beforeEach(() => {
+    engine.listAccounts.mockImplementation(() => Promise.resolve([work]));
+    engine.listRules.mockResolvedValue([]);
+    engine.liveSlots.mockResolvedValue(new Map());
+    engine.setAutoSwitchExcluded.mockClear();
+    engine.removeAccount.mockClear();
+  });
+
+  afterEach(() => {
+    engine.listAccounts.mockImplementation(() => Promise.resolve([]));
+  });
+
+  it('switch: the activated line names what the engine did', async () => {
+    engine.activate.mockResolvedValueOnce({
+      wroteCredentials: true,
+      refreshed: true,
+      adoptedPreviousRotation: true,
+    } as ActivateResult);
+    expect(await runCli(['switch', 'work'])).toEqual({
+      out: 'Activated Work (credentials written, token refreshed, adopted previous rotation).\n',
+      err: '',
+      exited: false,
+    });
+    engine.activate.mockResolvedValueOnce({ wroteCredentials: false } as ActivateResult);
+    expect((await runCli(['switch', 'id-1'])).out).toBe('Activated Work (no change).\n');
+  });
+
+  it('switch: --folder with no rule there names the global slot', async () => {
+    engine.activate.mockResolvedValueOnce({ wroteCredentials: true } as ActivateResult);
+    const r = await runCli(['switch', 'Work', '--folder', tmpdir()]);
+    expect(r.out).toBe(
+      `Activated Work in the global slot (no folder rule applies to ${tmpdir()}) (credentials written).\n`,
+    );
+  });
+
+  it('switch: every refusal is one error line', async () => {
+    const cases: Array<[Error, string]> = [
+      [new QuarantineError('dead'), 'error: Work is quarantined; re-login required.\n'],
+      [
+        new CadenceError('switched 5s ago', 1000),
+        'error: switched 5s ago. Use --force to override.\n',
+      ],
+      [new UnknownAccountError('id-1'), 'error: no account with id "id-1"\n'],
+      [
+        new SlotError('Work is live in another slot', 'live_elsewhere'),
+        'error: Work is live in another slot. Nothing was changed - switch that slot to another ' +
+          'account first, or pick an account that is free (cctl folders shows who is live where).\n',
+      ],
+      [
+        new UnsettledSwitchError('an earlier switch is unsettled'),
+        'error: an earlier switch is unsettled\n',
+      ],
+      [new SharedTokenError('login stored twice'), 'error: login stored twice\n'],
+    ];
+    for (const [thrown, line] of cases) {
+      engine.activate.mockRejectedValueOnce(thrown);
+      expect(await runCli(['switch', 'Work'])).toEqual({ out: '', err: line, exited: true });
+    }
+  });
+
+  it('switch: an unknown or ambiguous ref is refused before anything is activated', async () => {
+    engine.activate.mockClear();
+    expect((await runCli(['switch', 'nope'])).err).toBe('error: No account matches "nope".\n');
+    engine.listAccounts.mockImplementation(() => Promise.resolve([work, { ...work, id: 'id-2' }]));
+    expect((await runCli(['switch', 'Work'])).err).toBe(
+      'error: "Work" matches 2 accounts; use the id.\n',
+    );
+    expect(engine.activate).not.toHaveBeenCalled();
+  });
+
+  it('switch: an unexpected engine failure still escapes as itself', async () => {
+    engine.activate.mockRejectedValueOnce(new Error('disk on fire'));
+    await expect(runCli(['switch', 'Work'])).rejects.toThrow('disk on fire');
+  });
+
+  it('exclude / include: the four outcomes, word for word', async () => {
+    expect((await runCli(['accounts', 'exclude', 'Work'])).out).toBe(
+      'Excluded Work from auto-switch (manual switches still work).\n',
+    );
+    expect((await runCli(['accounts', 'include', 'Work'])).out).toBe(
+      'Work is already available to auto-switch.\n',
+    );
+    engine.listAccounts.mockImplementation(() =>
+      Promise.resolve([{ ...work, autoSwitchExcluded: true }]),
+    );
+    expect((await runCli(['accounts', 'exclude', 'Work'])).out).toBe(
+      'Work is already excluded from auto-switch.\n',
+    );
+    expect((await runCli(['accounts', 'include', 'Work'])).out).toBe(
+      'Work is available to auto-switch again.\n',
+    );
+    expect((await runCli(['accounts', 'include', 'ghost'])).err).toBe(
+      'error: No account matches "ghost".\n',
+    );
+  });
+
+  it('remove: the removed line, and an unknown ref refused', async () => {
+    expect(await runCli(['accounts', 'remove', 'Work'])).toEqual({
+      out: 'Removed Work.\n',
+      err: '',
+      exited: false,
+    });
+    expect((await runCli(['accounts', 'rm', 'ghost'])).err).toBe(
+      'error: No account matches "ghost".\n',
+    );
+    expect(engine.removeAccount).toHaveBeenCalledTimes(1);
+  });
+
+  it('add: the added line and each refusal', async () => {
+    engine.captureCurrentLogin.mockResolvedValueOnce({ ...work, label: 'new' });
+    expect((await runCli(['accounts', 'add', 'new'])).out).toBe(
+      'Added new (id-1) and set it active.\n',
+    );
+    engine.captureCurrentLogin.mockRejectedValueOnce(
+      new RefreshError('cannot capture inside a folder profile', 'capture_in_profile'),
+    );
+    expect((await runCli(['accounts', 'add', 'new'])).err).toBe(
+      'error: cannot capture inside a folder profile. Onboard a new account from a normal ' +
+        '(non-folder-bound) shell, or use: cctl accounts add <label> --fresh.\n',
+    );
+    engine.captureCurrentLogin.mockRejectedValueOnce(new Error('nothing there'));
+    expect((await runCli(['accounts', 'add', 'new'])).err).toBe(
+      'error: no live login to capture. Run `claude` and log in first, then retry.\n',
+    );
   });
 });

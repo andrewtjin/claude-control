@@ -14,22 +14,13 @@ import { hostname } from 'node:os';
 import { createInterface } from 'node:readline';
 import { dirname, join } from 'node:path';
 import {
-  CadenceError,
-  QuarantineError,
-  SharedTokenError,
-  SlotError,
   SwitchEngineError,
-  SwitchFailedError,
-  UnknownAccountError,
-  UnsettledSwitchError,
-  VaultError,
   buildAuthorizeUrl,
   defaultPaths,
   defaultProtector,
   generatePkce,
   generateState,
   canonicalizeFolder,
-  isOverloadCode,
   parsePastedCode,
   resolveAccountRef,
   type StoredAccount,
@@ -79,6 +70,14 @@ import {
   type OutageStatus,
 } from './outagesView.js';
 import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
+import {
+  addAccount,
+  removeAccount,
+  renameAccount,
+  runAccountAction,
+  setExcluded,
+  switchAccount,
+} from './accountActions.js';
 import { runSessionAliases, runSessionShow, type SessionAliasDeps } from './sessionAliases.js';
 import { runSessionExclude, runSessionInclude, runSessionReset } from './sessionRules.js';
 import { withCaptureDir } from './captureDir.js';
@@ -124,22 +123,11 @@ import {
   uninstallAutostart,
   type AutostartResult,
 } from './autostart.js';
-import {
-  colorEnabled,
-  detectPalette,
-  outlookStyle,
-  pacingStyle,
-  sanitizeForTerminal,
-} from './ansi.js';
+import { colorEnabled, detectPalette, outlookStyle, pacingStyle } from './ansi.js';
 import {
   buildFolderCommands,
-  describeSlotRefusal,
-  describeSwitchedGroup,
   renderFolderRulesAppendix,
   renderReservedAppendix,
-  refuseOnOlderDaemon,
-  switchSlotForFolder,
-  switchSlotOf,
 } from './folderCommands.js';
 import {
   renderAccountHeal,
@@ -315,72 +303,7 @@ export function buildProgram(): Command {
       "put the account in that folder's slot (the slot of the folder rule it runs under)",
     )
     .action(async (ref: string, opts: { force?: boolean; folder?: string }) => {
-      const engine = buildEngine();
-      // Resolve across the WHOLE registry (shared pool + reserved accounts) so `cctl switch <ref>`
-      // reaches an account a folder rule includes; activate() routes it to that rule's slot.
-      const fleet = await engine.listAllAccounts();
-      const resolved = resolveAccountRef(fleet, ref);
-      if (!resolved.ok) fail(resolved.message);
-      // --folder names the slot outright: the folder's rule slot (a rule slot may also take a shared
-      // account it does not exclude), or the global slot where no rule applies. Without it, the
-      // slot the account belonged to when it was resolved — asserted on the switch, so a rule change
-      // landing in between fails this command instead of switching a slot it never named. An account
-      // several rules include has no single slot: the engine picks the one it is live in, or refuses
-      // and says to name the folder.
-      const target =
-        opts.folder !== undefined ? await switchSlotForFolder(engine, opts.folder) : undefined;
-      const slot = target?.slot ?? switchSlotOf(fleet.find((a) => a.id === resolved.account.id));
-      // A shared account switched into a folder slot is one a daemon that predates folder rules
-      // could put live in the global slot as well.
-      const shared = (fleet.find((a) => a.id === resolved.account.id)?.ruleIds ?? []).length === 0;
-      if (slot !== undefined && slot !== 'global' && shared) await refuseOnOlderDaemon();
-      try {
-        const result = await engine.activate(resolved.account.id, {
-          force: Boolean(opts.force),
-          origin: 'manual',
-          ...(slot !== undefined ? { slot } : {}),
-        });
-        const bits = [
-          result.wroteCredentials ? 'credentials written' : 'no change',
-          result.refreshed ? 'token refreshed' : null,
-          result.adoptedPreviousRotation ? 'adopted previous rotation' : null,
-        ].filter(Boolean);
-        // A switch into a folder rule's slot moves that slot, not the global one — say which.
-        const group = await describeSwitchedGroup(engine, resolved.account.id);
-        const where = group
-          ? ` in the folder slot of ${sanitizeForTerminal(group.scopes)}`
-          : target !== undefined
-            ? ` in the global slot (no folder rule applies to ${sanitizeForTerminal(opts.folder ?? '')})`
-            : '';
-        process.stdout.write(
-          `Activated ${sanitizeForTerminal(resolved.account.label)}${where} (${bits.join(', ')}).\n`,
-        );
-      } catch (err) {
-        if (err instanceof QuarantineError)
-          fail(`${resolved.account.label} is quarantined; re-login required.`);
-        if (err instanceof CadenceError) fail(`${err.message}. Use --force to override.`);
-        if (err instanceof UnknownAccountError) fail(err.message);
-        if (err instanceof SlotError) fail(describeSlotRefusal(err, resolved.account.label));
-        // A switch that failed after it began writing the live login, one an earlier switch still
-        // blocks, or a login stored under two accounts: the engine's message already says what the
-        // live login is now and what to do, in words — it is the whole error line.
-        if (
-          err instanceof SwitchFailedError ||
-          err instanceof UnsettledSwitchError ||
-          err instanceof SharedTokenError
-        ) {
-          fail(err.message);
-        }
-        // The token endpoint shedding load is an outage, not a broken account: the engine has
-        // already spent its retry budget and checked the status page, so its message is the
-        // whole story and this switch simply did not happen. Printed as the CLI's own refusal
-        // (one error line, exit 1) so it reads like every other refusal here instead of
-        // escaping as an unhandled failure.
-        if (err instanceof SwitchEngineError && isOverloadCode(err.code)) {
-          fail(`${err.message}. Nothing was changed - try again shortly.`);
-        }
-        throw err;
-      }
+      await runAccountAction(() => switchAccount(ref, opts));
     });
 
   program
@@ -1243,7 +1166,7 @@ function buildSetupDeps(io: WizardIo, relayFlag?: string): SetupDeps {
     isLoggedIn: async () => (await checkLiveLogin(paths)).ok,
     listAccounts: () => engine.listAccounts(),
     captureCurrentLogin: (label) => engine.captureCurrentLogin(label),
-    addFreshAccount: (label) => addFreshAccount(label),
+    addFreshAccount: (label) => runAccountAction(() => addAccount(label, { fresh: true })),
     hooksInstalled: () => hooksInstalledAt(settingsPath),
     hooksProfilePath: settingsPath,
     channelEnabled: async () => {
@@ -1554,53 +1477,6 @@ function burnOption(state: UsageState): { burnUnitsPerDay?: number } {
 }
 
 /**
- * The `--fresh` capture flow: run an interactive `claude` inside a
- * throwaway `CLAUDE_CONFIG_DIR`, let the user /login as the NEW account there, then vault
- * what landed. The live login is never touched. The transient dir holds real tokens, so it
- * is deleted no matter how the flow ends.
- */
-async function addFreshAccount(label: string): Promise<void> {
-  const paths = defaultPaths();
-  // Failures are RETURNED, not `fail()`ed, so the dir is deleted before the process exits —
-  // `fail()` is `process.exit`, which skips `finally`. See captureDir.ts.
-  const failure = await withCaptureDir(dirname(paths.vaultDir), 'capture', async (captureDir) => {
-    // Darwin: the CLI writes every login to its single Keychain item regardless of
-    // CLAUDE_CONFIG_DIR, so the capture must diff the Keychain around the window instead of
-    // reading files from the transient dir — and restore the pre-window login afterwards.
-    // See SwitchEngine.captureFromKeychainDelta.
-    const engine = buildEngine();
-    const prior = process.platform === 'darwin' ? await engine.readLiveOauth() : undefined;
-    process.stdout.write(
-      'Opening a throwaway Claude window. In it:\n' +
-        '  1. /login - pick the NEW account in the browser (it may preselect the current one).\n' +
-        '  2. Send one short message so the login completes.\n' +
-        '  3. /exit\n\n',
-    );
-    const run = spawnSync('claude', [], {
-      stdio: 'inherit',
-      env: { ...process.env, CLAUDE_CONFIG_DIR: captureDir },
-      shell: process.platform === 'win32', // `claude` is a .cmd shim on Windows; a real PATH exe on mac/linux
-    });
-    if (run.error) return `could not launch \`claude\`: ${run.error.message}`;
-    try {
-      const account =
-        process.platform === 'darwin'
-          ? await engine.captureFromKeychainDelta(label, captureDir, prior)
-          : await engine.captureFromConfigDir(label, captureDir);
-      process.stdout.write(
-        `Added ${account.label} (${account.id}). Your current login was not touched - ` +
-          `\`cctl switch ${account.label}\` to use it.\n`,
-      );
-    } catch (err) {
-      if (err instanceof SwitchEngineError && err.code === 'no_capture_login') return err.message;
-      throw err;
-    }
-    return undefined;
-  });
-  if (failure) fail(failure);
-}
-
-/**
  * `cctl accounts relogin <ref>` — re-login an EXISTING account in place. Same transient-config-dir
  * capture as `add --fresh`, but the captured credentials are written into the account's existing
  * vault entry (SAME id) and its quarantine is cleared — which is exactly what `add --fresh` must
@@ -1617,10 +1493,11 @@ async function reloginAccount(ref: string): Promise<void> {
   const account = resolved.account;
 
   const paths = defaultPaths();
-  // Same return-don't-fail contract as addFreshAccount: cleanup has to outlive every failure
+  // Same return-don't-fail contract as the fresh add (accountActions.ts): cleanup has to outlive every failure
   // path, and `fail()` (process.exit) would skip it. See captureDir.ts.
   const failure = await withCaptureDir(dirname(paths.vaultDir), 'relogin', async (captureDir) => {
-    // Same darwin Keychain-diff-and-restore as addFreshAccount — see that flow's comment.
+    // Same darwin Keychain-diff-and-restore as the fresh add (accountActions.ts) — see that flow's
+    // comment.
     const prior = process.platform === 'darwin' ? await engine.readLiveOauth() : undefined;
     process.stdout.write(
       `Re-logging in "${account.label}" (${account.id}). A throwaway Claude window will open.\n` +
@@ -1747,36 +1624,6 @@ async function reauthAccount(ref: string): Promise<void> {
   }
 }
 
-/**
- * The shared body of `accounts exclude` / `accounts include`. Reports what the registry now says
- * rather than what the command asked for: running either verb on an account already in that
- * state is a no-op, and printing "Excluded X" there would claim a change that did not happen.
- */
-async function setExclusion(ref: string, excluded: boolean): Promise<void> {
-  const engine = buildEngine();
-  // Resolve against the WHOLE fleet, reserved (folder-bound) members included: a row-level mutation
-  // must reach exactly the accounts binding reserves, whose ids/labels live in the group registry, not
-  // the shared-only pool. The engine routes the write to the file that holds the row (groups.json for a
-  // reserved member). Same resolution as relogin/reauth.
-  const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
-  if (!resolved.ok) fail(resolved.message);
-  const already = resolved.account.autoSwitchExcluded === true;
-  if (already === excluded) {
-    process.stdout.write(
-      excluded
-        ? `${resolved.account.label} is already excluded from auto-switch.\n`
-        : `${resolved.account.label} is already available to auto-switch.\n`,
-    );
-    return;
-  }
-  await engine.setAutoSwitchExcluded(resolved.account.id, excluded);
-  process.stdout.write(
-    excluded
-      ? `Excluded ${resolved.account.label} from auto-switch (manual switches still work).\n`
-      : `${resolved.account.label} is available to auto-switch again.\n`,
-  );
-}
-
 function buildAccountCommands(program: Command): void {
   const accounts = program.command('accounts').description('manage stored accounts');
 
@@ -1815,27 +1662,7 @@ function buildAccountCommands(program: Command): void {
       'log in as a NEW account in a throwaway window, without touching the live login',
     )
     .action(async (label: string, opts: { fresh?: boolean }) => {
-      if (opts.fresh) {
-        await addFreshAccount(label);
-        return;
-      }
-      try {
-        const account = await buildEngine().captureCurrentLogin(label);
-        process.stdout.write(`Added ${account.label} (${account.id}) and set it active.\n`);
-      } catch (err) {
-        // A refused duplicate (label or login already stored) is the vault's own message.
-        if (err instanceof VaultError) fail(err.message);
-        // Run inside a group profile, capture reads a folder-bound account's live seat — never a
-        // fresh login to store. Surface the engine's own guidance instead of the no-login message.
-        if (err instanceof SwitchEngineError && err.code === 'capture_in_profile') {
-          fail(
-            `${err.message}. Onboard a new account from a normal (non-folder-bound) shell, ` +
-              `or use: cctl accounts add <label> --fresh.`,
-          );
-        }
-        // Anything else is the capture finding no login to store.
-        fail('no live login to capture. Run `claude` and log in first, then retry.');
-      }
+      await runAccountAction(() => addAccount(label, opts));
     });
 
   accounts
@@ -1859,14 +1686,14 @@ function buildAccountCommands(program: Command): void {
     .command('exclude <ref>')
     .description('stop auto-switch from ever hopping TO this account (manual switches still work)')
     .action(async (ref: string) => {
-      await setExclusion(ref, true);
+      await runAccountAction(() => setExcluded(ref, true));
     });
 
   accounts
     .command('include <ref>')
     .description('let auto-switch consider this account again')
     .action(async (ref: string) => {
-      await setExclusion(ref, false);
+      await runAccountAction(() => setExcluded(ref, false));
     });
 
   accounts
@@ -1874,13 +1701,7 @@ function buildAccountCommands(program: Command): void {
     .alias('rm')
     .description('remove a stored account by id or label')
     .action(async (ref: string) => {
-      const engine = buildEngine();
-      // Resolve across the WHOLE fleet so a reserved (folder-bound) member is reachable by id or
-      // label; removeAccount drops it from its group (dissolving a group left memberless).
-      const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
-      if (!resolved.ok) fail(resolved.message);
-      await engine.removeAccount(resolved.account.id);
-      process.stdout.write(`Removed ${resolved.account.label}.\n`);
+      await runAccountAction(() => removeAccount(ref));
     });
 
   accounts
@@ -1888,28 +1709,7 @@ function buildAccountCommands(program: Command): void {
     .alias('mv')
     .description('give a stored account a new label (its id and usage history are unchanged)')
     .action(async (ref: string, newLabel: string) => {
-      const engine = buildEngine();
-      // Resolve across the WHOLE fleet so a reserved (folder-bound) member is reachable by id or
-      // label; renameAccount asserts label uniqueness across all rows and writes the file holding it.
-      const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
-      if (!resolved.ok) fail(resolved.message);
-      // Answered here rather than written: nothing would change, so nothing should be saved or
-      // reported as a rename.
-      if (newLabel.trim() === resolved.account.label) {
-        process.stdout.write(`${resolved.account.label} already has that label.\n`);
-        return;
-      }
-      try {
-        const updated = await engine.renameAccount(resolved.account.id, newLabel);
-        process.stdout.write(
-          `Renamed ${resolved.account.label} to ${updated.label} (${updated.id}).\n`,
-        );
-      } catch (err) {
-        // A collision or an empty label is a user mistake carrying its own explanation; anything
-        // else is a real fault and propagates.
-        if (err instanceof VaultError) fail(err.message);
-        throw err;
-      }
+      await runAccountAction(() => renameAccount(ref, newLabel));
     });
 }
 
