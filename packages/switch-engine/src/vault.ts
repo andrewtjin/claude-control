@@ -1784,6 +1784,56 @@ export class Vault {
   }
 
   /**
+   * Create a SHARED account that has no credentials yet: a registry row carrying the identity it is
+   * known by, and no encrypted bundle. It is stored quarantined with `reason`, which is exactly what
+   * an account without a working login is to every reader: never a switch, refresh, poll or
+   * auto-switch target, listed with its reason, and brought back by a re-login, which writes the
+   * bundle and lifts the quarantine. The identity is what that re-login is checked against, so the
+   * login that fills the row has to be the account it names.
+   *
+   * The same label and login refusals as {@link addAccount} apply, across the whole registry. The
+   * row is stamped with the current metadata revision: there is no bundle to recompute it from, and
+   * the first bundle write fills in the plan fields anyway.
+   */
+  async addPendingAccount(
+    label: string,
+    identity: Pick<StoredAccount, 'accountUuid' | 'emailAddress' | 'organizationUuid'>,
+    reason: string,
+  ): Promise<StoredAccount> {
+    const st = await this.loadState();
+    const next = sanitizeTerminalText(label).trim();
+    if (next === '') throw new VaultError('a label cannot be empty');
+    const allRows = allRowsOf(st);
+    assertLabelFree(allRows, next, undefined);
+    const uuid = identity.accountUuid;
+    const stored = uuid !== undefined ? allRows.find((a) => a.accountUuid === uuid) : undefined;
+    if (stored) {
+      throw new VaultError(
+        `this login is account ${stored.id} ("${stored.label}"), which is already stored`,
+      );
+    }
+    const now = this.clock();
+    const account: StoredAccount = {
+      id: randomUUID(),
+      label: next,
+      ...(identity.accountUuid !== undefined ? { accountUuid: identity.accountUuid } : {}),
+      ...(identity.emailAddress !== undefined ? { emailAddress: identity.emailAddress } : {}),
+      ...(identity.organizationUuid !== undefined
+        ? { organizationUuid: identity.organizationUuid }
+        : {}),
+      metadataRev: ACCOUNT_METADATA_REV,
+      quarantined: true,
+      quarantineReason: reason,
+      quarantinedAtMs: now,
+      createdAtMs: now,
+      updatedAtMs: now,
+    };
+    st.shared.push(account);
+    await this.saveShared(st);
+    return account;
+  }
+
+  /**
    * Remove an account wherever it lives, and every reference to it: a shared row is dropped from
    * `accounts.json` (clearing the global active id if it pointed at it), a reserved row from the
    * reserved side; either way it leaves every rule's include and exclude list, a rule's active id that

@@ -104,6 +104,7 @@ import type {
   ExcludeResult,
   FolderBindingSnapshot,
   FolderRule,
+  ImportBundleResult,
   IncludeResult,
   OauthAccount,
   PoolEntry,
@@ -779,6 +780,105 @@ export class SwitchEngine {
       await this.refreshSnapshotForAccountsLocked();
       return account;
     });
+  }
+
+  // ---- moving accounts between machines ----
+  //
+  // A vault is sealed to the machine that wrote it, so an account travels as its decrypted bundle,
+  // re-sealed by the caller. Each of these takes and drops the credential lock on its own: a caller
+  // moving many accounts makes one call per account, so a slow decrypt per account (a PowerShell
+  // spawn on Windows) never stretches one lock hold toward the stale-lock reclaim.
+
+  /**
+   * The freshest credentials stored for an account, for carrying it to another machine. An account
+   * live in a slot here may have rotated its token there since the vault last saw it, and a copy of
+   * the older bundle would carry a refresh token that is already spent; so the live rotation is
+   * adopted into the vault first, the same reconcile a switch does. Never refreshes over the
+   * network: that would spend the token some session here may be holding.
+   */
+  async exportBundle(accountId: string): Promise<CredentialBundle> {
+    // Fingerprint the stored bundles before the lock, as activate() does: adoption checks the live
+    // token against every stored one under it.
+    await this.vault.readStoredTokens().catch(() => undefined);
+    return this.withCredentialLock(async () => {
+      const untrusted = await this.settleForAccountsLocked([accountId]);
+      if (!(await this.vault.getAccount(accountId))) throw new UnknownAccountError(accountId);
+      await this.adoptLiveRotationOf(accountId, untrusted);
+      return this.vault.readBundle(accountId);
+    });
+  }
+
+  /**
+   * Store an account that comes without credentials: a registry row carrying the identity it is
+   * known by, quarantined until a re-login (`cctl accounts relogin`) writes its bundle. The re-login
+   * is checked against that identity, so it has to be the same account. See
+   * {@link Vault.addPendingAccount}.
+   */
+  addPendingAccount(
+    label: string,
+    identity: Pick<StoredAccount, 'accountUuid' | 'emailAddress' | 'organizationUuid'>,
+  ): Promise<StoredAccount> {
+    return this.withCredentialLock(async () => {
+      const account = await this.vault.addPendingAccount(
+        label,
+        identity,
+        'imported without tokens - log in with cctl accounts relogin',
+      );
+      await this.refreshSnapshotForAccountsLocked();
+      return account;
+    });
+  }
+
+  /**
+   * Write credentials brought from another machine over an account already stored here, but only
+   * when they are the better copy: the stored login is quarantined or unreadable, or the brought
+   * grant was minted later (its access token expires later — lifetimes are fixed per provider, so
+   * expiry dates the mint, the same rule rotation adoption uses). A refresh token is single-use, so
+   * of two copies of one login only the newer can still be alive.
+   *
+   * The comparison is against the freshest copy here: a live rotation is adopted first. The write
+   * itself is a re-login's (see {@link applyReloginBundle}): the identity guard refuses a bundle
+   * that names another account, the quarantine is lifted, and an account live in a slot here gets
+   * the brought credentials written there too.
+   */
+  async importBundle(accountId: string, bundle: CredentialBundle): Promise<ImportBundleResult> {
+    await this.vault.readStoredTokens().catch(() => undefined);
+    return this.withCredentialLock(async () => {
+      const untrusted = await this.settleForAccountsLocked([accountId]);
+      const existing = await this.vault.getAccount(accountId);
+      if (!existing) throw new UnknownAccountError(accountId);
+      // Read before anything is written, for the reason reloginFromConfigDirLocked gives.
+      const liveSlot = await this.liveSlotOf(accountId);
+      await this.adoptLiveRotationOf(accountId, untrusted);
+      let reason: ImportBundleResult['reason'];
+      if (existing.quarantined) {
+        reason = 'quarantined';
+      } else {
+        const stored = await this.vault.readBundle(accountId).catch(() => undefined);
+        if (stored === undefined) reason = 'unreadable';
+        else if (bundle.claudeAiOauth.expiresAt > stored.claudeAiOauth.expiresAt) reason = 'newer';
+        else return { replaced: false, reason: 'stored_newer', healedLiveLogin: false };
+      }
+      const { healedLiveLogin } = await this.applyReloginBundle(
+        existing,
+        bundle.claudeAiOauth,
+        bundle.oauthAccount,
+        liveSlot,
+        bundle.oauthAccount,
+      );
+      return { replaced: true, reason, healedLiveLogin };
+    });
+  }
+
+  /** Adopt into the vault whatever rotation the slot an account is live in holds, unless that slot
+   *  is one a switch left unsettled (its live login cannot be trusted). Holds the lock. */
+  private async adoptLiveRotationOf(accountId: string, untrusted: Set<SlotId>): Promise<void> {
+    const liveSlot = await this.liveSlotOf(accountId);
+    if (liveSlot === undefined || untrusted.has(liveSlot)) return;
+    const credStore = this.slotRuntime(liveSlot).credStore;
+    const liveNow = await credStore.readLiveCredentials().catch(() => undefined);
+    const liveOauth = await credStore.readOauthAccount().catch(() => undefined);
+    await this.adoptRotationIfNeeded(accountId, liveNow, liveOauth);
   }
   /**
    * Remove an account wherever it lives, and clean every rule slot it occupied.

@@ -359,6 +359,24 @@ export interface ReloginResult {
   healedLiveLogin: boolean;
 }
 
+/** What {@link SwitchEngine.importBundle} did with a credential bundle brought from another
+ *  machine for an account already stored here. */
+export interface ImportBundleResult {
+  /** True when the brought bundle was written over the stored one. */
+  replaced: boolean;
+  /** Why it was or was not written:
+   *  - `newer`: the brought grant was minted after the stored one (its access token expires later),
+   *    so the stored refresh token is the one that has been spent.
+   *  - `quarantined`: the stored login is known dead, so anything is better.
+   *  - `unreadable`: the stored bundle could not be read or decrypted here.
+   *  - `stored_newer`: the copy here (after adopting any live rotation) is as new or newer, so it
+   *    was kept and nothing was written. */
+  reason: 'newer' | 'quarantined' | 'unreadable' | 'stored_newer';
+  /** True when the account was live in a slot here and the brought credentials were written there
+   *  too (verified by read-back), as a re-login does. */
+  healedLiveLogin: boolean;
+}
+
 /** Outcome of a startup recovery sweep. `unsettled` (with `recovered: false`): a switch is pending
  *  in some slot that could not be finished or undone yet; `detail` says which and why (every other
  *  slot was recovered regardless). It stays pending, and every operation on that slot retries it
