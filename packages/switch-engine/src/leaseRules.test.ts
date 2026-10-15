@@ -433,3 +433,33 @@ describe('the guard snapshot of a parallel session', () => {
     expect(folderBindingSnapshotContentEqual(lease, lease)).toBe(true);
   });
 });
+
+describe('folder rules beside a parallel session', () => {
+  it('excluding the leased account is refused, naming the parallel session', async () => {
+    const { vault, A, B } = await vaultWithThree();
+    await vault.createRule({
+      folders: [],
+      include: [A.id],
+      lease: { holders: [holder(10)], startedAtMs: 7 },
+    });
+    const folder = await vault.createRule({ folders: ['C:/repo'], exclude: [B.id] });
+    await expect(vault.excludeAccounts(folder.id, [A.id])).rejects.toThrow(
+      'account "A" is reserved to a parallel session of A (until it exits); only a shared account can be excluded',
+    );
+  });
+
+  it('including the leased account in a folder is allowed: it stays reserved there once the session ends', async () => {
+    const { vault, A, B } = await vaultWithThree();
+    const lease = await vault.createRule({
+      folders: [],
+      include: [A.id],
+      lease: { holders: [holder(10)], startedAtMs: 7 },
+    });
+    const folder = await vault.createRule({ folders: ['C:/repo'], exclude: [B.id] });
+    await vault.includeAccounts(folder.id, [A.id]);
+    await vault.removeRule(lease.id);
+    expect((await vault.listAllAccounts()).find((a) => a.id === A.id)?.ruleIds).toEqual([
+      folder.id,
+    ]);
+  });
+});

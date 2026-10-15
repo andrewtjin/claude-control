@@ -967,3 +967,29 @@ describe('sweepLeases', () => {
     ]);
   });
 });
+
+describe('accounts relogin of an account a parallel session holds', () => {
+  it('heals the parallel-session profile, where the account is live, and nothing else', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    const capture = join(h.paths.vaultDir, '..', 'relogin-B');
+    await mkdir(capture, { recursive: true });
+    const store = new CredentialStore({
+      claudeDir: capture,
+      credentialsPath: join(capture, '.credentials.json'),
+      claudeJsonPath: join(capture, '.claude.json'),
+      vaultDir: h.paths.vaultDir,
+    });
+    await store.writeLiveCredentials({
+      accessToken: 'B-fresh',
+      refreshToken: 'r-B-fresh',
+      expiresAt: NOW + 30 * HOUR,
+    });
+    await store.writeOauthAccount({ accountUuid: 'uuid-B', emailAddress: 'B@x.com' });
+    const res = await h.engine.reloginFromConfigDir(B.id, capture);
+    expect(res.healedLiveLogin).toBe(true);
+    expect((await leaseStore(h.paths, B.id).readLiveCredentials())?.accessToken).toBe('B-fresh');
+    expect((await h.global.readLiveCredentials())?.accessToken).toBe('A');
+  });
+});

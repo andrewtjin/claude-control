@@ -1510,8 +1510,11 @@ export class Vault {
     // rendered on the CLI, in the doctor, in the guard's decision text and in phone alerts, and an
     // operator types it freely. A label with nothing printable left falls back to the default.
     const firstAlias = plan.aliases[0];
+    // A parallel session is named by its account, at the time it starts.
+    const leasedLabel =
+      opts.lease === undefined ? undefined : findRowIn(st, plan.include[0] ?? '')?.row.label;
     const label =
-      sanitizeTerminalText(opts.label ?? '').trim() ||
+      sanitizeTerminalText(opts.label ?? leasedLabel ?? '').trim() ||
       sanitizeTerminalText(
         plan.folders[0] ??
           (firstAlias !== undefined ? `session "${firstAlias.alias}" in ${firstAlias.folder}` : ''),
