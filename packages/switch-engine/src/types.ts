@@ -204,15 +204,60 @@ export interface FolderRule {
   activeId: string | null;
   createdAtMs: number;
   updatedAtMs: number;
+  /** Present exactly when this rule is a parallel-session slot: `cctl claude --account <id>` running
+   *  that one account in a terminal without moving any other slot. Such a rule has no folders and no
+   *  aliases, includes exactly that account, excludes nothing, and its id is `session-<accountId>`.
+   *  It lives while processes hold it (see {@link SessionLease}). */
+  lease?: SessionLease;
+}
+
+/** One process that holds a parallel session. A holder is judged alive or dead from the process
+ *  that reads it (see processStarts.ts `holderState`); every doubt counts as alive, because ending a
+ *  session's slot under it logs that session out. */
+export interface LeaseHolder {
+  pid: number;
+  /** The process's start, never derived from the current wall clock at check time. On win32 the
+   *  creation time in epoch ms (compared within a tolerance); on linux field 22 of
+   *  `/proc/<pid>/stat`, clock ticks since boot (compared exactly, so a wall-clock step cannot make a
+   *  live holder look reused). 0 = unknown, which counts as alive. */
+  start: number;
+  /** `os.hostname()` of the machine that recorded it. Not the environment's idea of the host, which
+   *  differs between a terminal and a service-started daemon. */
+  host: string;
+  /** A WSL distro and its Windows host can share a host name; the platform tells them apart. Leases
+   *  exist only on these two. */
+  platform: 'win32' | 'linux';
+  /** linux: the boot the holder was recorded in. A different boot means the process is gone. */
+  bootId?: string;
+  /** linux: the pid namespace it was recorded in. Another namespace (another WSL distro, a
+   *  container) is foreign: its pids mean nothing here. */
+  pidNs?: string;
+  /** launcher: the `cctl claude` process. claude: its Claude Code child, or a process found running
+   *  on the slot's profile. background: a worker the profile's background service hosts. */
+  role: 'launcher' | 'claude' | 'background';
+  /** For a claude holder a launcher recorded: that launcher's pid, so a check can tell whether a dead
+   *  launcher's child was ever recorded. */
+  parent?: number;
+}
+
+/** What makes a rule a parallel-session slot (see {@link FolderRule.lease}). */
+export interface SessionLease {
+  /** Never empty on disk: a lease ends by removing its rule in one write. */
+  holders: LeaseHolder[];
+  startedAtMs: number;
+  /** Where the account sat in `accounts.json` before this lease reserved it, so ending the lease
+   *  puts it back in the same place in the shared pool. Absent when another rule already reserved
+   *  it. */
+  restoreIndex?: number;
 }
 
 /** The `groups.json` file: the reserved side of the one logical registry plus the folder rules over
  *  it. An account is in `reserved` (and absent from `accounts.json`) exactly while at least one rule
- *  includes it. Schema 1 (set-bound groups) is migrated on read. `schemaVersion` is 3 exactly while
- *  some rule carries an alias scope, so a build that knows only folder rules refuses the file instead
- *  of ignoring the alias rules it cannot honor; else 2. */
+ *  includes it. Schema 1 (set-bound groups) is migrated on read. `schemaVersion` is the highest the
+ *  content needs, so a build that cannot honor a kind of rule refuses the file instead of ignoring
+ *  it: 4 while a parallel session exists, else 3 while some rule carries an alias scope, else 2. */
 export interface RulesFile {
-  schemaVersion: 2 | 3;
+  schemaVersion: 2 | 3 | 4;
   /** Bumped on every write; the guard snapshot (see {@link FolderBindingSnapshot}) carries it so a
    *  stale snapshot can be detected. */
   generation: number;
@@ -307,6 +352,10 @@ export interface FolderBindingSnapshotGroup {
    *  printable text: the engine refuses control and bidi characters). Absent in a snapshot written by
    *  a build that predates alias rules, which the guard reads as none. */
   aliases?: { folder: string; aliasKey: string; alias?: string }[];
+  /** 'lease' for a parallel-session slot, whose sessions run wherever the operator started them on
+   *  purpose. Written only on such a group, so the snapshot keeps schema 1: the guard fails open on an
+   *  unknown schema, and a bump would switch enforcement off for every older guard. */
+  kind?: 'lease';
 }
 
 /** Write-ahead record of an in-progress switch, for crash recovery. Carries NO secrets.
@@ -590,4 +639,108 @@ export interface RepairResult {
   repaired: SlotViolation[];
   remaining: SlotViolation[];
   actions: string[];
+}
+
+/** One row of the Windows process table, as `readProcessTable` reads it in one query: the parent
+ *  link survives the parent's death, which is how a dead launcher's live child is still found. */
+export interface ProcessRow {
+  pid: number;
+  ppid: number;
+  /** Creation time, epoch ms (from an absolute FILETIME, so a wall-clock step does not move it). */
+  startMs: number;
+}
+
+/** The Linux `/proc` reads a parallel session's checks use: synchronous file reads, no spawn. */
+export interface ProcFs {
+  /** Fields 4 (ppid) and 22 (start, clock ticks since boot) of `/proc/<pid>/stat`. */
+  stat(pid: number): { ppid: number; startTicks: number } | undefined;
+  /** `/proc/sys/kernel/random/boot_id`. */
+  bootId(): string | undefined;
+  /** This process's pid namespace (`readlink /proc/self/ns/pid`). */
+  pidNs(): string | undefined;
+  /** The CLAUDE_CONFIG_DIR in a process's environment (same user only; others are unreadable). */
+  configDirOf(pid: number): string | undefined;
+  /** Every pid listed under `/proc`. */
+  pids(): number[];
+}
+
+/** Whether a holder's process still runs, judged from this process (see `holderState`):
+ *  `unverifiable` and `foreign` both keep a lease, since every doubt counts as alive. */
+export type LeaseHolderState = 'alive' | 'dead' | 'unverifiable' | 'foreign';
+
+/** The background workers a profile's service hosts, as holders, or `'unreadable'` when its roster
+ *  cannot be read right now. `verify` false reads the roster file only (every listed worker counts as
+ *  alive); true also checks each worker's start, as the background host's own listing does. */
+export type LeaseOccupancyProbe = (
+  profileDir: string,
+  opts: { verify: boolean },
+) => Promise<LeaseHolder[] | 'unreadable'>;
+
+/** Where `cctl claude --account <id>` would run, read without the lock (see
+ *  `SwitchEngine.planSessionSlot`):
+ *  - `global`: live in the global slot; `overrides` when the rule this launch runs under would refuse
+ *    the account there (the launch then outranks it for this session);
+ *  - `rule`: live in this launch's rule slot, or reserved and live in a rule that includes it;
+ *  - `lease`: a parallel-session slot of its own, new or `join`ing one that exists;
+ *  - `refused`: why it cannot run anywhere from here. */
+export type SessionSlotPlan =
+  | { kind: 'global'; overrides: boolean }
+  | { kind: 'rule'; ruleId: string }
+  | { kind: 'lease'; ruleId: string; profileDir: string; join: boolean }
+  | {
+      kind: 'refused';
+      code: 'quarantined' | 'session_slot_unsupported' | 'live_twice' | 'live_in_other_rule';
+      message: string;
+    };
+
+/** What `SwitchEngine.claimSessionSlot` did. `global` and `rule` claim nothing: the account turned
+ *  out to be live there by the time the lock was held. */
+export type SessionSlotClaim =
+  | { kind: 'global' }
+  | { kind: 'rule'; ruleId: string }
+  | {
+      kind: 'lease';
+      ruleId: string;
+      profileDir: string;
+      joined: boolean;
+      /** Holders recorded after the claim. */
+      holders: number;
+      /** Other terminals (launcher holders) on the session when this one joined. */
+      otherTerminals: number;
+    };
+
+/** Why a parallel session that has no live holder left was not ended yet. */
+export type LeaseDeferReason =
+  'roster_unreadable' | 'no_probe' | 'unrecorded_child' | 'slot_untrusted';
+
+/** What `SwitchEngine.releaseLease` did. */
+export interface LeaseRelease {
+  ended: boolean;
+  adoptedRotation: boolean;
+  /** Holders left on the lease after this release. */
+  remaining: number;
+  /** The lease outlived its terminals because its profile's background service still hosts workers. */
+  deferredToBackground: boolean;
+  /** Set when nothing was ended although no holder of this release is left: the sweep finishes it. */
+  deferred?: LeaseDeferReason;
+}
+
+/** What `SwitchEngine.sweepLeases` did. */
+export interface LeaseSweepReport {
+  droppedHolders: number;
+  adoptedHolders: number;
+  ended: Array<{ accountId: string; label: string; adoptedRotation: boolean }>;
+  deferred: Array<{ accountId: string; label: string; reason: LeaseDeferReason }>;
+  /** Processes found running on a lease profile and recorded as holders. */
+  adopted: Array<{ accountId: string; label: string; pid: number }>;
+}
+
+/** One parallel session as doctor, status and the TUI show it. */
+export interface LeaseView {
+  ruleId: string;
+  accountId: string;
+  label: string;
+  profileDir: string;
+  startedAtMs: number;
+  holders: Array<LeaseHolder & { state: LeaseHolderState; reused?: boolean }>;
 }

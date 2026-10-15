@@ -112,9 +112,16 @@ export class VaultError extends SwitchEngineError {
  *  - `rule_gone`: the folder rule whose slot was to be written no longer exists;
  *  - `live_elsewhere`: the target is live in another slot, and no account is live in two;
  *  - `slot_ambiguous`: no slot was named and the target could legitimately go to more than one (an
- *    account several rules include, live in none of them). */
+ *    account several rules include, live in none of them);
+ *  - `leased`: the account runs a parallel session (`cctl claude --account`), so nothing else may
+ *    seat it, place a session on it or remove it until that session exits. */
 export type SlotErrorCode =
-  'slot_mismatch' | 'not_slot_candidate' | 'rule_gone' | 'live_elsewhere' | 'slot_ambiguous';
+  | 'slot_mismatch'
+  | 'not_slot_candidate'
+  | 'rule_gone'
+  | 'live_elsewhere'
+  | 'slot_ambiguous'
+  | 'leased';
 
 /** An activation was refused because its target may not be live in the slot it was headed for.
  *  Always raised BEFORE anything live is written, so a refused switch changes nothing. */
@@ -138,5 +145,63 @@ export class UnknownAccountError extends SwitchEngineError {
 export class ProfileError extends SwitchEngineError {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, 'profile_error', options);
+  }
+}
+
+/** A parallel session's holder list was about to be written empty. Ending a parallel session is
+ *  removing its rule in one write; an empty list on disk is a file every reader refuses, so asking for
+ *  one is a programming error, refused before anything is written. */
+export class LeaseHoldersEmptyError extends SwitchEngineError {
+  constructor(ruleId: string) {
+    super(`the parallel session ${ruleId} would be left with no holder`, 'lease_holders_empty');
+  }
+}
+
+/** A parallel session already holds as many processes as a rules file may record. Refused before
+ *  anything is written. */
+export class LeaseHolderCapError extends SwitchEngineError {
+  constructor(
+    message: string,
+    /** The cap that was reached. */
+    readonly max: number,
+  ) {
+    super(message, 'lease_holders_full');
+  }
+}
+
+/** A write of `groups.json` was refused because the file it would produce does not pass this
+ *  build's own reader. Readers fail closed, so writing it would stop every command and the daemon;
+ *  refusing the write keeps the file on disk as it was. */
+export class RulesWriteRefusedError extends SwitchEngineError {
+  constructor(
+    /** What the reader would have refused. */
+    readonly reason: string,
+  ) {
+    super(
+      `refused to write a rules file this build could not read back (${reason})`,
+      'rules_write_refused',
+    );
+  }
+}
+
+/** Why `cctl claude --account` cannot run an account from here (see `SwitchEngine.claimSessionSlot`):
+ *  - `live_twice`: the account is live in two slots at once (a breach the doctor reports);
+ *  - `live_in_other_rule`: a shared account live in a rule slot this launch does not run under;
+ *  - `session_slot_unsupported`: a parallel session would be needed, and macOS has none yet;
+ *  - `lease_unsettled`: the parallel-session slot holds an interrupted switch that cannot be settled;
+ *  - `lease_seat_failed`: joining a parallel session needed its slot seated, and that failed;
+ *  - `rules_full`: the rules registry has no room for another rule. */
+export type SessionSlotErrorCode =
+  | 'live_twice'
+  | 'live_in_other_rule'
+  | 'session_slot_unsupported'
+  | 'lease_unsettled'
+  | 'lease_seat_failed'
+  | 'rules_full';
+
+/** A refusal of `cctl claude --account`, raised before anything is written (or after a rollback). */
+export class SessionSlotError extends SwitchEngineError {
+  constructor(message: string, code: SessionSlotErrorCode, options?: { cause?: unknown }) {
+    super(message, code, options);
   }
 }

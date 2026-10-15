@@ -21,7 +21,77 @@ import {
   type ScopedGroup,
 } from './folderPath.js';
 import { ruleIdOfSlot, ruleSlotId } from './types.js';
-import type { FolderRule, PoolEntry, SlotId, StoredAccount } from './types.js';
+import type {
+  FolderRule,
+  LeaseHolder,
+  PoolEntry,
+  SessionLease,
+  SlotId,
+  StoredAccount,
+} from './types.js';
+
+/** The id prefix of a parallel-session rule: `session-<accountId>`. Account ids are random UUIDs, so
+ *  the id (and the profile dir it names) stays unguessable, and two terminals asking for the same
+ *  account find the same rule. */
+export const LEASE_RULE_PREFIX = 'session-';
+
+/** The id of the parallel-session rule of an account. */
+export function leaseRuleId(accountId: string): string {
+  return `${LEASE_RULE_PREFIX}${accountId}`;
+}
+
+/** Whether a rule is a parallel-session slot rather than an operator's folder or alias rule. Every
+ *  place that treats the two differently branches on this one predicate, so the compiler and a reader
+ *  see each such place. */
+export function isLeaseRule(rule: FolderRule): rule is FolderRule & { lease: SessionLease } {
+  return rule.lease !== undefined;
+}
+
+/** The rules an operator made (folder and alias rules), without the parallel-session slots: what
+ *  every rule listing, `where` and the rule verbs show and act on. */
+export function operatorRules(rules: readonly FolderRule[]): FolderRule[] {
+  return rules.filter((r) => !isLeaseRule(r));
+}
+
+/** Whether two holder records name the same process slot: same pid on the same machine, platform and
+ *  pid namespace. A record on the same process with another start is that pid reused, so it is the
+ *  same SLOT in the list, replaced rather than kept beside the new one. */
+export function sameHolderProcess(a: LeaseHolder, b: LeaseHolder): boolean {
+  return (
+    a.pid === b.pid &&
+    a.host === b.host &&
+    a.platform === b.platform &&
+    (a.pidNs ?? null) === (b.pidNs ?? null)
+  );
+}
+
+/** Whether two holder records are the same process: {@link sameHolderProcess} and the same start. */
+export function sameHolder(a: LeaseHolder, b: LeaseHolder): boolean {
+  return sameHolderProcess(a, b) && a.start === b.start;
+}
+
+/** `holders` with `added` folded in, each added record replacing any on the same process slot (the
+ *  later record wins), never appended beside it: a list on disk never names one process twice. */
+export function withHolders(
+  holders: readonly LeaseHolder[],
+  added: readonly LeaseHolder[],
+): LeaseHolder[] {
+  let out = holders.slice();
+  for (const h of added) {
+    out = out.filter((x) => !sameHolderProcess(x, h));
+    out.push(h);
+  }
+  return out;
+}
+
+/** `holders` without the ones `removed` names exactly (same process and same start): a record of a
+ *  reused pid is someone else's and stays. */
+export function withoutHolders(
+  holders: readonly LeaseHolder[],
+  removed: readonly LeaseHolder[],
+): LeaseHolder[] {
+  return holders.filter((h) => !removed.some((r) => sameHolder(h, r)));
+}
 
 /** One consistent picture of the registry: the shared rows (`accounts.json`), the reserved rows and
  *  the rules (`groups.json`). Read once per decision so every function below sees the same state. */
@@ -63,6 +133,8 @@ export function slotMayHold(slot: SlotId, accountId: string, picture: RulesPictu
   const rule = picture.rules.find((r) => r.id === ruleId);
   if (rule === undefined) return false;
   if (rule.include.includes(accountId)) return true;
+  // A parallel session is pinned to the account it was started for: no shared fallback.
+  if (isLeaseRule(rule)) return false;
   return isShared && !rule.exclude.includes(accountId);
 }
 
@@ -98,6 +170,8 @@ export function slotMembers(
     if (account === undefined || account.quarantined) continue;
     included.push({ account, source: 'include', autoTarget: true });
   }
+  // Pinned: a parallel session's pool is its one account, never the shared pool.
+  if (isLeaseRule(rule)) return included;
   return [...included, ...inherited(rule.exclude)];
 }
 
@@ -254,6 +328,7 @@ export function ruleScopes(rule: FolderRule): string[] {
  *  hand edit leaves one). What refusals, alerts and the phone name a rule by. Unsanitized: every
  *  caller that prints it to a terminal passes it through its own sink sanitizer. */
 export function describeRuleScopes(rule: FolderRule): string {
+  if (isLeaseRule(rule)) return `a parallel session of ${rule.label} (until it exits)`;
   const parts = ruleScopes(rule);
   return parts.length > 0 ? parts.join(', ') : rule.label;
 }

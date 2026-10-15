@@ -79,6 +79,9 @@ export {
   MAX_RULE_ALIASES,
   MAX_ALIAS_LENGTH,
   MAX_RESERVED_ACCOUNTS,
+  MAX_LEASE_HOLDERS,
+  RULES_SCHEMA_VERSIONS_READ,
+  assertReadableRulesSchema,
   needsMetadataBackfill,
   type DedupeReport,
   type NewRuleOptions,
@@ -87,6 +90,14 @@ export {
 // Folder rules: the effective pool of every slot, and folder -> rule resolution. Pure, so the CLI
 // and the daemon decide with exactly the engine's rules.
 export {
+  LEASE_RULE_PREFIX,
+  isLeaseRule,
+  leaseRuleId,
+  operatorRules,
+  sameHolder,
+  sameHolderProcess,
+  withHolders,
+  withoutHolders,
   allSlots,
   availableInOrder,
   exactFolderRule,
@@ -166,6 +177,23 @@ export {
   type BuildSnapshotInput,
 } from './folderBindings.js';
 export { resolveAccountRef, type ResolveResult } from './resolveAccount.js';
+// Process identity for parallel sessions (`cctl claude --account`): who holds one and whether it runs.
+export {
+  LEASE_START_TOLERANCE_MS,
+  childHolder,
+  createProcFs,
+  holderState,
+  parseProcessTable,
+  pidAlive,
+  procFs,
+  readProcessStarts,
+  readProcessTable,
+  selfHolder,
+  windowsStartMs,
+  type HolderEvidence,
+  type HolderSource,
+  type ProcFsIo,
+} from './processStarts.js';
 export {
   CredentialStore,
   FileCredentialChannel,
@@ -183,6 +211,7 @@ export {
   type RefreshFn,
   type ExchangeFn,
   type ReauthResult,
+  type LeaseSweepOptions,
 } from './switchEngine.js';
 // Not switch-engine domain logic, but the workspace's only fsync'd atomic writer. Exposed so
 // other packages replace a state file the way this one already does, instead of hand-rolling a

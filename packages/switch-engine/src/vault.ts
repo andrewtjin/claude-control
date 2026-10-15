@@ -19,9 +19,11 @@ import type {
   AccountView,
   CredentialBundle,
   FolderRule,
+  LeaseHolder,
   OauthAccount,
   Registry,
   RulesFile,
+  SessionLease,
   StoredAccount,
   StoredAliasScope,
 } from './types.js';
@@ -35,8 +37,12 @@ import {
   folderUniquenessKey,
 } from './folderPath.js';
 import {
+  LEASE_RULE_PREFIX,
   describeRuleScopes,
+  isLeaseRule,
+  leaseRuleId,
   rulesIncluding,
+  sameHolderProcess,
   slotMayHold,
   type RulesPicture,
 } from './folderRules.js';
@@ -57,7 +63,13 @@ import {
   writePrintIndex,
   type TokenPrints,
 } from './tokenPrints.js';
-import { UnknownAccountError, VaultError } from './errors.js';
+import {
+  LeaseHolderCapError,
+  LeaseHoldersEmptyError,
+  RulesWriteRefusedError,
+  UnknownAccountError,
+  VaultError,
+} from './errors.js';
 import { noopLogger, type Logger } from './logger.js';
 
 /** What {@link Vault.dedupeAccounts} did, for the CLI to say out loud. */
@@ -89,6 +101,10 @@ export interface NewRuleOptions {
   exclude?: readonly string[];
   /** Display name; defaults to the first folder. */
   label?: string;
+  /** Makes the rule a parallel-session slot (see {@link FolderRule.lease}): its id is then
+   *  `session-<include[0]>`, and the account's place in the shared pool is recorded so ending the
+   *  lease puts it back there. */
+  lease?: { holders: LeaseHolder[]; startedAtMs: number };
 }
 
 /** The scopes of some rules as a display list, for "reserved to <folders>" messages. */
@@ -220,6 +236,18 @@ const RULES_SCHEMA_VERSION = 2;
  *  an alias scope exists, and 2 again once none is left, which those builds read as before. This
  *  build reads both. */
 const RULES_SCHEMA_VERSION_ALIASES = 3;
+/** Schema tag of a `groups.json` holding a parallel session (`cctl claude --account`). Builds that
+ *  read only 2 and 3 refuse it, which is the point: they would otherwise keep the `lease` field as an
+ *  opaque extra and treat the slot as an empty folder rule, free to seat any shared account and
+ *  blind to the session running on it. Stamped 4 only while a parallel session exists, and back to
+ *  3 or 2 once the last one ends. */
+const RULES_SCHEMA_VERSION_LEASES = 4;
+/** Every rules schema this build reads (1 is migrated, see below). */
+export const RULES_SCHEMA_VERSIONS_READ: readonly number[] = [
+  2,
+  RULES_SCHEMA_VERSION_ALIASES,
+  RULES_SCHEMA_VERSION_LEASES,
+];
 /** Schema tag of the set-bound groups `groups.json` held before folder rules. Still READ, and
  *  migrated to {@link RULES_SCHEMA_VERSION} in memory (written back as such on the next write). Any
  *  other value fails closed rather than being read as a shape this build does not understand. */
@@ -248,6 +276,14 @@ export const MAX_RULE_ALIASES = 256;
 export const MAX_ALIAS_LENGTH = 512;
 /** The most reserved rows `groups.json` may hold across all rules. */
 export const MAX_RESERVED_ACCOUNTS = 256;
+/** The most processes one parallel session may record. Far above any real use (a handful of
+ *  terminals on one account, each a launcher and its Claude Code); a bound so a runaway cannot grow
+ *  the file without end. */
+export const MAX_LEASE_HOLDERS = 32;
+/** Longest host name a holder record may carry. */
+const MAX_HOLDER_HOST_LENGTH = 256;
+/** Longest boot id or pid-namespace string a holder record may carry. */
+const MAX_HOLDER_TAG_LENGTH = 64;
 
 /** Property names that, if copied onto an object literal or used as a plain-object map key, reach
  *  through to `Object.prototype` (prototype pollution). Registry files are operator-editable and,
@@ -388,16 +424,24 @@ function parseRulesFile(
   if (value.schemaVersion === LEGACY_GROUPS_SCHEMA_VERSION) {
     return migrateLegacyGroups(validateLegacyGroups(value, platform), value.generation);
   }
-  if (
-    value.schemaVersion !== RULES_SCHEMA_VERSION &&
-    value.schemaVersion !== RULES_SCHEMA_VERSION_ALIASES
-  ) {
-    throw new VaultError(
-      `groups.json has an unsupported schemaVersion (${JSON.stringify(value.schemaVersion)}); ` +
-        'a newer build wrote it — this one refuses to read it rather than drop the rules it holds',
-    );
-  }
+  assertReadableRulesSchema(value.schemaVersion);
   return validateRulesFile(value, platform);
+}
+
+/**
+ * The schema gate of `groups.json`: refuse any version not in `accepted` with the message every
+ * build gives. `accepted` defaults to what this build reads; a test passes an older build's list to
+ * show that build refuses what this one writes.
+ */
+export function assertReadableRulesSchema(
+  version: unknown,
+  accepted: readonly number[] = RULES_SCHEMA_VERSIONS_READ,
+): void {
+  if (typeof version === 'number' && accepted.includes(version)) return;
+  throw new VaultError(
+    `groups.json has an unsupported schemaVersion (${JSON.stringify(version)}); ` +
+      'a newer build wrote it — this one refuses to read it rather than drop the rules it holds',
+  );
 }
 
 /**
@@ -479,6 +523,27 @@ function validateRulesFile(
     if (activeId !== null && (typeof activeId !== 'string' || activeId === '')) {
       throw new VaultError(`${where} (${r.id}) activeId is not an account id or null`);
     }
+    const lease =
+      r.lease === undefined
+        ? undefined
+        : validateLease(r.lease, `${where} (${r.id})`, {
+            id: r.id,
+            folders,
+            aliases,
+            include,
+            exclude,
+            activeId,
+          });
+    // A rule named like a parallel session, scoped to nothing, without its lease: what a build that
+    // dropped the field would leave. It would hold the account reserved while applying to nothing.
+    if (
+      lease === undefined &&
+      r.id.startsWith(LEASE_RULE_PREFIX) &&
+      folders.length === 0 &&
+      aliases.length === 0
+    ) {
+      throw new VaultError(`${where} (${r.id}) is a parallel-session slot without its lease`);
+    }
     rules.push({
       id: r.id,
       label: r.label,
@@ -490,7 +555,17 @@ function validateRulesFile(
       activeId,
       createdAtMs: r.createdAtMs,
       updatedAtMs: r.updatedAtMs,
+      ...(lease !== undefined ? { lease } : {}),
     });
+  }
+  // Implied by the id rule plus the duplicate-id check, and named here so a hand edit that breaks it
+  // is refused for what it is.
+  const leased = new Set<string>();
+  for (const r of rules) {
+    if (!isLeaseRule(r)) continue;
+    const id = r.include[0]!;
+    if (leased.has(id)) throw new VaultError(`account ${id} has two parallel sessions`);
+    leased.add(id);
   }
   for (const row of reserved) {
     if (!rules.some((r) => r.include.includes(row.id))) {
@@ -511,9 +586,137 @@ function validateRulesFile(
 /** The schema tag a `groups.json` holding `rules` is written with (see
  *  {@link RULES_SCHEMA_VERSION_ALIASES}). */
 function rulesSchemaVersionFor(rules: readonly FolderRule[]): RulesFile['schemaVersion'] {
+  if (rules.some(isLeaseRule)) return RULES_SCHEMA_VERSION_LEASES;
   return rules.some((r) => (r.aliases?.length ?? 0) > 0)
     ? RULES_SCHEMA_VERSION_ALIASES
     : RULES_SCHEMA_VERSION;
+}
+
+/** The keys of a rule's `lease` object this build writes. Anything else is refused, not carried:
+ *  this build owns the whole object. */
+const LEASE_KEYS: ReadonlySet<string> = new Set(['holders', 'startedAtMs', 'restoreIndex']);
+/** The keys of one lease holder this build writes; anything else is refused. */
+const HOLDER_KEYS: ReadonlySet<string> = new Set([
+  'pid',
+  'start',
+  'host',
+  'platform',
+  'bootId',
+  'pidNs',
+  'role',
+  'parent',
+]);
+
+/** Whether a value is an integer at least `min`. */
+function isIntAtLeast(value: unknown, min: number): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= min;
+}
+
+/**
+ * Validate a rule's `lease` (a parallel-session slot), failing CLOSED like the rest of the file: a
+ * plain object of known keys with a finite start time and an optional non-negative restore index;
+ * 1 to {@link MAX_LEASE_HOLDERS} holders, each a well-formed record of a distinct process; and a
+ * rule shaped as a parallel session is (no folders or aliases, exactly one included account, nothing
+ * excluded, the id `session-<account>`, live on that account or on nothing).
+ */
+function validateLease(
+  raw: unknown,
+  where: string,
+  rule: {
+    id: string;
+    folders: readonly string[];
+    aliases: readonly StoredAliasScope[];
+    include: readonly string[];
+    exclude: readonly string[];
+    activeId: string | null;
+  },
+): SessionLease {
+  const at = `${where} lease`;
+  if (!isPlainObject(raw)) throw new VaultError(`${at} is not an object`);
+  assertNoForbiddenKeys(raw, at);
+  for (const key of Object.keys(raw)) {
+    if (!LEASE_KEYS.has(key)) throw new VaultError(`${at} has an unknown field "${key}"`);
+  }
+  if (typeof raw.startedAtMs !== 'number' || !Number.isFinite(raw.startedAtMs)) {
+    throw new VaultError(`${at} startedAtMs is not a number`);
+  }
+  if (raw.restoreIndex !== undefined && !isIntAtLeast(raw.restoreIndex, 0)) {
+    throw new VaultError(`${at} restoreIndex is not a non-negative integer`);
+  }
+  if (!Array.isArray(raw.holders)) throw new VaultError(`${at} holders is not an array`);
+  if (raw.holders.length === 0) throw new VaultError(`${at} has no holders`);
+  if (raw.holders.length > MAX_LEASE_HOLDERS) {
+    throw new VaultError(`${at} holds ${raw.holders.length} processes (max ${MAX_LEASE_HOLDERS})`);
+  }
+  const holders: LeaseHolder[] = [];
+  for (let k = 0; k < raw.holders.length; k += 1) {
+    const h = validateHolder(raw.holders[k], `${at} holders[${k}]`);
+    if (holders.some((x) => sameHolderProcess(x, h))) {
+      throw new VaultError(`${at} names process ${h.pid} twice`);
+    }
+    holders.push(h);
+  }
+  if (rule.folders.length > 0 || rule.aliases.length > 0) {
+    throw new VaultError(`${where} is a parallel-session slot with folders or aliases`);
+  }
+  if (rule.include.length !== 1 || rule.exclude.length !== 0) {
+    throw new VaultError(
+      `${where} is a parallel-session slot that does not name exactly one account`,
+    );
+  }
+  const accountId = rule.include[0]!;
+  if (rule.id !== leaseRuleId(accountId)) {
+    throw new VaultError(`${where} is a parallel-session slot whose id does not name its account`);
+  }
+  if (rule.activeId !== null && rule.activeId !== accountId) {
+    throw new VaultError(`${where} is a parallel-session slot live on another account`);
+  }
+  return {
+    holders,
+    startedAtMs: raw.startedAtMs,
+    ...(raw.restoreIndex !== undefined ? { restoreIndex: raw.restoreIndex } : {}),
+  };
+}
+
+/** Validate one lease holder record (see {@link LeaseHolder}), failing closed. */
+function validateHolder(raw: unknown, at: string): LeaseHolder {
+  if (!isPlainObject(raw)) throw new VaultError(`${at} is not an object`);
+  assertNoForbiddenKeys(raw, at);
+  for (const key of Object.keys(raw)) {
+    if (!HOLDER_KEYS.has(key)) throw new VaultError(`${at} has an unknown field "${key}"`);
+  }
+  if (!isIntAtLeast(raw.pid, 1)) throw new VaultError(`${at} pid is not a positive integer`);
+  if (!isIntAtLeast(raw.start, 0)) {
+    throw new VaultError(`${at} start is not a non-negative integer`);
+  }
+  if (typeof raw.host !== 'string' || raw.host === '' || raw.host.length > MAX_HOLDER_HOST_LENGTH) {
+    throw new VaultError(`${at} host is not a host name`);
+  }
+  if (raw.platform !== 'win32' && raw.platform !== 'linux') {
+    throw new VaultError(`${at} platform is not win32 or linux`);
+  }
+  if (raw.role !== 'launcher' && raw.role !== 'claude' && raw.role !== 'background') {
+    throw new VaultError(`${at} role is not launcher, claude or background`);
+  }
+  for (const tag of ['bootId', 'pidNs'] as const) {
+    const v = raw[tag];
+    if (v !== undefined && (typeof v !== 'string' || v.length > MAX_HOLDER_TAG_LENGTH)) {
+      throw new VaultError(`${at} ${tag} is not a short string`);
+    }
+  }
+  if (raw.parent !== undefined && !isIntAtLeast(raw.parent, 1)) {
+    throw new VaultError(`${at} parent is not a positive integer`);
+  }
+  return {
+    pid: raw.pid,
+    start: raw.start,
+    host: raw.host,
+    platform: raw.platform,
+    role: raw.role,
+    ...(typeof raw.bootId === 'string' ? { bootId: raw.bootId } : {}),
+    ...(typeof raw.pidNs === 'string' ? { pidNs: raw.pidNs } : {}),
+    ...(raw.parent !== undefined ? { parent: raw.parent } : {}),
+  };
 }
 
 /**
@@ -752,6 +955,8 @@ const RULE_KEYS: ReadonlySet<string> = new Set([
   'activeId',
   'createdAtMs',
   'updatedAtMs',
+  // Owned like `aliases`: a lease that ends must never come back from the carried-forward extras.
+  'lease',
 ]);
 
 /** Every own field of `obj` whose key is not in `owned`, copied. (Forbidden prototype keys never
@@ -1171,10 +1376,9 @@ export class Vault {
    *  written back where they were read (see {@link RulesExtras}); this build's own fields are spread
    *  last, so an unknown field can never shadow one of them. */
   private async saveRules(st: RegistryState): Promise<void> {
-    st.generation += 1;
     const file: RulesFile = {
       schemaVersion: rulesSchemaVersionFor(st.rules),
-      generation: st.generation,
+      generation: st.generation + 1,
       reserved: st.reserved,
       rules: st.rules,
     };
@@ -1196,7 +1400,17 @@ export class Vault {
           : {}),
       })),
     };
-    await atomicWriteFile(this.rulesPath(), JSON.stringify(out, null, 2));
+    const text = JSON.stringify(out, null, 2);
+    // Every reader fails closed, so a file this build could not read back would stop every command
+    // and the daemon. Run the reader on exactly what is about to be written, and refuse the write
+    // instead; the file on disk stays as it was.
+    try {
+      parseRulesFile(JSON.parse(text), this.platform);
+    } catch (err) {
+      throw new RulesWriteRefusedError(err instanceof Error ? err.message : String(err));
+    }
+    await atomicWriteFile(this.rulesPath(), text);
+    st.generation = file.generation;
   }
 
   /**
@@ -1303,8 +1517,12 @@ export class Vault {
           (firstAlias !== undefined ? `session "${firstAlias.alias}" in ${firstAlias.folder}` : ''),
       ).trim() ||
       'folder rule';
+    // A parallel session remembers where its account sat in the shared pool, when this rule is what
+    // moves it out, so ending the session puts it back in the same place.
+    const leasedIndex =
+      opts.lease === undefined ? -1 : st.shared.findIndex((a) => a.id === plan.include[0]);
     const rule: FolderRule = {
-      id: randomUUID(),
+      id: opts.lease !== undefined ? this.leaseIdFor(plan) : randomUUID(),
       label,
       folders: plan.folders,
       ...(plan.aliases.length > 0 ? { aliases: plan.aliases } : {}),
@@ -1313,6 +1531,15 @@ export class Vault {
       activeId: null,
       createdAtMs: now,
       updatedAtMs: now,
+      ...(opts.lease !== undefined
+        ? {
+            lease: {
+              holders: opts.lease.holders.slice(),
+              startedAtMs: opts.lease.startedAtMs,
+              ...(leasedIndex >= 0 ? { restoreIndex: leasedIndex } : {}),
+            },
+          }
+        : {}),
     };
     st.rules.push(rule);
     st.reserved.push(...plan.moved);
@@ -1333,6 +1560,49 @@ export class Vault {
    */
   async checkCreateRule(opts: NewRuleOptions): Promise<void> {
     this.planNewRule(await this.loadState(), opts);
+  }
+
+  /** The id of a new parallel-session rule: `session-<account>`, refused when the plan is not one
+   *  account and nothing else, or when that account already has one. */
+  private leaseIdFor(plan: {
+    folders: readonly string[];
+    aliases: readonly StoredAliasScope[];
+    include: readonly string[];
+    exclude: readonly string[];
+  }): string {
+    if (
+      plan.include.length !== 1 ||
+      plan.exclude.length > 0 ||
+      plan.folders.length > 0 ||
+      plan.aliases.length > 0
+    ) {
+      throw new VaultError('a parallel session names exactly one account and nothing else');
+    }
+    return leaseRuleId(plan.include[0]!);
+  }
+
+  /**
+   * Replace the holders of a parallel session — the one way its holder list changes. The caller
+   * computes the list in memory (see `withHolders` / `withoutHolders`). An empty list is refused
+   * ({@link LeaseHoldersEmptyError}: ending a session is {@link removeRule}), and so is one past
+   * {@link MAX_LEASE_HOLDERS} ({@link LeaseHolderCapError}), both before anything is written. A rule
+   * that is gone or no parallel session is refused by name.
+   */
+  async setLeaseHolders(ruleId: string, holders: readonly LeaseHolder[]): Promise<FolderRule> {
+    if (holders.length === 0) throw new LeaseHoldersEmptyError(ruleId);
+    if (holders.length > MAX_LEASE_HOLDERS) {
+      throw new LeaseHolderCapError(
+        `a parallel session cannot hold more than ${MAX_LEASE_HOLDERS} processes`,
+        MAX_LEASE_HOLDERS,
+      );
+    }
+    const st = await this.loadState();
+    const rule = this.mustRule(st, ruleId);
+    if (!isLeaseRule(rule)) throw new VaultError(`rule ${ruleId} is not a parallel session`);
+    rule.lease = { ...rule.lease, holders: holders.slice() };
+    rule.updatedAtMs = this.clock();
+    await this.saveRules(st);
+    return rule;
   }
 
   /** The shared validation behind {@link createRule} and {@link checkCreateRule}: throws the named
@@ -1537,7 +1807,16 @@ export class Vault {
     const rule = this.mustRule(st, ruleId);
     const released = this.releasable(st, rule, rule.include);
     if (released.length > 0) {
-      st.shared.push(...released);
+      // A parallel session's account goes back where it sat in the shared pool before the session
+      // reserved it (clamped: rows may have left since); every other released row goes last.
+      const restoreAt = isLeaseRule(rule) ? rule.lease.restoreIndex : undefined;
+      for (const row of released) {
+        if (restoreAt !== undefined && row.id === rule.include[0]) {
+          st.shared.splice(Math.min(restoreAt, st.shared.length), 0, row);
+        } else {
+          st.shared.push(row);
+        }
+      }
       await this.saveShared(st); // accounts.json FIRST
     }
     st.rules = st.rules.filter((r) => r !== rule);
