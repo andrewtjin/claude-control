@@ -63,56 +63,82 @@ cctl export <file> --move           # remove the exported accounts here once the
                                     # written and read back (asks first; --yes skips that)
 cctl import <file>                  # add what the file holds to this machine
 cctl import <file> --dry-run        # print what an import would do, and change nothing
-cctl import <file> --replace        # also replace a stored account's tokens when the file's
-                                    # are newer or the stored login is quarantined
+cctl import <file> --replace        # also take the file's tokens for a stored account when
+                                    # they are newer or the stored login is quarantined, and
+                                    # the file's settings where this machine has others
 ```
 
 The vault is sealed to the machine that wrote it (DPAPI on Windows, a local key file on
 Linux), so a copy of the vault never opens anywhere else. `cctl export` reads each account's
 credentials, seals them under a passphrase you choose (scrypt and AES-256-GCM), and writes one
 file; `cctl import` opens it and stores the accounts in this machine's vault. There is no
-plaintext mode. The passphrase comes from `--passphrase-file <file>` (its first line), else
+plaintext mode. The passphrase comes from `--passphrase-file <file>` (its first line; a file
+saved as UTF-16 or with a byte-order mark, as PowerShell writes one, reads the same), else
 `CCTL_EXPORT_PASSPHRASE`, else a prompt (asked twice on export; at least 8 characters). Use
 `-` as the file to write to standard output or read from standard input; an import from
 standard input needs the passphrase from a file or the env var. An export never overwrites an
-existing file.
+existing file, and the file it writes is readable by you alone (on a file system that keeps no
+per-user permissions, such as a FAT USB stick, the passphrase alone protects it, and the
+export says so).
 
 **A login works on one machine at a time.** Refresh tokens are single-use: once either machine
 refreshes a login, the other machine's copy stops working. Keep each account on one machine,
 either by exporting with `--move` or by removing it on the other side
 (`cctl accounts remove <account>`). Every run that carries tokens ends with this reminder.
 
-What travels: each account's label, login, email, auto-switch exclusion and (unless
-`--no-tokens`) its credentials, freshest copy first (a rotation a running session made is
-adopted before it is read); the folder and session rules, with members named by login; and the
-settings `cctl settings set` persisted. What never travels: the relay pairing, the hook
-secret, the vault key, switch recovery files, the guard snapshot, profiles, the daemon's
-database (sessions, prompts, cards) and usage history. A setting that names a path
-(`CCTL_LOG_FILE`) is left out, as is a quarantined account's dead login (the account travels
+What travels: each account's label, login, email, organization, auto-switch exclusion and
+(unless `--no-tokens`) its credentials, freshest copy first (a rotation a running session made
+is adopted before it is read); every rule a travelling account is a member of, whole, with all
+of its members named by login (a member that stays behind is found by its login if the other
+machine already has it, and left out otherwise); and the settings `cctl settings set`
+persisted. What never travels: the relay (its URL and its pairing, which belong to this
+machine), the hook secret, the vault key, switch recovery files, the guard snapshot, profiles,
+the daemon's database (sessions, prompts, cards) and usage history. A setting that names a path
+(`CCTL_LOG_FILE`) is left out, as is a quarantined account's stored login (the account travels
 and waits for a login on the other side).
 
 What an import does with each part, printed in full by `--dry-run`:
 
 - **An account whose login is already stored here** is left as it is. With `--replace` its
   tokens are replaced when the file's are newer (a later expiry) or the stored login is
-  quarantined; the account keeps its id and usage history.
+  quarantined; the account keeps its id and usage history. Tokens that do not say which login
+  they belong to never replace a stored account's, and a stored copy that cannot be read right
+  now is not replaced either (the import says so; run it again).
 - **A label already taken here by another login** gets a number, `work (2)`, the same way
   duplicate repair numbers labels.
 - **An account without tokens** is stored waiting for a login (quarantined until then); the
   output lists `cctl accounts relogin <label>` for each, and that re-login must be the same
   account.
-- **Rules** are rebuilt one rule per folder or session scope, with the same included and
-  excluded accounts. A scope is skipped, and listed, when its folder does not exist here, this
-  machine already has a rule on it, or none of its accounts came along. Folder rules are not
-  created on macOS, nor while a daemon older than this build runs (`cctl daemon restart`).
-- **Settings** are checked the way `cctl settings set` checks them and saved the same way;
-  when one changed, the output ends with `cctl daemon restart`.
+- **An account reserved to a rule that is not made here** (its folder is missing here, say) is
+  added but kept out of auto-switch, so a client's account does not end up spending its quota
+  on other work; `cctl accounts include <account>` hands it back to auto-switch.
+- **Rules** are rebuilt whole: one rule with every folder and session scope the source rule
+  had, on one slot, with the same included and excluded accounts. When this machine already has
+  a rule on exactly those scopes (an earlier import of the same file, or of another file from
+  the same machine), the accounts it lacks are added to it. A scope is left out, and listed,
+  when its folder does not exist here, is a network folder (those are never looked up from a
+  file), is a folder of another platform, or is one no rule may cover (a drive root, the home
+  folder, cctl's own folders); a scope another rule here holds is left to that rule. A rule is
+  skipped, and listed, when none of its scopes is left, none of its accounts came along, none of
+  the accounts it includes is in the file or here (with only its exclusions it would open its
+  folders to every account), it would pass the 64-rule limit, or reserving an account would
+  leave this machine's main login with no account to run on. A rule that reserves the account
+  live on this machine's main login moves that login to another shared account first, and says
+  so. Folder rules are not created on macOS, nor while a daemon older than this build runs
+  (`cctl daemon restart`).
+- **Settings** are checked the way `cctl settings set` checks them and saved the same way. A
+  setting this machine already has with another value is kept unless `--replace`. When one
+  changed, the output ends with `cctl daemon restart`; a value set in the daemon's environment
+  still wins over the saved one, and the output names any setting that is.
 
 An import is safe to run twice: everything already in place is reported as such and left
-alone. A wrong passphrase, a file changed after it was written, or one cut short is refused
-before anything is imported. `--move` refuses an account that is the live login of this
-machine's main config (switch to another account first: `cctl switch <account>`), and
-removes nothing unless the written file reads back and opens with the same passphrase.
+alone, and a run that stopped part-way is completed by the next one. A wrong passphrase, a file
+changed after it was written, or one cut short is refused before anything is imported.
+`--move` refuses an account that is the live login of this machine's main config (switch to
+another account first: `cctl switch <account>`), and removes nothing unless the written file is
+on the disk and reads back, opening with the same passphrase. It keeps an account whose tokens
+did not travel (a quarantined one), and one whose tokens changed or that became the main login
+while it asked; each is listed with why.
 
 ## Folder rules
 

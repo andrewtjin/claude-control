@@ -11,12 +11,14 @@
 // a token. Secrets exist only inside the .enc blobs, which are useless off this machine/user.
 
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { ruleSlotId } from './types.js';
 import type {
+  AccountIdentity,
   AccountView,
+  AddAccountOptions,
   CredentialBundle,
   FolderRule,
   OauthAccount,
@@ -988,6 +990,18 @@ interface RegistryState {
 
 /** Every row in the one logical registry — shared rows plus the reserved rows — as a flat list, for
  *  the checks (label uniqueness, login uniqueness) that must see the whole namespace at once. */
+/** The fields of an identity that are set, ready to spread onto a row: an absent field stays
+ *  absent rather than becoming an explicit `undefined` key. */
+function definedIdentity(identity: AccountIdentity): AccountIdentity {
+  return {
+    ...(identity.accountUuid !== undefined ? { accountUuid: identity.accountUuid } : {}),
+    ...(identity.emailAddress !== undefined ? { emailAddress: identity.emailAddress } : {}),
+    ...(identity.organizationUuid !== undefined
+      ? { organizationUuid: identity.organizationUuid }
+      : {}),
+  };
+}
+
 function allRowsOf(st: RegistryState): StoredAccount[] {
   return [...st.shared, ...st.reserved];
 }
@@ -1740,8 +1754,18 @@ export class Vault {
    * already reserved, or a label a reserved account carries, is refused here too, or the name
    * resolver could not tell the two apart. A newly added account is always shared — including it in
    * a folder rule is a separate step.
+   *
+   * `opts` is for a caller that knows more than the bundle says (an import): the auto-switch
+   * exclusion lands in this same write, so no crash or lock timeout can leave the account stored
+   * without it; and when the bundle carries no identity block at all, the identity the caller states
+   * is recorded instead, so the row can be recognized again (a second import of it is then a no-op,
+   * and the login refusal below applies to it).
    */
-  async addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
+  async addAccount(
+    label: string,
+    bundle: CredentialBundle,
+    opts: AddAccountOptions = {},
+  ): Promise<StoredAccount> {
     const st = await this.loadState();
     // Strip terminal-interpreted controls (ANSI escapes, newlines, bidi/format controls) before the
     // label is stored — it is later rendered on the CLI, in Discord, and in the enforcement guard's
@@ -1753,7 +1777,8 @@ export class Vault {
     // The same login stored twice is the other way two rows come to answer to one name (and
     // to poll one quota twice). The identity block names the login; when it names a row that
     // is already here, that row is the one to refresh, never a second copy.
-    const uuid = bundle.oauthAccount?.accountUuid;
+    const stated = bundle.oauthAccount === undefined ? opts.identity : undefined;
+    const uuid = bundle.oauthAccount?.accountUuid ?? stated?.accountUuid;
     const stored = uuid !== undefined ? allRows.find((a) => a.accountUuid === uuid) : undefined;
     if (stored) {
       throw new VaultError(
@@ -1766,6 +1791,7 @@ export class Vault {
       id: randomUUID(),
       label: next,
       quarantined: false,
+      ...(opts.autoSwitchExcluded === true ? { autoSwitchExcluded: true } : {}),
       createdAtMs: now,
       updatedAtMs: now,
     };
@@ -1775,6 +1801,7 @@ export class Vault {
     // response missing one degrades to "unknown" in the CLI rather than crashing or forcing a
     // re-login (see planWeight() / `cctl accounts list` for how absence renders).
     applyBundleMetadata(account, bundle, this.log);
+    if (stated !== undefined) Object.assign(account, definedIdentity(stated));
     // Writes the blob only — the row is not in the registry yet, so its metadata refresh is a
     // no-op here; `saveShared` below is what persists the row built above.
     await this.writeBundle(account.id, bundle);
@@ -1793,12 +1820,14 @@ export class Vault {
    *
    * The same label and login refusals as {@link addAccount} apply, across the whole registry. The
    * row is stamped with the current metadata revision: there is no bundle to recompute it from, and
-   * the first bundle write fills in the plan fields anyway.
+   * the first bundle write fills in the plan fields anyway. `opts.autoSwitchExcluded` is written in
+   * the same write, as {@link addAccount} does.
    */
   async addPendingAccount(
     label: string,
-    identity: Pick<StoredAccount, 'accountUuid' | 'emailAddress' | 'organizationUuid'>,
+    identity: AccountIdentity,
     reason: string,
+    opts: Pick<AddAccountOptions, 'autoSwitchExcluded'> = {},
   ): Promise<StoredAccount> {
     const st = await this.loadState();
     const next = sanitizeTerminalText(label).trim();
@@ -1816,11 +1845,8 @@ export class Vault {
     const account: StoredAccount = {
       id: randomUUID(),
       label: next,
-      ...(identity.accountUuid !== undefined ? { accountUuid: identity.accountUuid } : {}),
-      ...(identity.emailAddress !== undefined ? { emailAddress: identity.emailAddress } : {}),
-      ...(identity.organizationUuid !== undefined
-        ? { organizationUuid: identity.organizationUuid }
-        : {}),
+      ...definedIdentity(identity),
+      ...(opts.autoSwitchExcluded === true ? { autoSwitchExcluded: true } : {}),
       metadataRev: ACCOUNT_METADATA_REV,
       quarantined: true,
       quarantineReason: reason,
@@ -2017,6 +2043,18 @@ export class Vault {
 
   /** Decrypt and return an account's credential bundle. The token fingerprints of the blob it read
    *  are remembered on the way (see {@link readStoredTokens}), since the decrypt is already paid. */
+  /** Whether an account has an encrypted bundle on disk at all — the one fact about a stored copy
+   *  that does not need it to be readable. */
+  async hasBundle(id: string): Promise<boolean> {
+    try {
+      await stat(this.bundlePath(id));
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw err;
+    }
+  }
+
   async readBundle(id: string): Promise<CredentialBundle> {
     let blob: string;
     try {

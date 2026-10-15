@@ -359,6 +359,65 @@ export interface ReloginResult {
   healedLiveLogin: boolean;
 }
 
+/** The identity a registry row is known by, as a caller states it (an import, from its file). */
+export type AccountIdentity = Pick<
+  StoredAccount,
+  'accountUuid' | 'emailAddress' | 'organizationUuid'
+>;
+
+/** What a caller adding an account knows beyond its bundle (see `Vault.addAccount`). */
+export interface AddAccountOptions {
+  /** Store the account excluded from auto-switch, in the same write that adds it. */
+  autoSwitchExcluded?: boolean;
+  /** The identity to record when the bundle carries no identity block at all. */
+  identity?: AccountIdentity;
+}
+
+/** What a removal that follows handing an account to another machine checks first (see
+ *  `SwitchEngine.removeAccount`). */
+export interface RemoveAccountOptions {
+  /** Refuse while the account is live on this machine's main login. */
+  refuseIfGloballyLive?: boolean;
+  /** Refuse unless the vault still holds this refresh token for the account. */
+  expectRefreshToken?: string;
+}
+
+/** One rule an import asks {@link SwitchEngine.importRules} for. */
+export interface ImportRuleSpec {
+  /** Every scope of the ONE rule this makes (or adds to), as the operator would name them. */
+  scopes: RuleScopeRef[];
+  include: string[];
+  exclude: string[];
+  /** The display name of a rule this creates. */
+  label?: string;
+  /** Add the members to this rule, which holds exactly these scopes, instead of creating one. */
+  intoRuleId?: string;
+}
+
+/** What {@link SwitchEngine.importRules} did with one {@link ImportRuleSpec}. */
+export type ImportRuleOutcome =
+  | {
+      ok: true;
+      rule: FolderRule;
+      /** True when the rule was created, false when the members were added to an existing one. */
+      created: boolean;
+      /** The outcome of making the rule's slot live, or null when that failed (the rule stands). */
+      live: RuleLiveResult | null;
+      runningSessions: RunningSession[];
+    }
+  | {
+      ok: false;
+      message: string;
+      /** Set when part of the rule was written before the failure. */
+      partial?: FolderRule;
+    };
+
+/** What {@link SwitchEngine.importRules} did, rule by rule, and the slots it moved first. */
+export interface ImportRulesResult {
+  rules: ImportRuleOutcome[];
+  handedOff: SlotHandOff[];
+}
+
 /** What {@link SwitchEngine.importBundle} did with a credential bundle brought from another
  *  machine for an account already stored here. */
 export interface ImportBundleResult {
@@ -368,10 +427,10 @@ export interface ImportBundleResult {
    *  - `newer`: the brought grant was minted after the stored one (its access token expires later),
    *    so the stored refresh token is the one that has been spent.
    *  - `quarantined`: the stored login is known dead, so anything is better.
-   *  - `unreadable`: the stored bundle could not be read or decrypted here.
+   *  - `missing`: the account has no stored bundle at all here.
    *  - `stored_newer`: the copy here (after adopting any live rotation) is as new or newer, so it
    *    was kept and nothing was written. */
-  reason: 'newer' | 'quarantined' | 'unreadable' | 'stored_newer';
+  reason: 'newer' | 'quarantined' | 'missing' | 'stored_newer';
   /** True when the account was live in a slot here and the brought credentials were written there
    *  too (verified by read-back), as a re-login does. */
   healedLiveLogin: boolean;

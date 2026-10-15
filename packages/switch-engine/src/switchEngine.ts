@@ -31,6 +31,7 @@ import {
   RefreshError,
   SharedTokenError,
   SlotError,
+  SwitchEngineError,
   SwitchFailedError,
   UnknownAccountError,
   UnsettledSwitchError,
@@ -97,20 +98,26 @@ import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { ruleIdOfSlot, ruleSlotId } from './types.js';
 import type {
+  AccountIdentity,
   AccountView,
   ActivateResult,
+  AddAccountOptions,
   ClaudeOauth,
   CredentialBundle,
   ExcludeResult,
   FolderBindingSnapshot,
   FolderRule,
   ImportBundleResult,
+  ImportRuleOutcome,
+  ImportRuleSpec,
+  ImportRulesResult,
   IncludeResult,
   OauthAccount,
   PoolEntry,
   RecoverResult,
   RefreshTokenResult,
   ReloginResult,
+  RemoveAccountOptions,
   RepairResult,
   ResetResult,
   RuleLiveResult,
@@ -427,14 +434,22 @@ function describeScope(scope: RuleScopeRef): string {
     : `session "${scope.alias}" in ${scope.folder}`;
 }
 
-/** The scope fields a new rule on `scope` is created with. */
-function newRuleScope(scope: RuleScopeRef): {
+/** The scope fields a new rule on `scopes` is created with: its folders, and its session aliases
+ *  when it has any. */
+function newRuleScopes(scopes: readonly RuleScopeRef[]): {
   folders: string[];
   aliases?: { folder: string; alias: string }[];
 } {
-  return scope.kind === 'folder'
-    ? { folders: [scope.folder] }
-    : { folders: [], aliases: [{ folder: scope.folder, alias: scope.alias }] };
+  const folders = scopes.flatMap((s) => (s.kind === 'folder' ? [s.folder] : []));
+  const aliases = scopes.flatMap((s) =>
+    s.kind === 'alias' ? [{ folder: s.folder, alias: s.alias }] : [],
+  );
+  return aliases.length > 0 ? { folders, aliases } : { folders };
+}
+
+/** The scope fields a new rule on the one `scope` is created with. */
+function newRuleScope(scope: RuleScopeRef): ReturnType<typeof newRuleScopes> {
+  return newRuleScopes([scope]);
 }
 
 /** A running Claude Code session as the scope matchers see it: the canonical cwd it runs in (what
@@ -774,9 +789,15 @@ export class SwitchEngine {
     return match === null ? null : { ruleId: match.rule.id, via: match.via, folder: match.folder };
   }
 
-  addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
+  /** Store a new shared account from a bundle. `opts` carries what an import knows beyond the
+   *  bundle (see {@link Vault.addAccount}), written in the same registry write. */
+  addAccount(
+    label: string,
+    bundle: CredentialBundle,
+    opts: AddAccountOptions = {},
+  ): Promise<StoredAccount> {
     return this.withCredentialLock(async () => {
-      const account = await this.vault.addAccount(label, bundle);
+      const account = await this.vault.addAccount(label, bundle, opts);
       await this.refreshSnapshotForAccountsLocked();
       return account;
     });
@@ -816,13 +837,15 @@ export class SwitchEngine {
    */
   addPendingAccount(
     label: string,
-    identity: Pick<StoredAccount, 'accountUuid' | 'emailAddress' | 'organizationUuid'>,
+    identity: AccountIdentity,
+    opts: Pick<AddAccountOptions, 'autoSwitchExcluded'> = {},
   ): Promise<StoredAccount> {
     return this.withCredentialLock(async () => {
       const account = await this.vault.addPendingAccount(
         label,
         identity,
         'imported without tokens - log in with cctl accounts relogin',
+        opts,
       );
       await this.refreshSnapshotForAccountsLocked();
       return account;
@@ -831,15 +854,21 @@ export class SwitchEngine {
 
   /**
    * Write credentials brought from another machine over an account already stored here, but only
-   * when they are the better copy: the stored login is quarantined or unreadable, or the brought
-   * grant was minted later (its access token expires later — lifetimes are fixed per provider, so
+   * when they are the better copy: the stored login is quarantined or has no stored bundle at all,
+   * or the brought grant was minted later (its access token expires later — lifetimes are fixed per provider, so
    * expiry dates the mint, the same rule rotation adoption uses). A refresh token is single-use, so
    * of two copies of one login only the newer can still be alive.
    *
    * The comparison is against the freshest copy here: a live rotation is adopted first. The write
    * itself is a re-login's (see {@link applyReloginBundle}): the identity guard refuses a bundle
    * that names another account, the quarantine is lifted, and an account live in a slot here gets
-   * the brought credentials written there too.
+   * the brought credentials written there too, and the guard snapshot is rewritten (the brought
+   * identity can fill in fields the row lacked, such as its organization).
+   *
+   * A stored bundle that exists but cannot be read right now (a busy file, a failed decrypt) is
+   * never taken as "unreadable, so anything is better": on Windows that is often a passing failure,
+   * and writing an older copy over the newest grant would lose the only working token. The import is
+   * refused instead, naming the cause.
    */
   async importBundle(accountId: string, bundle: CredentialBundle): Promise<ImportBundleResult> {
     await this.vault.readStoredTokens().catch(() => undefined);
@@ -854,8 +883,8 @@ export class SwitchEngine {
       if (existing.quarantined) {
         reason = 'quarantined';
       } else {
-        const stored = await this.vault.readBundle(accountId).catch(() => undefined);
-        if (stored === undefined) reason = 'unreadable';
+        const stored = await this.readStoredForImport(existing);
+        if (stored === undefined) reason = 'missing';
         else if (bundle.claudeAiOauth.expiresAt > stored.claudeAiOauth.expiresAt) reason = 'newer';
         else return { replaced: false, reason: 'stored_newer', healedLiveLogin: false };
       }
@@ -866,8 +895,27 @@ export class SwitchEngine {
         liveSlot,
         bundle.oauthAccount,
       );
+      await this.refreshSnapshotForAccountsLocked();
       return { replaced: true, reason, healedLiveLogin };
     });
+  }
+
+  /** The stored bundle {@link importBundle} compares against: undefined only when the account has
+   *  no bundle on disk at all. Any other failure to read it refuses the import. Holds the lock. */
+  private async readStoredForImport(
+    existing: StoredAccount,
+  ): Promise<CredentialBundle | undefined> {
+    try {
+      return await this.vault.readBundle(existing.id);
+    } catch (err) {
+      if (!(await this.vault.hasBundle(existing.id))) return undefined;
+      throw new VaultError(
+        `could not read the tokens stored for "${existing.label}" (${errorReason(err)}), so they ` +
+          "were not compared with the file's; nothing was replaced - try again, or log it in again " +
+          `with cctl accounts relogin ${existing.label}`,
+        { cause: err },
+      );
+    }
   }
 
   /** Adopt into the vault whatever rotation the slot an account is live in holds, unless that slot
@@ -898,13 +946,22 @@ export class SwitchEngine {
    * holding its latest token) with an empty seat the rule re-fills, and a rerun completes the
    * removal. The reverse order leaves the removed login live in the profile — and when the removal
    * dissolved the rule, in a profile no slot owns, which nothing else would ever clear.
+   *
+   * `opts` is for a removal that follows handing the account to another machine (`cctl export
+   * --move`), checked under the same lock as the removal so nothing can change between check and
+   * act: `refuseIfGloballyLive` refuses while the account is the global slot's (whose live files a
+   * removal leaves in place, so the login would stay live here); `expectRefreshToken` refuses unless
+   * the vault, after adopting every rotation a rule slot holds, still has the refresh token that was
+   * handed over — a refresh since then (the daemon's poller refreshes idle accounts) spent that
+   * token, and the copy here is now the only working one.
    */
-  removeAccount(id: string): Promise<void> {
+  removeAccount(id: string, opts: RemoveAccountOptions = {}): Promise<void> {
     return this.withCredentialLock(async () => {
       // A pending switch to or from this account needs its bundle to be settled correctly; one that
       // cannot be settled yet refuses the removal.
       const untrusted = await this.settleForAccountsLocked([id]);
       const picture = await this.vault.readPicture();
+      await this.checkHandedOverLocked(id, picture, untrusted, opts);
       const reserved = picture.reserved.some((a) => a.id === id);
       const dissolving = picture.rules.filter(
         (r) =>
@@ -942,6 +999,44 @@ export class SwitchEngine {
       else await this.refreshSnapshotForAccountsLocked();
     });
   }
+  /** The `opts` checks of {@link removeAccount}, run under its lock before anything moves. */
+  private async checkHandedOverLocked(
+    id: string,
+    picture: RulesPicture,
+    untrusted: Set<SlotId>,
+    opts: RemoveAccountOptions,
+  ): Promise<void> {
+    const label = (await this.vault.getAccount(id))?.label ?? id;
+    if (opts.refuseIfGloballyLive === true) {
+      const owners = await this.possibleLiveOwners('global');
+      if (owners.has(id) || (await this.getActiveId('global')) === id) {
+        throw new RefreshError(
+          "it is the live account of this machine's main login, and removing it would leave that " +
+            'login live here; switch to another account (cctl switch <account>), then remove it ' +
+            'with cctl accounts remove',
+          'account_live',
+        );
+      }
+    }
+    if (opts.expectRefreshToken === undefined) return;
+    const stored = await this.vault.readStoredTokens();
+    for (const rule of picture.rules) {
+      const slotId = ruleSlotId(rule.id);
+      if (untrusted.has(slotId)) continue;
+      if ((await this.possibleLiveOwners(slotId, stored)).has(id)) {
+        await this.adoptSlotRotation(this.slotRuntime(slotId));
+      }
+    }
+    const now = await this.vault.readBundle(id).catch(() => undefined);
+    if (now?.claudeAiOauth.refreshToken !== opts.expectRefreshToken) {
+      throw new RefreshError(
+        'its tokens changed after they were exported (a refresh here spent the copy in the ' +
+          `file), so "${label}" is kept here, where its login still works; export it again`,
+        'tokens_changed',
+      );
+    }
+  }
+
   renameAccount(id: string, label: string): Promise<StoredAccount> {
     return this.withCredentialLock(async () => {
       const renamed = await this.vault.renameAccount(id, label);
@@ -1366,6 +1461,222 @@ export class SwitchEngine {
   //
   // No verb ever defaults an account to the one in use: every call names its accounts. A default
   // would silently reserve the account currently live, and halt every other folder using it.
+
+  /**
+   * Whether `scope` may hold a rule here, as a creating verb would canonicalize and check it (a
+   * folder that exists, is no filesystem root or home directory, and does not overlap cctl's own
+   * directories; an alias that a session title could carry). Writes nothing and takes no lock, so a
+   * plan can show the refusal a real run would meet.
+   */
+  checkRuleScope(
+    scope: RuleScopeRef,
+  ): { ok: true; scope: RuleScopeRef } | { ok: false; reason: string } {
+    try {
+      return { ok: true, scope: this.canonicalizeEditScope(scope) };
+    } catch (err) {
+      if (err instanceof SwitchEngineError) return { ok: false, reason: err.message };
+      throw err;
+    }
+  }
+
+  /**
+   * Rebuild rules brought from another machine (`cctl import`), each WHOLE: one rule per spec with
+   * every one of its scopes, or the spec's members added to the existing rule that holds exactly
+   * those scopes. Done as one batch under one lock, because the per-scope verbs, run rule after rule,
+   * cannot rebuild what the source had: each seats its slot at once, so an earlier rule's slot can
+   * take an account a later rule includes (which that include then refuses), and an exclusion the
+   * source keeps on record for an account another rule reserves can no longer be made once that
+   * reservation exists. Here, in order:
+   *   1. every spec's refusals run first (scopes, caps, the target rule still holding exactly its
+   *      scopes, an exclusion that would empty a slot sessions run in); a refused spec is reported
+   *      and the rest go on.
+   *   2. hand off every slot that holds an account some spec reserves and may not keep it — all of
+   *      them chosen together. A spec whose reservation would leave some slot with nothing is refused
+   *      (its own refusal), and the choice is made again without it.
+   *   3. write every exclusion, then every inclusion: an account a later rule reserves is still
+   *      shared while the exclusions are written, as it was on the source when they were made.
+   *   4. seat each written rule's slot, once every reservation is in place, so no slot is given an
+   *      account another rule of the batch includes.
+   *   5. write the guard snapshot LAST.
+   * Each write is one of the vault's own crash-safe writes; a run that dies part-way leaves rules a
+   * second run finds and completes (as additions to rules that already hold the scopes).
+   */
+  async importRules(specs: readonly ImportRuleSpec[]): Promise<ImportRulesResult> {
+    this.refuseRuleSlotsOnDarwin();
+    const outcomes: Array<ImportRuleOutcome | undefined> = specs.map(() => undefined);
+    const refuse = (i: number, err: unknown): void => {
+      if (!(err instanceof SwitchEngineError)) throw err;
+      outcomes[i] = { ok: false, message: err.message };
+    };
+    const scopes: RuleScopeRef[][] = specs.map((spec, i) => {
+      try {
+        return spec.scopes.map((scope) => this.canonicalizeEditScope(scope));
+      } catch (err) {
+        refuse(i, err);
+        return [];
+      }
+    });
+    const open = (i: number): boolean => outcomes[i] === undefined;
+    await this.vault.readStoredTokens().catch(() => undefined);
+    return this.withCredentialLock(async () => {
+      const allIds = [...new Set(specs.flatMap((s) => [...s.include, ...s.exclude]))];
+      await this.resolveRequested(allIds);
+      await this.settleForAccountsLocked(allIds);
+      const picture = await this.vault.readPicture();
+
+      // 1. Refusals, before anything moves.
+      for (const [i, spec] of specs.entries()) {
+        if (!open(i)) continue;
+        try {
+          await this.checkImportSpecLocked(spec, scopes[i]!, picture);
+        } catch (err) {
+          refuse(i, err);
+        }
+      }
+
+      // 2. Hand-offs, chosen for the whole batch.
+      const mayKeep = (slotId: SlotId, accountId: string): boolean =>
+        specs.some(
+          (spec, i) =>
+            open(i) &&
+            spec.intoRuleId !== undefined &&
+            ruleSlotId(spec.intoRuleId) === slotId &&
+            spec.include.includes(accountId),
+        );
+      let steps: Array<{ slotId: SlotId; from: StoredAccount; to: string }> = [];
+      for (;;) {
+        const reservingIds = new Set(specs.flatMap((spec, i) => (open(i) ? spec.include : [])));
+        const reserving = picture.shared.filter((a) => reservingIds.has(a.id));
+        const plan = await this.planHandOffLocked(reserving, picture, mayKeep);
+        if (plan.ok) {
+          steps = plan.steps;
+          break;
+        }
+        for (const [i, spec] of specs.entries()) {
+          if (open(i) && spec.include.includes(plan.from.id)) refuse(i, plan.error);
+        }
+      }
+      const handedOff = await this.executeHandOffLocked(steps);
+
+      // 3. Exclusions, then inclusions.
+      const ruleIds = specs.map((spec) => spec.intoRuleId);
+      const created = new Set<number>();
+      for (const verb of ['exclude', 'include'] as const) {
+        for (const [i, spec] of specs.entries()) {
+          const ids = spec[verb];
+          if (!open(i) || ids.length === 0) continue;
+          try {
+            const ruleId = ruleIds[i];
+            if (ruleId === undefined) {
+              const rule = await this.vault.createRule({
+                ...newRuleScopes(scopes[i]!),
+                [verb]: ids,
+                ...(spec.label !== undefined ? { label: spec.label } : {}),
+              });
+              ruleIds[i] = rule.id;
+              created.add(i);
+            } else if (verb === 'exclude') {
+              await this.vault.excludeAccounts(ruleId, ids);
+            } else {
+              await this.vault.includeAccounts(ruleId, ids);
+            }
+          } catch (err) {
+            refuse(i, err);
+            const partial = ruleIds[i] !== undefined ? await this.vault.getRule(ruleIds[i]) : null;
+            if (partial)
+              outcomes[i] = { ...(outcomes[i] as { ok: false; message: string }), partial };
+          }
+        }
+      }
+
+      // 4. Seat each written rule's slot.
+      let written = false;
+      for (const [i] of specs.entries()) {
+        const ruleId = ruleIds[i];
+        if (ruleId === undefined) continue;
+        written = true;
+        if (!open(i)) continue;
+        const rule = await this.vault.getRule(ruleId);
+        if (!rule) continue;
+        let live: RuleLiveResult | null = null;
+        try {
+          live = await this.ensureRuleLiveLocked(rule, { preferIncluded: true });
+        } catch (err) {
+          if (!(err instanceof SwitchEngineError)) throw err;
+          this.log.warn(
+            { ruleId, reason: errorReason(err) },
+            'an imported rule could not be seated',
+          );
+        }
+        outcomes[i] = {
+          ok: true,
+          rule: (await this.vault.getRule(ruleId)) ?? rule,
+          created: created.has(i),
+          live,
+          runningSessions: await this.runningSessionsInRule(rule),
+        };
+      }
+
+      // 5. The guard snapshot, last.
+      if (written || handedOff.length > 0) await this.writeSnapshotLocked();
+      return { rules: outcomes as ImportRuleOutcome[], handedOff };
+    });
+  }
+
+  /** The refusals one {@link importRules} spec meets before anything moves. Holds the lock. */
+  private async checkImportSpecLocked(
+    spec: ImportRuleSpec,
+    scopes: readonly RuleScopeRef[],
+    picture: RegistryPicture,
+  ): Promise<void> {
+    if (spec.intoRuleId === undefined) {
+      await this.vault.checkCreateRule({
+        ...newRuleScopes(scopes),
+        include: spec.include,
+        exclude: spec.exclude,
+        ...(spec.label !== undefined ? { label: spec.label } : {}),
+      });
+      return;
+    }
+    const rule = picture.rules.find((r) => r.id === spec.intoRuleId);
+    if (!rule || !this.holdsExactly(rule, scopes)) {
+      throw new VaultError('the rule here changed while the import ran; run it again');
+    }
+    await this.vault.checkInclude(rule.id, spec.include);
+    await this.vault.checkExclude(rule.id, spec.exclude);
+    const slotId = ruleSlotId(rule.id);
+    await this.requireSettledLocked(this.slotRuntime(slotId));
+    const occupancy = await this.slotOccupancy(picture);
+    const owners = occupancy.get(slotId) ?? new Set<string>();
+    const movedOff = spec.exclude.find((id) => owners.has(id));
+    if (movedOff !== undefined) {
+      const after = withRule(picture, {
+        ...rule,
+        exclude: [...new Set([...rule.exclude, ...spec.exclude])],
+      });
+      const label = (await this.vault.getAccount(movedOff))?.label ?? movedOff;
+      await this.refuseEmptyingWhileRunning(
+        rule,
+        availableInOrder(slotPool(slotId, after, occupancy)),
+        `excluding "${label}"`,
+        false,
+      );
+    }
+  }
+
+  /** Whether `rule` holds exactly `scopes` — no more, no fewer — by the store's uniqueness keys. */
+  private holdsExactly(rule: FolderRule, scopes: readonly RuleScopeRef[]): boolean {
+    const keyOf = (scope: RuleScopeRef): string =>
+      scope.kind === 'folder'
+        ? `f\u0000${folderUniquenessKey(scope.folder, this.platform)}`
+        : `a\u0000${aliasScopeUniquenessKey(scope.folder, scope.alias, this.platform)}`;
+    const have = new Set([
+      ...rule.folders.map((folder) => keyOf({ kind: 'folder', folder })),
+      ...(rule.aliases ?? []).map((a) => keyOf({ kind: 'alias', ...a })),
+    ]);
+    const want = new Set(scopes.map(keyOf));
+    return have.size === want.size && [...want].every((k) => have.has(k));
+  }
 
   /**
    * Include accounts in a folder's rule, creating the rule (and its profile and slot) when the folder
@@ -1947,7 +2258,24 @@ export class SwitchEngine {
     picture: RegistryPicture,
     ownSlot: SlotId | undefined,
   ): Promise<SlotHandOff[]> {
-    if (reserving.length === 0) return [];
+    const plan = await this.planHandOffLocked(reserving, picture, (slotId) => slotId === ownSlot);
+    if (!plan.ok) throw plan.error;
+    return this.executeHandOffLocked(plan.steps);
+  }
+
+  /** Choose every hand-off {@link handOffLocked} would make, moving nothing: each slot that holds an
+   *  account being reserved and may not keep it (`mayKeep` says which slot may keep which account),
+   *  and the account it would move to. When some slot is left with none, says which account it is
+   *  stuck on, with the refusal. */
+  private async planHandOffLocked(
+    reserving: readonly StoredAccount[],
+    picture: RegistryPicture,
+    mayKeep: (slotId: SlotId, accountId: string) => boolean,
+  ): Promise<
+    | { ok: true; steps: Array<{ slotId: SlotId; from: StoredAccount; to: string }> }
+    | { ok: false; from: StoredAccount; error: RefreshError }
+  > {
+    if (reserving.length === 0) return { ok: true, steps: [] };
     const ids = new Set(reserving.map((a) => a.id));
     const after: RulesPicture = {
       shared: picture.shared.filter((a) => !ids.has(a.id)),
@@ -1957,21 +2285,29 @@ export class SwitchEngine {
     const occupancy = await this.slotOccupancy(picture);
     const moving: Array<{ slotId: SlotId; from: StoredAccount; options: StoredAccount[] }> = [];
     for (const [slotId, owners] of occupancy) {
-      if (slotId === ownSlot) continue;
-      const from = reserving.find((a) => owners.has(a.id));
+      const from = reserving.find((a) => owners.has(a.id) && !mayKeep(slotId, a.id));
       if (from === undefined) continue;
       moving.push({ slotId, from, options: availableInOrder(slotPool(slotId, after, occupancy)) });
     }
     const assigned = assignDistinct(moving.map((m) => m.options.map((a) => a.id)));
     if (!assigned.ok) {
       const short = moving[assigned.unserved]!;
-      throw this.noReplacementError(short.slotId, short.from, picture);
+      return {
+        ok: false,
+        from: short.from,
+        error: this.noReplacementError(short.slotId, short.from, picture),
+      };
     }
-    const plan = moving.map((m, i) => ({
-      slotId: m.slotId,
-      from: m.from,
-      to: assigned.chosen[i]!,
-    }));
+    return {
+      ok: true,
+      steps: moving.map((m, i) => ({ slotId: m.slotId, from: m.from, to: assigned.chosen[i]! })),
+    };
+  }
+
+  /** Make the hand-offs {@link planHandOffLocked} chose. */
+  private async executeHandOffLocked(
+    plan: ReadonlyArray<{ slotId: SlotId; from: StoredAccount; to: string }>,
+  ): Promise<SlotHandOff[]> {
     // A slot whose switch is stuck would refuse its move only after the slots before it had moved.
     for (const step of plan) await this.requireSettledLocked(this.slotRuntime(step.slotId));
     const handedOff: SlotHandOff[] = [];

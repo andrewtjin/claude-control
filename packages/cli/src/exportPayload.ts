@@ -7,15 +7,18 @@
 // under the passphrase, but whoever knew the passphrase wrote it, so its contents are input like
 // any other, bounded and shape-checked here so the import planner can trust the types.
 //
-// Never carried: the relay pairing identity, the hook secret, the vault key, switch-recovery
-// files, token fingerprints, the guard snapshot, profiles, the daemon's database (sessions,
-// outbox, cards) and usage history. Settings that name a path are dropped too: a path on this
-// machine means nothing on another.
+// Never carried: the relay (its URL and its pairing identity: a daemon's pairing token belongs to
+// the relay that issued it, so sending it to another relay would hand that relay this machine's
+// credential), the hook secret, the vault key, switch-recovery files, token fingerprints, the
+// guard snapshot, profiles, the daemon's database (sessions, outbox, cards) and usage history.
+// Settings that name a path are dropped too: a path on this machine means nothing on another.
 
 import {
+  MAX_RULES,
   MAX_RULE_ACCOUNTS,
   MAX_RULE_ALIASES,
   MAX_RULE_FOLDERS,
+  sanitizeTerminalText,
   type AccountView,
   type ClaudeOauth,
   type CredentialBundle,
@@ -30,6 +33,9 @@ export interface ExportedAccount {
   label: string;
   accountUuid?: string;
   emailAddress?: string;
+  /** Kept for an account that travels without tokens, so its row here carries every identity
+   *  anchor a re-login is checked against. */
+  organizationUuid?: string;
   autoSwitchExcluded: boolean;
   /** Absent when the export was made with `--no-tokens`, or when the account was quarantined
    *  (its login is dead, so its tokens are worth nothing): the import then stores it as an account
@@ -53,7 +59,8 @@ export interface ExportedRule {
   exclude: string[];
 }
 
-/** The persisted daemon settings: the relay and the `env` block of config.json. */
+/** The persisted daemon settings: the `env` block of config.json. `relayUrl` is never written; a
+ *  file that carries one (an earlier build wrote it) is read, and the import leaves it out. */
 export interface ExportedSettings {
   relayUrl?: string;
   env: Record<string, string>;
@@ -70,9 +77,11 @@ export interface ExportPayload {
 }
 
 /** What {@link buildExportPayload} reads. `bundles` holds the credentials of the accounts whose
- *  tokens travel; an account missing from it travels without them. */
+ *  tokens travel; an account missing from it travels without them. `allAccounts` is every account
+ *  here, selected or not, so a rule member that stays behind can still be named. */
 export interface ExportSource {
   accounts: readonly AccountView[];
+  allAccounts: readonly AccountView[];
   bundles: ReadonlyMap<string, CredentialBundle>;
   rules: readonly FolderRule[];
   config: DaemonFileConfig | undefined;
@@ -88,29 +97,36 @@ export function memberRef(account: Pick<AccountView, 'accountUuid' | 'label'>): 
 }
 
 /**
- * Assemble the payload for `source.accounts` (already the selection to export). A rule keeps only
- * the members that travel; a rule left with no member, or with no scope, is left out, since it
- * would be refused on the other side anyway. Settings that name a path, and names this build does
- * not know, are dropped.
+ * Assemble the payload for `source.accounts` (already the selection to export). A rule travels
+ * when at least one selected account is among its members, and then with EVERY member named,
+ * selected or not: a member that stays behind may already be stored on the other machine (the
+ * import finds it there by login, or leaves it out and says so), and dropping it here would change
+ * what the rule means — a folder pinned to one account would arrive open to any. A rule with no
+ * scope is left out. Settings that name a path, names this build does not know, and the relay are
+ * dropped.
  */
 export function buildExportPayload(source: ExportSource): ExportPayload {
-  const refById = new Map(source.accounts.map((a) => [a.id, memberRef(a)]));
+  const selected = new Set(source.accounts.map((a) => a.id));
+  const refById = new Map(
+    [...source.allAccounts, ...source.accounts].map((a) => [a.id, memberRef(a)]),
+  );
   const accounts: ExportedAccount[] = source.accounts.map((a) => {
     const bundle = source.bundles.get(a.id);
     return {
       label: a.label,
       ...(a.accountUuid !== undefined ? { accountUuid: a.accountUuid } : {}),
       ...(a.emailAddress !== undefined ? { emailAddress: a.emailAddress } : {}),
+      ...(a.organizationUuid !== undefined ? { organizationUuid: a.organizationUuid } : {}),
       autoSwitchExcluded: a.autoSwitchExcluded === true,
       ...(bundle !== undefined ? { bundle } : {}),
     };
   });
   const rules: ExportedRule[] = [];
   for (const rule of source.rules) {
+    if (![...rule.include, ...rule.exclude].some((id) => selected.has(id))) continue;
     const include = rule.include.flatMap((id) => refById.get(id) ?? []);
     const exclude = rule.exclude.flatMap((id) => refById.get(id) ?? []);
     const aliases = (rule.aliases ?? []).map((a) => ({ folder: a.folder, alias: a.alias }));
-    if (include.length + exclude.length === 0) continue;
     if (rule.folders.length + aliases.length === 0) continue;
     rules.push({ label: rule.label, folders: [...rule.folders], aliases, include, exclude });
   }
@@ -120,15 +136,20 @@ export function buildExportPayload(source: ExportSource): ExportPayload {
     if (setting === undefined || setting.kind === 'path') continue;
     env[setting.name] = value;
   }
-  const relayUrl = source.config?.relayUrl;
   return {
     exportedAtMs: source.nowMs,
     cctlVersion: source.cctlVersion,
     platform: source.platform,
     accounts,
     rules,
-    settings: { ...(relayUrl !== undefined ? { relayUrl } : {}), env },
+    settings: { env },
   };
+}
+
+/** The login an entry belongs to: the uuid recorded with it, else the one its tokens name. */
+export function loginOf(entry: ExportedAccount): string | undefined {
+  const fromBundle = entry.bundle?.oauthAccount?.accountUuid;
+  return entry.accountUuid ?? (typeof fromBundle === 'string' ? fromBundle : undefined);
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +160,8 @@ export function buildExportPayload(source: ExportSource): ExportPayload {
  *  rather than walked, so a hostile file cannot make the import spend memory or time on it. */
 export const PAYLOAD_LIMITS = {
   accounts: 512,
-  rules: 256,
+  /** No machine holds more rules than this, so no real export carries more. */
+  rules: MAX_RULES,
   settings: 64,
   /** Labels, emails, uuids, aliases, setting values. */
   text: 1024,
@@ -147,9 +169,31 @@ export const PAYLOAD_LIMITS = {
   path: 4096,
   /** One token. */
   token: 16 * 1024,
-  /** Keys of an identity block (it is upstream JSON kept verbatim). */
+  /** Keys of an identity block (it is upstream JSON kept verbatim), and of any object in it. */
   identityKeys: 64,
+  /** How deep an identity block may nest (Claude Code's holds an object or two). */
+  identityDepth: 6,
+  /** Values in an identity block, counted through every level. */
+  identityValues: 1024,
 } as const;
+
+/** The platforms Node runs on: a file naming anything else was not written by cctl. */
+const PLATFORMS: ReadonlySet<string> = new Set([
+  'aix',
+  'android',
+  'cygwin',
+  'darwin',
+  'freebsd',
+  'haiku',
+  'linux',
+  'netbsd',
+  'openbsd',
+  'sunos',
+  'win32',
+]);
+
+/** The identity fields a registry row keeps and the CLI prints: they must be plain text. */
+const ANCHORS = ['accountUuid', 'emailAddress', 'organizationUuid'] as const;
 
 /** Keys that would reach an object's prototype if a payload were ever merged naively. */
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -189,6 +233,21 @@ function optStr(value: unknown, where: string): string | undefined {
   return value === undefined ? undefined : str(value, where);
 }
 
+/** A string that is printed and stored as it is (an email, a login id): no terminal control or
+ *  bidirectional character may ride in it. */
+function plainText(value: string, where: string): string {
+  if (sanitizeTerminalText(value) !== value) {
+    bad(`${where} holds a control or bidirectional character`);
+  }
+  return value;
+}
+
+/** An optional bounded string that must be plain text. */
+function optPlain(value: unknown, where: string): string | undefined {
+  const s = optStr(value, where);
+  return s === undefined ? undefined : plainText(s, where);
+}
+
 /** A bounded array. */
 function arr(value: unknown, where: string, max: number): unknown[] {
   if (!Array.isArray(value)) bad(`${where} is not a list`);
@@ -226,36 +285,57 @@ function parseOauth(value: unknown, where: string): ClaudeOauth {
   return oauth;
 }
 
-/** The identity block, kept verbatim (it is Claude Code's own JSON, and the vault preserves keys it
- *  does not know), but flat: only strings, numbers, booleans and null, so nothing nested or
- *  oversized rides along. */
+/** The identity block, kept verbatim: it is Claude Code's own JSON (which nests — its onboarding
+ *  flags are an object), and the vault preserves keys it does not know. Bounded instead: its depth,
+ *  its keys per object and its values in all, each string's length, and no key that reaches a
+ *  prototype. The anchors a row stores and the CLI prints must be plain text. */
 function parseIdentity(value: unknown, where: string): OauthAccount {
-  const o = obj(value, where);
-  const keys = Object.keys(o);
-  if (keys.length > PAYLOAD_LIMITS.identityKeys) bad(`${where} has too many fields`);
-  const out: OauthAccount = {};
-  for (const key of keys) {
-    const v = o[key];
-    if (typeof v === 'string') out[key] = str(v, `${where}.${key}`);
-    else if (v === null || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)))
-      out[key] = v;
-    else bad(`${where}.${key} is not a plain value`);
+  let budget = PAYLOAD_LIMITS.identityValues;
+  const walk = (v: unknown, at: string, depth: number): unknown => {
+    budget -= 1;
+    if (budget < 0) bad(`${where} holds too many values`);
+    if (typeof v === 'string') return str(v, at);
+    if (v === null || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)))
+      return v;
+    if (depth >= PAYLOAD_LIMITS.identityDepth) bad(`${at} is nested too deeply`);
+    if (Array.isArray(v)) {
+      return arr(v, at, PAYLOAD_LIMITS.identityKeys).map((x, i) =>
+        walk(x, `${at}[${i}]`, depth + 1),
+      );
+    }
+    if (typeof v !== 'object') bad(`${at} is not a JSON value`);
+    const o = obj(v, at);
+    const keys = Object.keys(o);
+    if (keys.length > PAYLOAD_LIMITS.identityKeys) bad(`${at} has too many fields`);
+    const out: Record<string, unknown> = {};
+    for (const key of keys) out[key] = walk(o[key], `${at}.${key}`, depth + 1);
+    return out;
+  };
+  const out = walk(obj(value, where), where, 0) as OauthAccount;
+  for (const key of ANCHORS) {
+    const v = out[key];
+    if (typeof v === 'string') plainText(v, `${where}.${key}`);
   }
   return out;
 }
 
-/** One account entry. Its identity and its bundle's identity must agree when both name a login. */
+/**
+ * One account entry. Its identity and its bundle's identity must agree: on the login when both name
+ * one, and — when neither does, so the email is all either has to go by — on the email.
+ */
 function parseAccount(value: unknown, i: number): ExportedAccount {
   const where = `accounts[${i}]`;
   const o = obj(value, where);
-  const accountUuid = optStr(o['accountUuid'], `${where}.accountUuid`);
-  const emailAddress = optStr(o['emailAddress'], `${where}.emailAddress`);
+  const accountUuid = optPlain(o['accountUuid'], `${where}.accountUuid`);
+  const emailAddress = optPlain(o['emailAddress'], `${where}.emailAddress`);
+  const organizationUuid = optPlain(o['organizationUuid'], `${where}.organizationUuid`);
   const autoSwitchExcluded = o['autoSwitchExcluded'];
   if (typeof autoSwitchExcluded !== 'boolean') bad(`${where}.autoSwitchExcluded is not true/false`);
   const account: ExportedAccount = {
     label: nonEmpty(o['label'], `${where}.label`),
     ...(accountUuid !== undefined ? { accountUuid } : {}),
     ...(emailAddress !== undefined ? { emailAddress } : {}),
+    ...(organizationUuid !== undefined ? { organizationUuid } : {}),
     autoSwitchExcluded,
   };
   if (o['bundle'] !== undefined) {
@@ -266,9 +346,16 @@ function parseAccount(value: unknown, i: number): ExportedAccount {
     if (b['oauthAccount'] !== undefined) {
       bundle.oauthAccount = parseIdentity(b['oauthAccount'], `${where}.bundle.oauthAccount`);
       const bundleUuid = bundle.oauthAccount.accountUuid;
-      if (accountUuid !== undefined && bundleUuid !== undefined && bundleUuid !== accountUuid) {
-        bad(`${where} names one login and carries the tokens of another`);
-      }
+      const bundleEmail = bundle.oauthAccount.emailAddress;
+      const otherLogin =
+        accountUuid !== undefined && typeof bundleUuid === 'string'
+          ? bundleUuid !== accountUuid
+          : accountUuid === undefined &&
+            typeof bundleUuid !== 'string' &&
+            emailAddress !== undefined &&
+            typeof bundleEmail === 'string' &&
+            bundleEmail.toLowerCase() !== emailAddress.toLowerCase();
+      if (otherLogin) bad(`${where} names one login and carries the tokens of another`);
     }
     account.bundle = bundle;
   }
@@ -280,10 +367,15 @@ function strList(value: unknown, where: string, max: number, maxLen?: number): s
   return arr(value, where, max).map((s, i) => nonEmpty(s, `${where}[${i}]`, maxLen));
 }
 
-/** One rule entry. */
+/** One rule entry. A member listed twice counts once; one both included and excluded is a rule no
+ *  vault can hold, so it is refused. */
 function parseRule(value: unknown, i: number): ExportedRule {
   const where = `rules[${i}]`;
   const o = obj(value, where);
+  const include = [...new Set(strList(o['include'], `${where}.include`, MAX_RULE_ACCOUNTS))];
+  const exclude = [...new Set(strList(o['exclude'], `${where}.exclude`, MAX_RULE_ACCOUNTS))];
+  const both = include.find((ref) => exclude.includes(ref));
+  if (both !== undefined) bad(`${where} both includes and excludes ${both}`);
   return {
     label: str(o['label'], `${where}.label`),
     folders: strList(o['folders'], `${where}.folders`, MAX_RULE_FOLDERS, PAYLOAD_LIMITS.path),
@@ -294,13 +386,14 @@ function parseRule(value: unknown, i: number): ExportedRule {
         alias: nonEmpty(scope['alias'], `${where}.aliases[${j}].alias`),
       };
     }),
-    include: strList(o['include'], `${where}.include`, MAX_RULE_ACCOUNTS),
-    exclude: strList(o['exclude'], `${where}.exclude`, MAX_RULE_ACCOUNTS),
+    include,
+    exclude,
   };
 }
 
 /** The settings entry: a relay and a flat map of strings. Which names are honored is the planner's
- *  call (it reports the ones it skips); here they only have to be strings. */
+ *  call (it reports the ones it skips); here they only have to be strings, and no setting may be
+ *  named twice (an alias and its env name, say), since only one value can be saved for it. */
 function parseSettings(value: unknown): ExportedSettings {
   const o = obj(value, 'settings');
   const relayUrl = optStr(o['relayUrl'], 'settings.relayUrl');
@@ -308,15 +401,24 @@ function parseSettings(value: unknown): ExportedSettings {
   const names = Object.keys(envRaw);
   if (names.length > PAYLOAD_LIMITS.settings) bad('settings.env has too many entries');
   const env: Record<string, string> = {};
-  for (const name of names)
+  const seen = new Set<string>();
+  for (const name of names) {
+    const canonical = findDaemonEnvSetting(name)?.name ?? name;
+    if (seen.has(canonical)) bad(`settings.env names ${sanitizeTerminalText(canonical)} twice`);
+    seen.add(canonical);
     env[str(name, 'a setting name')] = str(envRaw[name], `settings.env.${name}`);
+  }
   return { ...(relayUrl !== undefined ? { relayUrl } : {}), env };
 }
+
+/** The largest magnitude a Date can hold, in milliseconds either side of the epoch. */
+const MAX_DATE_MS = 8.64e15;
 
 /**
  * Check an opened payload and return it typed. Refuses ({@link ExportFileError} `malformed`) any
  * field of the wrong type or past its bound, an account whose identity and tokens name different
- * logins, and the same login listed twice.
+ * logins, the same login listed twice (by the uuid recorded with it or the one its tokens name),
+ * a platform no build runs on, and a date no date can hold.
  */
 export function parseExportPayload(text: string): ExportPayload {
   let raw: unknown;
@@ -326,16 +428,21 @@ export function parseExportPayload(text: string): ExportPayload {
     bad('it is not JSON');
   }
   const o = obj(raw, 'the payload');
-  const platform = str(o['platform'], 'platform') as NodeJS.Platform;
+  const platformText = str(o['platform'], 'platform');
+  if (!PLATFORMS.has(platformText)) bad('platform is not one a cctl build runs on');
+  const platform = platformText as NodeJS.Platform;
   const accounts = arr(o['accounts'], 'accounts', PAYLOAD_LIMITS.accounts).map(parseAccount);
   const seen = new Set<string>();
   for (const a of accounts) {
-    if (a.accountUuid === undefined) continue;
-    if (seen.has(a.accountUuid)) bad(`the login ${a.accountUuid} is listed twice`);
-    seen.add(a.accountUuid);
+    const login = loginOf(a);
+    if (login === undefined) continue;
+    if (seen.has(login)) bad(`the login ${sanitizeTerminalText(login)} is listed twice`);
+    seen.add(login);
   }
+  const exportedAtMs = num(o['exportedAtMs'], 'exportedAtMs');
+  if (Math.abs(exportedAtMs) > MAX_DATE_MS) bad('exportedAtMs is not a date');
   return {
-    exportedAtMs: num(o['exportedAtMs'], 'exportedAtMs'),
+    exportedAtMs,
     cctlVersion: str(o['cctlVersion'], 'cctlVersion'),
     platform,
     accounts,

@@ -7,6 +7,7 @@ import {
   ExportFileError,
   MAX_EXPORT_FILE_BYTES,
   SCRYPT_LIMITS,
+  decodeExportText,
   openExport,
   parseEnvelope,
   scryptParamsProblem,
@@ -207,5 +208,35 @@ describe('scryptParamsProblem', () => {
 
   it('refuses to seal with parameters a reader would refuse', async () => {
     await expect(sealExport('{}', PASS, { N: 2 ** 10, r: 8, p: 1 })).rejects.toThrow(/refusing/);
+  });
+});
+
+describe('files other tools touched, and the size bound', () => {
+  it('reads a file a shell wrote as UTF-16 or with a byte-order mark', () => {
+    const text = '{"a":"b"}';
+    const le = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, 'utf16le')]);
+    const be = Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(text, 'utf16le').swap16()]);
+    const bom = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(text)]);
+    for (const bytes of [le, be, bom, Buffer.from(text)])
+      expect(decodeExportText(bytes)).toBe(text);
+  });
+
+  it('checks a ciphertext of several million characters without running out of stack', async () => {
+    const env = await sealedObject();
+    const big = JSON.stringify({ ...env, ct: 'A'.repeat(4_800_000) });
+    expect(parseEnvelope(big).ct.length).toBe(4_800_000);
+  });
+
+  it('refuses to seal more than an import would read', async () => {
+    expect(await codeOf(() => sealExport('x'.repeat(MAX_EXPORT_FILE_BYTES), PASS, FAST))).toBe(
+      'too_large',
+    );
+  });
+
+  it('does not blame the passphrase alone when the key settings may have changed', async () => {
+    const env = await sealedObject();
+    await expect(
+      openExport(JSON.stringify({ ...env, kdf: { ...env.kdf, salt: flip(env.kdf.salt) } }), PASS),
+    ).rejects.toThrow('the passphrase does not open this file, or its key settings were changed');
   });
 });

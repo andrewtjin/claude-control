@@ -34,6 +34,20 @@ function acct(id: string, label: string, extra: Partial<StoredAccount> = {}): St
 }
 
 describe('renderAccountsTable', () => {
+  it('prints an email or label holding terminal controls as plain text', () => {
+    const esc = String.fromCharCode(27);
+    const out = renderAccountsTable(
+      [
+        acct('id-1', `W${esc}[31m`, {
+          emailAddress: `${esc}]52;c;AAAA${String.fromCharCode(7)}a@b.c`,
+        }),
+      ],
+      null,
+    );
+    expect(out).not.toContain(esc);
+    expect(out).toContain(']52;c;AAAAa@b.c');
+  });
+
   it('prompts to add when empty', () => {
     expect(renderAccountsTable([], null)).toMatch(/No accounts yet/);
   });

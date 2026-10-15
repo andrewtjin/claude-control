@@ -7,10 +7,12 @@
 // payload carries live refresh tokens.
 //
 // The envelope header is bound to the ciphertext as additional authenticated data, so editing any
-// header field (the version, the KDF parameters, the IV) makes the file fail its integrity check
-// rather than decrypt under different rules. Reading is defensive throughout: the file may be cut
-// short, edited, or made by someone else, and its KDF parameters decide how much memory and time a
-// decode costs, so they are bounded before any key is derived.
+// header field makes the file refuse to open rather than decrypt under different rules. A change
+// to the IV fails the integrity check; a change to a field the key is derived from (the KDF
+// parameters, the salt) or to the check value fails the passphrase check before that, since no key
+// can tell such a change from a wrong passphrase. Reading is defensive throughout: the file may be
+// cut short, edited, re-encoded by a shell, or made by someone else, and its KDF parameters decide
+// how much memory and time a decode costs, so they are bounded before any key is derived.
 
 import {
   createCipheriv,
@@ -74,8 +76,10 @@ export interface ExportEnvelope {
   cipher: 'aes-256-gcm';
   iv: string;
   /** A short MAC of a fixed label under a key derived alongside the cipher key. It tells a wrong
-   *  passphrase apart from a changed file: both fail the GCM tag, but only a wrong passphrase also
-   *  fails this. It gives a guesser nothing the GCM tag does not already give them. */
+   *  passphrase apart from a changed ciphertext, IV or tag: those fail only the GCM tag, while a
+   *  wrong passphrase fails this first. A change to the salt, the KDF parameters or this value also
+   *  fails it, and is indistinguishable from a wrong passphrase without the right key. It gives a
+   *  guesser nothing the GCM tag does not already give them. */
   check: string;
   tag: string;
   ct: string;
@@ -199,12 +203,48 @@ export async function sealExport(
     tag: cipher.getAuthTag().toString('base64'),
     ct: ct.toString('base64'),
   };
-  return JSON.stringify(envelope, null, 2) + '\n';
+  const text = JSON.stringify(envelope, null, 2) + '\n';
+  // A file the import would refuse unread is not worth writing (and, for --move, not worth
+  // removing anything for).
+  if (Buffer.byteLength(text, 'utf8') > MAX_EXPORT_FILE_BYTES) {
+    throw new ExportFileError(
+      `the export would be larger than ${MAX_EXPORT_FILE_BYTES / (1024 * 1024)} MiB, more than ` +
+        'cctl import reads; export fewer accounts at a time with --accounts',
+      'too_large',
+    );
+  }
+  return text;
 }
 
-/** Strict base64: the alphabet, whole quads, and nothing else (Buffer.from would silently skip
- *  junk, so a damaged field could decode to fewer bytes without complaint). */
-const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+/**
+ * A file's bytes as text, whatever a shell or editor did to its encoding: UTF-16 (little- or
+ * big-endian, as Windows PowerShell 5.1 writes a `>` redirect) is decoded by its byte-order mark,
+ * and a UTF-8 byte-order mark is dropped. Anything else is read as UTF-8.
+ */
+export function decodeExportText(bytes: Buffer): string {
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return bytes.subarray(2).toString('utf16le');
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+    const body = Buffer.from(bytes.subarray(2, 2 + ((bytes.length - 2) & ~1)));
+    return body.swap16().toString('utf16le');
+  }
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return bytes.subarray(3).toString('utf8');
+  }
+  return bytes.toString('utf8');
+}
+
+/** The base64 alphabet with at most two padding characters at the end. Strictness comes from this
+ *  plus a whole number of quads (see {@link isStrictBase64}); the pattern has no repeated group,
+ *  because a repeated group backtracks once per quad and overflows the regex stack on a field of a
+ *  few million characters. */
+const BASE64_CHARS = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/** Strict base64: the alphabet, whole quads, padding only at the end, and nothing else
+ *  (Buffer.from would silently skip junk, so a damaged field could decode to fewer bytes without
+ *  complaint). */
+function isStrictBase64(value: string): boolean {
+  return value.length % 4 === 0 && BASE64_CHARS.test(value);
+}
 
 /** Decode one base64 field, refusing a malformed one or one of the wrong length by name. */
 function field(
@@ -212,7 +252,7 @@ function field(
   name: string,
   bytes: { exact?: number; min?: number; max?: number },
 ): Buffer {
-  if (typeof value !== 'string' || !BASE64.test(value)) {
+  if (typeof value !== 'string' || !isStrictBase64(value)) {
     throw new ExportFileError(`the file's ${name} is not valid base64`, 'malformed');
   }
   const buf = Buffer.from(value, 'base64');
@@ -322,7 +362,10 @@ export async function openExport(text: string, passphrase: string): Promise<stri
   );
   const expected = Buffer.from(env.check, 'base64');
   if (!timingSafeEqual(checkValue(checkKey), expected)) {
-    throw new ExportFileError('the passphrase does not open this file', 'wrong_passphrase');
+    throw new ExportFileError(
+      'the passphrase does not open this file, or its key settings were changed',
+      'wrong_passphrase',
+    );
   }
   const decipher = createDecipheriv('aes-256-gcm', cipherKey, Buffer.from(env.iv, 'base64'));
   decipher.setAAD(headerAad(env));

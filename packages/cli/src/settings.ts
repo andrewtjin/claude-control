@@ -216,6 +216,9 @@ export function settableSettingsSummary(): string {
   return DAEMON_ENV_SETTINGS.map((s) => `${s.alias} (${s.name})`).join(', ');
 }
 
+/** Why a saved setting may not be the one the daemon runs with: the environment is read first. */
+export const ENV_WINS_NOTE = 'A value set in the environment still wins over the file.';
+
 /** The lines `cctl settings set` prints once the value is on disk. The assignment is the
  *  outcome, so it alone is painted (green: done, nothing further owed); the path says where to
  *  look and the caveat what to do next, and both stay plain so the eye lands on the result.
@@ -228,8 +231,7 @@ export function renderSettingSaved(
 ): string {
   return (
     `${palette.green(`Saved ${setting.name}=${value}`)} to ${filePath}.\n` +
-    'Applies when the daemon next starts: cctl daemon restart. A value set in the ' +
-    'environment still wins over the file.\n'
+    `Applies when the daemon next starts: cctl daemon restart. ${ENV_WINS_NOTE}\n`
   );
 }
 

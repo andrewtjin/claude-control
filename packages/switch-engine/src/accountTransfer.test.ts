@@ -247,3 +247,147 @@ describe('importBundle', () => {
     expect((await h.vault.readBundle(a.id)).claudeAiOauth.accessToken).toBe('A1');
   });
 });
+
+/** The engine's own vault, for a test that has to make one read of it fail. */
+function vaultOf(engine: SwitchEngine): Vault {
+  return (engine as unknown as { vault: Vault }).vault;
+}
+
+/** A real folder beside the sandbox's vault, for a rule. */
+async function ruleFolder(h: Harness, name: string): Promise<string> {
+  const dir = join(h.paths.claudeDir, '..', name);
+  await mkdir(dir, { recursive: true });
+  return dir;
+}
+
+describe('importBundle and what the stored copy says', () => {
+  it('refuses, writing nothing, when the stored copy cannot be read for a passing reason', async () => {
+    const h = await harness();
+    const a = await h.engine.addAccount('work', bundle('A2', 'u-work', NOW + 5 * HOUR));
+    const vault = vaultOf(h.engine);
+    const read = vault.readBundle.bind(vault);
+    let failNext = true;
+    vault.readBundle = (id: string) => {
+      if (failNext) {
+        failNext = false;
+        return Promise.reject(Object.assign(new Error('resource busy'), { code: 'EBUSY' }));
+      }
+      return read(id);
+    };
+    await expect(
+      h.engine.importBundle(a.id, bundle('A1', 'u-work', NOW + HOUR)),
+    ).rejects.toBeInstanceOf(VaultError);
+    expect((await h.vault.readBundle(a.id)).claudeAiOauth.accessToken).toBe('A2');
+  });
+
+  it('rewrites the guard snapshot when the brought login fills in what the row lacked', async () => {
+    const h = await harness();
+    const work = await h.engine.addAccount('work', bundle('W1', 'u-work', NOW + HOUR));
+    await h.engine.includeInFolder(await ruleFolder(h, 'proj'), [work.id]);
+    const row = await h.engine.addPendingAccount('home', { accountUuid: 'u-home' });
+    const brought = bundle('H1', 'u-home', NOW + HOUR);
+    brought.oauthAccount!.organizationUuid = 'org-home';
+    await h.engine.importBundle(row.id, brought);
+    expect((await h.engine.getGuardSnapshotFreshness()).fresh).toBe(true);
+  });
+});
+
+describe('the verbs a move uses', () => {
+  it('stores the auto-switch exclusion and a stated identity in the same write as the account', async () => {
+    const h = await harness();
+    const bare: CredentialBundle = {
+      claudeAiOauth: { accessToken: 'N1', refreshToken: 'r-N1', expiresAt: NOW + HOUR },
+    };
+    const row = await h.engine.addAccount('nb', bare, {
+      autoSwitchExcluded: true,
+      identity: { accountUuid: 'u-nb', emailAddress: 'nb@x.com' },
+    });
+    expect(row).toMatchObject({
+      accountUuid: 'u-nb',
+      emailAddress: 'nb@x.com',
+      autoSwitchExcluded: true,
+    });
+    await expect(
+      h.engine.addAccount('again', bare, { identity: { accountUuid: 'u-nb' } }),
+    ).rejects.toThrow(/already stored/);
+    const pending = await h.engine.addPendingAccount(
+      'p',
+      { accountUuid: 'u-p' },
+      { autoSwitchExcluded: true },
+    );
+    expect(pending.autoSwitchExcluded).toBe(true);
+  });
+
+  it('removes an account only while it still holds the refresh token that was handed over', async () => {
+    const h = await harness();
+    const a = await h.engine.addAccount('work', bundle('A1', 'u-work', NOW + HOUR));
+    await h.vault.writeBundle(a.id, bundle('A2', 'u-work', NOW + 2 * HOUR));
+    await expect(h.engine.removeAccount(a.id, { expectRefreshToken: 'r-A1' })).rejects.toThrow(
+      /tokens changed/,
+    );
+    expect(await h.vault.getAccount(a.id)).toBeDefined();
+    await h.engine.removeAccount(a.id, { expectRefreshToken: 'r-A2' });
+    expect(await h.vault.getAccount(a.id)).toBeUndefined();
+  });
+
+  it("refuses to remove the account live on the machine's main login when asked to", async () => {
+    const h = await harness();
+    const a = await h.engine.addAccount('work', bundle('A1', 'u-work', NOW + HOUR));
+    await h.engine.activate(a.id);
+    await expect(h.engine.removeAccount(a.id, { refuseIfGloballyLive: true })).rejects.toThrow(
+      /live account of this machine's main login/,
+    );
+    expect(await h.vault.getAccount(a.id)).toBeDefined();
+  });
+});
+
+describe('importRules', () => {
+  it('creates one rule with every scope, exclusions before inclusions, and seats it once', async () => {
+    const h = await harness();
+    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+    const y = await h.engine.addAccount('y', bundle('Y1', 'u-y', NOW + HOUR));
+    await h.engine.addAccount('z', bundle('Z1', 'u-z', NOW + HOUR));
+    const p1 = await ruleFolder(h, 'p1');
+    const p2 = await ruleFolder(h, 'p2');
+    const p3 = await ruleFolder(h, 'p3');
+    const res = await h.engine.importRules([
+      {
+        scopes: [
+          { kind: 'folder', folder: p1 },
+          { kind: 'folder', folder: p2 },
+          { kind: 'alias', folder: p1, alias: 'Job' },
+        ],
+        include: [x.id],
+        exclude: [],
+        label: 'Client',
+      },
+      // Excludes y, which the next rule reserves: kept on record, as the source keeps it.
+      { scopes: [{ kind: 'folder', folder: p3 }], include: [], exclude: [y.id] },
+      { scopes: [{ kind: 'alias', folder: p3, alias: 'Other' }], include: [y.id], exclude: [] },
+    ]);
+    expect(res.rules.map((r) => r.ok)).toEqual([true, true, true]);
+    const rules = await h.engine.listRules();
+    expect(rules).toHaveLength(3);
+    const client = rules.find((r) => r.label === 'Client')!;
+    expect(client.folders).toHaveLength(2);
+    expect(client.aliases).toHaveLength(1);
+    expect(client.activeId).toBe(x.id);
+    expect(rules.find((r) => r.folders[0] === p3)!.exclude).toEqual([y.id]);
+  });
+
+  it('refuses only the rule whose reservation would leave the main login with nothing', async () => {
+    const h = await harness();
+    const only = await h.engine.addAccount('only', bundle('O1', 'u-o', NOW + HOUR));
+    await h.engine.activate(only.id);
+    const res = await h.engine.importRules([
+      {
+        scopes: [{ kind: 'folder', folder: await ruleFolder(h, 'p1') }],
+        include: [only.id],
+        exclude: [],
+      },
+    ]);
+    expect(res.rules[0]).toMatchObject({ ok: false });
+    expect(await h.engine.listRules()).toEqual([]);
+    expect(await h.engine.getActiveId('global')).toBe(only.id);
+  });
+});

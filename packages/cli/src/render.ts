@@ -42,10 +42,12 @@ export function renderAccountsTable(
 ): string {
   if (accounts.length === 0) return 'No accounts yet. Add one with: cctl accounts add <label>';
 
+  // The label and the email are printed as stored. Neither is trusted to be plain: an email comes
+  // from a login's identity block or an import file, and a row may predate label sanitizing.
   const rows = accounts.map((a) => ({
     active: a.id === activeId ? '*' : ' ',
-    label: a.label,
-    email: a.emailAddress ?? '-',
+    label: sanitizeForTerminal(a.label),
+    email: sanitizeForTerminal(a.emailAddress ?? '-'),
     plan: planLabel(a),
     billing: billingLabel(a, nowMs),
     // Quarantine wins when both apply: it is the reason the account CANNOT be used, which
