@@ -15,13 +15,9 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { writeBindGuard } from '@claude-control/daemon';
-import {
-  aliasKey,
-  canonicalizeFolder,
-  projectDirStem,
-  type FolderRule,
-} from '@claude-control/switch-engine';
+import { canonicalizeFolder, projectDirStem, type FolderRule } from '@claude-control/switch-engine';
 import { launchSessionContext, resolveLaunchRule } from './launchRouting.js';
+import { GLOBAL_ACCOUNT, writeGuardSnapshot } from './testing/guardSnapshot.js';
 
 /** Session ids as Claude Code writes them; the last character varies per test. */
 const SID = 'aaaaaaaa-0000-4000-8000-00000000000';
@@ -56,36 +52,28 @@ interface AliasSpec {
   alias: string;
 }
 
-/** Write the guard snapshot and return the vault FolderRule[] for a set of alias-only groups. */
+/** Write the guard snapshot as the engine writes it and return the vault FolderRule[] for a set of
+ *  alias-only groups. Each excludes the shared account the global slot holds, so a session left on
+ *  the global slot is refused through the guard's real exclusion path. */
 function bindAliases(specs: AliasSpec[]): FolderRule[] {
-  writeFileSync(
-    snapshotPath,
-    JSON.stringify({
-      schemaVersion: 1,
-      generation: 1,
-      enforce: 'block',
-      mainConfigDir: canon(claudeDir),
-      groups: specs.map((s) => ({
-        id: s.groupId,
-        label: s.groupId,
-        profileDir: profiles[s.groupId]!,
-        folders: [],
-        aliases: [{ folder: s.folder, aliasKey: aliasKey(s.alias), alias: s.alias }],
-        members: [s.member],
-      })),
-    }),
-  );
-  return specs.map((s) => ({
+  const rules: FolderRule[] = specs.map((s) => ({
     id: s.groupId,
     label: s.groupId,
     include: [s.member],
-    exclude: [],
+    exclude: [GLOBAL_ACCOUNT.id],
     activeId: s.member,
     folders: [],
     aliases: [{ folder: s.folder, alias: s.alias }],
     createdAtMs: 1,
     updatedAtMs: 1,
   }));
+  writeGuardSnapshot({
+    snapshotPath,
+    mainConfigDir: canon(claudeDir),
+    rules,
+    profileDirOf: (id) => profiles[id]!,
+  });
+  return rules;
 }
 
 /** The transcript file of session `id` whose project directory is named after `dirOf`. */
@@ -204,7 +192,8 @@ describe('two transcript copies of one id (a relocation left it in two places)',
     utimesSync(boundCopy, new Date(1_000_000_000_000), new Date(1_000_000_000_000));
     utimesSync(unboundCopy, new Date(), new Date());
 
-    // The session runs in the bound folder on the shared account, and is blocked: the printed
+    // The session runs in the bound folder on the shared account its rule excludes, and is
+    // blocked: the printed
     // command names the session by id.
     const blocked = guard({ slot: 'global', projectDir: repo, title: 'X', transcript: boundCopy });
     expect(blocked.decision).toBe('block');

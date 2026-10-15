@@ -11,9 +11,9 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { realpathSync, statSync } from 'node:fs';
+import { realpathSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { SwitchEngine, type BindFs } from './switchEngine.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
@@ -430,6 +430,23 @@ describe('resolveSessionRule — the precedence rule over rules', () => {
     });
   });
 
+  it('a recorded folder spelled through a link still finds the alias rule of the folder it names', async () => {
+    // A transcript records the cwd Claude Code ran with, which can be a junction or link to the
+    // folder the alias rule stores canonically.
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const repo = await h.folder('repo');
+    const other = await h.folder('other');
+    const link = join(dirname(repo), 'repo-link');
+    symlinkSync(repo, link, 'junction');
+    await h.engine.includeInFolder(repo, [A.id]);
+    const aliasRule = await h.engine.includeInAlias(repo, 'Auth Work', [B.id]);
+    expect(await h.engine.resolveSessionRule(other, 'auth work', link)).toMatchObject({
+      ruleId: aliasRule.rule.id,
+      via: 'alias',
+    });
+  });
+
   it('an alias rule with no folder rule beside it: other sessions there run on the global slot', async () => {
     const h = await harness();
     const { A } = await seed(h);
@@ -593,7 +610,7 @@ describe('running sessions of an alias rule', () => {
 describe('checkSlots / repairSlots understand an alias-only rule', () => {
   it('evicts an account its pool does not hold from the rule slot', async () => {
     const h = await harness();
-    const { A, B } = await seed(h);
+    const { B } = await seed(h);
     const repo = await h.folder('repo');
     const created = await h.engine.excludeInAlias(repo, 'x', [B.id]);
     // B is excluded there; plant it in the slot.
@@ -601,9 +618,8 @@ describe('checkSlots / repairSlots understand an alias-only rule', () => {
 
     expect((await h.engine.checkSlots()).length).toBeGreaterThan(0);
     await h.engine.repairSlots();
-    expect(await liveIn(h, created.rule.id)).not.toBe('B');
-    expect(await liveIn(h, created.rule.id)).toBeDefined();
-    expect(A.id).not.toBe(B.id);
+    // The slot now holds an account its pool does (the shared pool less B).
+    expect(['A', 'C', 'D']).toContain(await liveIn(h, created.rule.id));
     await expectOneSlotPerAccount(h.engine);
   });
 });
@@ -750,6 +766,24 @@ describe('alias scopes in the vault', () => {
     await expect(
       h.vault.removeAliasFromRule(created.id, { folder: repo, alias: 'Auth Work' }),
     ).rejects.toThrow('is not in folder rule');
+  });
+
+  it('resetting one scope of a rule holding a folder and an alias removes only that scope', async () => {
+    // Only a hand edit puts both kinds of scope in one rule, and the vault loads it as valid.
+    const h = await harness();
+    const { A } = await seed(h);
+    const repo = await h.folder('repo');
+    const other = await h.folder('other');
+    const created = await h.vault.createRule({
+      folders: [repo],
+      aliases: [{ folder: other, alias: 'x' }],
+      include: [A.id],
+    });
+    await expect(h.engine.resetAlias(other, 'x')).resolves.toMatchObject({ dissolved: false });
+    const [kept] = await h.engine.listRules();
+    expect(kept).toMatchObject({ id: created.id, folders: [repo], include: [A.id] });
+    expect(kept?.aliases).toBeUndefined();
+    expect(await ruleIdsOf(h, A.id)).toEqual([created.id]);
   });
 
   it('refuses removing the last scope of an alias-only rule (removing the rule is separate)', async () => {

@@ -34,13 +34,13 @@ import { basename, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { writeBindGuard } from '@claude-control/daemon';
 import {
-  aliasKey,
   canonicalizeFolder,
   projectDirStem,
   shellQuoteArg,
   type FolderRule,
 } from '@claude-control/switch-engine';
 import { launchSessionContext, resolveLaunchRule } from './launchRouting.js';
+import { GLOBAL_ACCOUNT, writeGuardSnapshot } from './testing/guardSnapshot.js';
 
 /** Session ids as Claude Code writes them; the last character varies per test. */
 const SID = 'aaaaaaaa-0000-4000-8000-00000000000';
@@ -68,33 +68,16 @@ function dir(...parts: string[]): string {
   return canon(p);
 }
 
-/** One alias-only group "A" holding (folder, alias): the vault's view and the guard's snapshot. */
-function bindAlias(folder: string, alias: string): FolderRule[] {
-  writeFileSync(
-    snapshotPath,
-    JSON.stringify({
-      schemaVersion: 1,
-      generation: 1,
-      enforce: 'block',
-      mainConfigDir: canon(claudeDir),
-      groups: [
-        {
-          id: 'A',
-          label: 'A',
-          profileDir: profileA,
-          folders: [],
-          aliases: [{ folder, aliasKey: aliasKey(alias), alias }],
-          members: ['alpha'],
-        },
-      ],
-    }),
-  );
-  return [
+/** One alias-only group "A" holding (folder, alias): the vault's view, and the guard's snapshot as
+ *  the engine writes it. The rule excludes the shared account the global slot holds, so a session
+ *  left on the global slot is refused through the guard's real exclusion path. */
+function bindAlias(folder: string, alias: string, exclude = [GLOBAL_ACCOUNT.id]): FolderRule[] {
+  const rules: FolderRule[] = [
     {
       id: 'A',
       label: 'A',
       include: ['alpha'],
-      exclude: [],
+      exclude,
       activeId: 'alpha',
       folders: [],
       aliases: [{ folder, alias }],
@@ -102,6 +85,13 @@ function bindAlias(folder: string, alias: string): FolderRule[] {
       updatedAtMs: 1,
     },
   ];
+  writeGuardSnapshot({
+    snapshotPath,
+    mainConfigDir: canon(claudeDir),
+    rules,
+    profileDirOf: () => profileA,
+  });
+  return rules;
 }
 
 /** The transcript file of session `id` whose project directory is named after `dirOf`. */
@@ -211,7 +201,7 @@ function guard(opts: {
   return r.stdout === '' ? {} : (JSON.parse(r.stdout) as Record<string, string>);
 }
 
-/** The argv of the resume command a block reason prints (PowerShell or POSIX single quotes). */
+/** The argv of the resume command a block reason (or an accept notice) prints (PowerShell or POSIX single quotes). */
 function hintArgs(reason: string | undefined): string[] {
   const m = /cctl claude --resume (.*)$/.exec(reason ?? '');
   if (m === null) throw new Error(`no resume command in: ${reason}`);
@@ -354,7 +344,8 @@ describe('relocations: Claude Code moves the transcript, and the launcher and th
     }
     // Resumed from the worktree itself, the same.
     expect(await launch(wt, ['--resume', id], groups, worktrees)).toBe('A');
-    // On the shared account it is held to its binding, and the printed command routes it.
+    // On the shared account, which its rule excludes, it is refused, and the printed command
+    // routes it.
     const onShared = guard({
       slot: 'global',
       projectDir: repo,
@@ -363,6 +354,7 @@ describe('relocations: Claude Code moves the transcript, and the launcher and th
       transcript: file,
     });
     expect(onShared.decision).toBe('block');
+    expect(onShared.reason).toContain('excludes personal');
     expect(hintArgs(onShared.reason)).toEqual(['--resume', id]);
     expect(await launch(repo, hintArgs(onShared.reason), groups, worktrees)).toBe('A');
   });
@@ -668,6 +660,17 @@ describe('a bound session started by -p or the SDK', () => {
 });
 
 describe('controls: the same shapes without the trigger', () => {
+  it('on a shared account its rule does not exclude: accepted once with a notice whose command routes it', async () => {
+    const repo = dir('repo');
+    const groups = bindAlias(repo, 'Small', []);
+    const file = ccTranscript(repo, `${SID}0`, { title: 'Small' });
+    const onShared = guard({ slot: 'global', projectDir: repo, title: 'Small', transcript: file });
+    expect(onShared.decision).toBeUndefined();
+    expect(onShared.systemMessage).toContain('also accepts');
+    expect(hintArgs(onShared.systemMessage)).toEqual(['--resume', `${SID}0`]);
+    expect(await launch(repo, hintArgs(onShared.systemMessage), groups)).toBe('A');
+  });
+
   it('a small first prompt: routed to the bound account, allowed there, blocked on the shared one', async () => {
     const repo = dir('repo');
     const groups = bindAlias(repo, 'Small');

@@ -556,9 +556,23 @@ function bindingLines(b: SessionBindingView, sessionId: string, palette: Palette
       ? `${who}  by its alias "${sanitizeForTerminal(b.alias ?? '')}" in ${sanitizeForTerminal(b.folder ?? '')}`
       : b.via === 'folder'
         ? `${who}  by its folder ${sanitizeForTerminal(b.folder ?? '')}`
-        : 'none: it runs on the global slot and the shared pool';
+        : 'none: it belongs on the global slot and the shared pool';
   const out = [`Rule      ${rule}`];
-  if (b.via === null) return out;
+  if (b.via === null) {
+    // No rule applies, yet it may still sit on a rule's slot (renamed away from its alias, launched
+    // with --account, or its rule reset while it ran): the guard refuses that slot, so say where it
+    // is and how to leave it.
+    if (b.inScope === false && b.slot !== null && b.slot !== 'global') {
+      const on = sanitizeForTerminal(b.slotLabel ?? b.slot);
+      out.push(
+        palette.yellow(
+          `Slot      NOT the global slot: it ${b.slotSource === 'env' ? 'runs' : 'last ran'} on ${on}; ` +
+            'start it again with: cctl claude',
+        ),
+      );
+    }
+    return out;
+  }
   const fix =
     b.via === 'alias'
       ? `resume it with: ${resumeSessionCommand(sessionId, b.alias ?? '')}`

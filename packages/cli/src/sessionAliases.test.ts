@@ -11,6 +11,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
+import { realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store, projectDirStem } from '@claude-control/daemon';
@@ -232,6 +233,18 @@ interface JsonOut {
   sessions: JsonSession[];
 }
 
+/** A session named "linked" recorded in a real folder (Claude Code records the resolved path), and
+ *  a junction to that folder. */
+async function linkedSession(): Promise<{ link: string; id: string }> {
+  const id = 'dddddddd-0000-4000-8000-000000000001';
+  await mkdir(join(root, 'target'), { recursive: true });
+  const target = realpathSync.native(join(root, 'target'));
+  const link = join(root, 'link');
+  symlinkSync(target, link, 'junction');
+  await writeSession(target, id, [userLine(target, T0), customTitle('linked')], T0 + HOUR);
+  return { link, id };
+}
+
 /** A session's per-account use as [label, turns, tokens] triples, in first-use order. */
 const uses = (s: JsonSession | undefined) => s?.accounts.map((a) => [a.label, a.turns, a.tokens]);
 
@@ -335,6 +348,22 @@ describe('runSessionShow', () => {
     const h = harness();
     await runSessionShow('away-only', { cwd: away, json: true }, h.deps);
     expect(h.json()).toMatchObject({ matchedBy: 'alias', inScope: true });
+  });
+
+  it('takes a relative --cwd against the current directory', async () => {
+    const h = harness({ cwd: root });
+    await runSessionShow('away-only', { cwd: 'elsewhere', json: true }, h.deps);
+    expect(h.json()).toMatchObject({ matchedBy: 'alias', inScope: true });
+    expect(h.notes.join('\n')).not.toContain('Searching every project');
+  });
+
+  it('follows a --cwd junction to the folder it points at', async () => {
+    const { link, id } = await linkedSession();
+    const h = harness();
+    await runSessionShow('linked', { cwd: link, json: true }, h.deps);
+    const out = h.json();
+    expect(out).toMatchObject({ matchedBy: 'alias', inScope: true });
+    expect(out.sessions.map((x) => x.sessionId)).toEqual([id]);
   });
 
   describe('an alias used in several other folders', () => {
@@ -448,6 +477,19 @@ describe('runSessionAliases', () => {
     const h = harness();
     await runSessionAliases({ cwd: away, json: true }, h.deps);
     expect(h.json().sessions.map((s) => s.sessionId)).toEqual([S_AWAY]);
+  });
+
+  it('lists a relative --cwd taken against the current directory', async () => {
+    const h = harness({ cwd: root });
+    await runSessionAliases({ cwd: 'elsewhere', json: true }, h.deps);
+    expect(h.json().sessions.map((s) => s.sessionId)).toEqual([S_AWAY]);
+  });
+
+  it('lists the folder a --cwd junction points at', async () => {
+    const { link, id } = await linkedSession();
+    const h = harness();
+    await runSessionAliases({ cwd: link, json: true }, h.deps);
+    expect(h.json().sessions.map((s) => s.sessionId)).toEqual([id]);
   });
 
   it('renders a table in text mode, and a hint for a folder with no named sessions', async () => {

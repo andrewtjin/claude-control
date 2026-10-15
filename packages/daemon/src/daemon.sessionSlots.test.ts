@@ -572,6 +572,71 @@ describe('Daemon: a managed spawn that resumes a NAMED session follows its alias
   });
 });
 
+describe('Daemon: an explicit shared account resuming a NAMED session follows its alias rule', () => {
+  const SDK_ID = '11111111-2222-4333-8444-555555555555';
+
+  /** Spawn the resume of session "Auth Work" (recorded in the ruled folder) on the shared account
+   *  acct-y, live in the given rule slot. Resolves with the config dirs spawned on and the error
+   *  answered, if any. */
+  async function spawnSharedResuming(liveIn: 'g1' | 'g2'): Promise<{
+    captured: Array<string | undefined>;
+    error: string | undefined;
+  }> {
+    const boundFolder = await sandbox();
+    const base = aliasAwareEngine(boundFolder);
+    const engine: GroupEngine = {
+      ...base,
+      getActiveId: (slot: SlotId = 'global'): Promise<string | null> =>
+        slot === ruleSlotId(liveIn) ? Promise.resolve('acct-y') : base.getActiveId(slot),
+      configDirForSlot: (slot: SlotId): string | undefined =>
+        slot === ruleSlotId('g2') ? ALIAS_PROFILE_DIR : base.configDirForSlot!(slot),
+    };
+    const captured: Array<string | undefined> = [];
+    harness = await createHarness({
+      switchEngine: engine,
+      createAgentSdkClient: (configDir?: string): AgentSdkClient => {
+        captured.push(configDir);
+        return scriptedAgentSdkClient([]);
+      },
+      sessionIdentityOf: () => Promise.resolve({ customTitle: 'Auth Work', folder: boundFolder }),
+    });
+    await harness.daemon.start();
+    const sent = harness.relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: {
+        requestId: 'r1',
+        prompt: 'go on',
+        idempotencyKey: 's1',
+        cwd: boundFolder,
+        accountId: 'acct-y',
+        resumeSessionId: SDK_ID,
+      },
+    });
+    await waitFor(
+      () =>
+        harness!.store.getSession('spawned-session') !== undefined ||
+        harness!.sent.some((e) => e.type === 'error' && e.payload.relatesTo === sent.id),
+    );
+    const err = harness.sent.find((e) => e.type === 'error' && e.payload.relatesTo === sent.id);
+    return { captured, error: err?.type === 'error' ? err.payload.message : undefined };
+  }
+
+  it('live in the alias rule slot: spawned there', async () => {
+    const res = await spawnSharedResuming('g2');
+    expect(res.error).toBeUndefined();
+    expect(res.captured).toEqual([ALIAS_PROFILE_DIR]);
+    expect(harness!.store.getSession('spawned-session')?.slot).toBe(ruleSlotId('g2'));
+  });
+
+  it('live only in the folder rule slot: refused, never spawned where the guard refuses it', async () => {
+    const res = await spawnSharedResuming('g1');
+    expect(res.captured).toEqual([]);
+    expect(res.error).toMatch(/slot of this session's rule/);
+    expect(harness!.store.getSession('spawned-session')).toBeUndefined();
+  });
+});
+
 /** A session manager that mints a distinct id per spawn (`sess-1`, `sess-2`, …) so two managed
  *  sessions can coexist — the shared fake reuses one id, which cannot express this case. */
 function mintingSessionManager(): SessionManager & { handles: Map<string, SessionHandle> } {

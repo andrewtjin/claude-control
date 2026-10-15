@@ -162,7 +162,7 @@ function customTitleOf(meta: SessionMeta): string | null {
 async function withBindings(
   deps: SessionAliasDeps,
   read: AccountsRead,
-  folder: string,
+  folder: LookupFolder,
 ): Promise<SessionView[]> {
   if (read.views.length === 0) return read.views;
   const engine = deps.engine ?? buildEngine(deps.paths);
@@ -186,11 +186,8 @@ async function withBindings(
   return read.views.map((view) => {
     const m = view.meta;
     const title = customTitleOf(m);
-    const lookupFolder = canonicalOrRaw(folder, deps);
-    const recorded = recordedFolderFor(
-      { folder: m.folder, dirName: m.projectDir },
-      { spelled: folder, canonical: lookupFolder },
-      (f) => canonicalOrRaw(f, deps),
+    const recorded = recordedFolderFor({ folder: m.folder, dirName: m.projectDir }, folder, (f) =>
+      canonicalOrRaw(f, deps),
     );
     const required =
       recorded === null ? null : resolveSessionRule(recorded, title, rules, deps.platform);
@@ -237,13 +234,39 @@ export function canonicalOrRaw(
   return r.ok ? r.path : folder;
 }
 
+/** The folder a lookup is about, as given (made absolute against the current directory) and
+ *  canonical (realpath when it exists). */
+interface LookupFolder {
+  spelled: string;
+  canonical: string;
+}
+
+/**
+ * The folder `--cwd` names, or the current directory: a relative path is taken against the current
+ * directory, and a junction or link is resolved, as every other folder input is. Both spellings are
+ * kept, since Claude Code may have named a project directory after either. Fails on a path with no
+ * canonical form, rather than silently looking in another folder.
+ */
+function lookupFolderOf(cwdOpt: string | undefined, deps: SessionAliasDeps): LookupFolder {
+  const input = cwdOpt ?? deps.cwd;
+  const spelled = canonicalizeFolder(input, { platform: deps.platform, cwd: deps.cwd });
+  if (!spelled.ok) fail(`cannot use folder "${sanitizeForTerminal(input)}": ${spelled.reason}`);
+  return { spelled: spelled.path, canonical: canonicalOrRaw(spelled.path, deps) };
+}
+
+/** Whether project directory `name` can hold sessions launched in `folder`, by either spelling. */
+function projectDirMatchesFolder(name: string, folder: LookupFolder): boolean {
+  return projectDirMatches(name, folder.canonical) || projectDirMatches(name, folder.spelled);
+}
+
 /** `cctl session show [ref]`. */
 export async function runSessionShow(
   ref: string | undefined,
   options: SessionShowOptions,
   deps: SessionAliasDeps,
 ): Promise<void> {
-  const folder = options.cwd ?? deps.cwd;
+  const lookup = lookupFolderOf(options.cwd, deps);
+  const folder = lookup.canonical;
   const target = ref ?? deps.env[SESSION_ID_ENV];
   if (target === undefined || target.trim() === '') {
     fail(
@@ -267,7 +290,7 @@ export async function runSessionShow(
   if (resolution.kind === 'none') {
     const inScope = await readSessionCatalog({
       claudeDir: deps.paths.claudeDir,
-      projectDirFilter: (name) => projectDirMatches(name, folder),
+      projectDirFilter: (name) => projectDirMatchesFolder(name, lookup),
     });
     resolution = resolveSessionRef(inScope.sessions, target, folder, deps.platform);
   }
@@ -307,7 +330,7 @@ export async function runSessionShow(
   }
 
   const sessions = resolution.kind === 'id' ? [resolution.session] : resolution.sessions;
-  const views = await withBindings(deps, await withAccounts(deps, sessions), folder);
+  const views = await withBindings(deps, await withAccounts(deps, sessions), lookup);
   const context = {
     matchedBy: resolution.kind,
     ...(resolution.kind === 'alias' ? { inScope: resolution.inScope } : {}),
@@ -327,12 +350,13 @@ export async function runSessionAliases(
   options: SessionAliasesOptions,
   deps: SessionAliasDeps,
 ): Promise<void> {
-  const folder = options.all === true ? null : (options.cwd ?? deps.cwd);
+  const lookup = options.all === true ? null : lookupFolderOf(options.cwd, deps);
+  const folder = lookup === null ? null : lookup.canonical;
   if (folder === null) deps.note(`Reading every project under ${deps.paths.claudeDir} ...`);
   const catalog = await readSessionCatalog({
     claudeDir: deps.paths.claudeDir,
-    ...(folder !== null
-      ? { projectDirFilter: (name: string) => projectDirMatches(name, folder) }
+    ...(lookup !== null
+      ? { projectDirFilter: (name: string) => projectDirMatchesFolder(name, lookup) }
       : {}),
   });
   const sessions = aliasedSessions(catalog.sessions, folder, deps.platform).filter(

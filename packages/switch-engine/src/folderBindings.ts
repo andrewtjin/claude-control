@@ -96,9 +96,11 @@ export function buildFolderBindingSnapshot(input: BuildSnapshotInput): FolderBin
   const labelOf = (id: string): string | undefined =>
     input.reserved.find((a) => a.id === id)?.label;
   const groups: FolderBindingSnapshotGroup[] = input.rules.map((r) => {
-    // Each alias scope as its canonical folder and comparison key plus the alias as entered, which
-    // the guard only ever shows. Written only when the rule has one, so a snapshot without alias
-    // rules keeps the shape older guards read.
+    // The rule's folders in their canonical spelling, as the launcher and `where` match them, so a
+    // hand-edited spelling cannot route a session onto a slot the guard then refuses. Each alias
+    // scope as its canonical folder and comparison key plus the alias as entered, which the guard
+    // only ever shows. Written only when the rule has one, so a snapshot without alias rules keeps
+    // the shape older guards read.
     const scoped = scopedRuleOf(r, input.platform);
     const stored = r.aliases ?? [];
     const aliases = (scoped.aliases ?? []).map((a, i) => ({
@@ -110,7 +112,7 @@ export function buildFolderBindingSnapshot(input: BuildSnapshotInput): FolderBin
       id: r.id,
       label: r.label,
       profileDir: input.profileDirOf(r.id),
-      folders: r.folders.slice(),
+      folders: scoped.folders.slice(),
       members: r.include.map(labelOf).filter((l): l is string => l !== undefined),
       excluded: r.exclude
         .map((id) => input.shared.find((a) => a.id === id))

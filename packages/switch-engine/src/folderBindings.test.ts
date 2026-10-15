@@ -10,6 +10,8 @@ import {
   readFolderBindingSnapshot,
   snapshotIdentityKey,
 } from './folderBindings.js';
+import { resolveFolderRule, resolveSessionRule } from './folderRules.js';
+import { resolveSessionBinding } from './folderPath.js';
 import { folderBindingsPath, groupProfileDir } from './paths.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { VaultError } from './errors.js';
@@ -397,6 +399,38 @@ describe('buildFolderBindingSnapshot — session alias rules', () => {
     const older = structuredClone(now);
     for (const g of older.groups) delete g.aliases;
     expect(folderBindingSnapshotContentEqual(now, older)).toBe(true);
+  });
+});
+
+describe('a hand-edited folder spelling', () => {
+  // groups.json is operator-editable and its loader accepts any spelling of a folder, so the
+  // launcher, `where`, the daemon and the guard must all compare the one canonical spelling.
+  const handEdited = (): FolderRule => rule('r1', ['m1'], [], ['C:/work/']);
+  const snapshotOf = (rules: FolderRule[]) =>
+    buildFolderBindingSnapshot({
+      shared: [],
+      rules,
+      reserved: [row('m1', 'A')],
+      generation: 1,
+      enforce: 'block',
+      mainConfigDir: 'C:\\main',
+      mainIdentityFile: ID_FILE,
+      profileDirOf: (id) => `C:\\profiles\\${id}`,
+      platform: 'win32',
+    });
+
+  it('is written to the guard snapshot canonically', () => {
+    expect(snapshotOf([handEdited()]).groups[0]?.folders).toEqual(['C:\\work']);
+  });
+
+  it('routes the same rule for the launcher, `where` and the guard', () => {
+    const rules = [handEdited()];
+    const guardRows = snapshotOf(rules).groups;
+    for (const folder of ['C:\\work', 'C:\\work\\sub']) {
+      expect(resolveSessionRule(folder, null, rules, 'win32')?.rule.id).toBe('r1');
+      expect(resolveFolderRule(folder, rules, 'win32')?.rule.id).toBe('r1');
+      expect(resolveSessionBinding(folder, null, guardRows, 'win32')?.groupId).toBe('r1');
+    }
   });
 });
 

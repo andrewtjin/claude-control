@@ -23,6 +23,7 @@ import {
   exactFolderRule,
   folderBindingsPath,
   folderKey,
+  folderUniquenessKey,
   profilesRoot,
   resolveAccountRef,
   recordedFolderFor,
@@ -1098,9 +1099,19 @@ export function buildFolderCommands(program: Command): void {
               ...profileOf(vscodeProfileNames(picture.rules).get(match.rule.id)),
             };
       const aliases = whereAliasViews(canonical, picture);
+      const elsewhere =
+        folderArg !== undefined &&
+        folderUniquenessKey(canonical, process.platform) !==
+          folderUniquenessKey(canonicalizeCliFolder(process.cwd()), process.platform);
       process.stdout.write(
         renderWhere(
-          { folder: canonical, rule, global, ...(aliases.length > 0 ? { aliases } : {}) },
+          {
+            folder: canonical,
+            rule,
+            global,
+            ...(aliases.length > 0 ? { aliases } : {}),
+            ...(elsewhere ? { elsewhere } : {}),
+          },
           detectPalette(),
         ) + '\n',
       );
@@ -1155,19 +1166,22 @@ export function buildFolderCommands(program: Command): void {
  * systemMessage in a headless (`-p` / SDK) run, where the guard warning would otherwise be invisible;
  * this line is the reliable signal in every mode. It names the actual session cwd, where the
  * relaxation applies, rather than the account's own folder. Both inputs pass sanitizeForTerminal
- * at this sink so a crafted label/path cannot inject terminal control sequences.
+ * at this sink so a crafted label/path cannot inject terminal control sequences. `reservedTo` words
+ * an --account launch the way the guard's own notice does: an account whose rule holds a session
+ * alias is reserved to its rule, one whose rule holds only folders to its folders.
  */
 export function relaxationBannerLine(
   kind: 'override' | 'explicit',
   label: string,
   cwd: string,
+  reservedTo: 'folders' | 'rule' = 'folders',
 ): string {
   const safeLabel = sanitizeForTerminal(label);
   const safeCwd = sanitizeForTerminal(cwd);
   return kind === 'override'
     ? `cctl: --override in effect: allowing ${safeLabel} in ${safeCwd}, whose folder rule runs ` +
         `on a different slot.\n`
-    : `cctl: --account in effect: ${safeLabel} is reserved to its folders; running it in ` +
+    : `cctl: --account in effect: ${safeLabel} is reserved to its ${reservedTo}; running it in ` +
         `${safeCwd} on purpose.\n`;
 }
 
@@ -1545,6 +1559,8 @@ async function runClaude(opts: {
 
   let slot: LaunchSlot;
   let explicit = false;
+  // What an explicit reserved account is reserved to, for the --account banner.
+  let reservedTo: 'folders' | 'rule' = 'folders';
 
   if (opts.account !== undefined) {
     explicit = true;
@@ -1583,30 +1599,40 @@ async function runClaude(opts: {
         label: acct.label,
         context: `explicit account, ${describeRuleScopes(rule)}`,
       };
+      reservedTo = (rule.aliases?.length ?? 0) > 0 ? 'rule' : 'folders';
     } else {
-      // A shared account runs where it is already live: the global slot, or the slot of this
-      // folder's rule when it is live there (the folder's fallback, or a folder that excludes the
-      // global account). A launch never switches a slot out from under the sessions on it, so
-      // anywhere else --account of a shared account is refused.
+      // A shared account runs where it is already live: the global slot, or the slot of the rule
+      // this launch runs under when it is live there (the rule's fallback, or a rule that excludes
+      // the global account). That rule is the one the guard will require: THE precedence rule over
+      // the session the arguments open, so a named session's alias rule outranks the folder's. A
+      // launch never switches a slot out from under the sessions on it, so anywhere else --account
+      // of a shared account is refused.
       const globalLive = await engine.getActiveId('global');
-      const match = resolveFolderRule(
-        canonicalizeCliFolder(process.cwd()),
-        await engine.listRules(),
-        platform,
-      );
+      const { match, alias } =
+        acct.id === globalLive ? { match: null, alias: null } : await launchRule();
       const liveHere =
         match !== null && (await engine.liveSlots()).get(ruleSlotId(match.rule.id)) === acct.id;
       if (acct.id === globalLive) {
         slot = { kind: 'global', label: acct.label, context: 'global (shared account)' };
       } else if (match !== null && liveHere) {
-        // The folder's own slot on the account it holds: no relaxation is involved.
+        // The rule's own slot on the account it holds: no relaxation is involved.
         explicit = false;
         slot = {
           kind: 'group',
           profileDir: ruleProfilePath(paths.vaultDir, match.rule.id),
           label: acct.label,
-          context: `${match.folder} folder rule`,
+          context:
+            match.via === 'alias'
+              ? `session "${alias ?? ''}" in ${match.folder} rule`
+              : `${match.folder} folder rule`,
         };
+      } else if (match !== null && match.via === 'alias') {
+        // No command switches an alias rule's slot to a chosen account; without --account the
+        // launch runs on whichever account that slot holds.
+        fail(
+          `${acct.label} is a shared account live neither in the global slot nor in the slot of ` +
+            `session "${sanitizeForTerminal(alias ?? '')}"'s rule. Omit --account to run it on that rule's account.`,
+        );
       } else {
         fail(
           `${acct.label} is a shared account live neither in the global slot nor in this folder's ` +
@@ -1685,6 +1711,7 @@ async function runClaude(opts: {
     launchOnSlot({
       slot,
       explicit,
+      reservedTo,
       override: opts.override,
       args: opts.args,
       paths,
@@ -1760,6 +1787,8 @@ async function launchRouted(
 async function launchOnSlot(input: {
   slot: LaunchSlot;
   explicit: boolean;
+  /** What an explicit account is reserved to (see relaxationBannerLine). */
+  reservedTo: 'folders' | 'rule';
   override: boolean;
   args: string[];
   paths: Paths;
@@ -1819,7 +1848,9 @@ async function launchOnSlot(input: {
     process.stderr.write(relaxationBannerLine('override', slot.label, process.cwd()));
   }
   if (explicitToken !== undefined) {
-    process.stderr.write(relaxationBannerLine('explicit', slot.label, process.cwd()));
+    process.stderr.write(
+      relaxationBannerLine('explicit', slot.label, process.cwd(), input.reservedTo),
+    );
   }
 
   try {

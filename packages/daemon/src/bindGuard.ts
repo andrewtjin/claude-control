@@ -333,12 +333,15 @@ function judgeGlobal(snapshot, rule) {
   return { verdict: 'accept', label: label, own: own };
 }
 
-// Claim the one-time notice for a session: true when it has not been shown in this session yet (and
-// is now recorded as shown), false when it has. A session id that cannot name a file, or a marker
-// that cannot be written, shows the notice rather than lose it.
-function claimNotice(sessionId) {
+// Claim the one-time notice of a rule for a session: true when it has not been shown in this session
+// for this rule yet (and is now recorded as shown), false when it has. Keyed by the rule as well,
+// because a session can come under another rule mid-way (renamed onto an alias rule) and must then
+// be told about that one. A session or rule id that cannot name a file, or a marker that cannot be
+// written, shows the notice rather than lose it.
+function claimNotice(sessionId, ruleId) {
   if (typeof sessionId !== 'string' || !SESSION_ID_PATTERN.test(sessionId)) return true;
-  var file = path.join(NOTICES_DIR, sessionId);
+  if (typeof ruleId !== 'string' || !SESSION_ID_PATTERN.test(ruleId)) return true;
+  var file = path.join(NOTICES_DIR, sessionId + '.' + ruleId);
   try {
     fs.mkdirSync(NOTICES_DIR, { recursive: true });
   } catch (e) {
@@ -594,7 +597,7 @@ function run(input) {
       var members = membersOf(rule);
       // Nothing to tell when the rule prefers no account (it only excludes) or the global slot
       // already holds one of its own; otherwise tell it once per session.
-      if (!members || judged.own || !claimNotice(payload.session_id)) process.exit(0);
+      if (!members || judged.own || !claimNotice(payload.session_id, rule.id)) process.exit(0);
       var onAccount = judged.label ? judged.label + ' from the shared pool' : 'the shared account';
       var notice =
         'cctl: ' +

@@ -4096,15 +4096,16 @@ export class Daemon {
         }
       }
       // Shared (or unknown) account. A KNOWN shared account runs where it is already live: the
-      // global slot, or the slot of this session's folder when it is live there (as the folder's
-      // fallback, or in a folder that excludes the global account). A spawn never switches a slot
-      // out from under the sessions on it, so anywhere else it is refused. An unknown id keeps the
-      // legacy attribution-tag behavior.
+      // global slot, or the slot of the rule this session runs under when it is live there (as the
+      // rule's fallback, or under a rule that excludes the global account). That rule is the one
+      // the guard will require — the precedence rule, so a resumed named session's alias rule
+      // outranks the folder's. A spawn never switches a slot out from under the sessions on it, so
+      // anywhere else it is refused. An unknown id keeps the legacy attribution-tag behavior.
       const globalLive = await engine.getActiveId('global');
       if (acct !== undefined && accountId !== globalLive) {
         const match =
-          cwd !== undefined && engine.resolveFolderRule
-            ? await engine.resolveFolderRule(cwd)
+          cwd !== undefined
+            ? await this.resolveSessionRuleFor(cwd, this.spawnResumeAnchorOrNone(resumeRef))
             : null;
         if (match !== null) {
           const slot = ruleSlotId(match.ruleId);
@@ -4116,7 +4117,7 @@ export class Daemon {
         }
         throw new SpawnBindingError(
           `account "${acct.label}" is a shared account live neither in the global slot nor in ` +
-            `the slot of this session's folder; switch to it first (cctl switch ${acct.label}) ` +
+            `the slot of this session's rule; switch to it first (cctl switch ${acct.label}) ` +
             'or start the session without naming an account',
         );
       }
@@ -4126,13 +4127,7 @@ export class Daemon {
     // No explicit account: resolve the working directory's folder rule (and a resumed session's
     // alias rule).
     if (cwd !== undefined && engine.resolveFolderRule) {
-      let anchor: string | undefined;
-      try {
-        anchor = this.resolveSpawnResumeAnchor(resumeRef);
-      } catch {
-        anchor = undefined; // the spawn path reports an unresumable ref itself
-      }
-      const match = await this.resolveSessionRuleFor(cwd, anchor);
+      const match = await this.resolveSessionRuleFor(cwd, this.spawnResumeAnchorOrNone(resumeRef));
       if (match !== null) {
         // Once the cwd is known to have a rule, the session MUST run in that rule's slot. Any
         // failure to place it there is a REFUSAL, never a fall-through to the global slot: a session
@@ -4166,6 +4161,16 @@ export class Daemon {
       }
     }
     return { slot: 'global', accountId: undefined, configDir: undefined };
+  }
+
+  /** The resume anchor of a spawn's `resumeRef` for routing, or undefined when it has none or it
+   *  cannot be resumed: the spawn path reports an unresumable ref itself. */
+  private spawnResumeAnchorOrNone(resumeRef: string | undefined): string | undefined {
+    try {
+      return this.resolveSpawnResumeAnchor(resumeRef);
+    } catch {
+      return undefined;
+    }
   }
 
   /**

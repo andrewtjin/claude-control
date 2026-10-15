@@ -355,6 +355,22 @@ describe('cctl session reset', () => {
     );
   });
 
+  it('beside a daemon that cannot honor alias rules, still removes a whole rule but drops no account', async () => {
+    await runSessionInclude('Side', 'work,client', { cwd: away }, harness().deps);
+    const older = (): ReturnType<typeof harness> =>
+      harness({
+        refuseOnOlderDaemon: () => Promise.reject(new CliFailure('the running daemon predates')),
+      });
+    // Dropping accounts edits a rule that daemon cannot read: refused, nothing changed.
+    await expect(runSessionReset('Side', 'client', { cwd: away }, older().deps)).rejects.toThrow(
+      'the running daemon predates',
+    );
+    expect((await onlyRule()).include).toEqual([work.id, client.id]);
+    // Removing the whole rule is how the operator backs out: allowed.
+    await runSessionReset('Side', undefined, { cwd: away }, older().deps);
+    expect(await engine.listRules()).toEqual([]);
+  });
+
   it('refuses an alias with no rule', async () => {
     await expect(runSessionReset('nope', undefined, {}, harness().deps)).rejects.toThrow(
       new RegExp(`session "nope" in .* has no rule`),
@@ -475,7 +491,9 @@ describe('cctl session show — Rule and Slot', () => {
     });
     const text = harness();
     await runSessionShow('Side', { cwd: away }, text.deps);
-    expect(text.text()).toContain('Rule      none: it runs on the global slot and the shared pool');
+    expect(text.text()).toContain(
+      'Rule      none: it belongs on the global slot and the shared pool',
+    );
   });
 
   it('a generated-title session in an alias-ruled folder is not under the alias rule', async () => {

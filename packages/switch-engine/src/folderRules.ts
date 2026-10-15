@@ -199,13 +199,19 @@ export function assignDistinct(
 }
 
 /** The rule a folder runs under: the longest rule folder that contains it wins, with no merging
- *  between nested rules; `null` means the global slot. `folder` must be canonical. */
+ *  between nested rules; `null` means the global slot. `folder` must be canonical. Stored folders
+ *  are compared in their canonical spelling (`scopedRuleOf`), exactly as `resolveSessionRule` and
+ *  the guard snapshot compare them. */
 export function resolveFolderRule(
   folder: string,
   rules: readonly FolderRule[],
   platform: NodeJS.Platform,
 ): { rule: FolderRule; folder: string } | null {
-  const match = resolveBinding(folder, rules, platform);
+  const match = resolveBinding(
+    folder,
+    rules.map((r) => scopedRuleOf(r, platform)),
+    platform,
+  );
   if (match === null) return null;
   const rule = rules.find((r) => r.id === match.groupId);
   return rule === undefined ? null : { rule, folder: match.folder };

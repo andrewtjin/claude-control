@@ -451,7 +451,29 @@ describe('session alias rules in the folder views', () => {
     );
     expect(out).toContain('Named sessions with a rule of their own here');
     expect(out).toContain('"it\'s here" -> Research (uses E first, excludes D), live: E');
-    expect(out).toContain("start or resume it with: cctl claude --resume 'it''s here'");
+    expect(out).toContain("resume it with: cctl claude --resume 'it''s here'");
+    // --resume cannot start a new session; --name does.
+    expect(out).toContain("start it with:  cctl claude --name 'it''s here'");
+    expect(out).not.toContain('start or resume');
+    expect(out).not.toContain('cd ');
+  });
+
+  it('asked about another folder, prints commands that change to it first', () => {
+    const out = renderWhere(
+      {
+        folder: 'C:\\repo',
+        rule: null,
+        global: globalSlot,
+        aliases: [
+          { alias: 'auth work', ruleLabel: 'R', include: [], exclude: [], liveLabel: null },
+        ],
+        elsewhere: true,
+      },
+      PLAIN_PALETTE,
+      'win32',
+    );
+    expect(out).toContain("resume it with: cd 'C:\\repo'; cctl claude --resume 'auth work'");
+    expect(out).toContain("start it with:  cd 'C:\\repo'; cctl claude --name 'auth work'");
   });
 
   it('quotes exactly like the copy the enforcement guard embeds', () => {

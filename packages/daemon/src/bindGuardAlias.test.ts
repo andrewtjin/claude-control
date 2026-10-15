@@ -1058,6 +1058,24 @@ describe('bind guard — session alias rules', () => {
       expect(again).toMatchObject({ code: 0, stdout: '' });
     });
 
+    it('a session renamed onto an alias rule is told about that rule too, once', async () => {
+      await writeSnapshot([{ ...folderGroup(), excluded: [] }, accepting()]);
+      const unnamed = JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        session_id: SID,
+        prompt: 'hi',
+      });
+      const first = await runGuard(scriptPath, unnamed, onSlot(undefined));
+      expect(decision(first).systemMessage).toContain('To use work@x here');
+      // After /rename onto the alias rule: that rule's own notice, with its resume command.
+      const renamed = await runGuard(scriptPath, named('Auth Work'), onSlot(undefined));
+      expect(decision(renamed).systemMessage).toContain(
+        `To use research@x here, exit and resume it with: cctl claude --resume ${SID}`,
+      );
+      const again = await runGuard(scriptPath, named('Auth Work'), onSlot(undefined));
+      expect(again).toMatchObject({ code: 0, stdout: '' });
+    });
+
     it('a background session is told cctl moves it between turns', async () => {
       await writeSnapshot([accepting()]);
       const r = await runGuard(scriptPath, named('auth work'), {

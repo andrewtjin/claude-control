@@ -1163,12 +1163,32 @@ describe('renderSessionDetails — Rule and Slot', () => {
     expect(out).toContain(`cctl claude --resume ${SID}`);
   });
 
+  it("a session no rule applies to, still on a rule's slot, is called out", () => {
+    // Renamed away from its alias (or launched with --account): the guard refuses that slot.
+    const out = render(
+      binding({
+        via: null,
+        ruleId: null,
+        ruleLabel: null,
+        members: [],
+        requiredSlot: 'global',
+        inScope: false,
+      }),
+    );
+    expect(out).toContain('Rule      none: it belongs on the global slot and the shared pool');
+    expect(out).toContain(
+      'Slot      NOT the global slot: it runs on the folder slot of session "Auth Work" in ' +
+        'C:\\work\\app; start it again with: cctl claude',
+    );
+    expect(out).not.toContain('it runs on the global slot');
+  });
+
   it('a folder rule, no rule, and an unknown slot', () => {
     expect(render(binding({ via: 'folder', alias: null }))).toContain(
       'by its folder C:\\work\\app',
     );
     const none = render(binding({ via: null, ruleId: null, ruleLabel: null, members: [] }));
-    expect(none).toContain('Rule      none: it runs on the global slot and the shared pool');
+    expect(none).toContain('Rule      none: it belongs on the global slot and the shared pool');
     expect(none).not.toContain('Slot');
     expect(render(binding({ slot: null, slotSource: null, inScope: null }))).toContain(
       'unknown (no slot recorded for this session yet)',

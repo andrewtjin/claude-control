@@ -108,6 +108,12 @@ describe('relaxationBannerLine', () => {
     expect(line).toContain('C:/somewhere');
   });
 
+  it('words an account a session alias rule includes as reserved to its rule, like the guard', () => {
+    const line = relaxationBannerLine('explicit', 'work@corp', 'C:/somewhere', 'rule');
+    expect(line).toContain('work@corp is reserved to its rule; running it in C:/somewhere');
+    expect(line).not.toContain('folders');
+  });
+
   it('strips terminal control sequences from a crafted label and cwd', () => {
     const line = relaxationBannerLine('override', 'a\u001b[31mred\u0007', 'C:/x\r\nFAKE: injected');
     expect(line).not.toContain('\u001b');

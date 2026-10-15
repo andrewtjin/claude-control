@@ -446,6 +446,9 @@ export interface WhereView {
   /** Named sessions with a rule of their own in EXACTLY this folder: they outrank the folder's rule
    *  above. */
   aliases?: WhereAliasView[];
+  /** The folder asked about is not the current directory. `cctl claude` finds a named session in
+   *  the folder it runs in, so a command printed for one here must change to this folder first. */
+  elsewhere?: boolean;
 }
 
 /** One named session with a rule of its own in the queried folder, for `cctl where`. */
@@ -466,6 +469,8 @@ export interface WhereAliasView {
 function whereAliasLines(view: WhereView, palette: Palette, platform: NodeJS.Platform): string[] {
   const aliases = view.aliases ?? [];
   if (aliases.length === 0) return [];
+  const cd =
+    view.elsewhere === true ? `cd ${shellQuote(sanitizeForTerminal(view.folder), platform)}; ` : '';
   const lines = [
     '',
     'Named sessions with a rule of their own here (they outrank any folder rule):',
@@ -484,9 +489,21 @@ function whereAliasLines(view: WhereView, palette: Palette, platform: NodeJS.Pla
     lines.push(
       `  "${alias}" -> ${palette.bold(sanitizeForTerminal(a.ruleLabel))} (${uses}${excludes}), live: ${live}`,
     );
-    lines.push(`    start or resume it with: ${resumeCommand(a.alias, { platform })}`);
+    lines.push(`    resume it with: ${cd}${resumeCommand(a.alias, { platform })}`);
+    const start = startCommand(a.alias, platform);
+    if (start !== null) lines.push(`    start it with:  ${cd}${start}`);
   }
   return lines;
+}
+
+/** The command that starts a NEW session under `alias` (`--resume` only opens an existing one), or
+ *  null for an alias a terminal could not show verbatim, which cannot be printed as a working
+ *  argument. */
+function startCommand(alias: string, platform: NodeJS.Platform): string | null {
+  const text = alias.trim();
+  return text !== '' && sanitizeForTerminal(text) === text
+    ? `cctl claude --name ${shellQuoteArg(text, platform)}`
+    : null;
 }
 
 /** Quote one argument so it pastes into the operator's shell as a single literal word: PowerShell
