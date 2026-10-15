@@ -15,6 +15,7 @@ import { createInterface } from 'node:readline';
 import { dirname, join } from 'node:path';
 import {
   SwitchEngineError,
+  VaultError,
   buildAuthorizeUrl,
   defaultPaths,
   defaultProtector,
@@ -1670,9 +1671,13 @@ function buildAccountCommands(program: Command): void {
           return await addAccount(label, { ...opts, onAdded: announce });
         } catch (err) {
           // This command answers every failed capture of the current login with the no-login
-          // line, faults included. The action lets those faults escape as themselves so a caller
-          // that can show more does; the command keeps its own words for them.
-          if (opts.fresh || err instanceof AccountActionError) throw err;
+          // line, faults included — except a vault fault, which it has always printed in the
+          // vault's own words (that line is what a malformed registry needs read). The action
+          // lets those faults escape as themselves so a caller that can show more does; the
+          // command keeps its own words for them.
+          if (opts.fresh || err instanceof AccountActionError || err instanceof VaultError) {
+            throw err;
+          }
           throw new AccountActionError('no_live_login', NO_LIVE_LOGIN, { cause: err });
         }
       });

@@ -114,6 +114,7 @@ function assertLabelFree(rows: StoredAccount[], label: string, exceptId: string 
     throw new VaultError(
       `"${label}" already refers to account ${taken.id} ("${taken.label}"); ` +
         'two accounts answering to one name could not be told apart on switch',
+      { code: 'label_taken' },
     );
   }
 }
@@ -1747,7 +1748,7 @@ export class Vault {
     // label is stored — it is later rendered on the CLI, in Discord, and in the enforcement guard's
     // decision text, and a label is the one field an operator types freely.
     const next = sanitizeTerminalText(label).trim();
-    if (next === '') throw new VaultError('a label cannot be empty');
+    if (next === '') throw new VaultError('a label cannot be empty', { code: 'label_empty' });
     const allRows = allRowsOf(st);
     assertLabelFree(allRows, next, undefined);
     // The same login stored twice is the other way two rows come to answer to one name (and
@@ -1759,6 +1760,7 @@ export class Vault {
       throw new VaultError(
         `this login is account ${stored.id} ("${stored.label}"), which is already stored; run ` +
           `\`cctl accounts relogin ${stored.label}\` to refresh it instead of adding a duplicate`,
+        { code: 'login_stored' },
       );
     }
     const now = this.clock();
@@ -1875,7 +1877,7 @@ export class Vault {
   async renameAccount(id: string, label: string): Promise<StoredAccount> {
     // Same stripping as addAccount: a rename is the other place a label is typed freely.
     const next = sanitizeTerminalText(label).trim();
-    if (next === '') throw new VaultError('a label cannot be empty');
+    if (next === '') throw new VaultError('a label cannot be empty', { code: 'label_empty' });
     return this.patchAccount(id, (account, st) => {
       // Uniqueness is checked across the WHOLE registry — a name the resolver could confuse with a
       // reserved account is as unusable as one it confuses with a shared account.

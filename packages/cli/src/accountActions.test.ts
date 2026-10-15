@@ -34,7 +34,7 @@ import {
   type AccountActionErrorCode,
   type LoginWindow,
 } from './accountActions.js';
-import { CliFailure } from './context.js';
+import { CliFailure, reportFatal } from './context.js';
 
 // The fresh add makes its throwaway dir beside the vault, so the vault is moved into a temp root
 // for every test; nothing may land in the operator's real data dir.
@@ -369,7 +369,9 @@ describe('renameAccount', () => {
   });
 
   it("refuses with the vault's own words on a collision or an empty label", async () => {
-    engine.renameAccount.mockRejectedValueOnce(new VaultError('"home" already refers to x'));
+    engine.renameAccount.mockRejectedValueOnce(
+      new VaultError('"home" already refers to x', { code: 'label_taken' }),
+    );
     await expectRefused(
       renameAccount('Work', 'home', ctx),
       'vault_refused',
@@ -381,6 +383,23 @@ describe('renameAccount', () => {
     const boom = new Error('disk on fire');
     engine.renameAccount.mockRejectedValueOnce(boom);
     await expect(renameAccount('Work', 'home', ctx)).rejects.toBe(boom);
+  });
+
+  it('lets a vault fault escape as itself rather than call it a refusal', async () => {
+    const malformed = new VaultError('the account registry at x is malformed');
+    engine.renameAccount.mockRejectedValueOnce(malformed);
+    await expect(renameAccount('Work', 'home', ctx)).rejects.toBe(malformed);
+  });
+
+  it('refuses an empty label with the vault words', async () => {
+    engine.renameAccount.mockRejectedValueOnce(
+      new VaultError('a label cannot be empty', { code: 'label_empty' }),
+    );
+    await expectRefused(
+      renameAccount('Work', ' ', ctx),
+      'vault_refused',
+      'a label cannot be empty',
+    );
   });
 });
 
@@ -403,7 +422,7 @@ describe('addAccount (the current login)', () => {
   });
 
   it("refuses a duplicate with the vault's words, keeping the cause", async () => {
-    const duplicate = new VaultError('"new" already refers to x');
+    const duplicate = new VaultError('"new" already refers to x', { code: 'label_taken' });
     engine.captureCurrentLogin.mockRejectedValueOnce(duplicate);
     const err = await refusal(addAccount('new', {}, ctx));
     expect({ code: err.code, message: err.message, cause: err.cause }).toEqual({
@@ -448,6 +467,29 @@ describe('addAccount (the current login)', () => {
     const boom = new Error('accounts.json is not valid JSON; fix the file or move it aside');
     engine.captureCurrentLogin.mockRejectedValueOnce(boom);
     await expect(addAccount('new', {}, ctx)).rejects.toBe(boom);
+  });
+
+  it('lets a vault fault escape as itself rather than call it a refusal', async () => {
+    const malformed = new VaultError('the account registry at x is malformed');
+    engine.captureCurrentLogin.mockRejectedValueOnce(malformed);
+    await expect(addAccount('new', {}, ctx)).rejects.toBe(malformed);
+  });
+
+  it('refuses a login already stored, and an empty label, in the vault words', async () => {
+    engine.captureCurrentLogin.mockRejectedValueOnce(
+      new VaultError('this login is account id-1 ("Work"), which is already stored', {
+        code: 'login_stored',
+      }),
+    );
+    await expectRefused(
+      addAccount('new', {}, ctx),
+      'vault_refused',
+      'this login is account id-1 ("Work"), which is already stored',
+    );
+    engine.captureCurrentLogin.mockRejectedValueOnce(
+      new VaultError('a label cannot be empty', { code: 'label_empty' }),
+    );
+    await expectRefused(addAccount(' ', {}, ctx), 'vault_refused', 'a label cannot be empty');
   });
 });
 
@@ -518,7 +560,9 @@ describe('addAccount (fresh, in a throwaway window)', () => {
 
   it("refuses a taken label or a stored login with the vault's words, as the plain add does", async () => {
     const { window } = recordingWindow();
-    const taken = new VaultError('"second" already refers to account id-9');
+    const taken = new VaultError('"second" already refers to account id-9', {
+      code: 'label_taken',
+    });
     engine.captureFromConfigDir.mockRejectedValueOnce(taken);
     engine.captureFromKeychainDelta.mockRejectedValueOnce(taken);
     const err = await refusal(addAccount('second', { fresh: true, loginWindow: window }, ctx));
@@ -527,6 +571,17 @@ describe('addAccount (fresh, in a throwaway window)', () => {
       message: '"second" already refers to account id-9',
       cause: taken,
     });
+    expect(await leftoverCaptureDirs()).toEqual([]);
+  });
+
+  it('lets a vault fault escape as itself, and still deletes the dir', async () => {
+    const { window } = recordingWindow();
+    const malformed = new VaultError('the account registry at x is malformed');
+    engine.captureFromConfigDir.mockRejectedValueOnce(malformed);
+    engine.captureFromKeychainDelta.mockRejectedValueOnce(malformed);
+    await expect(addAccount('second', { fresh: true, loginWindow: window }, ctx)).rejects.toBe(
+      malformed,
+    );
     expect(await leftoverCaptureDirs()).toEqual([]);
   });
 
@@ -588,6 +643,36 @@ describe('runAccountAction with a fresh add', () => {
       },
     ]);
     expect(existsSync(dirs[0]!)).toBe(false);
+  });
+
+  it('reports a vault refusal and a vault fault as the same error line the entry point prints', async () => {
+    // Before the actions existed, every VaultError from a fresh capture escaped to the entry
+    // point's reporter. A refusal now goes through fail() and a fault still escapes; both must
+    // reach the person as the identical `error: <vault words>` line.
+    const window: LoginWindow = () => Promise.resolve(undefined);
+    const lines: string[] = [];
+    for (const thrown of [
+      new VaultError('"second" already refers to account id-9', { code: 'label_taken' }),
+      new VaultError('"second" already refers to account id-9'),
+    ]) {
+      engine.captureFromConfigDir.mockRejectedValueOnce(thrown);
+      engine.captureFromKeychainDelta.mockRejectedValueOnce(thrown);
+      const err = await runAccountAction(() =>
+        addAccount('second', { fresh: true, loginWindow: window }, ctx),
+      ).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(err instanceof CliFailure).toBe(thrown.code === 'label_taken');
+      let line = '';
+      reportFatal(err, { write: (text: string) => (line += text) });
+      process.exitCode = undefined;
+      lines.push(line);
+    }
+    expect(lines).toEqual([
+      'error: "second" already refers to account id-9\n',
+      'error: "second" already refers to account id-9\n',
+    ]);
   });
 });
 

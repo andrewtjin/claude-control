@@ -288,6 +288,8 @@ describe('capturing the current login', () => {
     await h.global.writeOauthAccount(identity('N'));
 
     await expect(h.mk().captureCurrentLogin('N')).rejects.toThrow(/already stored/);
+    // A refusal of the request, not a vault fault: callers show it to the person who asked.
+    await expect(h.mk().captureCurrentLogin('N')).rejects.toMatchObject({ code: 'login_stored' });
 
     expect((await h.vault.listAllAccounts()).map((a) => a.label).sort()).toEqual(['P', 'R', 'T']);
   });

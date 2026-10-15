@@ -136,7 +136,7 @@ vi.mock('./daemonControl.js', async (importOriginal) => ({
 /** Run one command through commander with stdout/stderr captured. `fail()` throws a CliFailure
  *  that the entry point turns into an error line and exit 1, so a refusal comes back here as
  *  `exited` with that line in `err`; a stray `process.exit` is turned into a throw as well. */
-async function runCli(args: string[]) {
+async function runCli(args: string[], opts: { asEntry?: boolean } = {}) {
   const out: string[] = [];
   const err: string[] = [];
   const stdout = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
@@ -154,7 +154,12 @@ async function runCli(args: string[]) {
     await buildProgram().parseAsync(args, { from: 'user' });
     return { out: out.join(''), err: err.join(''), exited: false };
   } catch (e) {
-    if (e instanceof CliFailure) {
+    // With `asEntry`, any escaped error is reported the way bin.ts reports it, so a fault the
+    // command lets escape can be compared byte for byte with a refusal it prints itself.
+    if (
+      e instanceof CliFailure ||
+      (opts.asEntry && !(e instanceof Error && /^exit /.test(e.message)))
+    ) {
       // The entry point's own reporter, so the line comes back exactly as a terminal or a
       // redirected stderr would see it (color included); the exit code it asks for is reset.
       reportFatal(e);
@@ -281,10 +286,24 @@ describe('buildProgram', () => {
 
     it('turns a vault refusal (collision, empty label) into an error line and exit 1', async () => {
       engine.listAccounts.mockResolvedValueOnce([work]);
-      engine.renameAccount.mockRejectedValueOnce(new VaultError('"home" already refers to x'));
+      engine.renameAccount.mockRejectedValueOnce(
+        new VaultError('"home" already refers to x', { code: 'label_taken' }),
+      );
       const r = await rename(['work', 'home']);
       expect(r.exited).toBe(true);
       expect(r.err).toBe('error: "home" already refers to x\n');
+    });
+
+    it('prints a vault fault in its own words, the same line as before', async () => {
+      engine.listAccounts.mockResolvedValueOnce([work]);
+      engine.renameAccount.mockRejectedValueOnce(
+        new VaultError('the account registry is malformed; fix the file or move it aside'),
+      );
+      expect(await runCli(['accounts', 'rename', 'work', 'home'], { asEntry: true })).toEqual({
+        out: '',
+        err: 'error: the account registry is malformed; fix the file or move it aside\n',
+        exited: true,
+      });
     });
 
     it('fails on an unknown ref before touching the engine', async () => {
@@ -481,6 +500,7 @@ describe('buildProgram', () => {
     engine.captureCurrentLogin.mockRejectedValueOnce(
       new VaultError(
         '"jina25" already refers to account abc ("jina25"); two accounts answering to one name could not be told apart on switch',
+        { code: 'label_taken' },
       ),
     );
     const r = await runCli(['accounts', 'add', 'jina25']);
@@ -2063,13 +2083,19 @@ describe('account commands print exactly what they always have', () => {
         exited: true,
       });
     }
-    engine.captureCurrentLogin.mockRejectedValueOnce(
+    // A vault fault and a vault refusal both read in the vault's own words, as they always have.
+    for (const thrown of [
       new VaultError('the account registry is malformed; fix the file or move it aside'),
-    );
-    expect(await runCli(['accounts', 'add', 'new'])).toEqual({
-      out: '',
-      err: 'error: the account registry is malformed; fix the file or move it aside\n',
-      exited: true,
-    });
+      new VaultError('the account registry is malformed; fix the file or move it aside', {
+        code: 'label_taken',
+      }),
+    ]) {
+      engine.captureCurrentLogin.mockRejectedValueOnce(thrown);
+      expect(await runCli(['accounts', 'add', 'new'], { asEntry: true })).toEqual({
+        out: '',
+        err: 'error: the account registry is malformed; fix the file or move it aside\n',
+        exited: true,
+      });
+    }
   });
 });

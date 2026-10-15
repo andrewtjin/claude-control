@@ -3231,6 +3231,7 @@ export class SwitchEngine {
         throw new VaultError(
           `this login is account ${holder} ("${row?.label ?? holder}"), which is already stored; ` +
             `switch to it with \`cctl switch ${row?.label ?? holder}\` instead of adding it again`,
+          { code: 'login_stored' },
         );
       }
       if (holders.length > 1) {
@@ -3238,6 +3239,7 @@ export class SwitchEngine {
         throw new VaultError(
           `this login's token is already stored under ` +
             `${quotedLabels(holders, await this.vault.listAllAccounts())}; ${SHARED_TOKEN_REMEDY}`,
+          { code: 'login_stored' },
         );
       }
       const oauthAccount = await this.credStore.readOauthAccount();

@@ -22,9 +22,9 @@ import {
   SwitchFailedError,
   UnknownAccountError,
   UnsettledSwitchError,
-  VaultError,
   defaultPaths,
   isOverloadCode,
+  isVaultRefusal,
   resolveAccountRef,
   type AccountView,
   type ActivateResult,
@@ -68,8 +68,9 @@ export type AccountActionErrorCode =
   | 'switch_failed'
   /** The token endpoint is shedding load; nothing changed. */
   | 'overloaded'
-  /** The vault refused the write: a label collision, an empty label, a login it already stores,
-   *  or a registry it cannot read. Its own message says which, and the VaultError is the cause. */
+  /** The vault refused the write: a label collision, an empty label, or a login it already
+   *  stores. Its own message says which, and the VaultError is the cause. A vault fault (a
+   *  registry it cannot read) is not a refusal and escapes as itself. */
   | 'vault_refused'
   /** A plain add ran inside a folder profile, where the live login is a folder's seat. */
   | 'capture_in_profile'
@@ -369,10 +370,12 @@ export async function removeAccount(
 }
 
 /** The vault's refusal of a write (a label taken or empty, a login stored already) as the refusal
- *  a person reads, in the vault's own words; undefined for anything that is not the vault's.
- *  One mapping for rename and both adds, so the same refusal reads the same from each. */
+ *  a person reads, in the vault's own words; undefined for anything else. A vault that cannot do
+ *  its job (a registry it cannot read or parse, a key it cannot unwrap) is a fault, not a refusal,
+ *  and escapes as itself like any other. One mapping for rename and both adds, so the same refusal
+ *  reads the same from each. */
 function vaultRefusal(err: unknown): AccountActionError | undefined {
-  return err instanceof VaultError
+  return isVaultRefusal(err)
     ? new AccountActionError('vault_refused', err.message, { cause: err })
     : undefined;
 }

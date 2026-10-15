@@ -30,6 +30,7 @@ import {
   type UsageRepollResult,
   type UsageRepollVerdict,
 } from '@claude-control/daemon';
+import { DEFAULT_REQUEST_TIMEOUT_MS } from './daemonControl.js';
 
 /** A tracked session as echoed back by the daemon (compact view). */
 export interface SessionView {
@@ -58,11 +59,23 @@ export type SessionVerb = 'register' | 'label' | 'watch' | 'unregister';
  *  carries a human-actionable message; a dedicated class lets the command action print it cleanly
  *  (via `fail`) without leaking a stack trace or guessing whether an Error was expected. */
 export class SessionClientError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    /** What kind of failure this is, for a caller that reacts rather than prints (a live view
+     *  greying out a refresh while the daemon is down). See {@link SessionClientFailure}. */
+    readonly failure: SessionClientFailure = 'refused',
+  ) {
     super(message);
     this.name = 'SessionClientError';
   }
 }
+
+/** The kinds of {@link SessionClientError}:
+ *  - `down`: no daemon to ask (it never ran, published no endpoint, or nothing listens there);
+ *  - `hung`: a daemon accepted the request and did not answer in time;
+ *  - `older_daemon`: the running daemon predates the route;
+ *  - `refused`: the daemon answered and said no, or answered with something unusable. */
+export type SessionClientFailure = 'down' | 'hung' | 'older_daemon' | 'refused';
 
 /** Injectable seams so the colocated test can point at a temp data dir + passthrough protector
  *  and a real (temporary) HookReceiver instead of the production paths/DPAPI. */
@@ -71,6 +84,9 @@ export interface SessionClientDeps {
   dataDir?: string;
   /** The at-rest protector for reading the hook secret; defaults to this platform's real one. */
   protector?: Protector;
+  /** How long one request may wait for the daemon's answer; defaults to
+   *  {@link DEFAULT_REQUEST_TIMEOUT_MS}, the same bound `cctl daemon stop` gives its request. */
+  requestTimeoutMs?: number;
 }
 
 /**
@@ -123,8 +139,10 @@ async function postToDaemon(
   // A route can put a refusal in better words than the daemon's own (a daemon too old to know the
   // route, for one), judged by the status and the daemon's answer; undefined falls through to the
   // daemon's message.
-  explainRefusal: (status: number, body: DaemonReply | undefined) => string | undefined = () =>
-    undefined,
+  explainRefusal: (
+    status: number,
+    body: DaemonReply | undefined,
+  ) => SessionClientError | undefined = () => undefined,
 ): Promise<DaemonReply | undefined> {
   const paths = defaultPaths();
   const dataDir = dataDirOf(deps, paths);
@@ -135,42 +153,70 @@ async function postToDaemon(
     throw new SessionClientError(
       'the daemon has never run on this machine, so its loopback secret does not exist yet - ' +
         'start it with `cctl daemon run`',
+      'down',
     );
   }
   const endpoint = await readHookEndpoint(hookEndpointPath(dataDir));
   if (endpoint === undefined) {
     throw new SessionClientError(
       'the daemon is not running (no loopback endpoint published) - start it with `cctl daemon run`',
+      'down',
     );
   }
 
-  let res: Awaited<ReturnType<typeof fetch>>;
+  // Bounded: a daemon whose event loop is wedged accepts the connection and never answers, and a
+  // caller that asks repeatedly (a live view's refresh key) must hear that rather than hang. The
+  // bound covers the body as well as the headers, since a reply can stall between the two.
+  const timeoutMs = deps.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const hung = (): SessionClientError =>
+    new SessionClientError(
+      `the daemon on 127.0.0.1:${endpoint.port} took the request but did not answer within ` +
+        `${formatSeconds(timeoutMs)} - it may be stuck; \`cctl daemon restart\` restarts it`,
+      'hung',
+    );
   try {
-    res = await fetch(`http://127.0.0.1:${endpoint.port}${route}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-claude-control-secret': secret },
-      body: JSON.stringify(payload),
-    });
-  } catch (err) {
-    // A published endpoint whose daemon has since died → connection refused.
-    throw new SessionClientError(
-      `could not reach the daemon on 127.0.0.1:${endpoint.port} - is \`cctl daemon run\` still ` +
-        `running? (${err instanceof Error ? err.message : String(err)})`,
-    );
-  }
+    let res: Awaited<ReturnType<typeof fetch>>;
+    try {
+      res = await fetch(`http://127.0.0.1:${endpoint.port}${route}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-claude-control-secret': secret },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (controller.signal.aborted) throw hung();
+      // A published endpoint whose daemon has since died → connection refused.
+      throw new SessionClientError(
+        `could not reach the daemon on 127.0.0.1:${endpoint.port} - is \`cctl daemon run\` still ` +
+          `running? (${err instanceof Error ? err.message : String(err)})`,
+        'down',
+      );
+    }
 
-  const body = (await res.json().catch(() => undefined)) as DaemonReply | undefined;
-  if (!res.ok) {
-    // 4xx/5xx from the daemon: surface its explanation (unknown_session message, validation
-    // error) verbatim so the user sees exactly what to fix.
-    throw new SessionClientError(
-      explainRefusal(res.status, body) ??
-        body?.message ??
-        body?.error ??
-        `daemon returned HTTP ${res.status}`,
-    );
+    const body = (await res.json().catch(() => undefined)) as DaemonReply | undefined;
+    if (controller.signal.aborted) throw hung();
+    if (!res.ok) {
+      // 4xx/5xx from the daemon: surface its explanation (unknown_session message, validation
+      // error) verbatim so the user sees exactly what to fix.
+      throw (
+        explainRefusal(res.status, body) ??
+        new SessionClientError(
+          body?.message ?? body?.error ?? `daemon returned HTTP ${res.status}`,
+          'refused',
+        )
+      );
+    }
+    return body;
+  } finally {
+    clearTimeout(timer);
   }
-  return body;
+}
+
+/** A timeout in the words a person reads: whole seconds when it is whole, else milliseconds. */
+function formatSeconds(ms: number): string {
+  return ms % 1000 === 0 ? `${ms / 1000} s` : `${ms} ms`;
 }
 
 /**
@@ -235,8 +281,11 @@ export async function callDaemonUsageRepoll(
     deps,
     (status, reply) =>
       predatesUsageRepoll(status, reply)
-        ? 'the running daemon is older than this cctl and cannot refresh usage on demand - ' +
-          'restart it with `cctl daemon restart`'
+        ? new SessionClientError(
+            'the running daemon is older than this cctl and cannot refresh usage on demand - ' +
+              'restart it with `cctl daemon restart`',
+            'older_daemon',
+          )
         : undefined,
   );
   if (!body || body.ok !== true || !Array.isArray(body.results)) {
