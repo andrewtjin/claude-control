@@ -80,6 +80,7 @@ import {
 } from './outagesView.js';
 import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
 import { runSessionAliases, runSessionShow, type SessionAliasDeps } from './sessionAliases.js';
+import { runSessionExclude, runSessionInclude, runSessionReset } from './sessionRules.js';
 import { withCaptureDir } from './captureDir.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
 import {
@@ -164,6 +165,7 @@ import {
 } from './sessionClient.js';
 import {
   checkAutostart,
+  checkDaemonAliasRules,
   checkDaemonFolderRules,
   checkFolderRules,
   checkLiveLogin,
@@ -346,7 +348,7 @@ export function buildProgram(): Command {
         // A switch into a folder rule's slot moves that slot, not the global one — say which.
         const group = await describeSwitchedGroup(engine, resolved.account.id);
         const where = group
-          ? ` in the folder slot of ${sanitizeForTerminal(group.folders.join(', '))}`
+          ? ` in the folder slot of ${sanitizeForTerminal(group.scopes)}`
           : target !== undefined
             ? ` in the global slot (no folder rule applies to ${sanitizeForTerminal(opts.folder ?? '')})`
             : '';
@@ -720,6 +722,11 @@ export function buildProgram(): Command {
       checks.push(
         ...(await checkFolderRules(engine, paths)),
         checkDaemonFolderRules(report, heartbeat),
+        checkDaemonAliasRules(
+          report,
+          heartbeat,
+          (await engine.listRules().catch(() => [])).some((r) => (r.aliases ?? []).length > 0),
+        ),
         checkVersionSkew(VERSION, daemonBuild, heartbeat.state === 'alive'),
       );
       // Windows only: flag a PowerShell `claude` wrapper whose embedded node/cctl paths have gone
@@ -2135,6 +2142,56 @@ function buildSessionCommands(program: Command): void {
     .action(async (opts: { cwd?: string; all?: boolean; auto?: boolean; json?: boolean }) => {
       await runSessionAliases(opts, sessionAliasDeps());
     });
+
+  // A rule of its own for one named session: the folder verbs' twins (see sessionRules.ts).
+  session
+    .command('include <alias> <accounts>')
+    .description(
+      'reserve accounts to a named session (its alias in its folder) and use them there first ' +
+        '(comma-separated labels, emails or ids; always named, never the account in use)',
+    )
+    .option('--cwd <folder>', 'the folder the session belongs to (default: its own, else this one)')
+    .option('--label <label>', "a display name for the session's rule, if this creates it")
+    .action(async (alias: string, accounts: string, opts: { cwd?: string; label?: string }) => {
+      await runSessionInclude(alias, accounts, opts, sessionAliasDeps());
+    });
+
+  session
+    .command('exclude <alias> <accounts>')
+    .description('keep a named session off shared accounts (comma-separated), in a slot of its own')
+    .option('--cwd <folder>', 'the folder the session belongs to (default: its own, else this one)')
+    .option('--label <label>', "a display name for the session's rule, if this creates it")
+    .option(
+      '--force',
+      'clear the slot even while the session runs, when an excluded account is live and nothing else is free',
+    )
+    .action(
+      async (
+        alias: string,
+        accounts: string,
+        opts: { cwd?: string; label?: string; force?: boolean },
+      ) => {
+        await runSessionExclude(alias, accounts, opts, sessionAliasDeps());
+      },
+    );
+
+  session
+    .command('reset <alias> [accounts]')
+    .description(
+      "drop named accounts from a named session's rule; with none named, remove the rule (the " +
+        "session goes back to its folder's rule)",
+    )
+    .option('--cwd <folder>', 'the folder the session belongs to (default: its own, else this one)')
+    .option('--force', 'go ahead even when the session is running')
+    .action(
+      async (
+        alias: string,
+        accounts: string | undefined,
+        opts: { cwd?: string; force?: boolean },
+      ) => {
+        await runSessionReset(alias, accounts, opts, sessionAliasDeps());
+      },
+    );
 
   session
     .command('status')

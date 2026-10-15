@@ -46,7 +46,11 @@ import {
   type AutoSwitchPolicy,
 } from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
-import { FOLDER_RULES_REPORT_ROW, FOLDER_RULES_SUPPORTED } from './folderRulesSupport.js';
+import {
+  FOLDER_RULES_REPORT_ROW,
+  FOLDER_RULES_SUPPORTED,
+  SESSION_ALIAS_RULES_REPORT_ROW,
+} from './folderRulesSupport.js';
 
 export type { SettingRow } from '@claude-control/shared-protocol';
 
@@ -717,6 +721,15 @@ export function resolveDaemonConfig(
       value: FOLDER_RULES_SUPPORTED,
       source: 'default',
       detail: 'cctl folder include / exclude: per-folder account pools',
+    },
+    {
+      // A capability too: a daemon whose report carries this row reads a rules file holding a
+      // session alias rule, and routes a named session's phone spawn and background move by it. The
+      // CLI refuses alias rule edits while a running daemon's report lacks it.
+      name: SESSION_ALIAS_RULES_REPORT_ROW,
+      value: FOLDER_RULES_SUPPORTED,
+      source: 'default',
+      detail: 'cctl session include / exclude: account pools for a named session',
     },
     {
       name: 'auto-switch',

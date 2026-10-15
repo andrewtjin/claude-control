@@ -601,9 +601,11 @@ export interface RouteContext {
   /** The folders a title given to --resume from `cwd` is searched in, as Claude Code searches:
    *  the folder itself and every git worktree of its repository (Claude Code's own among them). */
   titleFolders(cwd: string): Promise<string[]>;
-  /** Where a session working in a folder belongs. Makes that folder's slot live, as a launch there
-   *  would, so it is asked only once a session has been found. */
-  homeOf(cwd: string): Promise<SessionHome>;
+  /** Where a session working in a folder belongs: the slot of its alias rule (its title in the folder
+   *  its conversation was recorded in, read from the transcript of `sessionId`), else of the folder's
+   *  rule. Makes that slot live, as a launch there would, so it is asked only once a session has been
+   *  found. */
+  homeOf(cwd: string, sessionId?: string): Promise<SessionHome>;
   /** The config dir a launch that follows the folder runs under, without making anything live. */
   launchConfigDir(): Promise<string | null>;
   /** A config dir in words. */
@@ -1268,7 +1270,7 @@ async function decide(
       );
       return here(where.configDir);
     }
-    const home = await ctx.homeOf(where.cwd);
+    const home = await ctx.homeOf(where.cwd, where.currentId);
     if (sameConfigDir(where.configDir, home.configDir, platform)) return here(where.configDir);
     // It runs on another config dir's service: anything run where it belongs would reach it through
     // a row there, so it is either moved first or opened where it runs.
@@ -1397,7 +1399,7 @@ async function decide(
         'resume the one you mean by its id: cctl claude --resume <id>.',
     };
   }
-  const home = await ctx.homeOf(target.cwd);
+  const home = await ctx.homeOf(target.cwd, target.currentId);
 
   // Started under a config dir from its row there, idle, and confirmed; a refusal says why. The row
   // is woken by the id its job started with: Claude Code wakes it into the conversation it ran last,

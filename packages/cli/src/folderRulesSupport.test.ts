@@ -2,7 +2,10 @@ import { describe, it, expect } from 'vitest';
 import {
   FOLDER_RULES_REPORT_ROW,
   FOLDER_RULES_SUPPORTED,
+  SESSION_ALIAS_RULES_REPORT_ROW,
+  olderDaemonAliasReason,
   olderDaemonReason,
+  reportSupportsAliasRules,
   reportSupportsFolderRules,
 } from './folderRulesSupport.js';
 import { resolveDaemonConfig, type SettingsReport } from './settings.js';
@@ -58,5 +61,29 @@ describe('olderDaemonReason', () => {
         ageMs: 1,
       }),
     ).toBeUndefined();
+  });
+});
+
+describe('session alias rules support', () => {
+  const aliasRow = { name: SESSION_ALIAS_RULES_REPORT_ROW, value: FOLDER_RULES_SUPPORTED };
+
+  it('accepts the report a daemon of this build writes', () => {
+    const settings = resolveDaemonConfig({}).rows;
+    expect(reportSupportsAliasRules({ startedAtMs: 1, settings })).toBe(true);
+  });
+
+  it('a daemon that honors folder rules but predates alias rules is named, with the fix', () => {
+    const older = report([supported, { name: 'daemon build', value: 'v1.0.0' }]);
+    expect(reportSupportsAliasRules(older)).toBe(false);
+    const reason = olderDaemonAliasReason(older, alive);
+    expect(reason).toContain('(v1.0.0)');
+    expect(reason).toContain('predates session alias rules');
+    expect(reason).toContain('cctl daemon restart');
+    expect(olderDaemonAliasReason(undefined, alive)).toContain('predates session alias rules');
+  });
+
+  it('has nothing to say about a daemon that honors them, or one not running', () => {
+    expect(olderDaemonAliasReason(report([supported, aliasRow]), alive)).toBeUndefined();
+    expect(olderDaemonAliasReason(report([]), { state: 'never' })).toBeUndefined();
   });
 });

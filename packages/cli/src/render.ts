@@ -30,6 +30,7 @@ import {
 } from '@claude-control/usage-advisor';
 import { PLAIN_PALETTE, sanitizeForTerminal, severityPaint, type Palette } from './ansi.js';
 import { MANUAL_START_HINT, type AutostartQuery } from './autostart.js';
+import { resumeSessionCommand } from './folderRender.js';
 
 /** Render the accounts registry as an aligned table. `activeId` is marked with `*`. `nowMs`
  *  drives the PLAN/BILLING columns' estimates and defaults to the real clock; tests pin it. */
@@ -457,10 +458,39 @@ export function renderAccountHeal(report: DedupeReport, palette: Palette = PLAIN
 // Session aliases (`cctl session show` / `cctl session aliases`)
 // ---------------------------------------------------------------------------
 
+/** Which rule a session runs under by THE precedence rule, and whether it runs on that rule's
+ *  slot. */
+export interface SessionBindingView {
+  /** How the rule matched: its alias in its folder, a folder rule, or nothing (the global slot). */
+  via: 'alias' | 'folder' | null;
+  /** The rule's folder (the alias's exact folder, or the ruled folder that contains it). */
+  folder: string | null;
+  /** The alias as the rule holds it, when `via` is 'alias'. */
+  alias: string | null;
+  ruleId: string | null;
+  ruleLabel: string | null;
+  /** Labels of the rule's included accounts, in preference order. */
+  members: string[];
+  /** The slot the rule requires: 'global' or 'group:<id>'. */
+  requiredSlot: string;
+  /** The slot the session runs (or last ran) in, or null when it is unknown: nothing recorded it,
+   *  or (slotSource 'env') this session runs on a config dir cctl does not manage. */
+  slot: string | null;
+  /** Where `slot` came from: this process's own session env, or the daemon's record. */
+  slotSource: 'env' | 'recorded' | null;
+  /** A display name for `slot` ("the global slot", or a rule's folder slot). */
+  slotLabel: string | null;
+  /** slot === requiredSlot, or null when the slot is unknown. */
+  inScope: boolean | null;
+}
+
 /** One session with the accounts its turns were billed to. */
 export interface SessionView {
   meta: SessionMeta;
   accounts: SessionAccountUse[];
+  /** Present on `cctl session show`: the rule the session runs under and whether it is on its
+   *  slot. */
+  binding?: SessionBindingView;
 }
 
 /** `YYYY-MM-DD HH:MM` in local time — the operator reads their own clock. */
@@ -508,7 +538,56 @@ export function sessionViewJson(view: SessionView): Record<string, unknown> {
       first: new Date(a.firstMs).toISOString(),
       last: new Date(a.lastMs).toISOString(),
     })),
+    ...(view.binding !== undefined ? { binding: { ...view.binding } } : {}),
   };
+}
+
+/** The `Rule` / `Slot` lines of `cctl session show`. A session on the global slot under a rule is
+ *  not out of place — a rule accepts the global slot's account unless it excludes it — so it is
+ *  told how to move onto the rule's own accounts rather than called out of scope. */
+function bindingLines(b: SessionBindingView, sessionId: string, palette: Palette): string[] {
+  const members = b.members.map((m) => sanitizeForTerminal(m)).join(', ');
+  const who =
+    b.ruleLabel === null
+      ? ''
+      : `${palette.bold(sanitizeForTerminal(b.ruleLabel))}${members !== '' ? ` (uses ${members} first)` : ''}`;
+  const rule =
+    b.via === 'alias'
+      ? `${who}  by its alias "${sanitizeForTerminal(b.alias ?? '')}" in ${sanitizeForTerminal(b.folder ?? '')}`
+      : b.via === 'folder'
+        ? `${who}  by its folder ${sanitizeForTerminal(b.folder ?? '')}`
+        : 'none: it runs on the global slot and the shared pool';
+  const out = [`Rule      ${rule}`];
+  if (b.via === null) return out;
+  const fix =
+    b.via === 'alias'
+      ? `resume it with: ${resumeSessionCommand(sessionId, b.alias ?? '')}`
+      : 'start it again with: cctl claude';
+  if (b.inScope === null) {
+    out.push(
+      `Slot      ${palette.dim(
+        b.slotSource === 'env'
+          ? 'unknown (this session runs on a config dir cctl does not manage)'
+          : 'unknown (no slot recorded for this session yet)',
+      )}`,
+    );
+  } else if (b.inScope) {
+    out.push(`Slot      its rule's own slot`);
+  } else if (b.slot === 'global') {
+    const tense = b.slotSource === 'env' ? 'runs' : 'last ran';
+    out.push(
+      `Slot      it ${tense} on the global slot, which its rule accepts unless it excludes that ` +
+        `account${members !== '' ? `; to use ${members}, ${fix}` : ''}`,
+    );
+  } else {
+    const on = sanitizeForTerminal(b.slotLabel ?? b.slot ?? '?');
+    out.push(
+      palette.yellow(
+        `Slot      NOT its rule's slot: it ${b.slotSource === 'env' ? 'runs' : 'last ran'} on ${on}; ${fix}`,
+      ),
+    );
+  }
+  return out;
 }
 
 /** One account's line: label, turns, tokens and when. */
@@ -581,6 +660,9 @@ export function renderSessionDetails(
     out.push(`Session   ${sanitizeForTerminal(m.sessionId)}`);
     const since = m.firstActivityMs === null ? '?' : localStamp(m.firstActivityMs);
     out.push(`Active    ${since} -> ${localStamp(m.lastActivityMs)}`);
+    if (view.binding !== undefined) {
+      out.push(...bindingLines(view.binding, view.meta.sessionId, palette));
+    }
     if (view.accounts.length === 0) {
       out.push(`Accounts  ${palette.dim('(no turns recorded yet)')}`);
     } else {

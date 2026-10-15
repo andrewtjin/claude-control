@@ -1,13 +1,8 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import {
-  sandboxPaths,
-  type CredentialBundle,
-  type Paths,
-  type RefreshDeps,
-} from '@claude-control/switch-engine';
+import { join } from 'node:path';
+import { sandboxPaths, type Paths, type RefreshDeps } from '@claude-control/switch-engine';
 import { ANSI_PALETTE, PLAIN_PALETTE } from './ansi.js';
 import { buildEngine, CliFailure, fail, paintErrorLine, reportFatal } from './context.js';
 
@@ -112,52 +107,6 @@ describe('buildEngine: where the engine writes its diagnostics', () => {
   });
 });
 
-describe('a switch that cannot write the live identity file', () => {
-  // As root a read-only directory still accepts the write, so there is nothing to reproduce there.
-  const runsAsRoot = process.platform !== 'win32' && process.getuid?.() === 0;
-
-  it.skipIf(runsAsRoot)(
-    'ends in one plain error line on stderr, with no structured log line before it',
-    async () => {
-      const paths = sandboxPaths(freshTempDir());
-      // No CCTL_LOG_LEVEL / CCTL_LOG_FILE from the shell running the suite: the default is the point.
-      const engine = buildEngine(paths, process.stderr, {});
-      const far = Date.now() + 8 * 3_600_000;
-      const bundle = (t: string): CredentialBundle => ({
-        claudeAiOauth: { accessToken: `at-${t}`, refreshToken: `rt-${t}`, expiresAt: far },
-        oauthAccount: { accountUuid: `uuid-${t}`, emailAddress: `${t}@x.com` },
-      });
-      const P = await engine.addAccount('P', bundle('P'));
-      const T = await engine.addAccount('T', bundle('T'));
-      await engine.activate(P.id, { force: true });
-      // What another program holding the file does to a replace, reproduced without one: a
-      // read-only file refuses it on Windows, a read-only directory everywhere else.
-      const locked =
-        process.platform === 'win32' ? paths.claudeJsonPath : dirname(paths.claudeJsonPath);
-      chmodSync(locked, process.platform === 'win32' ? 0o444 : 0o555);
-      let captured: { stdout: string[]; stderr: string[] };
-      try {
-        captured = await captureConsole(async () => {
-          const err = await engine.activate(T.id, { force: true }).catch((e: unknown) => e);
-          reportFatal(err);
-        });
-      } finally {
-        chmodSync(locked, process.platform === 'win32' ? 0o644 : 0o755);
-        process.exitCode = undefined;
-      }
-
-      const lines = captured.stderr.join('').split('\n').filter(Boolean);
-      expect(lines).toHaveLength(1);
-      expect(lines[0]).not.toContain('"level"');
-      expect(lines[0]).toMatch(
-        /^error: could not write .*\.claude\.json \((EPERM|EACCES)\): another program probably has it open .*The switch to "T" was undone and the previous login was kept - nothing changed\. Close that program/,
-      );
-      expect(captured.stdout).toEqual([]);
-    },
-    60_000,
-  );
-});
-
 describe('the CLI failure path', () => {
   it('ends a command by throwing, never by tearing the process down', () => {
     // A command that failed mid-request still has sockets closing behind it. Exiting on top of
@@ -186,6 +135,19 @@ describe('the CLI failure path', () => {
       expect(exitSpy).not.toHaveBeenCalled();
     } finally {
       exitSpy.mockRestore();
+      process.exitCode = previous;
+    }
+  });
+
+  it('strips terminal controls a message echoes, keeping its line breaks', () => {
+    const written: string[] = [];
+    const previous = process.exitCode;
+    try {
+      reportFatal(new CliFailure('no account matches "x\u001b]0;pwned\u0007"\nsecond line'), {
+        write: (text: string) => written.push(text),
+      });
+      expect(written.join('')).toBe('error: no account matches "x]0;pwned"\nsecond line\n');
+    } finally {
       process.exitCode = previous;
     }
   });

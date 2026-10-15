@@ -141,6 +141,146 @@ Nothing was changed.
 runs: it cannot stop an older daemon started later (an older install's logon task, say). Before
 going back to an older build, remove every folder rule with `cctl folder reset <folder>`.
 
+### A rule for one named session
+
+A rule can also apply to ONE session instead of a whole folder: its alias (the name you give
+it with `/rename` or `claude --name`) in the folder it belongs to. It is a rule like a folder's
+in every other way — it includes accounts (reserved, used first), excludes shared ones,
+inherits the rest of the shared pool, and runs in its own slot — and it **outranks every folder
+rule**, the one of its own folder included. It does not merge with that folder's rule: a
+session alias's rule names its own includes and excludes.
+
+```
+cctl session include <alias> <account>[,<account>...]   # reserve accounts to that session, used first
+cctl session include <alias> <accounts> --cwd <folder>  # an alias of another folder
+cctl session include <alias> <accounts> --label <name>  # ...naming the rule it creates
+cctl session exclude <alias> <account>[,<account>...]   # keep that session off some shared accounts
+cctl session reset <alias> <account>[,<account>...]     # take accounts back out of its rule
+cctl session reset <alias>                              # remove the session's rule entirely
+```
+
+As for folders, the alias and the accounts are always named — nothing is filled in for you.
+The folder is `--cwd`, else, when you run the command inside the session the alias names (from
+a Bash tool or a `!` command), the folder that session belongs to, else the current folder.
+Only a name you set counts: a session with just a generated title is not covered (a generated
+title changes under you), and aliases compare the way `claude --resume` compares them:
+case-insensitive, ignoring surrounding spaces. An alias longer than 200 characters is refused:
+Claude Code keeps only the first 200 characters of a session's name (an emoji counts as one),
+so no session could ever carry it; so is one with control or bidirectional characters. A rule
+for one session covers the conversations recorded in its exact folder, not in its subfolders,
+so your home folder or a drive root may hold one. The reports are the folder verbs' own, about
+the session ("Created a rule for session "auth work" in C:\repo: it uses research first, then
+the shared pool."); when the command runs inside a session that is now on another slot than its
+rule names, it says so, with the command that resumes it.
+
+Session alias rules need **Claude Code 2.1.283 or newer**: the guard reads a session's name from
+the `session_title` field Claude Code sends with each prompt, never from the transcript. An
+older Claude Code does not send it, so every session looks unnamed and runs by its folder's rule.
+
+Which rule a session runs under is decided by one rule, used by `cctl claude`, the guard, the
+daemon's phone spawns and background moves, `cctl where` and `cctl session show` alike:
+
+1. its alias has a rule for the folder the conversation was **recorded** in -> that rule;
+2. else the longest ruled folder containing the folder it runs in -> that rule;
+3. else the global slot.
+
+The recorded folder is where the session was started (its transcript's first working
+directory), or where it moved to since: entering or leaving a worktree (`EnterWorktree`,
+`ExitWorktree`) moves a session, and Claude Code moves its transcript along. It matters because
+`claude --resume <alias>` run in a git repo root can also resume a session recorded in one of
+the repo's subfolders or worktrees (or in a sibling folder whose name starts with the root's):
+the resumed conversation keeps belonging to its own folder, so it is routed and checked by that
+folder's alias rule, and a same-titled conversation of another folder never runs on an alias
+rule's reserved accounts.
+
+**A fork belongs to the folder it is launched in.** `claude --resume <alias> --fork-session`
+(or `--continue --fork-session`) copies the conversation into a NEW session of the folder you
+run it in, under the same name. So a fork made in the alias's folder stays under its rule, and a
+fork made from another folder is a conversation of that folder.
+
+`cctl claude`, the guard, `cctl session show` and the running-session check all read a
+transcript's recorded folder the same way:
+
+- the first line with a working directory within the transcript's first 1 MiB (Claude Code
+  writes a long first prompt twice before that line, so a smaller window would miss it);
+- the last `relocated` line within its last 64 KiB — Claude Code records one whenever a session
+  changes folder (a `.claude/worktrees/<name>` checkout, or `/cd`) and moves the transcript into
+  that folder's project directory;
+- the relocation counts when the project directory the transcript lives in is named after it and
+  it leads to where the session started or above it, counting a `.claude/worktrees/<name>`
+  checkout as its repository. Otherwise the first working directory counts, when the project
+  directory is named after it;
+- otherwise — no working directory within the window, one that disagrees, a transcript that does
+  not exist yet or cannot be read — the session counts for the folder it runs in when the project
+  directory's name can stand for that folder, and for no alias rule otherwise. The name is lossy
+  (`C:\a_b` and `C:\a-b` share one), so it never picks a ruled folder the session does not run in.
+
+`cctl claude` reads Claude Code's own arguments to see which session it opens — `--resume
+<alias>`, `--resume <session id>`, `--resume <path to a .jsonl transcript>`, `--continue` (it
+wins when given together with `--resume`, as in Claude Code), `--name <alias>`, `--session-id`,
+with or without `--fork-session` — then finds that session the way Claude Code will (the
+folder's sessions, plus the repo's subfolders and worktrees when Claude Code would search them)
+and launches it on the rule of the session's own name and recorded folder:
+
+```
+cctl claude --resume 'auth work'    # resumes the session on its rule's slot
+```
+
+A resume by text that matches only a generated title is an unnamed session (the folder rule
+applies). An interactive `claude --resume <text>` does not find sessions started with `-p` or the
+SDK, so an interactive launch does not route by them; a `-p` launch does. When the text matches
+several sessions under different rules, Claude Code decides which one opens (its picker), so the
+launch uses the folder rule and the guard judges the pick. `cctl claude` carries Claude Code's
+own option table; when your arguments hold an option it does not know before the session flags,
+it cannot tell which session opens, so it launches by the folder rule and says so in one line:
+
+```
+cctl: could not tell which session these arguments open (unrecognized option "--x"); launching
+by the folder rule — the enforcement guard checks the session Claude Code opens
+```
+
+It reads nothing at all when no rule holds a session alias, or no title the launch can end up
+with has one. A session resumed from your phone follows the same rule, and so does a background
+session the daemon moves: it goes to the slot of its alias's rule when it has one, whatever its
+folder runs under.
+
+The guard checks each prompt with the same rule, and treats a session alias's rule exactly as a
+folder's: a session on the global slot is accepted unless the rule excludes that account (or it
+is reserved to other rules), with the one-time notice when the rule includes accounts it is not
+on. Its refusals and notices name the session and resume THAT session by its id — a name several
+sessions share would reopen Claude Code's picker:
+
+```
+cctl: session "auth work" in C:\repo has its own cctl rule (it uses research first) and
+excludes personal, the account this session runs on. Exit and resume it with: cctl claude
+--resume 0b1c2d3e-4f50-4617-8899-aabbccddeeff
+```
+
+A session on a session alias's slot that carries another name (renamed away, or another
+conversation altogether) is refused too — start it again with `cctl claude`, or, if it is that
+session, rename it back — and so is a same-titled session recorded in another folder.
+
+`cctl folders` lists a session's rule with a `session:` line in place of its folder,
+`cctl where` names the sessions with a rule of their own in a folder (they outrank the folder's
+rule), and `cctl session show` adds `Rule` and `Slot` lines (`--json`: a `binding` field). A
+running session counts for an alias when its transcript names it; when a live session's name
+cannot be learned at all (its transcript cannot be read, or it has none yet: a fork or a new
+session before its first prompt) and it runs in the alias's folder, it may be that conversation,
+so emptying the rule's slot refuses without `--force`, and says how many could not be
+identified. A rule whose folder was moved and replaced by a link (a junction or symlink) to its
+new home can still be removed by its old path: `cctl session reset <alias> --cwd <old path>`
+(and `cctl folder reset <old path>`) look the rule up by the folder as spelled when the resolved
+path has none.
+
+**Mixing cctl versions.** While any session alias rule exists, `groups.json` is written as
+schema 3, which a cctl without them refuses to read (every command fails there, naming the
+schema) instead of quietly routing named sessions by their folder alone. So `cctl session
+include` and `exclude` (and `reset` with accounts) refuse while a running daemon predates them
+— restart it on this build first (`cctl daemon restart`); `cctl doctor` flags the same
+mismatch (`daemon-alias-rules`). Once the last session rule is gone the file goes back to
+schema 2. Before going back to an older build, remove every session rule with
+`cctl session reset <alias>`.
+
 ### Switching a folder's slot by hand
 
 ```
@@ -183,6 +323,13 @@ cctl shell-init bash         # (also: zsh, fish)
 For PowerShell, `cctl shell-init powershell` prints a function to add to your profile
 (`$PROFILE`); afterwards typing `claude` in any ruled folder starts on the right slot,
 and typing it anywhere else behaves exactly as before. The command prints where to put it.
+
+One PowerShell caveat: the wrapper is a PowerShell _function_, and PowerShell binds a
+function's arguments before it runs — a bare `--` is consumed, an unquoted comma splits one
+argument into several, and `-name:value` splits at the colon. So through the wrapper
+`claude -p -- --resume x` resumes the session `x`, where a direct `claude.exe` call sends the
+prompt "--resume x", and `claude --resume=a,b` resumes "a". Quote such arguments (`'--'`,
+`'--resume=a,b'`, `'-r:x'`) or call `claude.exe` directly. The generated wrapper says so too.
 
 In **VS Code**, the Claude Code extension takes its environment from the
 `claudeCode.environmentVariables` setting (a list of `{ "name", "value" }` pairs). That
@@ -727,6 +874,13 @@ used them, with turns, tokens and dates. `--json` prints the same data for scrip
 `stats`, it reads local files only and needs no running daemon; a session's slot is known
 from the hooks the daemon receives, so turns from before the daemon saw the session are
 billed against the global slot.
+
+`cctl session show` also says which rule the session runs under (see
+[A rule for one named session](#a-rule-for-one-named-session)) and whether it runs on that
+rule's slot: for the session you run it from, by the config dir that session is on now; for any
+other, by the slot the daemon last recorded for it. A session on the global slot under a rule is
+told the rule accepts it unless it excludes that account, and how to move onto the rule's own
+accounts.
 
 ## Prompts to idle sessions
 

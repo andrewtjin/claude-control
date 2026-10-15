@@ -11,6 +11,7 @@ import {
   renderUsage,
   sessionViewJson,
   type DaemonStatusView,
+  type SessionBindingView,
   type SessionView,
   type UsageRow,
 } from './render.js';
@@ -1107,6 +1108,85 @@ describe('renderAmbiguousAlias', () => {
     ]);
     expect(out).not.toContain(ESC_CHAR);
     expect(out).not.toContain('\u202e');
+  });
+});
+
+describe('renderSessionDetails — Rule and Slot', () => {
+  const SID = 'aaaaaaaa-0000-4000-8000-000000000001';
+  const binding = (over: Partial<SessionBindingView> = {}): SessionBindingView => ({
+    via: 'alias',
+    folder: 'C:\\work\\app',
+    alias: 'Auth Work',
+    ruleId: 'r1',
+    ruleLabel: 'Research',
+    members: ['research'],
+    requiredSlot: 'group:r1',
+    slot: 'group:r1',
+    slotSource: 'env',
+    slotLabel: 'the folder slot of session "Auth Work" in C:\\work\\app',
+    inScope: true,
+    ...over,
+  });
+  const view = (b: SessionBindingView): SessionView => ({
+    meta: sessionMeta({ sessionId: SID, customTitle: 'Auth Work' }),
+    accounts: [],
+    binding: b,
+  });
+  const render = (b: SessionBindingView): string =>
+    renderSessionDetails([view(b)], { folder: 'C:\\work\\app', matchedBy: 'id' });
+
+  it('names the rule and how it matched, and says the session is on its own slot', () => {
+    const out = render(binding());
+    expect(out).toContain(
+      'Rule      Research (uses research first)  by its alias "Auth Work" in C:\\work\\app',
+    );
+    expect(out).toContain("Slot      its rule's own slot");
+  });
+
+  it('a session on the global slot is told its rule accepts it, and how to move by its id', () => {
+    const out = render(binding({ slot: 'global', inScope: false, slotLabel: 'the global slot' }));
+    expect(out).toContain('it runs on the global slot, which its rule accepts');
+    expect(out).toContain(`to use research, resume it with: cctl claude --resume ${SID}`);
+    expect(out).not.toContain('NOT');
+  });
+
+  it('a session on another rule’s slot is called out', () => {
+    const out = render(
+      binding({
+        slot: 'group:r2',
+        slotSource: 'recorded',
+        inScope: false,
+        slotLabel: 'the folder slot of C:\\other',
+      }),
+    );
+    expect(out).toContain("NOT its rule's slot: it last ran on the folder slot of C:\\other");
+    expect(out).toContain(`cctl claude --resume ${SID}`);
+  });
+
+  it('a folder rule, no rule, and an unknown slot', () => {
+    expect(render(binding({ via: 'folder', alias: null }))).toContain(
+      'by its folder C:\\work\\app',
+    );
+    const none = render(binding({ via: null, ruleId: null, ruleLabel: null, members: [] }));
+    expect(none).toContain('Rule      none: it runs on the global slot and the shared pool');
+    expect(none).not.toContain('Slot');
+    expect(render(binding({ slot: null, slotSource: null, inScope: null }))).toContain(
+      'unknown (no slot recorded for this session yet)',
+    );
+    expect(render(binding({ slot: null, inScope: null }))).toContain(
+      'unknown (this session runs on a config dir cctl does not manage)',
+    );
+  });
+
+  it('strips terminal controls from the alias and labels', () => {
+    const out = render(binding({ alias: 'a\u001b[2Jb', ruleLabel: 'R\u001b]0;x\u0007' }));
+    expect(out).not.toContain('\u001b');
+    expect(out).not.toContain('\u0007');
+  });
+
+  it('carries the rule in the --json shape', () => {
+    const json = sessionViewJson(view(binding()));
+    expect(json.binding).toEqual(binding());
   });
 });
 
