@@ -50,7 +50,21 @@ import {
 } from './oauth.js';
 import { folderBindingsPath, groupProfileDir, profilesRoot, type Paths } from './paths.js';
 import { atomicWriteFile, removeIfExists } from './fsutil.js';
-import { canonicalizeFolder, checkBindTarget, folderKey, isWithin } from './folderPath.js';
+import {
+  CLAUDE_CODE_TITLE_MAX_LENGTH,
+  aliasFitsSessionTitle,
+  aliasKey,
+  aliasScopeUniquenessKey,
+  canonicalizeFolder,
+  checkAliasFolder,
+  checkBindTarget,
+  folderKey,
+  folderUniquenessKey,
+  isWellFormedText,
+  isWithin,
+} from './folderPath.js';
+import { projectDirMatches, recordedFolderFor } from './recordedFolder.js';
+import { sanitizeTerminalText } from './terminalSafe.js';
 import { createNodeProfileFs, ensureGroupProfile, planGroupProfile } from './profile.js';
 import {
   buildFolderBindingSnapshot,
@@ -62,10 +76,14 @@ import {
   allSlots,
   assignDistinct,
   availableInOrder,
+  describeRuleScopes,
+  exactAliasRule,
   exactFolderRule,
   legitimateOccupancy,
   liveElsewhere,
   resolveFolderRule,
+  resolveSessionRule,
+  ruleScopeCount,
   rulesIncluding,
   slotMayHold,
   slotPool,
@@ -95,7 +113,10 @@ import type {
   RepairResult,
   ResetResult,
   RuleLiveResult,
+  RuleScopeRef,
   RunningSession,
+  SessionIdentity,
+  SessionIdentityLookup,
   SlotHandOff,
   SlotId,
   SlotLiveToken,
@@ -103,7 +124,13 @@ import type {
   StoredAccount,
   SwitchIntent,
 } from './types.js';
-import { needsMetadataBackfill, Vault, type DedupeReport, type RegistryPicture } from './vault.js';
+import {
+  MAX_ALIAS_LENGTH,
+  needsMetadataBackfill,
+  Vault,
+  type DedupeReport,
+  type RegistryPicture,
+} from './vault.js';
 import { tokenPrints, type StoredTokens } from './tokenPrints.js';
 
 /** The filesystem seam the folder-rule verbs ({@link SwitchEngine.includeInFolder} and its
@@ -201,6 +228,12 @@ export interface SwitchEngineOptions {
   /** Process-liveness probe for the running-session scan. Defaults to a signal-0 check; tests inject
    *  a deterministic one. */
   isProcessAlive?: (pid: number) => boolean;
+  /** Reads a running session's custom title and recorded folder from its transcript, for the alias
+   *  half of the running-session scan. Claude Code's `sessions/<pid>.json` does not carry the title
+   *  of a RESUMED session (it records a derived name), so without this seam the scan can only use a
+   *  name the operator set at launch (`nameSource: "user"`). The CLI wires the daemon's session
+   *  catalog here; absent, only that launch-time name is used. */
+  sessionIdentity?: SessionIdentityLookup;
   /** The enforcement mode stamped into the guard snapshot written after every rule mutation.
    *  Defaults to `'block'`. Pass a plain mode for a one-shot CLI process; pass a RESOLVER for a
    *  long-lived process (the daemon), which is called at each snapshot write so a live
@@ -380,10 +413,53 @@ function captureInProfileError(configDir: string): RefreshError {
   );
 }
 
-/** A rule's folders as a display list, for messages ("the folder slot of <folders>"). Falls back to
- *  the rule's label for a rule that somehow holds no folder. */
+/** A rule's scopes as a display list, for messages ("the folder slot of <folders>"): its folders,
+ *  then its session aliases. Falls back to the rule's label for a rule that somehow holds none. */
 function describeRule(rule: FolderRule): string {
-  return rule.folders.length > 0 ? rule.folders.join(', ') : rule.label;
+  return describeRuleScopes(rule);
+}
+
+/** A rule scope as a refusal names it: the quoted folder, or the alias in its folder. */
+function describeScope(scope: RuleScopeRef): string {
+  return scope.kind === 'folder'
+    ? `"${scope.folder}"`
+    : `session "${scope.alias}" in ${scope.folder}`;
+}
+
+/** The scope fields a new rule on `scope` is created with. */
+function newRuleScope(scope: RuleScopeRef): {
+  folders: string[];
+  aliases?: { folder: string; alias: string }[];
+} {
+  return scope.kind === 'folder'
+    ? { folders: [scope.folder] }
+    : { folders: [], aliases: [{ folder: scope.folder, alias: scope.alias }] };
+}
+
+/** A running Claude Code session as the scope matchers see it: the canonical cwd it runs in (what
+ *  a FOLDER scope covers), and — for an ALIAS scope — its custom title and the canonical folder its
+ *  conversation was recorded in (see `SwitchEngine.scanRunningSessions` for where each comes
+ *  from). `title` null = unnamed; `titleKnown` false = the title could not be learned at all, so the
+ *  session may carry any title. `recordedFolder` null = none an alias scope can name; `dirName` = the
+ *  project directory its transcript lives in, when known. */
+interface SessionRecordView {
+  cwd: string;
+  title: string | null;
+  titleKnown: boolean;
+  recordedFolder: string | null;
+  dirName: string | undefined;
+}
+
+/** The clause a running-session refusal adds for sessions counted only because they MAY be the
+ *  conversation (see {@link RunningSession.unidentified}), so the operator knows why. */
+function unidentifiedNote(sessions: readonly RunningSession[]): string {
+  const n = sessions.filter((s) => s.unidentified === true).length;
+  if (n === 0) return '';
+  return (
+    ` (${n} of them could not be identified — a transcript that cannot be read, or a session ` +
+    "that has not sent its first prompt yet, such as a fork — and run in the alias's folder, so " +
+    'they may be its conversation)'
+  );
 }
 
 /** Structural equality of two violations — enough to tell whether a breach the repair set out to fix
@@ -525,6 +601,8 @@ export class SwitchEngine {
   private readonly bindFs: BindFs;
   /** See {@link SwitchEngineOptions.isProcessAlive}. */
   private readonly isProcessAlive: (pid: number) => boolean;
+  /** See {@link SwitchEngineOptions.sessionIdentity}. */
+  private readonly sessionIdentity: SessionIdentityLookup | undefined;
   /** Resolves the enforcement mode at snapshot-write time. See {@link SwitchEngineOptions.bindEnforce}
    *  — a plain mode is wrapped in a constant function; a resolver is read on every write so a live
    *  settings change is honored by daemon-side writers too. */
@@ -564,6 +642,7 @@ export class SwitchEngine {
     this.lockOptions = options.lockOptions ?? {};
     this.bindFs = options.bindFs ?? defaultBindFs();
     this.isProcessAlive = options.isProcessAlive ?? defaultIsProcessAlive;
+    this.sessionIdentity = options.sessionIdentity;
     this.resolveBindEnforce =
       typeof options.bindEnforce === 'function'
         ? options.bindEnforce
@@ -666,6 +745,32 @@ export class SwitchEngine {
     if (rules.length === 0) return null;
     const match = resolveFolderRule(this.canonReserved(cwd), rules, this.platform);
     return match === null ? null : { ruleId: match.rule.id, folder: match.folder };
+  }
+
+  /**
+   * The rule a SESSION runs under, by the precedence rule (see `resolveSessionRule`): the alias rule
+   * of the folder its conversation was recorded in (`recordedFolder`, default `folder`; null =
+   * recorded in no folder an alias rule can name) and its custom title (`title`; null/blank =
+   * unnamed), else the folder rule of `folder`, else `null` (the global slot). Canonicalizes leniently
+   * like {@link resolveFolderRule}.
+   */
+  async resolveSessionRule(
+    folder: string,
+    title: string | null | undefined,
+    recordedFolder?: string | null,
+  ): Promise<{ ruleId: string; via: 'alias' | 'folder'; folder: string } | null> {
+    const rules = await this.vault.listRules();
+    if (rules.length === 0) return null;
+    const match = resolveSessionRule(
+      this.canonReserved(folder),
+      title,
+      rules,
+      this.platform,
+      recordedFolder === undefined || recordedFolder === null
+        ? recordedFolder
+        : this.canonReserved(recordedFolder),
+    );
+    return match === null ? null : { ruleId: match.rule.id, via: match.via, folder: match.folder };
   }
 
   addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
@@ -1125,8 +1230,19 @@ export class SwitchEngine {
    * global. Canonicalized so a case difference or trailing separator still matches on Windows.
    */
   async slotForConfigDir(configDir: string | null | undefined): Promise<SlotId> {
+    return (await this.recognizedSlotForConfigDir(configDir)) ?? 'global';
+  }
+
+  /**
+   * {@link slotForConfigDir} without the guess: the global slot for an absent config dir or the main
+   * one, a rule's slot for its profile, and `null` for anything else — a config dir cctl does not
+   * manage (a removed rule's profile, a hand-made store), whose account is unknown. What a caller must
+   * use before acting on "the account this session runs on".
+   */
+  async recognizedSlotForConfigDir(configDir: string | null | undefined): Promise<SlotId | null> {
     if (configDir === undefined || configDir === null || configDir === '') return 'global';
     const key = folderKey(this.canonReserved(configDir), this.platform);
+    if (key === folderKey(this.canonReserved(this.paths.claudeDir), this.platform)) return 'global';
     for (const rule of await this.vault.listRules()) {
       const profileKey = folderKey(
         this.canonReserved(groupProfileDir(this.paths.vaultDir, rule.id)),
@@ -1134,7 +1250,7 @@ export class SwitchEngine {
       );
       if (key === profileKey) return ruleSlotId(rule.id);
     }
-    return 'global';
+    return null;
   }
 
   // ---- folder rules (include / exclude / reset / ensure-live) ----
@@ -1172,8 +1288,36 @@ export class SwitchEngine {
     accountIds: readonly string[],
     opts: { label?: string } = {},
   ): Promise<IncludeResult> {
+    return this.includeInScope({ kind: 'folder', folder }, accountIds, opts);
+  }
+
+  /**
+   * Include accounts in the rule of a session ALIAS in one exact folder, creating that rule when the
+   * alias has none: sessions titled `alias` (the `claude --resume` rule: case-insensitive, trimmed)
+   * whose conversation was recorded in `folder` run on the rule's slot, and that rule outranks every
+   * folder rule. Everything else is {@link includeInFolder}'s contract, step for step and fault point
+   * for fault point. The alias is stored as entered; one carrying a control or bidi character, or
+   * longer than Claude Code keeps a session name, is refused (it flows into hook output and
+   * terminals, and a longer one could never match).
+   */
+  async includeInAlias(
+    folder: string,
+    alias: string,
+    accountIds: readonly string[],
+    opts: { label?: string } = {},
+  ): Promise<IncludeResult> {
+    return this.includeInScope({ kind: 'alias', folder, alias }, accountIds, opts);
+  }
+
+  /** The shared body of {@link includeInFolder} and {@link includeInAlias}; see includeInFolder for
+   *  the order. */
+  private async includeInScope(
+    target: RuleScopeRef,
+    accountIds: readonly string[],
+    opts: { label?: string },
+  ): Promise<IncludeResult> {
     this.refuseRuleSlotsOnDarwin();
-    const canonicalFolder = this.canonicalizeBindFolder(folder);
+    const scope = this.canonicalizeEditScope(target);
     const requestedIds = this.requireAccountIds(accountIds, 'include');
     const label = opts.label !== undefined ? { label: opts.label } : {};
     // Fingerprint the stored bundles before the lock, as activate() does: the hand-off below checks
@@ -1185,7 +1329,7 @@ export class SwitchEngine {
       // is settled first — and the include refused while one to or from them cannot be.
       await this.settleForAccountsLocked(requestedIds);
       const picture = await this.vault.readPicture();
-      const existing = exactFolderRule(canonicalFolder, picture.rules, this.platform);
+      const existing = this.exactScopeRule(scope, picture.rules);
       if (existing) {
         await this.vault.checkInclude(existing.id, requestedIds);
         // The rule's own slot is written last (ensure-live); a switch stuck there would refuse that
@@ -1193,7 +1337,7 @@ export class SwitchEngine {
         await this.requireSettledLocked(this.slotRuntime(ruleSlotId(existing.id)));
       } else {
         await this.vault.checkCreateRule({
-          folders: [canonicalFolder],
+          ...newRuleScope(scope),
           include: requestedIds,
           ...label,
         });
@@ -1212,7 +1356,7 @@ export class SwitchEngine {
         unexcluded = res.unexcluded;
       } else {
         rule = await this.vault.createRule({
-          folders: [canonicalFolder],
+          ...newRuleScope(scope),
           include: requestedIds,
           ...label,
         });
@@ -1229,7 +1373,7 @@ export class SwitchEngine {
         unexcluded,
         handedOff,
         live,
-        runningSessions: await this.runningSessionsUnder([canonicalFolder]),
+        runningSessions: await this.runningSessionsInScope(scope),
       };
     });
   }
@@ -1249,8 +1393,29 @@ export class SwitchEngine {
     accountIds: readonly string[],
     opts: { force?: boolean; label?: string } = {},
   ): Promise<ExcludeResult> {
+    return this.excludeInScope({ kind: 'folder', folder }, accountIds, opts);
+  }
+
+  /** {@link excludeInFolder} for the rule of a session alias in one exact folder (see
+   *  {@link includeInAlias}): the named sessions avoid these shared accounts, in a slot of their
+   *  own. */
+  async excludeInAlias(
+    folder: string,
+    alias: string,
+    accountIds: readonly string[],
+    opts: { force?: boolean; label?: string } = {},
+  ): Promise<ExcludeResult> {
+    return this.excludeInScope({ kind: 'alias', folder, alias }, accountIds, opts);
+  }
+
+  /** The shared body of {@link excludeInFolder} and {@link excludeInAlias}. */
+  private async excludeInScope(
+    target: RuleScopeRef,
+    accountIds: readonly string[],
+    opts: { force?: boolean; label?: string },
+  ): Promise<ExcludeResult> {
     this.refuseRuleSlotsOnDarwin();
-    const canonicalFolder = this.canonicalizeBindFolder(folder);
+    const scope = this.canonicalizeEditScope(target);
     const requestedIds = this.requireAccountIds(accountIds, 'exclude');
     const label = opts.label !== undefined ? { label: opts.label } : {};
     await this.vault.readStoredTokens().catch(() => undefined);
@@ -1258,14 +1423,14 @@ export class SwitchEngine {
       const requested = await this.resolveRequested(requestedIds);
       await this.settleForAccountsLocked(requestedIds);
       const picture = await this.vault.readPicture();
-      const existing = exactFolderRule(canonicalFolder, picture.rules, this.platform);
+      const existing = this.exactScopeRule(scope, picture.rules);
       if (existing) {
         await this.vault.checkExclude(existing.id, requestedIds);
         // Refused here, not after the rule write: ensure-live writes this slot (see include).
         await this.requireSettledLocked(this.slotRuntime(ruleSlotId(existing.id)));
       } else {
         await this.vault.checkCreateRule({
-          folders: [canonicalFolder],
+          ...newRuleScope(scope),
           exclude: requestedIds,
           ...label,
         });
@@ -1296,7 +1461,7 @@ export class SwitchEngine {
       const rule = existing
         ? (await this.vault.excludeAccounts(existing.id, requestedIds)).rule
         : await this.vault.createRule({
-            folders: [canonicalFolder],
+            ...newRuleScope(scope),
             exclude: requestedIds,
             ...label,
           });
@@ -1310,9 +1475,7 @@ export class SwitchEngine {
         movedOff,
         live,
         runningSessions:
-          runningSessions.length > 0
-            ? runningSessions
-            : await this.runningSessionsUnder(rule.folders),
+          runningSessions.length > 0 ? runningSessions : await this.runningSessionsInRule(rule),
       };
     });
   }
@@ -1334,25 +1497,76 @@ export class SwitchEngine {
     accountIds?: readonly string[],
     opts: { force?: boolean } = {},
   ): Promise<ResetResult> {
+    return this.resetScope({ kind: 'folder', folder }, accountIds, opts);
+  }
+
+  /** {@link resetFolder} for the rule of a session alias in one exact folder (see
+   *  {@link includeInAlias}): drop named accounts from it, or remove it entirely. */
+  async resetAlias(
+    folder: string,
+    alias: string,
+    accountIds?: readonly string[],
+    opts: { force?: boolean } = {},
+  ): Promise<ResetResult> {
+    return this.resetScope({ kind: 'alias', folder, alias }, accountIds, opts);
+  }
+
+  /** The shared body of {@link resetFolder} and {@link resetAlias}. */
+  private async resetScope(
+    target: RuleScopeRef,
+    accountIds: readonly string[] | undefined,
+    opts: { force?: boolean },
+  ): Promise<ResetResult> {
     // The folder may since have been deleted, but its rule still needs clearing.
-    const canonicalFolder = this.canonicalizeBindFolder(folder, { mustExist: false });
+    const resolved = this.canonicalizeBindFolder(target.folder, { mustExist: false });
+    // The folder as spelled, canonicalized WITHOUT resolving links. A ruled folder that was moved and
+    // replaced by a link to its new home resolves to the new home, where no rule is, while the rule
+    // still names the old path: this spelling is how that rule can still be found and removed.
+    const spelled = canonicalizeFolder(target.folder, {
+      platform: this.platform,
+      cwd: this.bindFs.cwd(),
+    });
     const requestedIds =
       accountIds === undefined ? undefined : this.requireAccountIds(accountIds, 'reset');
     return this.withCredentialLock(async () => {
       const picture = await this.vault.readPicture();
-      const rule = exactFolderRule(canonicalFolder, picture.rules, this.platform);
-      if (rule === undefined) {
-        throw new RefreshError(`"${canonicalFolder}" has no folder rule`, 'not_ruled');
+      const at = (folder: string): RuleScopeRef => ({ ...target, folder });
+      let scope = at(resolved);
+      let rule = this.exactScopeRule(scope, picture.rules);
+      if (rule === undefined && spelled.ok && spelled.path !== resolved) {
+        rule = this.exactScopeRule(at(spelled.path), picture.rules);
+        if (rule !== undefined) scope = at(spelled.path);
       }
+      if (rule === undefined) {
+        throw new RefreshError(
+          scope.kind === 'folder'
+            ? `"${scope.folder}" has no folder rule`
+            : `${describeScope(scope)} has no rule`,
+          'not_ruled',
+        );
+      }
+      // Report the scope as the rule STORED it — the operator may have typed another case, spacing
+      // or separator spelling.
+      scope = this.storedScope(rule, scope);
+      const reported = {
+        folder: scope.folder,
+        ...(scope.kind === 'alias' ? { alias: scope.alias } : {}),
+      };
       const force = opts.force === true;
 
       if (requestedIds === undefined) {
-        if (rule.folders.length > 1) {
-          // One of several folders leaves; the rule and its live slot stay intact.
-          const updated = await this.vault.removeFolderFromRule(rule.id, canonicalFolder);
+        if (ruleScopeCount(rule) > 1) {
+          // One of several scopes leaves; the rule and its live slot stay intact.
+          const updated =
+            scope.kind === 'folder'
+              ? await this.vault.removeFolderFromRule(rule.id, scope.folder)
+              : await this.vault.removeAliasFromRule(rule.id, {
+                  folder: scope.folder,
+                  alias: scope.alias,
+                });
           await this.writeSnapshotLocked();
           return {
-            folder: canonicalFolder,
+            ...reported,
             dissolved: false,
             rule: updated,
             released: [],
@@ -1360,7 +1574,7 @@ export class SwitchEngine {
             runningSessions: [],
           };
         }
-        return this.dissolveRuleLocked(rule, canonicalFolder, force);
+        return { ...(await this.dissolveRuleLocked(rule, scope, force)), ...reported };
       }
 
       const requested = await this.resolveRequested(requestedIds);
@@ -1375,7 +1589,7 @@ export class SwitchEngine {
       const include = rule.include.filter((id) => !requestedIds.includes(id));
       const exclude = rule.exclude.filter((id) => !requestedIds.includes(id));
       if (include.length === 0 && exclude.length === 0) {
-        return this.dissolveRuleLocked(rule, canonicalFolder, force);
+        return { ...(await this.dissolveRuleLocked(rule, scope, force)), ...reported };
       }
 
       await this.settleForAccountsLocked(requestedIds);
@@ -1416,7 +1630,7 @@ export class SwitchEngine {
       await this.ensureRuleLiveLocked(res.rule);
       await this.writeSnapshotLocked();
       return {
-        folder: canonicalFolder,
+        ...reported,
         dissolved: false,
         rule: (await this.vault.getRule(rule.id)) ?? res.rule,
         released: res.released,
@@ -1437,14 +1651,14 @@ export class SwitchEngine {
    */
   private async dissolveRuleLocked(
     rule: FolderRule,
-    canonicalFolder: string,
+    scope: RuleScopeRef,
     force: boolean,
   ): Promise<ResetResult> {
-    const runningSessions = await this.runningSessionsUnder(rule.folders);
+    const runningSessions = await this.runningSessionsInRule(rule);
     if (runningSessions.length > 0 && !force) {
       throw new RefreshError(
-        `"${canonicalFolder}" (${describeRule(rule)}) has ${runningSessions.length} running ` +
-          'session(s) under it; exit them or rerun with --force',
+        `${describeScope(scope)} (${describeRule(rule)}) has ${runningSessions.length} running ` +
+          `session(s) under it${unidentifiedNote(runningSessions)}; exit them or rerun with --force`,
         'sessions_running',
       );
     }
@@ -1463,7 +1677,7 @@ export class SwitchEngine {
 
     await this.writeSnapshotLocked();
     return {
-      folder: canonicalFolder,
+      folder: scope.folder,
       dissolved: true,
       released,
       adoptedRotation,
@@ -1709,11 +1923,12 @@ export class SwitchEngine {
     force: boolean,
   ): Promise<RunningSession[]> {
     if (next.length > 0) return [];
-    const sessions = await this.runningSessionsUnder(rule.folders);
+    const sessions = await this.runningSessionsInRule(rule);
     if (sessions.length > 0 && !force) {
       throw new RefreshError(
         `${what} leaves ${describeRule(rule)} with no account to switch to, and ${sessions.length} ` +
-          'running session(s) are using it; exit them or rerun with --force',
+          `running session(s) are using it${unidentifiedNote(sessions)}; exit them or rerun with ` +
+          '--force',
         'sessions_running',
       );
     }
@@ -2478,6 +2693,112 @@ export class SwitchEngine {
     return canon.path;
   }
 
+  /** Canonicalize the scope a creating or editing verb (include, exclude) names: a folder by
+   *  {@link canonicalizeBindFolder}'s rules, an alias scope's folder by
+   *  {@link canonicalizeAliasFolder}'s lighter ones, with its alias text checked. */
+  private canonicalizeEditScope(scope: RuleScopeRef): RuleScopeRef {
+    if (scope.kind === 'folder') {
+      return { kind: 'folder', folder: this.canonicalizeBindFolder(scope.folder) };
+    }
+    this.checkAliasText(scope.alias);
+    return {
+      kind: 'alias',
+      folder: this.canonicalizeAliasFolder(scope.folder),
+      alias: scope.alias,
+    };
+  }
+
+  /** The rule holding exactly this scope — a folder rule of the folder, or the alias rule of
+   *  (folder, alias key) — if any. */
+  private exactScopeRule(
+    scope: RuleScopeRef,
+    rules: readonly FolderRule[],
+  ): FolderRule | undefined {
+    return scope.kind === 'folder'
+      ? exactFolderRule(scope.folder, rules, this.platform)
+      : exactAliasRule(scope.folder, scope.alias, rules, this.platform);
+  }
+
+  /** `scope` as `rule` stores it (matched by the store's uniqueness key), so a report names the
+   *  folder and alias as they were entered, not as the operator retyped them. */
+  private storedScope(rule: FolderRule, scope: RuleScopeRef): RuleScopeRef {
+    if (scope.kind === 'folder') {
+      const key = folderUniquenessKey(scope.folder, this.platform);
+      const stored = rule.folders.find((f) => folderUniquenessKey(f, this.platform) === key);
+      return stored === undefined ? scope : { kind: 'folder', folder: stored };
+    }
+    const key = aliasScopeUniquenessKey(scope.folder, scope.alias, this.platform);
+    const stored = (rule.aliases ?? []).find(
+      (a) => aliasScopeUniquenessKey(a.folder, a.alias, this.platform) === key,
+    );
+    return stored === undefined ? scope : { kind: 'alias', ...stored };
+  }
+
+  /** Refuse an alias no session title could usefully carry here: blank (after the resume rule's
+   *  trim), longer than Claude Code keeps a session's title (it stores the first
+   *  {@link CLAUDE_CODE_TITLE_MAX_LENGTH} characters, so a longer alias would never match any
+   *  session — a rule that silently applies to nothing), carrying an unpaired surrogate (which Claude
+   *  Code stores as U+FFFD, so again no session could match it), or holding a control/bidi character
+   *  — the alias is echoed into hook decisions and terminals, and a title that needs one is not worth
+   *  the risk. */
+  private checkAliasText(alias: string): void {
+    if (typeof alias !== 'string' || aliasKey(alias) === '') {
+      throw new RefreshError('a session alias cannot be empty', 'bind_refused');
+    }
+    if (!isWellFormedText(alias)) {
+      throw new RefreshError(
+        'a session alias cannot contain an unpaired surrogate: Claude Code stores it as the ' +
+          'Unicode replacement character in a session name, so no session could match this alias',
+        'bind_refused',
+      );
+    }
+    if (alias.length > MAX_ALIAS_LENGTH || !aliasFitsSessionTitle(alias)) {
+      throw new RefreshError(
+        `a session alias cannot be longer than ${CLAUDE_CODE_TITLE_MAX_LENGTH} characters: ` +
+          'Claude Code keeps only the first ' +
+          `${CLAUDE_CODE_TITLE_MAX_LENGTH} characters of a session name, so no session could ` +
+          'match a longer one',
+        'bind_refused',
+      );
+    }
+    if (sanitizeTerminalText(alias) !== alias) {
+      throw new RefreshError(
+        'a session alias cannot contain control or bidirectional characters',
+        'bind_refused',
+      );
+    }
+  }
+
+  /** Canonicalize the folder of an alias scope, refusing only what {@link checkAliasFolder} refuses
+   *  (a missing folder, or one inside cctl's state / the main config dir): an alias scope covers one
+   *  exact folder, so the home dir or a volume root — refused for FOLDER rules because they would
+   *  capture everything beneath — is a legitimate place for a named session. */
+  private canonicalizeAliasFolder(folder: string): string {
+    const canon = canonicalizeFolder(folder, {
+      platform: this.platform,
+      cwd: this.bindFs.cwd(),
+      realpath: this.bindFs.realpath,
+    });
+    if (!canon.ok) {
+      throw new RefreshError(`cannot use folder "${folder}": ${canon.reason}`, 'bind_refused');
+    }
+    const check = checkAliasFolder(canon.path, {
+      platform: this.platform,
+      isDirectory: this.bindFs.isDirectory,
+      homeDir: this.canonReserved(this.bindFs.homedir()),
+      vaultDir: this.canonReserved(this.paths.vaultDir),
+      profilesRoot: this.canonReserved(profilesRoot(this.paths.vaultDir)),
+      mainConfigDir: this.canonReserved(this.paths.claudeDir),
+    });
+    if (!check.ok) {
+      throw new RefreshError(
+        `cannot give a session in "${canon.path}" a rule: it ${check.reason}`,
+        'bind_refused',
+      );
+    }
+    return canon.path;
+  }
+
   /** Canonicalize a cctl-internal reserved path for containment checks — same rules as a rule
    *  folder, but falling back to the raw path when it does not exist yet (the profiles root has no
    *  directory until the first rule). */
@@ -2506,10 +2827,81 @@ export class SwitchEngine {
     await rm(rt.stateDir, { recursive: true, force: true });
   }
 
-  /** Scan `<mainConfigDir>/sessions/*.json` for Claude Code sessions whose recorded pid is alive and
-   *  whose cwd is within one of `folders`. Defensive: a missing dir, an unreadable or malformed file,
-   *  or a session with no usable pid/cwd is simply skipped, never thrown — this only feeds a warning. */
+  /** Running sessions whose cwd is within one of `folders` — what a folder scope covers. */
   private async runningSessionsUnder(folders: readonly string[]): Promise<RunningSession[]> {
+    if (folders.length === 0) return [];
+    return this.scanRunningSessions((rec) =>
+      folders.some((f) => isWithin(rec.cwd, f, this.platform)),
+    );
+  }
+
+  /** Running sessions an alias scope covers: a custom title matching `alias` by alias key, in a
+   *  conversation RECORDED in exactly `folder` (the precedence rule's alias key — a session resumed
+   *  from a parent folder still belongs to the folder it was recorded in). An unnamed session is not
+   *  counted: it is outside the alias scope by definition. A session whose title could not be
+   *  learned IS counted — marked {@link RunningSession.unidentified} — when it runs in `folder`, or
+   *  its transcript's project directory can stand for `folder`: it may be that conversation, and
+   *  emptying the slot must not strand it silently. */
+  private async runningAliasSessions(folder: string, alias: string): Promise<RunningSession[]> {
+    const here = folderUniquenessKey(folder, this.platform);
+    const key = aliasKey(alias);
+    return this.scanRunningSessions((rec) => {
+      if (!rec.titleKnown) {
+        return folderUniquenessKey(rec.cwd, this.platform) === here ||
+          (rec.recordedFolder !== null &&
+            folderUniquenessKey(rec.recordedFolder, this.platform) === here) ||
+          (rec.dirName !== undefined && projectDirMatches(rec.dirName, folder))
+          ? 'unidentified'
+          : false;
+      }
+      return (
+        rec.title !== null &&
+        aliasKey(rec.title) === key &&
+        rec.recordedFolder !== null &&
+        folderUniquenessKey(rec.recordedFolder, this.platform) === here
+      );
+    });
+  }
+
+  /** Running sessions one scope covers. */
+  private async runningSessionsInScope(scope: RuleScopeRef): Promise<RunningSession[]> {
+    return scope.kind === 'folder'
+      ? this.runningSessionsUnder([scope.folder])
+      : this.runningAliasSessions(scope.folder, scope.alias);
+  }
+
+  /** Running sessions in ANY of a rule's scopes (folders and aliases), each reported once. What
+   *  emptying the rule's slot refuses on: every session that could be running on it. */
+  private async runningSessionsInRule(rule: FolderRule): Promise<RunningSession[]> {
+    const found = await this.runningSessionsUnder(rule.folders);
+    for (const a of rule.aliases ?? []) {
+      for (const s of await this.runningAliasSessions(a.folder, a.alias)) {
+        if (!found.some((f) => f.sessionFile === s.sessionFile)) found.push(s);
+      }
+    }
+    return found;
+  }
+
+  /**
+   * Scan `<mainConfigDir>/sessions/*.json` for Claude Code sessions whose recorded pid is alive and
+   * that `matches` accepts. Each file records `{pid, cwd, sessionId, name, nameSource}` (it is
+   * removed on a clean exit and left stale by a hard kill, hence the pid check). The cwd is where the
+   * session runs. Its title and recorded folder come from its TRANSCRIPT when
+   * {@link sessionIdentity} is wired — the only source for a resumed session, whose `name` is derived
+   * (`nameSource: "derived"`), never its title — the recorded folder decided as everywhere else
+   * (recordedFolderFor over the shared reading, the session's cwd as the folder it runs in). A
+   * session the transcript does not know yet (a `--name` launch before its first turn) falls back to
+   * a `name` the operator set (`nameSource: "user"`, or no `nameSource` at all from an older Claude
+   * Code), recorded where it runs. Anything else — an unreadable transcript, a session with no
+   * transcript and no name of its own (a fork or a new session before its first prompt), a failed
+   * lookup — has an UNKNOWN title (`titleKnown` false), which the matcher decides about. A matcher
+   * answering 'unidentified' counts the session as possibly in scope. Defensive: a missing dir, an
+   * unreadable or malformed session file, or a session with no usable pid/cwd is skipped — this only
+   * feeds a warning or a refusal the operator can `--force`, never throws.
+   */
+  private async scanRunningSessions(
+    matches: (rec: SessionRecordView) => boolean | 'unidentified',
+  ): Promise<RunningSession[]> {
     const dir = join(this.paths.claudeDir, 'sessions');
     let names: string[];
     try {
@@ -2517,7 +2909,14 @@ export class SwitchEngine {
     } catch {
       return [];
     }
-    const out: RunningSession[] = [];
+    const live: {
+      pid: number;
+      rawCwd: string;
+      cwd: string;
+      file: string;
+      sessionId: string | undefined;
+      launchName: string | null;
+    }[] = [];
     for (const name of names) {
       if (!name.endsWith('.json')) continue;
       const file = join(dir, name);
@@ -2528,17 +2927,82 @@ export class SwitchEngine {
         continue;
       }
       if (typeof parsed !== 'object' || parsed === null) continue;
-      const rec = parsed as { pid?: unknown; cwd?: unknown };
+      const rec = parsed as {
+        pid?: unknown;
+        cwd?: unknown;
+        name?: unknown;
+        nameSource?: unknown;
+        sessionId?: unknown;
+      };
       const pid = typeof rec.pid === 'number' && Number.isInteger(rec.pid) ? rec.pid : undefined;
       const rawCwd = typeof rec.cwd === 'string' ? rec.cwd : undefined;
       if (pid === undefined || rawCwd === undefined) continue;
       if (!this.isProcessAlive(pid)) continue;
-      const canonCwd = this.canonReserved(rawCwd);
-      if (folders.some((f) => isWithin(canonCwd, f, this.platform))) {
-        out.push({ pid, cwd: canonCwd, sessionFile: file });
-      }
+      const userNamed = rec.nameSource === undefined || rec.nameSource === 'user';
+      live.push({
+        pid,
+        rawCwd,
+        cwd: this.canonReserved(rawCwd),
+        file,
+        sessionId:
+          typeof rec.sessionId === 'string' && rec.sessionId !== '' ? rec.sessionId : undefined,
+        launchName: userNamed && typeof rec.name === 'string' ? rec.name : null,
+      });
+    }
+    const identities = await this.lookupSessionIdentities(
+      live.flatMap((l) => (l.sessionId !== undefined ? [l.sessionId] : [])),
+    );
+    const out: RunningSession[] = [];
+    for (const l of live) {
+      const known: SessionIdentity | undefined =
+        l.sessionId !== undefined ? identities.get(l.sessionId.toLowerCase()) : undefined;
+      const readable = known !== undefined && known.unreadable !== true;
+      const titleKnown = readable || (known === undefined && l.launchName !== null);
+      const title = readable ? known.customTitle : titleKnown ? l.launchName : null;
+      // The folder the conversation belongs to, decided exactly as the guard decides it: a known
+      // transcript's trusted folder, else the folder it runs in when the transcript's project
+      // directory can stand for it; a named launch before its first turn belongs where it runs.
+      const recordedFolder =
+        known !== undefined
+          ? recordedFolderFor(
+              { folder: readable ? known.folder : null, dirName: known.dirName ?? '' },
+              { spelled: l.rawCwd, canonical: l.cwd },
+              (f) => this.canonReserved(f),
+            )
+          : l.cwd;
+      const verdict = matches({
+        cwd: l.cwd,
+        title,
+        titleKnown,
+        recordedFolder,
+        dirName: known?.dirName,
+      });
+      if (verdict === false) continue;
+      out.push({
+        pid: l.pid,
+        cwd: l.cwd,
+        sessionFile: l.file,
+        ...(verdict === 'unidentified' ? { unidentified: true as const } : {}),
+      });
     }
     return out;
+  }
+
+  /** {@link sessionIdentity} for these ids, or an empty map when it is not wired, there is nothing to
+   *  look up, or the lookup fails (the scan then falls back to what the session file records). */
+  private async lookupSessionIdentities(
+    sessionIds: readonly string[],
+  ): Promise<ReadonlyMap<string, SessionIdentity>> {
+    if (this.sessionIdentity === undefined || sessionIds.length === 0) return new Map();
+    try {
+      return await this.sessionIdentity(this.paths.claudeDir, sessionIds);
+    } catch (err) {
+      this.log.warn(
+        { reason: errorReason(err) },
+        "could not read running sessions' transcripts; using their session files only",
+      );
+      return new Map();
+    }
   }
 
   /** Build the guard snapshot object from the current registry (no IO beyond the vault reads). The
@@ -2555,6 +3019,7 @@ export class SwitchEngine {
       mainConfigDir: this.canonReserved(this.paths.claudeDir),
       mainIdentityFile: this.paths.claudeJsonPath,
       profileDirOf: (ruleId) => this.canonReserved(groupProfileDir(this.paths.vaultDir, ruleId)),
+      platform: this.platform,
     });
   }
 
@@ -2781,9 +3246,32 @@ export class SwitchEngine {
         : { claudeAiOauth: live };
       const account = await this.vault.addAccount(label, bundle);
       // The just-captured account IS the live one; record that so the first switch reconciles.
-      await this.vault.setActive(account.id);
+      await this.adoptAsGlobalLiveLocked(account.id);
       await this.refreshSnapshotForAccountsLocked();
       return account;
+    });
+  }
+
+  /**
+   * Record that `accountId` is now the global slot's live account WITHOUT a switch — a login cctl
+   * captured in place (`accounts add` of the current login, a first login with nothing live before
+   * it). Sets the registry's active id AND appends the same `activated` audit entry a switch writes:
+   * the attribution journal derives its activation timeline from that log alone, so without it a box
+   * that never switched has no interval at all and every turn reads as unattributed. Caller holds the
+   * credential lock.
+   */
+  private async adoptAsGlobalLiveLocked(accountId: string): Promise<void> {
+    const previous = await this.vault.getActiveId();
+    await this.vault.setActive(accountId);
+    if (previous === accountId) return;
+    this.audit.append({
+      ts: this.clock(),
+      event: 'activated',
+      fromAccountId: previous,
+      toAccountId: accountId,
+      origin: 'manual',
+      slot: 'global',
+      detail: 'adopted the current login',
     });
   }
 
@@ -2877,7 +3365,7 @@ export class SwitchEngine {
         const account = await this.vault.addAccount(label, bundle);
         if (!prior) {
           // Nothing to restore: the captured login is now the live one — record that.
-          await this.vault.setActive(account.id);
+          await this.adoptAsGlobalLiveLocked(account.id);
         }
         return account;
       } finally {
@@ -2934,7 +3422,7 @@ export class SwitchEngine {
           : { claudeAiOauth: creds };
         await this.vault.writeBundle(accountId, bundle);
         await this.vault.clearQuarantine(accountId);
-        if (!prior) await this.vault.setActive(accountId);
+        if (!prior) await this.adoptAsGlobalLiveLocked(accountId);
         const refreshed = await this.vault.getAccount(accountId);
         if (!refreshed) throw new UnknownAccountError(accountId);
         return refreshed;

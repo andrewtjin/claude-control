@@ -254,6 +254,64 @@ describe('a switch decided before an include reserved its target', () => {
   });
 });
 
+describe('a switch decided before a session alias rule reserved its target', () => {
+  it('a global hop is refused, and the newly reserved account is live only in the alias rule slot', async () => {
+    const h = await harness();
+    const { A, C } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.activate(A.id, { force: true });
+    h.setNow(NOW + 10 * 60_000);
+
+    const daemon = h.other();
+    const p = pauseNextLock();
+    const hop = settle(daemon.activate(C.id, { origin: 'auto', slot: 'global' }));
+    await p.arrived;
+    // The operator's alias include holds the lock: C is reserved and seated in the alias rule slot.
+    const included = await h.engine.includeInAlias(work, 'feature', [C.id]);
+    expect(included.live.liveAccount).toBe(C.id);
+    p.release();
+    const outcome = await hop;
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.err.code).toBe('slot_mismatch');
+    expect((await h.credStore.readLiveCredentials())?.refreshToken).toBe('r-A');
+    expect((await ruleStore(h.paths, included.rule.id).readLiveCredentials())?.refreshToken).toBe(
+      'r-C',
+    );
+    expect(await h.engine.checkSlots()).toEqual([]);
+    expect(await new IntentStore(h.paths.vaultDir).read()).toBeUndefined();
+  });
+
+  it('a rule-slot hop decided before an alias reset dissolved the rule never re-seeds its profile', async () => {
+    const h = await harness();
+    const { A, B, C } = await seed(h);
+    const work = await h.folder('work');
+    await h.engine.activate(A.id, { force: true });
+    const included = await h.engine.includeInAlias(work, 'feature', [B.id, C.id]);
+    expect(included.live.liveAccount).toBe(B.id);
+    const slot = ruleSlotId(included.rule.id);
+    const profileCreds = join(
+      groupProfileDir(h.paths.vaultDir, included.rule.id),
+      '.credentials.json',
+    );
+    h.setNow(NOW + 10 * 60_000);
+
+    const daemon = h.other();
+    const p = pauseNextLock();
+    const hop = settle(daemon.activate(C.id, { origin: 'auto', slot }));
+    await p.arrived;
+    const reset = await h.engine.resetAlias(work, 'FEATURE');
+    expect(reset.dissolved).toBe(true);
+    p.release();
+    const outcome = await hop;
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.err.code).toBe('slot_mismatch');
+    expect(existsSync(profileCreds)).toBe(false);
+    expect(await h.engine.checkSlots()).toEqual([]);
+  });
+});
+
 describe('a rule-slot switch decided before an exclude of its target', () => {
   it('is refused, and the excluded account is never written into the slot', async () => {
     const h = await harness();

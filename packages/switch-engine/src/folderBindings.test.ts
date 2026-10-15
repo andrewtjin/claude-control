@@ -334,6 +334,72 @@ describe('folderBindingSnapshotContentEqual (pure)', () => {
   });
 });
 
+describe('buildFolderBindingSnapshot — session alias rules', () => {
+  const aliasRule = (): FolderRule => ({
+    ...rule('a1', ['m1'], [], []),
+    aliases: [{ folder: 'C:/work/', alias: ' Auth Work ' }],
+  });
+
+  it('carries each alias scope as its canonical folder, its key and the alias as entered', () => {
+    const snapshot = buildFolderBindingSnapshot({
+      shared: [],
+      rules: [aliasRule(), rule('f1', [])],
+      reserved: [row('m1', 'A')],
+      generation: 1,
+      enforce: 'block',
+      mainConfigDir: 'C:\\main',
+      mainIdentityFile: ID_FILE,
+      profileDirOf: (id) => `C:\\profiles\\${id}`,
+      platform: 'win32',
+    });
+    expect(snapshot.groups[0]).toMatchObject({
+      id: 'a1',
+      folders: [],
+      members: ['A'],
+      aliases: [{ folder: 'C:\\work', aliasKey: 'auth work', alias: ' Auth Work ' }],
+    });
+    // A rule with no alias scope carries no field: the shape older guards read.
+    expect('aliases' in snapshot.groups[1]!).toBe(false);
+  });
+
+  it('is unequal when an alias scope is added, changed or removed (the guard enforces it)', () => {
+    const build = (rules: FolderRule[]) =>
+      buildFolderBindingSnapshot({
+        shared: [],
+        rules,
+        reserved: [row('m1', 'A')],
+        generation: 1,
+        enforce: 'block',
+        mainConfigDir: 'C:\\main',
+        mainIdentityFile: ID_FILE,
+        profileDirOf: (id) => `C:\\profiles\\${id}`,
+        platform: 'win32',
+      });
+    const plain = build([rule('a1', ['m1'])]);
+    const withAlias = build([aliasRule()]);
+    expect(folderBindingSnapshotContentEqual(plain, withAlias)).toBe(false);
+    const renamed = build([{ ...aliasRule(), aliases: [{ folder: 'C:/work', alias: 'Other' }] }]);
+    expect(folderBindingSnapshotContentEqual(withAlias, renamed)).toBe(false);
+    expect(folderBindingSnapshotContentEqual(withAlias, build([aliasRule()]))).toBe(true);
+  });
+
+  it('reads a snapshot written before alias rules existed as having none', () => {
+    const now = buildFolderBindingSnapshot({
+      shared: [],
+      rules: [rule('g1', ['m1'])],
+      reserved: [row('m1', 'A')],
+      generation: 1,
+      enforce: 'block',
+      mainConfigDir: 'C:\\main',
+      mainIdentityFile: ID_FILE,
+      profileDirOf: (id) => `C:\\profiles\\${id}`,
+    });
+    const older = structuredClone(now);
+    for (const g of older.groups) delete g.aliases;
+    expect(folderBindingSnapshotContentEqual(now, older)).toBe(true);
+  });
+});
+
 describe('Vault.writeFolderBindings / readFolderBindings', () => {
   it('writes the snapshot beside the vault and reads it back with the live generation', async () => {
     const { v, vaultDir, snapshotPath } = await vaultAt();

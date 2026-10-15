@@ -157,6 +157,17 @@ export interface SlotLiveToken {
 }
 
 /**
+ * One session-alias scope of a rule: sessions whose CUSTOM title matches `alias` (compared by
+ * `aliasKey`, the `claude --resume` rule: lower-cased and trimmed) in a conversation recorded in
+ * EXACTLY `folder` (canonical; not its subfolders) run under the rule. `alias` is kept as the
+ * operator entered it, for display.
+ */
+export interface StoredAliasScope {
+  folder: string;
+  alias: string;
+}
+
+/**
  * A per-folder rule over the inherited global pool, persisted in `groups.json`.
  *
  * A rule applies to its folders and everything beneath them (the longest matching folder wins, with
@@ -171,8 +182,14 @@ export interface FolderRule {
   id: string;
   /** Display name. Defaults to the folder the rule was created on. */
   label: string;
-  /** Canonical folder paths this rule applies to (see `folderPath.ts`). Unique across all rules. */
+  /** Canonical folder paths this rule applies to (see `folderPath.ts`). Unique across all rules.
+   *  Empty for a rule that applies only to a session alias. */
   folders: string[];
+  /** Session-alias scopes (see {@link StoredAliasScope}). Absent (never an empty array on disk) when
+   *  the rule has none, so a rules file without alias rules keeps the exact shape older builds read.
+   *  A (folder, alias key) pair is unique across all rules, and outranks every folder rule: a
+   *  session titled so, recorded in that folder, runs under this rule wherever it is resumed from. */
+  aliases?: StoredAliasScope[];
   /** Ids of the accounts positively assigned to these folders, in preference order. Each is a
    *  RESERVED account (its row is in {@link RulesFile.reserved}); several rules may include the same
    *  account, and those folders share it. Including an account overrides its global auto-switch
@@ -189,11 +206,13 @@ export interface FolderRule {
   updatedAtMs: number;
 }
 
-/** The `groups.json` file, schema 2: the reserved side of the one logical registry plus the folder
- *  rules over it. An account is in `reserved` (and absent from `accounts.json`) exactly while at
- *  least one rule includes it. Schema 1 (set-bound groups) is migrated on read. */
+/** The `groups.json` file: the reserved side of the one logical registry plus the folder rules over
+ *  it. An account is in `reserved` (and absent from `accounts.json`) exactly while at least one rule
+ *  includes it. Schema 1 (set-bound groups) is migrated on read. `schemaVersion` is 3 exactly while
+ *  some rule carries an alias scope, so a build that knows only folder rules refuses the file instead
+ *  of ignoring the alias rules it cannot honor; else 2. */
 export interface RulesFile {
-  schemaVersion: 2;
+  schemaVersion: 2 | 3;
   /** Bumped on every write; the guard snapshot (see {@link FolderBindingSnapshot}) carries it so a
    *  stale snapshot can be detected. */
   generation: number;
@@ -283,6 +302,11 @@ export interface FolderBindingSnapshotGroup {
    *  folder is refused while the global slot holds one of them. Absent in a snapshot written by a
    *  build that predates it, which the guard reads as "cannot tell". */
   excluded?: FolderBindingSnapshotIdentity[];
+  /** Alias scopes: the canonical folder, the key the guard compares a prompt's session title
+   *  against (lower-cased, trimmed), and the alias as entered, for the guard's messages (an alias is
+   *  printable text: the engine refuses control and bidi characters). Absent in a snapshot written by
+   *  a build that predates alias rules, which the guard reads as none. */
+  aliases?: { folder: string; aliasKey: string; alias?: string }[];
 }
 
 /** Write-ahead record of an in-progress switch, for crash recovery. Carries NO secrets.
@@ -373,7 +397,42 @@ export interface RunningSession {
   cwd: string;
   /** The session file it was read from, for diagnostics. */
   sessionFile: string;
+  /** Set when the session was counted for an alias scope although its title could not be learned
+   *  (its transcript cannot be read, or it has none yet — a fork or a new session before its first
+   *  prompt), because it runs in that scope's folder: it MAY be that conversation. */
+  unidentified?: true;
 }
+
+/** What a rule change acts on, as an operator names it: a folder (the folder and every subfolder),
+ *  or one session alias in one exact folder. Both are scopes of a rule, and every rule verb treats
+ *  them alike. */
+export type RuleScopeRef =
+  { kind: 'folder'; folder: string } | { kind: 'alias'; folder: string; alias: string };
+
+/** What Claude Code's transcript says about one session: its custom title (`/rename`, `--name`;
+ *  null = unnamed — a generated title never counts) and the folder it was recorded in, as the one
+ *  shared reading decides it (recordedFolder.ts readRecordedFolder: its first recorded cwd, or a
+ *  later relocation, each trusted only when consistent with the transcript's project directory;
+ *  null = none trusted, when `dirName` is the fallback — see recordedFolderFor). */
+export interface SessionIdentity {
+  customTitle: string | null;
+  folder: string | null;
+  /** The name of the project directory the transcript lives in. */
+  dirName?: string;
+  /** Set when the transcript exists but could not be read (locked, an IO error): its title is then
+   *  UNKNOWN, not absent — `customTitle` null does not mean unnamed. */
+  unreadable?: boolean;
+}
+
+/** Look sessions up by id in Claude Code's transcripts under `claudeDir` (the main config dir): a
+ *  map from the LOWER-CASED session id to what its transcript records — or, for a transcript that
+ *  exists but cannot be read, an entry marked `unreadable`. An id with no transcript yet is simply
+ *  absent. Injected into the engine because the transcript reader lives with the daemon's session
+ *  catalog; see `SwitchEngineOptions.sessionIdentity`. */
+export type SessionIdentityLookup = (
+  claudeDir: string,
+  sessionIds: readonly string[],
+) => Promise<ReadonlyMap<string, SessionIdentity>>;
 
 /** What {@link SwitchEngine.ensureRuleLive} settled a rule's slot to — reported at the mechanism
  *  level like {@link ActivateResult}: `liveAccount` is the account whose credentials are now written
@@ -407,10 +466,10 @@ export interface SlotHandOff {
   to: string;
 }
 
-/** What {@link SwitchEngine.includeInFolder} did — reported so the CLI can tell the operator exactly
- *  what moved. */
+/** What {@link SwitchEngine.includeInFolder} / {@link SwitchEngine.includeInAlias} did — reported so
+ *  the CLI can tell the operator exactly what moved. */
 export interface IncludeResult {
-  /** The folder's rule after the change (created or updated). */
+  /** The scope's rule after the change (created or updated). */
   rule: FolderRule;
   /** True when the folder had no rule and one was created. */
   created: boolean;
@@ -429,9 +488,9 @@ export interface IncludeResult {
   runningSessions: RunningSession[];
 }
 
-/** What {@link SwitchEngine.excludeInFolder} did. */
+/** What {@link SwitchEngine.excludeInFolder} / {@link SwitchEngine.excludeInAlias} did. */
 export interface ExcludeResult {
-  /** The folder's rule after the change (created or updated). */
+  /** The scope's rule after the change (created or updated). */
   rule: FolderRule;
   /** True when the folder had no rule and one was created. */
   created: boolean;
@@ -444,10 +503,12 @@ export interface ExcludeResult {
   runningSessions: RunningSession[];
 }
 
-/** What {@link SwitchEngine.resetFolder} did. */
+/** What {@link SwitchEngine.resetFolder} / {@link SwitchEngine.resetAlias} did. */
 export interface ResetResult {
-  /** The canonical folder that was reset. */
+  /** The canonical folder of the scope that was reset, as the rule stored it. */
   folder: string;
+  /** For an alias scope: the alias as the rule stored it; absent for a folder. */
+  alias?: string;
   /** True when the rule was removed entirely (no accounts named, or nothing left in it); false when
    *  only some accounts were removed, or only this folder left a rule that keeps other folders. */
   dissolved: boolean;
