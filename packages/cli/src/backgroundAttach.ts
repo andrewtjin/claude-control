@@ -73,6 +73,7 @@ import {
   SHORT_OPTIONS,
   type ClaudeBackgroundHost,
 } from './backgroundHost.js';
+import { parseClaudeSessionArgs } from './launcher.js';
 
 /** Claude Code's own rule for a job id given to `attach` and its kin: one to eight lowercase hex
  *  digits are always a prefix of a job id, never a name. */
@@ -1563,4 +1564,45 @@ export async function runHolding<T>(
     release();
     await watch;
   }
+}
+
+/**
+ * Whether these arguments start a NEW background session: `--bg` or `--background` with no
+ * background-session verb run first (Claude Code's own reading; see {@link BACKGROUND_STARTS}).
+ * Such a session outlives the terminal that started it.
+ */
+export function startsBackgroundSession(args: readonly string[]): boolean {
+  const words = args[0] === '--' ? args.slice(1) : args;
+  return words.some((w) => BACKGROUND_STARTS.has(w)) && claudeCodeVerbAt(args, true) === -1;
+}
+
+/**
+ * Why these arguments cannot run in a parallel session (`cctl claude --account`, which lasts as long
+ * as its terminal), or undefined when they can. Read by token, as Claude Code reads them, never from
+ * an uncertain parse: an unrecognized option before a session option is a launch like any other.
+ *   - a new background session (`--bg`, `--background`): it would outlive the session's terminal;
+ *   - `attach`, `stop`, `kill`, `rm`, `respawn`: they reach a session its own service runs;
+ *   - any other subcommand (`auth login`, `setup-token`, `mcp`, `update`...): not a session, and a
+ *     login would overwrite the session's own in its profile.
+ * A resume, a continue, the picker, a prompt or a print run are sessions, and run.
+ */
+export function leaseArgRefusal(args: readonly string[], label: string): string | undefined {
+  const request = parseBackgroundRequest(args);
+  if (request?.verb === 'attach' || request?.verb === 'control') {
+    const verb = request.args[request.refAt - 1] ?? request.verb;
+    return (
+      `"${verb}" opens a background session, which runs on the account its service holds; ` +
+      '--account cannot choose one for it. Run it without --account.'
+    );
+  }
+  if (startsBackgroundSession(args)) {
+    return (
+      `${label} would run here as a parallel session, which lasts only as long as this terminal, ` +
+      'and "--bg" starts a background session that outlives it. To give a named session its own ' +
+      `account, run: cctl session include <name> ${label}`
+    );
+  }
+  const sub = parseClaudeSessionArgs(args).subcommand;
+  if (sub !== undefined) return `"claude ${sub}" is not a session; run it without --account.`;
+  return undefined;
 }

@@ -725,6 +725,7 @@ describe('checkFolderRules', () => {
       'rule-scopes',
       'guard-snapshot',
       'guard-hook',
+      'parallel-sessions',
     ]);
     expect(out.every((c) => c.ok)).toBe(true);
   });

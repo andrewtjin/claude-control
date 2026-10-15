@@ -32,8 +32,12 @@ import {
   isOverloadCode,
   parsePastedCode,
   resolveAccountRef,
+  isLeaseRule,
+  type FolderRule,
   type StoredAccount,
 } from '@claude-control/switch-engine';
+import { cliLeaseProbe, sweepBeforeLeaseRefusal, terminalsOf } from './leaseCli.js';
+import { olderInstallReason } from './folderRulesSupport.js';
 import {
   ControlPlaneClient,
   ExhaustionLog,
@@ -166,6 +170,7 @@ import {
 import {
   checkAutostart,
   checkDaemonAliasRules,
+  checkDaemonScopeSupport,
   checkDaemonFolderRules,
   checkFolderRules,
   checkLiveLogin,
@@ -318,9 +323,15 @@ export function buildProgram(): Command {
       const engine = buildEngine();
       // Resolve across the WHOLE registry (shared pool + reserved accounts) so `cctl switch <ref>`
       // reaches an account a folder rule includes; activate() routes it to that rule's slot.
-      const fleet = await engine.listAllAccounts();
+      let fleet = await engine.listAllAccounts();
       const resolved = resolveAccountRef(fleet, ref);
       if (!resolved.ok) fail(resolved.message);
+      // A parallel session holding the account refuses the switch while it runs. Whether its
+      // processes still run is checked first (with no daemon, nothing else would end one whose
+      // terminal was closed), and the fleet re-read if that ended it.
+      const before = fleet.find((a) => a.id === resolved.account.id)?.ruleIds;
+      await sweepBeforeLeaseRefusal(engine, defaultPaths(), resolved.account.id);
+      if (before !== undefined) fleet = await engine.listAllAccounts();
       // --folder names the slot outright: the folder's rule slot (a rule slot may also take a shared
       // account it does not exclude), or the global slot where no rule applies. Without it, the
       // slot the account belonged to when it was resolved — asserted on the switch, so a rule change
@@ -719,13 +730,24 @@ export function buildProgram(): Command {
       const report = await readSettingsReport(daemonSettingsPath());
       const heartbeat = await readHeartbeat(daemonHeartbeatPath());
       const daemonBuild = report?.settings.find((r) => r.name === 'daemon build')?.value;
+      const rules = await engine.listRules().catch(() => [] as FolderRule[]);
+      const hasLeases = rules.some(isLeaseRule);
       checks.push(
-        ...(await checkFolderRules(engine, paths)),
+        ...(await checkFolderRules(engine, paths, cliLeaseProbe(paths))),
         checkDaemonFolderRules(report, heartbeat),
         checkDaemonAliasRules(
           report,
           heartbeat,
-          (await engine.listRules().catch(() => [])).some((r) => (r.aliases ?? []).length > 0),
+          rules.some((r) => (r.aliases ?? []).length > 0),
+        ),
+        checkDaemonScopeSupport(
+          'lease',
+          report,
+          heartbeat,
+          hasLeases,
+          hasLeases
+            ? olderInstallReason({ cliBuild: VERSION, daemonAlive: heartbeat.state === 'alive' })
+            : undefined,
         ),
         checkVersionSkew(VERSION, daemonBuild, heartbeat.state === 'alive'),
       );
@@ -1301,8 +1323,12 @@ async function readStatusSummary(): Promise<SetupSummary> {
     dpapiIdentityStore(join(dataDir, 'daemon-identity.enc'), defaultProtector()).load(),
   ]);
   const heartbeat = await readHeartbeat(daemonHeartbeatPath(paths));
+  const parallelSessions = (await engine.listRules().catch(() => [] as FolderRule[]))
+    .filter(isLeaseRule)
+    .map((r) => ({ label: r.label, terminals: terminalsOf(r.lease.holders) }));
   return {
     accounts: accounts.map((a) => ({ label: a.label, active: a.id === activeId })),
+    ...(parallelSessions.length > 0 ? { parallelSessions } : {}),
     hooksInstalled,
     hooksProfilePath: settingsPath,
     relayUrl: resolveRelayUrl(),
@@ -1879,7 +1905,15 @@ function buildAccountCommands(program: Command): void {
       // label; removeAccount drops it from its group (dissolving a group left memberless).
       const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
       if (!resolved.ok) fail(resolved.message);
-      await engine.removeAccount(resolved.account.id);
+      // A parallel session holding it refuses the removal; one whose processes are gone is ended
+      // first (see cctl switch).
+      await sweepBeforeLeaseRefusal(engine, defaultPaths(), resolved.account.id);
+      try {
+        await engine.removeAccount(resolved.account.id);
+      } catch (err) {
+        if (err instanceof SlotError && err.code === 'leased') fail(err.message);
+        throw err;
+      }
       process.stdout.write(`Removed ${resolved.account.label}.\n`);
     });
 

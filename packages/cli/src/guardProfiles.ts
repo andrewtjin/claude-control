@@ -9,7 +9,7 @@
 
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { profilesRoot, type FolderRule } from '@claude-control/switch-engine';
+import { isLeaseRule, profilesRoot, type FolderRule } from '@claude-control/switch-engine';
 
 /** The settings.json inside a single rule profile dir (`<profilesRoot>/<ruleId>/settings.json`). */
 function profileSettingsPath(vaultDir: string, ruleId: string): string {
@@ -42,4 +42,14 @@ export function resolveGuardProfileSettingsPaths(
     return [];
   }
   return entries.map((name) => join(profilesRoot(vaultDir), name, 'settings.json'));
+}
+
+/**
+ * Whether any rule needs the enforcement guard: a folder or alias rule. A parallel session's sessions
+ * run wherever they were started (the guard lets its profile through without a check), so a vault
+ * holding only parallel sessions has nothing to enforce, and installing the hook into the user's
+ * `settings.json` on every such launch, then removing it at the end, would be churn for nothing.
+ */
+export function hasGuardedRules(rules: readonly FolderRule[]): boolean {
+  return rules.some((r) => !isLeaseRule(r));
 }

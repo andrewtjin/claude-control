@@ -18,14 +18,21 @@ import { isBindGuardInSettingsText, type HeartbeatReading } from '@claude-contro
 import {
   CLAUDE_CODE_TITLE_MAX_LENGTH,
   aliasFitsSessionTitle,
+  isLeaseRule,
   shellQuoteArg,
   type FolderRule,
+  type LeaseOccupancyProbe,
+  type LeaseView,
   type SwitchEngine,
 } from '@claude-control/switch-engine';
 import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
 import type { AutostartState } from './autostart.js';
 import { describeEnforceMode } from './folderRender.js';
-import { olderDaemonAliasReason, olderDaemonReason } from './folderRulesSupport.js';
+import {
+  olderDaemonReason,
+  olderDaemonScopeReason,
+  type GatedScope,
+} from './folderRulesSupport.js';
 import { verifyManagedSettingsEffective } from './managedSettings.js';
 import type { SettingsReport } from './settings.js';
 import { parsePowerShellWrapper, POWERSHELL_WRAPPER_MARKER } from './shellInit.js';
@@ -411,7 +418,10 @@ export async function checkGuardSnapshot(
  *  keeps a session's name, or not well-formed text; again only a hand edit stores one), which never
  *  matches — with the command that removes it. Pure over the rules. */
 export function checkRuleScopes(rules: readonly FolderRule[]): DoctorCheck {
-  const scopeless = rules.filter((r) => r.folders.length === 0 && (r.aliases ?? []).length === 0);
+  // A parallel session has no scope by design: it runs wherever its terminal started it.
+  const scopeless = rules.filter(
+    (r) => !isLeaseRule(r) && r.folders.length === 0 && (r.aliases ?? []).length === 0,
+  );
   const unmatchable = rules.flatMap((r) =>
     (r.aliases ?? []).filter((a) => !aliasFitsSessionTitle(a.alias)),
   );
@@ -452,17 +462,162 @@ export function checkDaemonAliasRules(
   heartbeat: HeartbeatReading,
   hasAliasRules: boolean,
 ): DoctorCheck {
-  const reason = hasAliasRules ? olderDaemonAliasReason(report, heartbeat) : undefined;
-  if (reason !== undefined) return { name: 'daemon-alias-rules', ok: false, detail: reason };
-  return {
+  return checkDaemonScopeSupport('alias', report, heartbeat, hasAliasRules);
+}
+
+/** The words of each gated kind's check: its name, what it checks and its pass lines. */
+const SCOPE_CHECKS: Record<GatedScope, { name: string; none: string; honored: string }> = {
+  alias: {
     name: 'daemon-alias-rules',
+    none: 'no session alias rule to check',
+    honored: 'the running daemon honors session alias rules',
+  },
+  lease: {
+    name: 'daemon-parallel-sessions',
+    none: 'no parallel session to check',
+    honored: 'the running daemon reads parallel sessions',
+  },
+};
+
+/** Whether the running daemon reads a kind of rule a rules file holds right now (see
+ *  folderRulesSupport.ts). Nothing of that kind, no running daemon, or one that says it reads them,
+ *  is a pass. For parallel sessions, `installReason` (an older cctl on PATH or in the autostart
+ *  registration, see `olderInstallReason`) fails it too. Pure. */
+export function checkDaemonScopeSupport(
+  kind: GatedScope,
+  report: SettingsReport | undefined,
+  heartbeat: HeartbeatReading,
+  present: boolean,
+  installReason?: string,
+): DoctorCheck {
+  const words = SCOPE_CHECKS[kind];
+  const reason = present
+    ? (olderDaemonScopeReason(kind, report, heartbeat) ?? installReason)
+    : undefined;
+  if (reason !== undefined) return { name: words.name, ok: false, detail: reason };
+  return {
+    name: words.name,
     ok: true,
-    detail: !hasAliasRules
-      ? 'no session alias rule to check'
+    detail: !present
+      ? words.none
       : heartbeat.state === 'alive'
-        ? 'the running daemon honors session alias rules'
+        ? words.honored
         : 'no running daemon to check',
   };
+}
+
+/** What doctor learned about a parallel session with no running holder, beyond its holders: a
+ *  process found on its profile, a roster that could not be read, a slot that cannot be settled. */
+export interface LeaseFacts {
+  rosterUnreadable?: string;
+  untrusted?: string;
+}
+
+/**
+ * The `parallel-sessions` check: each parallel session is held by a running process, or doctor says
+ * why it is not and what frees it — exited processes only (naming a pid another program now has),
+ * processes this machine cannot check, a roster that could not be read, a slot that cannot be
+ * settled, or a process running on its profile that the next full check will record. Pure.
+ */
+export function checkSessionLeases(
+  leases: readonly LeaseView[],
+  facts: ReadonlyMap<string, LeaseFacts> = new Map(),
+): DoctorCheck {
+  if (leases.length === 0)
+    return { name: 'parallel-sessions', ok: true, detail: 'no parallel sessions' };
+  const problems: string[] = [];
+  for (const lease of leases) {
+    const label = sanitizeForTerminal(lease.label);
+    const running = lease.holders.filter((h) => h.state === 'alive' || h.state === 'unverifiable');
+    if (running.length > 0) continue;
+    const foreign = lease.holders.filter((h) => h.state === 'foreign');
+    if (foreign.length > 0) {
+      problems.push(
+        `the parallel session of ${label} is held by processes this machine cannot check (` +
+          foreign.map((h) => `pid ${h.pid} on ${h.platform}`).join(', ') +
+          ', another pid namespace or host): exit them where they run; the next cctl claude ' +
+          '--account or cctl switch there frees it.',
+      );
+      continue;
+    }
+    if ((lease.unrecorded ?? []).length > 0) {
+      problems.push(
+        `the parallel session of ${label} has no recorded process running, but process(es) ` +
+          `${lease.unrecorded!.join(', ')} run on its profile; the next full check records them ` +
+          'and the session stays until they exit.',
+      );
+      continue;
+    }
+    const fact = facts.get(lease.ruleId) ?? {};
+    if (fact.untrusted !== undefined) {
+      problems.push(
+        `the parallel session of ${label} could not be ended: its slot has an unfinished change ` +
+          `that cannot be settled (${sanitizeForTerminal(fact.untrusted)}), and clearing it could ` +
+          'lose its latest login. It is retried every poll.',
+      );
+      continue;
+    }
+    if (fact.rosterUnreadable !== undefined) {
+      problems.push(
+        `the parallel session of ${label} could not be ended: the background-session roster of ` +
+          `its profile could not be read (${sanitizeForTerminal(fact.rosterUnreadable)}). It is ` +
+          'retried every poll.',
+      );
+      continue;
+    }
+    const pids = lease.holders.map((h) => h.pid);
+    const reused = lease.holders.filter((h) => h.reused === true).map((h) => h.pid);
+    problems.push(
+      `the parallel session of ${label} is held only by exited processes (pids ${pids.join(', ')}` +
+        (reused.length > 0
+          ? `; ${reused.join(', ')} ${reused.length === 1 ? 'is' : 'are'} now another program`
+          : '') +
+        '). The running daemon frees it within one poll; with no daemon running, the next ' +
+        `cctl switch ${label} or cctl claude --account ${label} checks those processes and frees it.`,
+    );
+  }
+  if (problems.length > 0)
+    return { name: 'parallel-sessions', ok: false, detail: problems.join('; ') };
+  return {
+    name: 'parallel-sessions',
+    ok: true,
+    detail: `${leases.length} parallel session(s), each held by a running process`,
+  };
+}
+
+/**
+ * Read what {@link checkSessionLeases} judges, read-only and with the full process check (doctor can
+ * afford the process query): every parallel session with its holders judged, and for one with no
+ * running holder, whether its roster reads and whether its slot can be settled.
+ */
+export async function gatherSessionLeases(
+  engine: Pick<SwitchEngine, 'listLeases' | 'checkSlots'>,
+  probe: LeaseOccupancyProbe | undefined,
+): Promise<{ leases: LeaseView[]; facts: Map<string, LeaseFacts> }> {
+  const leases = await engine.listLeases({ mode: 'full' });
+  const facts = new Map<string, LeaseFacts>();
+  const stalled = leases.filter(
+    (l) => !l.holders.some((h) => h.state === 'alive' || h.state === 'unverifiable'),
+  );
+  if (stalled.length === 0) return { leases, facts };
+  const violations = await engine.checkSlots().catch(() => []);
+  for (const lease of stalled) {
+    const fact: LeaseFacts = {};
+    const unsettled = violations.find(
+      (v) => v.kind === 'unsettled_switch' && v.ruleId === lease.ruleId,
+    );
+    if (unsettled !== undefined) fact.untrusted = unsettled.detail;
+    if (probe !== undefined) {
+      const workers = await probe(lease.profileDir, { verify: true }).catch(
+        () => 'unreadable' as const,
+      );
+      if (workers === 'unreadable') {
+        fact.rosterUnreadable = join(lease.profileDir, 'daemon', 'roster.json');
+      }
+    }
+    facts.set(lease.ruleId, fact);
+  }
+  return { leases, facts };
 }
 
 /**
@@ -476,8 +631,12 @@ export function checkDaemonAliasRules(
  * rules unknown, the guard hook is judged as if rules exist: a missing guard may then be a real gap.
  */
 export async function checkFolderRules(
-  engine: Pick<SwitchEngine, 'listRules' | 'checkSlots' | 'getGuardSnapshotFreshness'>,
+  engine: Pick<
+    SwitchEngine,
+    'listRules' | 'checkSlots' | 'getGuardSnapshotFreshness' | 'listLeases'
+  >,
   paths: Paths,
+  leaseProbe?: LeaseOccupancyProbe,
 ): Promise<DoctorCheck[]> {
   const out: DoctorCheck[] = [];
   let rules: FolderRule[] | undefined;
@@ -494,8 +653,21 @@ export async function checkFolderRules(
   if (rules !== undefined) out.push(checkRuleScopes(rules));
   out.push(
     await checkGuardSnapshot(engine),
-    checkGuardHook(paths, rules === undefined || rules.length > 0),
+    // Parallel sessions alone need no guard: their sessions run wherever they were started.
+    checkGuardHook(paths, rules === undefined || rules.some((r) => !isLeaseRule(r))),
   );
+  if (rules !== undefined) {
+    try {
+      const { leases, facts } = await gatherSessionLeases(engine, leaseProbe);
+      out.push(checkSessionLeases(leases, facts));
+    } catch (err) {
+      out.push({
+        name: 'parallel-sessions',
+        ok: false,
+        detail: `could not check the parallel sessions: ${(err as Error).message}`,
+      });
+    }
+  }
   return out;
 }
 

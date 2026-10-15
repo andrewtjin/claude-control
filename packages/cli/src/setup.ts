@@ -11,7 +11,7 @@
 
 import type { StoredAccount } from '@claude-control/switch-engine';
 import { renderDoctor, summarize, type DoctorCheck, type RelayProbe } from './doctor.js';
-import { PLAIN_PALETTE, type Palette } from './ansi.js';
+import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
 import { BOT_INVITE_URL, BOT_USER_INSTALL_URL } from './settings.js';
 import { MANUAL_START_HINT, type AutostartResult, type AutostartState } from './autostart.js';
 
@@ -210,6 +210,9 @@ export async function connectWithTimeout(
 
 export interface SetupSummary {
   accounts: { label: string; active: boolean }[];
+  /** The parallel sessions running now (`cctl claude --account`), each with how many terminals
+   *  hold it. Absent when none runs. */
+  parallelSessions?: { label: string; terminals: number }[];
   hooksInstalled: boolean;
   hooksProfilePath: string;
   relayUrl: string;
@@ -266,8 +269,25 @@ export function renderSetupSummary(
     ? ok('discord: paired')
     : warn('discord: local-only (not paired) — pair later: cctl setup --reconfigure');
 
+  // An account a parallel session holds is out of the pool until its terminals exit; say so beside
+  // the accounts, since no switch reaches it meanwhile.
+  const sessionsLine =
+    s.parallelSessions === undefined || s.parallelSessions.length === 0
+      ? []
+      : [
+          ok(
+            `parallel sessions: ${s.parallelSessions
+              .map(
+                (p) =>
+                  `${sanitizeForTerminal(p.label)} (in use by ${p.terminals} terminal${p.terminals === 1 ? '' : 's'})`,
+              )
+              .join(', ')}`,
+          ),
+        ];
+
   const lines = [
     accountsLine,
+    ...sessionsLine,
     hooksLine,
     `${palette.dim('relay:')} ${s.relayUrl}`,
     daemonLine,

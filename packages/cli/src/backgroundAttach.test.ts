@@ -265,6 +265,10 @@ class FakeClaude implements ClaudeBackgroundHost {
     const reused = opts?.verified === true ? [] : (this.reusedPids.get(key(c)) ?? []);
     return Promise.resolve([...(this.hosted.get(key(c)) ?? []), ...reused]);
   }
+  /** Parallel sessions are not what these cases drive: no service hosts a worker for one. */
+  hostedWorkerProcesses(): Promise<Array<{ pid: number; procStart?: string }>> {
+    return Promise.resolve([]);
+  }
   activity(c: Config): Promise<Map<string, SessionActivity>> {
     this.calls.push(`agents ${key(c)}`);
     const out = new Map<string, SessionActivity>();

@@ -32,6 +32,9 @@ import {
   ruleIdOfSlot,
   ruleSlotId,
   rulesIncluding,
+  isLeaseRule,
+  operatorRules,
+  selfHolder,
   type AccountView,
   type ExcludeResult,
   type FolderRule,
@@ -43,6 +46,11 @@ import {
   type SessionIdentity,
   type ResolveResult,
   type RuleLiveResult,
+  type LeaseDeferReason,
+  type LeaseHolder,
+  type LeaseOccupancyProbe,
+  type SessionSlotClaim,
+  type SessionSlotPlan,
   type SlotId,
   type StoredAccount,
 } from '@claude-control/switch-engine';
@@ -73,8 +81,11 @@ import {
   type ClaudeBackgroundHost,
 } from './backgroundHost.js';
 import {
+  leaseArgRefusal,
   parseBackgroundRequest,
   routeBackgroundLaunch,
+  startsBackgroundSession,
+  type BackgroundRequest,
   runHolding,
   selfRelaunchRefusal,
   selfRelaunchingWord,
@@ -106,8 +117,25 @@ import {
   type LaunchRuleDecision,
 } from './launchRouting.js';
 import { canonicalOrRaw } from './sessionAliases.js';
-import { olderDaemonAliasReason, olderDaemonReason } from './folderRulesSupport.js';
-import { daemonHeartbeatPath, daemonSettingsPath, readSettingsReport } from './settings.js';
+import {
+  olderDaemonReason,
+  olderDaemonScopeReason,
+  olderInstallReason,
+  type GatedScope,
+} from './folderRulesSupport.js';
+import {
+  cliLeaseProbe,
+  holdLeaseSignals,
+  terminalsOf,
+  terminalsPhrase,
+  trackChildHolder,
+} from './leaseCli.js';
+import {
+  VERSION,
+  daemonHeartbeatPath,
+  daemonSettingsPath,
+  readSettingsReport,
+} from './settings.js';
 import {
   bannerContextForLaunch,
   buildLaunchEnv,
@@ -123,7 +151,7 @@ import {
   resolveShellInitTarget,
   SUPPORTED_SHELLS,
 } from './shellInit.js';
-import { resolveGuardProfileSettingsPaths } from './guardProfiles.js';
+import { hasGuardedRules, resolveGuardProfileSettingsPaths } from './guardProfiles.js';
 
 type Engine = ReturnType<typeof buildEngine>;
 
@@ -161,8 +189,9 @@ export function slotName(slot: SlotId, rules: readonly FolderRule[]): string {
   const ruleId = ruleIdOfSlot(slot);
   if (ruleId === undefined) return 'the global slot';
   const rule = rules.find((r) => r.id === ruleId);
-  return rule === undefined
-    ? 'a folder slot whose rule no longer exists'
+  if (rule === undefined) return 'a folder slot whose rule no longer exists';
+  return isLeaseRule(rule)
+    ? `the parallel-session slot of ${rule.label}`
     : `the folder slot of ${describeRuleScopes(rule)}`;
 }
 
@@ -178,7 +207,8 @@ export function isAliasRule(rule: FolderRule): boolean {
  *  reconciles the guard on its next start. */
 export async function reconcileFolderGuard(engine: Engine, paths: Paths): Promise<void> {
   const rules = await engine.listRules();
-  const hasRules = rules.length > 0;
+  // Parallel sessions alone need no guard (see hasGuardedRules).
+  const hasRules = hasGuardedRules(rules);
   try {
     await ensureBindGuard({
       settingsPath: join(paths.claudeDir, 'settings.json'),
@@ -307,11 +337,19 @@ function liveSource(
  *  folderRulesSupport.ts): such a daemon cannot read a rules file holding one. Checked before
  *  anything is resolved or written, so a refusal changes nothing. */
 export async function refuseOnOlderDaemonForAliases(): Promise<void> {
+  await refuseOnOlderDaemonFor('alias');
+}
+
+/** Refuse a change that writes a kind of rule an older running daemon cannot read (see
+ *  folderRulesSupport.ts): a session alias rule, or a parallel session. Checked before anything is
+ *  resolved or written, so a refusal changes nothing. */
+export async function refuseOnOlderDaemonFor(kind: GatedScope): Promise<void> {
   const [report, heartbeat] = await Promise.all([
     readSettingsReport(daemonSettingsPath()),
     readHeartbeat(daemonHeartbeatPath()),
   ]);
-  const reason = olderDaemonReason(report, heartbeat) ?? olderDaemonAliasReason(report, heartbeat);
+  const reason =
+    olderDaemonReason(report, heartbeat) ?? olderDaemonScopeReason(kind, report, heartbeat);
   if (reason !== undefined) fail(`${reason}. Nothing was changed.`);
 }
 
@@ -378,16 +416,19 @@ export function buildPoolView(
 /** Everything the folder views read, in one pass: the rules, who is live in each slot, every account
  *  (shared and reserved), and each slot's pool. */
 async function readFolderPicture(engine: Engine): Promise<{
+  /** The operator's rules: what every rule view lists. */
   rules: FolderRule[];
+  /** Every rule, parallel sessions included: what names the slot an account is live in. */
+  allRules: FolderRule[];
   live: Map<SlotId, string | null>;
   accounts: AccountView[];
 }> {
-  const [rules, live, accounts] = await Promise.all([
+  const [allRules, live, accounts] = await Promise.all([
     engine.listRules(),
     engine.liveSlots(),
     engine.listAllAccounts(),
   ]);
-  return { rules, live, accounts };
+  return { rules: operatorRules(allRules), allRules, live, accounts };
 }
 
 /** One rule's pool as the views show it (see {@link buildPoolView}). */
@@ -398,7 +439,13 @@ async function rulePoolView(
 ): Promise<PoolEntryView[]> {
   const slot = ruleSlotId(rule.id);
   const liveId = picture.live.get(slot) ?? null;
-  return buildPoolView(rule, await engine.slotPool(slot), liveId, picture.accounts, picture.rules);
+  return buildPoolView(
+    rule,
+    await engine.slotPool(slot),
+    liveId,
+    picture.accounts,
+    picture.allRules,
+  );
 }
 
 /** The full view of one rule. */
@@ -468,14 +515,14 @@ async function buildGlobalView(
   const pool = await engine.slotPool('global');
   return {
     live: buildLiveView(liveId, undefined, picture.accounts),
-    pool: buildPoolView(undefined, pool, liveId, picture.accounts, picture.rules),
+    pool: buildPoolView(undefined, pool, liveId, picture.accounts, picture.allRules),
   };
 }
 
 /** The per-folder section `cctl usage` and `cctl timeline` end on, or '' when no folder has a rule —
  *  so the shared-pool views those commands print are joined by what each folder runs on. */
 export async function renderFolderRulesAppendix(engine: Engine, palette: Palette): Promise<string> {
-  const rules = await engine.listRules();
+  const rules = operatorRules(await engine.listRules());
   // Nothing more to read with no rules: every `usage` and `timeline` call reaches this.
   if (rules.length === 0) return '';
   const picture = await readFolderPicture(engine);
@@ -505,7 +552,12 @@ export function buildReservedViews(
         billing: billingLabel(a, nowMs),
         quarantined: a.quarantined,
         live: including.some((r) => live.get(ruleSlotId(r.id)) === a.id),
-        includedBy: including.map((r) => describeRuleScopes(r)),
+        // A parallel session is no rule the operator made: it says what holds the account.
+        includedBy: including.map((r) =>
+          isLeaseRule(r)
+            ? `in use: parallel session (${terminalsPhrase(terminalsOf(r.lease.holders))})`
+            : describeRuleScopes(r),
+        ),
       };
     });
 }
@@ -516,7 +568,7 @@ export async function renderReservedAppendix(engine: Engine, palette: Palette): 
   if (rules.length === 0) return '';
   const picture = await readFolderPicture(engine);
   const text = renderReservedAccounts(
-    buildReservedViews(picture.accounts, picture.rules, picture.live),
+    buildReservedViews(picture.accounts, picture.allRules, picture.live),
     palette,
   );
   return text === '' ? '' : '\n\n' + text;
@@ -852,7 +904,7 @@ export async function changeContext(
   for (const rule of picture.rules) pools.set(rule.id, await rulePoolView(engine, rule, picture));
   return {
     accounts: picture.accounts,
-    rules: picture.rules,
+    rules: picture.allRules,
     vaultDir,
     palette: detectPalette(),
     pools,
@@ -904,6 +956,9 @@ export function describeSlotRefusal(err: SlotError, accountLabel: string): strin
         `${err.message}. Nothing was changed - pick an account that folder may use, or change its ` +
         'rule (cctl folder include / cctl folder reset).'
       );
+    case 'leased':
+      // The engine's words name the session and when the account comes back.
+      return err.message;
     default:
       return `${err.message}. Nothing was changed - check cctl folders.`;
   }
@@ -1171,13 +1226,27 @@ export function buildFolderCommands(program: Command): void {
  * alias is reserved to its rule, one whose rule holds only folders to its folders.
  */
 export function relaxationBannerLine(
-  kind: 'override' | 'explicit',
+  kind: 'override' | 'explicit' | 'account',
   label: string,
   cwd: string,
   reservedTo: 'folders' | 'rule' = 'folders',
+  outranked?: { via: 'alias' | 'folder'; folder: string; alias: string | null },
 ): string {
   const safeLabel = sanitizeForTerminal(label);
   const safeCwd = sanitizeForTerminal(cwd);
+  if (kind === 'account') {
+    // --account on the global slot over the rule here, which would refuse that account there: for
+    // this session only. An alias rule's session can keep the account by a rule of its own.
+    const folder = sanitizeForTerminal(outranked?.folder ?? cwd);
+    if (outranked?.via === 'alias') {
+      const alias = sanitizeForTerminal(outranked.alias ?? '');
+      return (
+        `cctl: --account outranks the rule of session "${alias}" in ${folder} for this session ` +
+        `only. To keep this session on ${safeLabel}, run: cctl session include ${alias} ${safeLabel}\n`
+      );
+    }
+    return `cctl: --account outranks the folder rule of ${folder} for this session only.\n`;
+  }
   return kind === 'override'
     ? `cctl: --override in effect: allowing ${safeLabel} in ${safeCwd}, whose folder rule runs ` +
         `on a different slot.\n`
@@ -1396,9 +1465,15 @@ function routeContext(
       if (configDir === null) return named(labelIn('global'), 'the global slot');
       const key = folderKeyOf(configDir, platform);
       const rule = rules.find((r) => folderKeyOf(profileOf(r.id), platform) === key);
-      return rule === undefined
-        ? { slot: 'the profile of a folder rule since removed', removed: true }
-        : named(labelIn(ruleSlotId(rule.id)), `the folder slot of ${foldersOf(rule)}`);
+      if (rule === undefined) {
+        return { slot: 'the profile of a folder rule since removed', removed: true };
+      }
+      return named(
+        labelIn(ruleSlotId(rule.id)),
+        isLeaseRule(rule)
+          ? slotName(ruleSlotId(rule.id), rules)
+          : `the folder slot of ${foldersOf(rule)}`,
+      );
     },
     daemonRunning,
     say: (line) => process.stderr.write(`${sanitizeForTerminal(line)}\n`),
@@ -1561,84 +1636,105 @@ async function runClaude(opts: {
   let explicit = false;
   // What an explicit reserved account is reserved to, for the --account banner.
   let reservedTo: 'folders' | 'rule' = 'folders';
+  // Set when --account runs on the global slot over the rule here, which would refuse it: the line
+  // that says so, and the override token that lets the guard through for this session only.
+  let outranks: string | undefined;
+  // Set when --account runs as a parallel session: what was planned, and the account.
+  let parallel: { plan: LeasePlan; account: AccountView; launchRuleId: string | null } | undefined;
 
   if (opts.account !== undefined) {
-    explicit = true;
     const acct = await resolveAcrossAll(engine, opts.account);
-    if (acct.ruleIds !== undefined && acct.ruleIds.length > 0) {
-      // A reserved account: make it live in its rule's slot (a deliberate launch overrides cadence),
-      // then run in that profile. One several rules include goes to the slot it is live in.
-      const live = await engine.liveSlots();
-      const ruleId =
-        acct.ruleIds.length === 1
-          ? acct.ruleIds[0]
-          : acct.ruleIds.find((id) => live.get(ruleSlotId(id)) === acct.id);
-      if (ruleId === undefined) {
-        fail(
-          `${acct.label} is included by several folders and live in none of them; ` +
-            'run cctl claude from one of its folders instead.',
-        );
+    const label = sanitizeForTerminal(acct.label);
+    // The rule this launch runs under here (THE precedence rule over the session the arguments
+    // open): the slot --account outranks, and the one a shared account may already serve.
+    const { match, alias } = await launchRule();
+    const launchRuleId = match?.rule.id ?? null;
+    const plan = await planAccountSlot(engine, paths, acct.id, launchRuleId);
+    if (plan.kind === 'refused') fail(sanitizeForTerminal(plan.message));
+    switch (plan.kind) {
+      case 'global': {
+        slot = {
+          kind: 'global',
+          label: acct.label,
+          context: 'the global slot; this session follows global switches',
+        };
+        if (plan.overrides && match !== null) {
+          // The rule here refuses this account on the global slot; --account outranks it, for this
+          // session only. A background session would outlive the token that says so.
+          const scope =
+            match.via === 'alias'
+              ? `the rule of session "${alias ?? ''}" in ${match.folder}`
+              : `the folder rule of ${match.folder}`;
+          if (startsBackgroundSession(opts.args)) {
+            fail(
+              `${label} runs here on the global slot only because --account outranks ` +
+                `${sanitizeForTerminal(scope)}, and that lasts only as long as this terminal; "--bg" ` +
+                'starts a background session that outlives it. To give a named session its own ' +
+                `account, run: cctl session include <name> ${label}`,
+            );
+          }
+          outranks = relaxationBannerLine('account', acct.label, process.cwd(), 'folders', {
+            via: match.via,
+            folder: match.folder,
+            alias,
+          });
+        }
+        break;
       }
-      const rule = await engine.getRule(ruleId);
-      if (!rule) fail(`account ${acct.label} is reserved to a folder rule that no longer exists.`);
-      try {
-        // Asserting the rule slot: if the account was released between the lookup above and this
-        // switch, it must fail here rather than switch the GLOBAL slot and then launch into a profile.
-        await engine.activate(acct.id, {
-          force: true,
-          origin: 'manual',
-          slot: ruleSlotId(rule.id),
-        });
-      } catch (err) {
-        if (err instanceof SwitchEngineError) fail(err.message);
-        throw err;
-      }
-      slot = {
-        kind: 'group',
-        profileDir: ruleProfilePath(paths.vaultDir, rule.id),
-        label: acct.label,
-        context: `explicit account, ${describeRuleScopes(rule)}`,
-      };
-      reservedTo = (rule.aliases?.length ?? 0) > 0 ? 'rule' : 'folders';
-    } else {
-      // A shared account runs where it is already live: the global slot, or the slot of the rule
-      // this launch runs under when it is live there (the rule's fallback, or a rule that excludes
-      // the global account). That rule is the one the guard will require: THE precedence rule over
-      // the session the arguments open, so a named session's alias rule outranks the folder's. A
-      // launch never switches a slot out from under the sessions on it, so anywhere else --account
-      // of a shared account is refused.
-      const globalLive = await engine.getActiveId('global');
-      const { match, alias } =
-        acct.id === globalLive ? { match: null, alias: null } : await launchRule();
-      const liveHere =
-        match !== null && (await engine.liveSlots()).get(ruleSlotId(match.rule.id)) === acct.id;
-      if (acct.id === globalLive) {
-        slot = { kind: 'global', label: acct.label, context: 'global (shared account)' };
-      } else if (match !== null && liveHere) {
-        // The rule's own slot on the account it holds: no relaxation is involved.
-        explicit = false;
+      case 'rule': {
+        const rule = await engine.getRule(plan.ruleId);
+        if (rule === undefined)
+          fail(`${label} changed slots while this launch started; run it again.`);
+        // A reserved account live in a rule that includes it, or a shared account live in this
+        // launch's rule slot (its fallback): no switch, the slot as it is. The reserved one is
+        // relaxed into this folder by today's explicit token; the rule's own account needs none.
+        const reserved = (acct.ruleIds ?? []).includes(rule.id);
+        explicit = reserved && rule.id !== launchRuleId;
+        reservedTo = (rule.aliases?.length ?? 0) > 0 ? 'rule' : 'folders';
         slot = {
           kind: 'group',
-          profileDir: ruleProfilePath(paths.vaultDir, match.rule.id),
+          profileDir: ruleProfilePath(paths.vaultDir, rule.id),
           label: acct.label,
-          context:
-            match.via === 'alias'
-              ? `session "${alias ?? ''}" in ${match.folder} rule`
-              : `${match.folder} folder rule`,
+          context: isAliasRule(rule)
+            ? `the slot of ${describeRuleScopes(rule)}; this session follows that rule's switches`
+            : `the folder slot of ${describeRuleScopes(rule)}; this session follows that folder's switches`,
         };
-      } else if (match !== null && match.via === 'alias') {
-        // No command switches an alias rule's slot to a chosen account; without --account the
-        // launch runs on whichever account that slot holds.
-        fail(
-          `${acct.label} is a shared account live neither in the global slot nor in the slot of ` +
-            `session "${sanitizeForTerminal(alias ?? '')}"'s rule. Omit --account to run it on that rule's account.`,
-        );
-      } else {
-        fail(
-          `${acct.label} is a shared account live neither in the global slot nor in this folder's ` +
-            `slot. Switch to it first (cctl switch ${acct.label}, with --folder <folder> for a ` +
-            `folder's slot), then run cctl claude, or omit --account.`,
-        );
+        break;
+      }
+      case 'lease': {
+        // Everything that can refuse a parallel session is checked before anything is claimed.
+        const refusal = leaseArgRefusal(opts.args, label);
+        if (refusal !== undefined) fail(refusal);
+        await refuseOnOlderDaemonFor('lease');
+        const install = olderInstallReason({
+          cliBuild: VERSION,
+          daemonAlive: await daemonIsRunning(),
+        });
+        if (install !== undefined) fail(`${sanitizeForTerminal(install)}. Nothing was changed.`);
+        // A session the arguments open that runs in a background service is never taken from it,
+        // and --account cannot move it there: refused before the claim.
+        if (request !== undefined) {
+          const decision = await route({ kind: 'fixed', configDir: plan.profileDir });
+          if (decision.kind === 'refuse') return;
+          if (decision.kind === 'open') {
+            decision.hold?.lock.release();
+            const short = openedSessionRef(decision.args) ?? requestRef(request) ?? '';
+            const where = (await routing!.ctx.view(decision.configDir)).slot;
+            fail(
+              `session ${sanitizeForTerminal(short)} runs in the background on ` +
+                `${sanitizeForTerminal(where)}; --account cannot move a running session. Open it ` +
+                `where it runs: cctl claude attach ${sanitizeForTerminal(short)}`,
+            );
+          }
+        }
+        parallel = { plan, account: acct, launchRuleId };
+        slot = {
+          kind: 'group',
+          profileDir: plan.profileDir,
+          label: acct.label,
+          context: 'parallel session, this terminal only',
+        };
+        break;
       }
     }
   } else {
@@ -1707,12 +1803,29 @@ async function runClaude(opts: {
   }
   const hold = routing?.decision.kind === 'pass' ? routing.decision.hold : undefined;
   const holdHost = routing?.ctx.host;
+  if (parallel !== undefined) {
+    await runParallelSession({
+      engine,
+      paths,
+      profRoot,
+      slot,
+      override: opts.override,
+      args: opts.args,
+      plan: parallel.plan,
+      account: parallel.account,
+      launchRuleId: parallel.launchRuleId,
+      holdHost: holdHost ?? NO_JOURNAL,
+      hold,
+    });
+    return;
+  }
   await runHolding(holdHost ?? NO_JOURNAL, hold, (spawned) =>
     launchOnSlot({
       slot,
       explicit,
       reservedTo,
       override: opts.override,
+      ...(outranks !== undefined ? { outranks } : {}),
       args: opts.args,
       paths,
       profRoot,
@@ -1720,6 +1833,171 @@ async function runClaude(opts: {
     }),
   );
 }
+
+/** A plan that runs `--account` as a parallel session. */
+type LeasePlan = Extract<SessionSlotPlan, { kind: 'lease' }>;
+
+/**
+ * Where `cctl claude --account` runs (see the engine's planSessionSlot), after ending the parallel
+ * sessions whose processes are gone: a quick check whenever one exists, and the full check of this
+ * account's own before planning a join (with no daemon, nothing else would end one whose terminal
+ * was closed). A check that fails decides nothing: the plan follows.
+ */
+async function planAccountSlot(
+  engine: Engine,
+  paths: Paths,
+  accountId: string,
+  launchRuleId: string | null,
+): Promise<SessionSlotPlan> {
+  const probe = cliLeaseProbe(paths) ?? NO_LEASE_WORKERS;
+  if ((await engine.listRules()).some(isLeaseRule)) {
+    await engine.sweepLeases({ mode: 'quick', probe }).catch(() => undefined);
+  }
+  const plan = await engine.planSessionSlot(accountId, { launchRuleId });
+  if (plan.kind !== 'lease' || !plan.join) return plan;
+  await engine.sweepLeases({ mode: 'full', only: accountId, probe }).catch(() => undefined);
+  return engine.planSessionSlot(accountId, { launchRuleId });
+}
+
+/** The background workers of a platform with no parallel sessions: none. */
+const NO_LEASE_WORKERS: LeaseOccupancyProbe = () => Promise.resolve([]);
+
+/** The session an `open` route names in its arguments (`attach <id>`), if any. */
+function openedSessionRef(args: readonly string[]): string | undefined {
+  const at = args.indexOf('attach');
+  return at >= 0 ? args[at + 1] : undefined;
+}
+
+/** The session a background request names, if it names one. */
+function requestRef(request: BackgroundRequest): string | undefined {
+  return 'ref' in request ? request.ref : undefined;
+}
+
+/**
+ * Run Claude Code as a parallel session: the account in a slot of its own, in this terminal only.
+ * From before the claim until the release returns, the signals that would end this process (Ctrl-C,
+ * and on Windows Ctrl-Break and a closing console) are held, so an extra Ctrl-C after Claude Code
+ * exits, or closing the tab, cannot cut the release short. The claim decides again under the lock;
+ * a slot it no longer plans as a parallel session claims nothing and is refused. Claude Code's
+ * process is recorded as a holder once spawned (retried while it runs, see trackChildHolder). The
+ * release always runs, on a failed launch too, and never changes the exit code; when it cannot end
+ * the session (a roster it cannot read, background workers, a lock it cannot take) it says so, and
+ * the daemon's next poll or the next refusing command finishes the job.
+ */
+async function runParallelSession(input: {
+  engine: Engine;
+  paths: Paths;
+  profRoot: string;
+  slot: LaunchSlot;
+  override: boolean;
+  args: string[];
+  plan: LeasePlan;
+  account: AccountView;
+  launchRuleId: string | null;
+  holdHost: Parameters<typeof runHolding>[0];
+  hold: Parameters<typeof runHolding>[1];
+}): Promise<void> {
+  const { engine, paths, account } = input;
+  const label = sanitizeForTerminal(account.label);
+  const say = (line: string): void => void process.stderr.write(`${line}\n`);
+  const shield = holdLeaseSignals();
+  try {
+    const me = selfHolder('launcher');
+    let claim: SessionSlotClaim;
+    try {
+      claim = await engine.claimSessionSlot(account.id, me, { launchRuleId: input.launchRuleId });
+    } catch (err) {
+      input.hold?.lock.release();
+      if (err instanceof SwitchEngineError) fail(sanitizeForTerminal(err.message));
+      throw err;
+    }
+    if (claim.kind !== 'lease') {
+      // Live elsewhere by the time the lock was held: nothing was claimed.
+      input.hold?.lock.release();
+      fail(`${label} changed slots while this launch started; run it again.`);
+    }
+    // The guard on disk is this build's, or none when parallel sessions are all there is.
+    await reconcileFolderGuard(engine, paths);
+    const others = claim.joined ? claim.otherTerminals : 0;
+    const slot: LaunchSlot = {
+      ...input.slot,
+      profileDir: claim.profileDir,
+      context:
+        others > 0
+          ? `parallel session, this terminal only; shared with ${others} other ` +
+            `terminal${others === 1 ? '' : 's'}`
+          : 'parallel session, this terminal only',
+    };
+    const child = trackChildHolder({
+      add: (holders) => engine.addLeaseHolders(claim.ruleId, holders),
+      say,
+      label,
+    });
+    const probe = cliLeaseProbe(paths) ?? NO_LEASE_WORKERS;
+    try {
+      await runHolding(input.holdHost, input.hold, (spawned) =>
+        launchOnSlot({
+          slot,
+          explicit: false,
+          reservedTo: 'folders',
+          override: input.override,
+          parallel: true,
+          args: input.args,
+          paths,
+          profRoot: input.profRoot,
+          onSpawn: (pid) => {
+            spawned?.(pid);
+            child.record(pid);
+          },
+        }),
+      );
+    } finally {
+      child.stop();
+      await child.settled();
+      await releaseParallelSession(engine, claim.ruleId, [me, ...child.holders()], probe, label);
+    }
+  } finally {
+    shield.release();
+  }
+}
+
+/** Release this terminal's holders of a parallel session, saying what is left to do when it could
+ *  not end it. Never throws and never touches the exit code. */
+async function releaseParallelSession(
+  engine: Engine,
+  ruleId: string,
+  holders: LeaseHolder[],
+  probe: LeaseOccupancyProbe,
+  label: string,
+): Promise<void> {
+  const later = (reason: string): void =>
+    void process.stderr.write(
+      `cctl: could not return ${label} to the pool yet (${sanitizeForTerminal(reason)}); the ` +
+        `daemon does it on its next poll, or, with no daemon, the next cctl claude --account ` +
+        `${label} or cctl switch ${label} does.\n`,
+    );
+  try {
+    const released = await engine.releaseLease(ruleId, holders, probe);
+    if (released.deferredToBackground) {
+      process.stderr.write(
+        `cctl: ${label} stays reserved while the background session(s) this session started ` +
+          'run; it rejoins the pool when they end.\n',
+      );
+    } else if (released.deferred !== undefined) {
+      later(LEASE_DEFER_WORDS[released.deferred]);
+    }
+  } catch (err) {
+    later(err instanceof Error ? err.message : String(err));
+  }
+}
+
+/** Why a release was deferred, in words. */
+const LEASE_DEFER_WORDS: Record<LeaseDeferReason, string> = {
+  roster_unreadable: 'its background-session roster could not be read',
+  no_probe: 'its background-session roster could not be read',
+  unrecorded_child: 'a process still runs on its profile',
+  slot_untrusted: 'its slot has an unfinished change',
+};
 
 /** A host for {@link runHolding} when nothing is held. */
 const NO_JOURNAL = { attachedBy: () => Promise.resolve(false) };
@@ -1790,6 +2068,13 @@ async function launchOnSlot(input: {
   /** What an explicit account is reserved to (see relaxationBannerLine). */
   reservedTo: 'folders' | 'rule';
   override: boolean;
+  /** The line saying --account outranks the rule here, which would refuse the account on the
+   *  global slot: printed, and an override token minted, for this session only. */
+  outranks?: string;
+  /** A parallel session. A current guard lets its profile through without a token; both tokens are
+   *  minted anyway for a guard older than parallel sessions, which reads the slot as a plain rule
+   *  slot. No relaxation line is printed: nothing is relaxed. */
+  parallel?: boolean;
   args: string[];
   paths: Paths;
   profRoot: string;
@@ -1797,6 +2082,7 @@ async function launchOnSlot(input: {
   onSpawn?: (pid: number) => void;
 }): Promise<void> {
   const { explicit, paths, profRoot } = input;
+  const parallel = input.parallel === true;
   let slot = input.slot;
   const platform = process.platform;
   const target = claudeLaunchTarget(platform);
@@ -1821,10 +2107,10 @@ async function launchOnSlot(input: {
   const slotKey = slotProfileKey(slot, platform);
   let explicitToken: string | undefined;
   let overrideToken: string | undefined;
-  if (explicit && slot.kind === 'group') {
+  if ((explicit || parallel) && slot.kind === 'group') {
     explicitToken = mintBindToken({ tokensDir, kind: 'explicit', profileKey: slotKey });
   }
-  if (input.override) {
+  if (input.override || input.outranks !== undefined || parallel) {
     overrideToken = mintBindToken({ tokensDir, kind: 'override', profileKey: slotKey });
   }
 
@@ -1844,10 +2130,13 @@ async function launchOnSlot(input: {
   // systemMessage. Claude Code drops UserPromptSubmit systemMessages in a headless (-p / SDK) run, so
   // the guard warning would be invisible there; this banner line is the reliable signal in every mode.
   // It names the actual session cwd (where the relaxation applies), not the account's own folder.
-  if (overrideToken !== undefined) {
+  if (input.outranks !== undefined) {
+    // One line for --account outranking the rule here, not an --override line beside it.
+    process.stderr.write(input.outranks);
+  } else if (input.override) {
     process.stderr.write(relaxationBannerLine('override', slot.label, process.cwd()));
   }
-  if (explicitToken !== undefined) {
+  if (explicitToken !== undefined && !parallel) {
     process.stderr.write(
       relaxationBannerLine('explicit', slot.label, process.cwd(), input.reservedTo),
     );
