@@ -94,6 +94,15 @@ export interface ReadTranscriptTurnsOptions {
   claudeDir: string;
   /** Only turns at or after this instant are returned. */
   sinceMs: number;
+  /** Only these sessions' files (their top-level transcript and sub-agent files) are read; every
+   *  other file is passed over without being opened or counted. Absent = every session. */
+  sessionIds?: ReadonlySet<string>;
+  /** How far `message.id` de-duplication reaches (rule 1). `'global'` (the default) counts each API
+   *  response once machine-wide — right for totals, where a forked session's copied turns were
+   *  already spent by its parent. `'session'` counts it once PER SESSION — right for a per-session
+   *  view, where the fork's inherited history is part of that conversation and must not vanish
+   *  just because its parent was scanned first. */
+  dedupe?: 'global' | 'session';
 }
 
 /** The byte prefilter (rule 3): a line without these bytes cannot be a turn line, and skipping it
@@ -229,6 +238,13 @@ export async function readTranscriptTurns(
   const seenMessageIds = new Set<string>();
 
   for (const file of files) {
+    const sessionId = sessionIdForFile(file);
+    if (
+      options.sessionIds !== undefined &&
+      (sessionId === null || !options.sessionIds.has(sessionId))
+    ) {
+      continue;
+    }
     try {
       const stats = await stat(file);
       if (stats.mtimeMs < options.sinceMs) {
@@ -240,7 +256,14 @@ export async function readTranscriptTurns(
       continue;
     }
     try {
-      await scanFile(file, sessionIdForFile(file), options.sinceMs, seenMessageIds, scan);
+      await scanFile(
+        file,
+        sessionId,
+        options.sinceMs,
+        seenMessageIds,
+        scan,
+        options.dedupe === 'session' ? `${sessionId ?? ''}\u0000` : '',
+      );
       scan.filesScanned++;
     } catch {
       // Deleted mid-scan, locked, or an IO error: one unreadable file is reported in the counts
@@ -259,6 +282,9 @@ async function scanFile(
   sinceMs: number,
   seenMessageIds: Set<string>,
   scan: TranscriptScan,
+  /** Prefixed to each message id before the de-dup check: '' = global, `<session>\u0000` = per
+   *  session (a sub-agent file shares its parent's prefix, so its turns still de-dup with it). */
+  dedupeKeyPrefix: string,
 ): Promise<void> {
   const handleLine = (bytes: Buffer): void => {
     if (bytes.length === 0 || !bytes.includes(USAGE_NEEDLE)) return;
@@ -272,15 +298,29 @@ async function scanFile(
     const found = turnFromLine(parsed, sessionId);
     if (!found || found.turn.tsMs < sinceMs) return;
     if (found.messageId !== null) {
-      if (seenMessageIds.has(found.messageId)) {
+      const key = dedupeKeyPrefix + found.messageId;
+      if (seenMessageIds.has(key)) {
         scan.duplicateTurns++;
         return;
       }
-      seenMessageIds.add(found.messageId);
+      seenMessageIds.add(key);
     }
     scan.turns.push(found.turn);
   };
 
+  await forEachLine(file, handleLine);
+}
+
+/**
+ * Stream `file` line by line as raw bytes, splitting on the newline BYTE (rule 3): the handler
+ * decides from the bytes whether a line is worth decoding at all. A final line without a trailing
+ * newline is still delivered. Shared by every transcript reader so none of them ever loads a
+ * whole (possibly >512 MB) transcript into one string.
+ */
+export async function forEachLine(
+  file: string,
+  handleLine: (bytes: Buffer) => void,
+): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const stream = createReadStream(file, { highWaterMark: READ_CHUNK_BYTES });
     // Bytes of the final, still-incomplete line of the previous chunk. Annotated `Buffer` (the
