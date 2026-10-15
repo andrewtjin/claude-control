@@ -896,6 +896,7 @@ describe('bind guard script', () => {
         mainConfigDir: canon(root),
         mainIdentityFile: identityFile,
         profileDirOf: () => profileDir,
+        platform: process.platform,
       });
       await writeFile(snapshotPath, JSON.stringify(snapshot), 'utf8');
       const env = { ...baseEnv(), CLAUDE_PROJECT_DIR: boundFolder };

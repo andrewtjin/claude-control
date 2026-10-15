@@ -2205,6 +2205,9 @@ export class Vault {
       mainConfigDir: opts.mainConfigDir,
       mainIdentityFile: opts.mainIdentityFile,
       profileDirOf: (ruleId) => groupProfileDir(this.vaultDir, ruleId),
+      // The rules were validated under the vault's platform; their folders are canonicalized under
+      // the same one.
+      platform: this.platform,
     });
     await writeFolderBindingSnapshot(folderBindingsPath(this.vaultDir), snapshot);
     return snapshot;

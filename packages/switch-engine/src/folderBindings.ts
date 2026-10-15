@@ -55,9 +55,11 @@ export interface BuildSnapshotInput {
   /** Maps a rule id to its on-disk profile dir; the guard matches a session's config dir against
    *  the value. Injected so the vault's path convention stays in one place (see `paths.ts`). */
   profileDirOf: (ruleId: string) => string;
-  /** Selects the path rules the stored alias folders are canonicalized under (default: this
-   *  host's). */
-  platform?: NodeJS.Platform;
+  /** The path rules the rules' stored folders are canonicalized under: the platform the registry
+   *  was read under, which is the one the guard and the launcher compare folders on. Required, never
+   *  defaulted to the host's, so a registry read under one platform's rules is never rewritten under
+   *  another's (a Windows folder read as a POSIX path would gain a leading slash). */
+  platform: NodeJS.Platform;
 }
 
 /** The namespace every identity key is taken in, so a key is useless anywhere but here. The guard
@@ -84,8 +86,9 @@ function identityOf(a: StoredAccount): FolderBindingSnapshotIdentity {
 }
 
 /**
- * Build the guard snapshot from the folder rules. Pure: no IO, so it is trivially testable and the
- * caller decides when to persist it. Every rule becomes a row of {folders, profileDir, LABELS of its
+ * Build the guard snapshot from the folder rules. Pure: no IO (stored folders are canonicalized as
+ * strings, under `input.platform`), so it is trivially testable and the caller decides when to
+ * persist it. Every rule becomes a row of {folders, profileDir, LABELS of its
  * included accounts in include order, the identities of the shared accounts it excludes} — no tokens.
  * A rule that only excludes has an empty member list; the guard words its message for that case. An
  * excluded id naming no shared row is inert (see `FolderRule.exclude`) and is left out, exactly as

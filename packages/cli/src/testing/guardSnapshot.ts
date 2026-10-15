@@ -53,6 +53,7 @@ export function writeGuardSnapshot(opts: {
     mainConfigDir: opts.mainConfigDir,
     mainIdentityFile,
     profileDirOf: opts.profileDirOf,
+    platform: process.platform,
   });
   writeFileSync(opts.snapshotPath, JSON.stringify(snapshot));
 }
