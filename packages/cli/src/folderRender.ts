@@ -332,6 +332,10 @@ export interface ReservedAccountView {
   id: string;
   label: string;
   email: string | undefined;
+  /** The PLAN cell, as the shared table renders it (`planLabel`). */
+  plan: string;
+  /** The BILLING cell, as the shared table renders it (`billingLabel`). */
+  billing: string;
   quarantined: boolean;
   /** Live in one of its folders' slots right now. */
   live: boolean;
@@ -340,8 +344,9 @@ export interface ReservedAccountView {
 }
 
 /** The reserved accounts as an aligned table: they are not in the shared table above it, and each
- *  is usable only in the folders that include it, which the last-but-one column names. '' when no
- *  account is reserved. */
+ *  is usable only in the folders that include it, which the last-but-one column names. Its first
+ *  columns match the shared table's, so a reserved account shows its plan and billing as any other
+ *  account does. '' when no account is reserved. */
 export function renderReservedAccounts(
   rows: readonly ReservedAccountView[],
   palette: Palette = PLAIN_PALETTE,
@@ -351,6 +356,8 @@ export function renderReservedAccounts(
     live: r.live ? '*' : ' ',
     label: sanitizeForTerminal(r.label),
     email: sanitizeForTerminal(r.email ?? '-'),
+    plan: sanitizeForTerminal(r.plan),
+    billing: sanitizeForTerminal(r.billing),
     status: r.quarantined ? 'quarantined' : 'ok',
     includedBy: r.includedBy.map((f) => sanitizeForTerminal(f)).join('; '),
     id: sanitizeForTerminal(r.id),
@@ -359,6 +366,8 @@ export function renderReservedAccounts(
     live: ' ',
     label: 'LABEL',
     email: 'EMAIL',
+    plan: 'PLAN',
+    billing: 'BILLING',
     status: 'STATUS',
     includedBy: 'INCLUDED BY',
     id: 'ID',
@@ -370,11 +379,13 @@ export function renderReservedAccounts(
   const padded = (c: Cells): string[] => keys.map((k) => c[k].padEnd(width(k)));
   // Pad first, paint after: ANSI codes are zero-width, so alignment survives.
   const line = (c: Cells): string => {
-    const [live, label, email, status, includedBy, id] = padded(c);
+    const [live, label, email, plan, billing, status, includedBy, id] = padded(c);
     return [
       palette.green(live ?? ''),
       palette.bold(label ?? ''),
       email ?? '',
+      plan ?? '',
+      palette.dim(billing ?? ''),
       c.status === 'quarantined' ? palette.red(status ?? '') : (status ?? ''),
       includedBy ?? '',
       palette.dim(id ?? ''),

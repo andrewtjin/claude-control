@@ -185,13 +185,20 @@ describe('buildPoolView', () => {
 });
 
 describe('buildReservedViews', () => {
-  it('lists every reserved account with its email, the folders including it, and liveness', () => {
+  it('lists every reserved account with its email, plan, billing, the folders including it, and liveness', () => {
     const r1 = rule('r1', { include: ['e'] });
     const r2 = rule('r2', { include: ['e', 'f'] });
     const views = buildReservedViews(
       [
         account('a'),
-        account('e', { ruleIds: ['r1', 'r2'], emailAddress: 'e@example.com' }),
+        account('e', {
+          ruleIds: ['r1', 'r2'],
+          emailAddress: 'e@example.com',
+          subscriptionType: 'team',
+          rateLimitTier: 'default_claude_max_5x',
+          billingType: 'stripe_subscription',
+          subscriptionCreatedAt: '2026-09-20T22:09:56.946Z',
+        }),
         account('f', { ruleIds: ['r2'] }),
       ],
       [r1, r2],
@@ -199,12 +206,16 @@ describe('buildReservedViews', () => {
         ['global', 'a'],
         ['group:r2', 'e'],
       ]),
+      // Far from the real clock, so a builder that reads Date.now() instead of nowMs fails.
+      Date.parse('2027-03-01T12:00:00Z'),
     );
     expect(views).toEqual([
       {
         id: 'e',
         label: 'E',
         email: 'e@example.com',
+        plan: '5x',
+        billing: '~Mar 20 (est.)',
         quarantined: false,
         live: true,
         includedBy: [F('r1'), F('r2')],
@@ -213,6 +224,9 @@ describe('buildReservedViews', () => {
         id: 'f',
         label: 'F',
         email: undefined,
+        // No plan or billing signal on record: the same honest cells the shared table shows.
+        plan: '?',
+        billing: 'unknown',
         quarantined: false,
         live: false,
         includedBy: [F('r2')],

@@ -873,19 +873,31 @@ describe('derived account metadata is repaired from the stored bundle', () => {
   });
 
   /** Rewrite the registry the way a build predating these fields left it on disk: derived keys
-   *  absent, no revision stamp — while the encrypted bundles keep carrying the values. */
+   *  absent, no revision stamp — while the encrypted bundles keep carrying the values. Covers the
+   *  reserved rows in groups.json as well, when a rule has created that file. */
   async function degradeRegistry(paths: Paths): Promise<void> {
+    const degrade = (rows: Record<string, unknown>[]) => {
+      for (const account of rows) {
+        delete account.metadataRev;
+        delete account.organizationRateLimitTier;
+        delete account.billingType;
+        delete account.subscriptionCreatedAt;
+      }
+    };
     const path = join(paths.vaultDir, 'accounts.json');
     const reg = JSON.parse(await readFile(path, 'utf8')) as {
       accounts: Record<string, unknown>[];
     };
-    for (const account of reg.accounts) {
-      delete account.metadataRev;
-      delete account.organizationRateLimitTier;
-      delete account.billingType;
-      delete account.subscriptionCreatedAt;
-    }
+    degrade(reg.accounts);
     await writeFile(path, JSON.stringify(reg, null, 2));
+    const groupsPath = join(paths.vaultDir, 'groups.json');
+    const groups = await readFile(groupsPath, 'utf8').then(
+      (text) => JSON.parse(text) as { reserved: Record<string, unknown>[] },
+      () => undefined,
+    );
+    if (!groups) return;
+    degrade(groups.reserved);
+    await writeFile(groupsPath, JSON.stringify(groups, null, 2));
   }
 
   it('repairs the target during a switch that needs no token refresh', async () => {
@@ -920,6 +932,25 @@ describe('derived account metadata is repaired from the stored bundle', () => {
       expect((await h.vault.getAccount(id))?.organizationRateLimitTier).toBe(PLAN_TIER);
     }
     // Stamped rows are skipped, so a listing does not pay for a decrypt on every run.
+    expect(await h.engine.backfillAccountMetadata()).toBe(0);
+  });
+
+  it('sweeps a reserved account too, writing its repair to the reserved side', async () => {
+    // A reserved row lives in groups.json, outside the shared list, yet `accounts list` renders
+    // its PLAN/BILLING all the same. The global slot never switches to it, so the sweep is the only
+    // repair it gets short of a token write in its own folder.
+    const h = await harness();
+    const { accountA, accountB } = await seedAActiveWithB(h);
+    await h.vault.writeBundle(accountA.id, planBundle('A', NOW + 10 * HOUR));
+    await h.vault.writeBundle(accountB.id, planBundle('B', NOW + 10 * HOUR));
+    await h.vault.createRule({ folders: ['C:\\work'], include: [accountB.id] });
+    await degradeRegistry(h.paths);
+    expect(await h.vault.getAccount(accountB.id)).not.toHaveProperty('billingType');
+
+    expect(await h.engine.backfillAccountMetadata()).toBe(2);
+    expect((await h.vault.getAccount(accountB.id))?.organizationRateLimitTier).toBe(PLAN_TIER);
+    // Still reserved: the repair landed in groups.json, not as a resurrected shared row.
+    expect((await h.vault.listAccounts()).map((a) => a.id)).toEqual([accountA.id]);
     expect(await h.engine.backfillAccountMetadata()).toBe(0);
   });
 
