@@ -68,11 +68,13 @@ export type AccountActionErrorCode =
   | 'switch_failed'
   /** The token endpoint is shedding load; nothing changed. */
   | 'overloaded'
-  /** The vault refused a label (a collision, an empty label) or a duplicate login. */
+  /** The vault refused the write: a label collision, an empty label, a login it already stores,
+   *  or a registry it cannot read. Its own message says which, and the VaultError is the cause. */
   | 'vault_refused'
   /** A plain add ran inside a folder profile, where the live login is a folder's seat. */
   | 'capture_in_profile'
-  /** A plain add found no live login to store. */
+  /** A plain add found no live login to store. Only that: any other capture failure is a fault
+   *  and escapes as itself. */
   | 'no_live_login'
   /** A fresh add could not open the login window. */
   | 'launch_failed'
@@ -334,8 +336,7 @@ export async function renameAccount(
   } catch (err) {
     // A collision or an empty label is a user mistake carrying its own explanation; anything else
     // is a real fault and propagates.
-    if (err instanceof VaultError) throw new AccountActionError('vault_refused', err.message);
-    throw err;
+    throw vaultRefusal(err) ?? err;
   }
   return {
     previousLabel: account.label,
@@ -365,6 +366,15 @@ export async function removeAccount(
   const { account } = await resolveRef(engine, ref);
   await engine.removeAccount(account.id);
   return { account, message: `Removed ${account.label}.` };
+}
+
+/** The vault's refusal of a write (a label taken or empty, a login stored already) as the refusal
+ *  a person reads, in the vault's own words; undefined for anything that is not the vault's.
+ *  One mapping for rename and both adds, so the same refusal reads the same from each. */
+function vaultRefusal(err: unknown): AccountActionError | undefined {
+  return err instanceof VaultError
+    ? new AccountActionError('vault_refused', err.message, { cause: err })
+    : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +413,12 @@ export interface AddOptions {
   fresh?: boolean;
   /** The window a fresh add runs; defaults to {@link claudeLoginWindow}. */
   loginWindow?: LoginWindow;
+  /** Called with the outcome the moment the account is stored, before the action returns. A
+   *  fresh add still has its throwaway dir to delete then, which can take seconds on Windows (a
+   *  `claude` that exited may still hold a file in it), so a caller that tells the person here
+   *  does not leave them looking at a hung command, and a cleanup warning lands after the news
+   *  that the account was added, not before it. */
+  onAdded?: (outcome: AddOutcome) => void;
 }
 
 /** What an add did. `fresh` says which flow ran: a plain add also makes the account active, a
@@ -420,17 +436,17 @@ export async function addAccount(
   opts: AddOptions = {},
   ctx: AccountActionContext = {},
 ): Promise<AddOutcome> {
-  if (opts.fresh) return addFreshAccount(label, opts.loginWindow ?? claudeLoginWindow, ctx);
+  const onAdded = opts.onAdded ?? (() => {});
+  if (opts.fresh) {
+    return addFreshAccount(label, opts.loginWindow ?? claudeLoginWindow, onAdded, ctx);
+  }
+  let account: StoredAccount;
   try {
-    const account = await engineOf(ctx).captureCurrentLogin(label);
-    return {
-      account,
-      fresh: false,
-      message: `Added ${account.label} (${account.id}) and set it active.`,
-    };
+    account = await engineOf(ctx).captureCurrentLogin(label);
   } catch (err) {
     // A refused duplicate (label or login already stored) is the vault's own message.
-    if (err instanceof VaultError) throw new AccountActionError('vault_refused', err.message);
+    const refused = vaultRefusal(err);
+    if (refused) throw refused;
     // Run inside a group profile, capture reads a folder-bound account's live seat — never a fresh
     // login to store. Surface the engine's own guidance instead of the no-login message.
     if (err instanceof SwitchEngineError && err.code === 'capture_in_profile') {
@@ -438,31 +454,47 @@ export async function addAccount(
         'capture_in_profile',
         `${err.message}. Onboard a new account from a normal (non-folder-bound) shell, ` +
           `or use: cctl accounts add <label> --fresh.`,
+        { cause: err },
       );
     }
-    // Anything else is the capture finding no login to store.
-    throw new AccountActionError(
-      'no_live_login',
-      'no live login to capture. Run `claude` and log in first, then retry.',
-      { cause: err },
-    );
+    if (err instanceof SwitchEngineError && err.code === 'no_live_login') {
+      throw new AccountActionError('no_live_login', NO_LIVE_LOGIN, { cause: err });
+    }
+    // Anything else (a credential store that cannot be read, a lock that never came free) is a
+    // fault, not a person who forgot to log in, and a caller told "log in first" would be misled.
+    throw err;
   }
+  const outcome: AddOutcome = {
+    account,
+    fresh: false,
+    message: `Added ${account.label} (${account.id}) and set it active.`,
+  };
+  onAdded(outcome);
+  return outcome;
 }
+
+/** What a plain add says when there is no live login to store. `cctl accounts add` has always
+ *  printed it for any failed capture, so the command reuses it for the faults this action lets
+ *  escape. */
+export const NO_LIVE_LOGIN = 'no live login to capture. Run `claude` and log in first, then retry.';
 
 /**
  * The fresh capture: run the login window inside a throwaway `CLAUDE_CONFIG_DIR`, let the person
  * /login as the NEW account there, then vault what landed. The live login is never touched. The
  * throwaway dir holds real tokens, so it is deleted however the flow ends — refusals are thrown
- * from inside `withCaptureDir`, whose `finally` runs the cleanup before they escape.
+ * from inside `withCaptureDir`, whose `finally` runs the cleanup before they escape. The outcome
+ * is reported through `onAdded` from inside it too, before that cleanup, which may retry for
+ * seconds.
  */
 async function addFreshAccount(
   label: string,
   loginWindow: LoginWindow,
+  onAdded: (outcome: AddOutcome) => void,
   ctx: AccountActionContext,
 ): Promise<AddOutcome> {
   const engine = engineOf(ctx);
   const paths = defaultPaths();
-  let added: StoredAccount | undefined;
+  let added: AddOutcome | undefined;
   await withCaptureDir(dirname(paths.vaultDir), 'capture', async (captureDir) => {
     // Darwin: the CLI writes every login to its single Keychain item regardless of
     // CLAUDE_CONFIG_DIR, so the capture must diff the Keychain around the window instead of
@@ -477,8 +509,9 @@ async function addFreshAccount(
         { cause: launchError },
       );
     }
+    let account: StoredAccount;
     try {
-      added =
+      account =
         process.platform === 'darwin'
           ? await engine.captureFromKeychainDelta(label, captureDir, prior)
           : await engine.captureFromConfigDir(label, captureDir);
@@ -486,34 +519,50 @@ async function addFreshAccount(
       if (err instanceof SwitchEngineError && err.code === 'no_capture_login') {
         throw new AccountActionError('no_capture_login', err.message, { cause: err });
       }
-      throw err;
+      // The capture stores through the same vault write as the plain add, so a taken label or a
+      // login already stored is refused the same way.
+      throw vaultRefusal(err) ?? err;
     }
+    added = {
+      account,
+      fresh: true,
+      message:
+        `Added ${account.label} (${account.id}). Your current login was not touched - ` +
+        `\`cctl switch ${account.label}\` to use it.`,
+    };
+    onAdded(added);
     return undefined;
   });
   // withCaptureDir only returns after the body did, and the body only returns once `added` is set.
-  const account = added!;
-  return {
-    account,
-    fresh: true,
-    message:
-      `Added ${account.label} (${account.id}). Your current login was not touched - ` +
-      `\`cctl switch ${account.label}\` to use it.`,
-  };
+  return added!;
 }
 
 // ---------------------------------------------------------------------------
 // The command side
 // ---------------------------------------------------------------------------
 
-/** Run an action for a one-shot command: print its message as one stdout line, and turn an
- *  expected refusal into the CLI's error line and exit 1. Anything else escapes as itself. */
-export async function runAccountAction(action: () => Promise<{ message: string }>): Promise<void> {
+/**
+ * Run an action for a one-shot command: print its message as one stdout line, and turn an
+ * expected refusal into the CLI's error line and exit 1. Anything else escapes as itself.
+ *
+ * The action is handed `announce`, which prints a message at once. An action with work left after
+ * its result is settled (a fresh add deleting its throwaway dir) passes it on as its `onAdded`, so
+ * the line shows when the result is known; an announced action is not printed again at the end.
+ */
+export async function runAccountAction(
+  action: (announce: (outcome: { message: string }) => void) => Promise<{ message: string }>,
+): Promise<void> {
+  let announced = false;
+  const announce = (outcome: { message: string }): void => {
+    announced = true;
+    process.stdout.write(`${outcome.message}\n`);
+  };
   let outcome: { message: string };
   try {
-    outcome = await action();
+    outcome = await action(announce);
   } catch (err) {
     if (err instanceof AccountActionError) fail(err.message);
     throw err;
   }
-  process.stdout.write(`${outcome.message}\n`);
+  if (!announced) announce(outcome);
 }

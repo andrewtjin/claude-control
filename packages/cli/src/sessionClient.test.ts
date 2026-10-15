@@ -293,28 +293,93 @@ describe('callDaemonUsageRepoll', () => {
     expect((err as Error).message).toMatch(/never run on this machine/);
   });
 
+  const OLDER_DAEMON =
+    'the running daemon is older than this cctl and cannot refresh usage on demand - ' +
+    'restart it with `cctl daemon restart`';
+
+  /**
+   * Point the client at a stand-in daemon that refuses every request with `status` and `error`,
+   * and return the message the client failed with plus what the stand-in was sent. The secret it
+   * expects is the real one the harness wrote, so a request that forgot it would show here.
+   */
+  async function refusedWith(
+    status: number,
+    error: string,
+  ): Promise<{ message: string; url: string | undefined; secretSent: boolean }> {
+    const h = await harness(() => ({ ok: true, status: 'applied', session: view }));
+    const secret = await loadOrCreateHookSecret({
+      filePath: hookSecretPath(h.dataDir),
+      protector: h.protector,
+    });
+    let url: string | undefined;
+    let secretSent = false;
+    const standIn = createServer((req, res) => {
+      url = req.url;
+      secretSent = req.headers['x-claude-control-secret'] === secret;
+      req.resume();
+      req.on('end', () => {
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error }));
+      });
+    });
+    await new Promise<void>((resolve) => standIn.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = standIn.address();
+      if (address === null || typeof address === 'string') throw new Error('no address');
+      await writeHookEndpoint(hookEndpointPath(h.dataDir), { port: address.port });
+      const err = await callDaemonUsageRepoll(undefined, {
+        dataDir: h.dataDir,
+        protector: h.protector,
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(SessionClientError);
+      return { message: (err as Error).message, url, secretSent };
+    } finally {
+      await new Promise<void>((resolve) => standIn.close(() => resolve()));
+    }
+  }
+
   it('says a daemon from before the route cannot refresh, instead of its session complaint', async () => {
     // A daemon from before the route reads it as a session command: no usage handler, and the
     // session-shape check refuses it with a 400.
-    const h = await harness(() => ({ ok: true, status: 'applied', session: view }));
-    const older = createServer((_req, res) => {
-      res.writeHead(400, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: 'sessionId and idempotencyKey are required' }));
+    expect(await refusedWith(400, 'sessionId and idempotencyKey are required')).toEqual({
+      message: OLDER_DAEMON,
+      url: '/cli/usage/repoll',
+      secretSent: true,
     });
-    await new Promise<void>((resolve) => older.listen(0, '127.0.0.1', resolve));
-    try {
-      const address = older.address();
-      if (address === null || typeof address === 'string') throw new Error('no address');
-      await writeHookEndpoint(hookEndpointPath(h.dataDir), { port: address.port });
-      await expect(
-        callDaemonUsageRepoll(undefined, { dataDir: h.dataDir, protector: h.protector }),
-      ).rejects.toThrow(
-        'the running daemon is older than this cctl and cannot refresh usage on demand - ' +
-          'restart it with `cctl daemon restart`',
-      );
-    } finally {
-      await new Promise<void>((resolve) => older.close(() => resolve()));
-    }
+  });
+
+  it('says the same for a daemon that answers the route as an unknown endpoint', async () => {
+    const answer = await refusedWith(404, 'unknown CLI endpoint "/cli/usage/repoll"');
+    expect(answer.message).toBe(OLDER_DAEMON);
+  });
+
+  it("keeps the daemon's own words for a stale secret, which no restart of the daemon fixes", async () => {
+    expect((await refusedWith(401, 'invalid secret')).message).toBe('invalid secret');
+  });
+
+  it("keeps the daemon's own words for any other 400 a current daemon gives", async () => {
+    expect((await refusedWith(400, 'malformed body: body too large')).message).toBe(
+      'malformed body: body too large',
+    );
+    expect((await refusedWith(400, 'ids must be a list of account ids')).message).toBe(
+      'ids must be a list of account ids',
+    );
+  });
+
+  it('an id list over the daemon body cap is reported as too large, not as an older daemon', async () => {
+    const h = await usageHarness([]);
+    // About 1.2 MB of ids: past the receiver's 1 MB cap, which a current daemon refuses with 400.
+    const ids = Array.from(
+      { length: 30_000 },
+      (_, i) => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`,
+    );
+    const err = await callDaemonUsageRepoll(ids, h.deps).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SessionClientError);
+    expect((err as Error).message).toBe('malformed body: body too large');
+    expect(h.asked).toEqual([]);
   });
 
   it("surfaces the daemon's own words for any other refusal", async () => {

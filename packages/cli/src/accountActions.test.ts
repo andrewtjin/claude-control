@@ -402,9 +402,21 @@ describe('addAccount (the current login)', () => {
     });
   });
 
-  it("refuses a duplicate with the vault's words", async () => {
-    engine.captureCurrentLogin.mockRejectedValueOnce(new VaultError('"new" already refers to x'));
-    await expectRefused(addAccount('new', {}, ctx), 'vault_refused', '"new" already refers to x');
+  it("refuses a duplicate with the vault's words, keeping the cause", async () => {
+    const duplicate = new VaultError('"new" already refers to x');
+    engine.captureCurrentLogin.mockRejectedValueOnce(duplicate);
+    const err = await refusal(addAccount('new', {}, ctx));
+    expect({ code: err.code, message: err.message, cause: err.cause }).toEqual({
+      code: 'vault_refused',
+      message: '"new" already refers to x',
+      cause: duplicate,
+    });
+  });
+
+  it('calls onAdded with the outcome it returns', async () => {
+    const onAdded = vi.fn();
+    const out = await addAccount('new', { onAdded }, ctx);
+    expect(onAdded.mock.calls).toEqual([[out]]);
   });
 
   it('points a capture inside a folder profile at --fresh', async () => {
@@ -419,8 +431,8 @@ describe('addAccount (the current login)', () => {
     );
   });
 
-  it('reads any other failure as no live login, keeping the cause', async () => {
-    const cause = new Error('no credentials file');
+  it('refuses as no live login when the engine found none, keeping the cause', async () => {
+    const cause = new RefreshError('no live credentials to capture; log in first', 'no_live_login');
     engine.captureCurrentLogin.mockRejectedValueOnce(cause);
     const err = await refusal(addAccount('new', {}, ctx));
     expect(err.code).toBe('no_live_login');
@@ -428,6 +440,14 @@ describe('addAccount (the current login)', () => {
       'no live login to capture. Run `claude` and log in first, then retry.',
     );
     expect(err.cause).toBe(cause);
+  });
+
+  it('lets any other failure escape as itself rather than call it a missing login', async () => {
+    // A registry that cannot be parsed, a credential store that cannot be read: real faults, not
+    // a person who forgot to log in.
+    const boom = new Error('accounts.json is not valid JSON; fix the file or move it aside');
+    engine.captureCurrentLogin.mockRejectedValueOnce(boom);
+    await expect(addAccount('new', {}, ctx)).rejects.toBe(boom);
   });
 });
 
@@ -496,15 +516,78 @@ describe('addAccount (fresh, in a throwaway window)', () => {
     expect(await leftoverCaptureDirs()).toEqual([]);
   });
 
+  it("refuses a taken label or a stored login with the vault's words, as the plain add does", async () => {
+    const { window } = recordingWindow();
+    const taken = new VaultError('"second" already refers to account id-9');
+    engine.captureFromConfigDir.mockRejectedValueOnce(taken);
+    engine.captureFromKeychainDelta.mockRejectedValueOnce(taken);
+    const err = await refusal(addAccount('second', { fresh: true, loginWindow: window }, ctx));
+    expect({ code: err.code, message: err.message, cause: err.cause }).toEqual({
+      code: 'vault_refused',
+      message: '"second" already refers to account id-9',
+      cause: taken,
+    });
+    expect(await leftoverCaptureDirs()).toEqual([]);
+  });
+
   it('lets any other capture failure escape as itself, and still deletes the dir', async () => {
     const { window } = recordingWindow();
-    const boom = new VaultError('vault unreadable');
+    const boom = new Error('disk on fire');
     engine.captureFromConfigDir.mockRejectedValueOnce(boom);
     engine.captureFromKeychainDelta.mockRejectedValueOnce(boom);
     await expect(addAccount('second', { fresh: true, loginWindow: window }, ctx)).rejects.toBe(
       boom,
     );
     expect(await leftoverCaptureDirs()).toEqual([]);
+  });
+
+  it('reports the stored account through onAdded while the throwaway dir still exists', async () => {
+    // Deleting the dir can take seconds on Windows (a `claude` that exited still holding a file
+    // in it), so the person must hear about the stored account before that, not after.
+    const { window, dirs } = recordingWindow();
+    const seen: Array<{ message: string; dirExisted: boolean }> = [];
+    const out = await addAccount(
+      'second',
+      {
+        fresh: true,
+        loginWindow: window,
+        onAdded: (added) => seen.push({ message: added.message, dirExisted: existsSync(dirs[0]!) }),
+      },
+      ctx,
+    );
+    expect(seen).toEqual([{ message: out.message, dirExisted: true }]);
+    expect(await leftoverCaptureDirs()).toEqual([]);
+  });
+});
+
+describe('runAccountAction with a fresh add', () => {
+  it('prints the added line once, before the throwaway dir is deleted', async () => {
+    const dirs: string[] = [];
+    const window: LoginWindow = (dir) => {
+      dirs.push(dir);
+      return Promise.resolve(undefined);
+    };
+    const writes: Array<{ text: string; dirExisted: boolean }> = [];
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      writes.push({ text: String(chunk), dirExisted: existsSync(dirs[0]!) });
+      return true;
+    });
+    try {
+      await runAccountAction((announce) =>
+        addAccount('second', { fresh: true, loginWindow: window, onAdded: announce }, ctx),
+      );
+    } finally {
+      write.mockRestore();
+    }
+    expect(writes).toEqual([
+      {
+        text:
+          'Added second (new-1). Your current login was not touched - ' +
+          '`cctl switch second` to use it.\n',
+        dirExisted: true,
+      },
+    ]);
+    expect(existsSync(dirs[0]!)).toBe(false);
   });
 });
 
@@ -521,6 +604,24 @@ describe('runAccountAction', () => {
       write.mockRestore();
     }
     expect(out).toEqual(['Removed Work.\n']);
+  });
+
+  it('prints an announced message when it is announced, and not again at the end', async () => {
+    const events: string[] = [];
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      events.push(`printed ${String(chunk)}`);
+      return true;
+    });
+    try {
+      await runAccountAction((announce) => {
+        announce({ message: 'Added X.' });
+        events.push('cleanup');
+        return Promise.resolve({ message: 'Added X.' });
+      });
+    } finally {
+      write.mockRestore();
+    }
+    expect(events).toEqual(['printed Added X.\n', 'cleanup']);
   });
 
   it("turns a refusal into the CLI's failure with the same words", async () => {

@@ -120,9 +120,11 @@ async function postToDaemon(
   route: string,
   payload: Record<string, unknown>,
   deps: SessionClientDeps,
-  // A route can put a refusal status in better words than the daemon's own (a daemon too old to
-  // know the route, for one); undefined falls through to the daemon's message.
-  explainRefusal: (status: number) => string | undefined = () => undefined,
+  // A route can put a refusal in better words than the daemon's own (a daemon too old to know the
+  // route, for one), judged by the status and the daemon's answer; undefined falls through to the
+  // daemon's message.
+  explainRefusal: (status: number, body: DaemonReply | undefined) => string | undefined = () =>
+    undefined,
 ): Promise<DaemonReply | undefined> {
   const paths = defaultPaths();
   const dataDir = dataDirOf(deps, paths);
@@ -162,7 +164,7 @@ async function postToDaemon(
     // 4xx/5xx from the daemon: surface its explanation (unknown_session message, validation
     // error) verbatim so the user sees exactly what to fix.
     throw new SessionClientError(
-      explainRefusal(res.status) ??
+      explainRefusal(res.status, body) ??
         body?.message ??
         body?.error ??
         `daemon returned HTTP ${res.status}`,
@@ -196,6 +198,22 @@ export async function callDaemonSession(
   };
 }
 
+/** The words a daemon from before the usage refresh answers the route with: it reads it as a
+ *  session command and refuses the missing session. Kept as a literal on purpose, since it
+ *  identifies what already-shipped daemons say, whatever the current receiver says later. */
+const PRE_REPOLL_SESSION_REFUSAL = 'sessionId and idempotencyKey are required';
+
+/**
+ * Whether a refusal of `/cli/usage/repoll` comes from a daemon that predates the route. Such a
+ * daemon answers 404 (an unknown CLI endpoint) or a 400 complaining about the session fields; a
+ * current daemon never answers 404 here, and its own 400s (a body over its size cap, a malformed
+ * id list) and a 401 for a stale secret are not cured by a restart, so they keep their own words.
+ */
+function predatesUsageRepoll(status: number, reply: DaemonReply | undefined): boolean {
+  if (status === 404) return true;
+  return status === 400 && reply?.error === PRE_REPOLL_SESSION_REFUSAL;
+}
+
 /**
  * Ask the running daemon to refresh usage now for these accounts (every stored account when `ids`
  * is absent). The daemon honors each account's poll floor and 429 backoff, so the answer is a
@@ -207,8 +225,7 @@ export async function callDaemonUsageRepoll(
   ids?: readonly string[],
   deps: SessionClientDeps = {},
 ): Promise<UsageRepollResult> {
-  // Checked here so a refusal from the daemon can only mean it does not know the route: the
-  // daemon refuses a malformed list with the same 400 an older daemon gives every unknown route.
+  // Caught here, in words naming the mistake, rather than as the daemon's generic list refusal.
   if (ids !== undefined && ids.some((id) => id.length === 0)) {
     throw new SessionClientError('an account id to refresh is empty');
   }
@@ -216,10 +233,8 @@ export async function callDaemonUsageRepoll(
     '/cli/usage/repoll',
     ids === undefined ? {} : { ids: [...ids] },
     deps,
-    (status) =>
-      // A daemon from before this route reads it as a session command missing its session (400)
-      // or an unknown CLI endpoint (404).
-      status === 400 || status === 404
+    (status, reply) =>
+      predatesUsageRepoll(status, reply)
         ? 'the running daemon is older than this cctl and cannot refresh usage on demand - ' +
           'restart it with `cctl daemon restart`'
         : undefined,

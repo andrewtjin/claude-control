@@ -2050,9 +2050,26 @@ describe('account commands print exactly what they always have', () => {
       'error: cannot capture inside a folder profile. Onboard a new account from a normal ' +
         '(non-folder-bound) shell, or use: cctl accounts add <label> --fresh.\n',
     );
-    engine.captureCurrentLogin.mockRejectedValueOnce(new Error('nothing there'));
-    expect((await runCli(['accounts', 'add', 'new'])).err).toBe(
-      'error: no live login to capture. Run `claude` and log in first, then retry.\n',
+    // The plain add has always read every other capture failure as a missing login, whether the
+    // engine found no login or something else broke.
+    for (const thrown of [
+      new Error('nothing there'),
+      new RefreshError('no live credentials to capture; log in first', 'no_live_login'),
+    ]) {
+      engine.captureCurrentLogin.mockRejectedValueOnce(thrown);
+      expect(await runCli(['accounts', 'add', 'new'])).toEqual({
+        out: '',
+        err: 'error: no live login to capture. Run `claude` and log in first, then retry.\n',
+        exited: true,
+      });
+    }
+    engine.captureCurrentLogin.mockRejectedValueOnce(
+      new VaultError('the account registry is malformed; fix the file or move it aside'),
     );
+    expect(await runCli(['accounts', 'add', 'new'])).toEqual({
+      out: '',
+      err: 'error: the account registry is malformed; fix the file or move it aside\n',
+      exited: true,
+    });
   });
 });

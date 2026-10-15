@@ -71,6 +71,8 @@ import {
 } from './outagesView.js';
 import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
 import {
+  AccountActionError,
+  NO_LIVE_LOGIN,
   addAccount,
   removeAccount,
   renameAccount,
@@ -1166,7 +1168,8 @@ function buildSetupDeps(io: WizardIo, relayFlag?: string): SetupDeps {
     isLoggedIn: async () => (await checkLiveLogin(paths)).ok,
     listAccounts: () => engine.listAccounts(),
     captureCurrentLogin: (label) => engine.captureCurrentLogin(label),
-    addFreshAccount: (label) => runAccountAction(() => addAccount(label, { fresh: true })),
+    addFreshAccount: (label) =>
+      runAccountAction((announce) => addAccount(label, { fresh: true, onAdded: announce })),
     hooksInstalled: () => hooksInstalledAt(settingsPath),
     hooksProfilePath: settingsPath,
     channelEnabled: async () => {
@@ -1662,7 +1665,17 @@ function buildAccountCommands(program: Command): void {
       'log in as a NEW account in a throwaway window, without touching the live login',
     )
     .action(async (label: string, opts: { fresh?: boolean }) => {
-      await runAccountAction(() => addAccount(label, opts));
+      await runAccountAction(async (announce) => {
+        try {
+          return await addAccount(label, { ...opts, onAdded: announce });
+        } catch (err) {
+          // This command answers every failed capture of the current login with the no-login
+          // line, faults included. The action lets those faults escape as themselves so a caller
+          // that can show more does; the command keeps its own words for them.
+          if (opts.fresh || err instanceof AccountActionError) throw err;
+          throw new AccountActionError('no_live_login', NO_LIVE_LOGIN, { cause: err });
+        }
+      });
     });
 
   accounts
