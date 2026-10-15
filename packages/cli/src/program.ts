@@ -79,6 +79,7 @@ import {
   type OutageStatus,
 } from './outagesView.js';
 import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
+import { buildTransferCommands } from './accountTransfer.js';
 import { runSessionAliases, runSessionShow, type SessionAliasDeps } from './sessionAliases.js';
 import { runSessionExclude, runSessionInclude, runSessionReset } from './sessionRules.js';
 import { withCaptureDir } from './captureDir.js';
@@ -305,6 +306,7 @@ export function buildProgram(): Command {
   buildSessionCommands(program);
   buildChannelCommands(program);
   buildFolderCommands(program);
+  buildTransferCommands(program);
 
   program
     .command('switch <ref>')
