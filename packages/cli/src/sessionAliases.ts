@@ -28,6 +28,7 @@ import {
   aliasKey,
   canonicalizeFolder,
   describeRuleScopes,
+  isLeaseRule,
   recordedFolderFor,
   resolveSessionRule,
   ruleSlotId,
@@ -180,8 +181,10 @@ async function withBindings(
   const slotLabel = (slot: string): string => {
     if (slot === 'global') return 'the global slot';
     const r = rules.find((x) => ruleSlotId(x.id) === slot);
-    return r === undefined
-      ? 'a folder slot whose rule no longer exists'
+    if (r === undefined) return 'a folder slot whose rule no longer exists';
+    // A parallel session (`cctl claude --account`) is named by its account.
+    return isLeaseRule(r)
+      ? `the parallel-session slot of ${r.label}`
       : `the folder slot of ${describeRuleScopes(r)}`;
   };
   return read.views.map((view) => {

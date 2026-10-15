@@ -17,7 +17,9 @@ import {
   defaultPaths,
   folderBindingsPath,
   groupProfileDir,
+  leaseRuleId,
   sandboxPaths,
+  selfHolder,
   type ClaudeOauth,
   type CredentialBundle,
   type Paths,
@@ -289,6 +291,27 @@ describe.skipIf(process.platform === 'darwin')(
       await runSessionReset('Other', undefined, { cwd: repo }, h.deps);
       const settings = await readFile(join(mainDir, 'settings.json'), 'utf8').catch(() => '');
       expect(settings).not.toContain('bind-guard');
+    });
+
+    it('a session on a parallel-session profile is never told to move: it runs where it was started', async () => {
+      const mainDir = paths.claudeDir;
+      const env = { LOCALAPPDATA: root, XDG_DATA_HOME: root, CLAUDE_CONFIG_DIR: mainDir };
+      const mainPaths = defaultPaths(env, process.platform);
+      const engine = sandboxEngine(() => true, mainPaths);
+      const A = await engine.addAccount('A', bundle('A'));
+      const W = await engine.addAccount('W', bundle('W'));
+      await engine.addAccount('C', bundle('C'));
+      await engine.activate(A.id, { force: true });
+      await engine.claimSessionSlot(W.id, selfHolder('launcher'), { launchRuleId: null });
+      const profile = groupProfileDir(mainPaths.vaultDir, leaseRuleId(W.id));
+
+      const sessionEnv = { ...env, CLAUDE_CONFIG_DIR: profile, [SESSION_ID_ENV]: S_CUR };
+      const seenThrough = defaultPaths(sessionEnv, process.platform);
+      const cliEngine = sandboxEngine(() => true, seenThrough);
+      const h = harness(cliEngine, { paths: seenThrough, env: sessionEnv });
+      await runSessionInclude('Auth Work', 'A', { cwd: repo }, h.deps);
+      expect(h.text()).not.toContain("This session now runs on another rule's slot");
+      expect(h.text()).not.toContain('runs on the global slot');
     });
   },
 );
