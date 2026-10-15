@@ -54,7 +54,12 @@ import {
   readHeartbeat,
   removeBindToken,
 } from '@claude-control/daemon';
-import { timelineInputFromWire, type AccountUsageInput } from '@claude-control/usage-advisor';
+import {
+  billingLabel,
+  planLabel,
+  timelineInputFromWire,
+  type AccountUsageInput,
+} from '@claude-control/usage-advisor';
 import type { AccountUsage } from '@claude-control/shared-protocol';
 import { buildEngine, daemonDbPath, fail } from './context.js';
 import {
@@ -411,11 +416,14 @@ export async function renderFolderRulesAppendix(engine: Engine, palette: Palette
 }
 
 /** The reserved accounts, as `cctl accounts list` shows them below the shared table: each WITH its
- *  email, and the folders of every rule that includes it. Pure over its inputs. */
+ *  email, its plan and billing cells (the same ones the shared table derives, so one account never
+ *  reads two ways), and the folders of every rule that includes it. Pure over its inputs; `nowMs`
+ *  drives the billing estimate and defaults to the real clock, as the shared table's does. */
 export function buildReservedViews(
   accounts: readonly AccountView[],
   rules: readonly FolderRule[],
   live: ReadonlyMap<SlotId, string | null>,
+  nowMs: number = Date.now(),
 ): ReservedAccountView[] {
   return accounts
     .filter((a) => (a.ruleIds ?? []).length > 0)
@@ -425,6 +433,8 @@ export function buildReservedViews(
         id: a.id,
         label: a.label,
         email: a.emailAddress,
+        plan: planLabel(a),
+        billing: billingLabel(a, nowMs),
         quarantined: a.quarantined,
         live: including.some((r) => live.get(ruleSlotId(r.id)) === a.id),
         includedBy: including.map((r) => r.folders.join(', ')),

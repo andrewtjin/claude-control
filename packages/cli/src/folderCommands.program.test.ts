@@ -605,6 +605,39 @@ describe('cctl accounts list', () => {
     expect(line?.startsWith('*')).toBe(true);
   });
 
+  it('gives a reserved account the same PLAN and BILLING cells a shared one with its signals gets', async () => {
+    const signals = {
+      subscriptionType: 'team',
+      rateLimitTier: 'default_claude_max_5x',
+      billingType: 'stripe_subscription',
+      subscriptionCreatedAt: '2026-09-20T22:09:56.946Z',
+    };
+    // A shared twin with identical signals: whatever the shared table says, the reserved row says.
+    const twin = account('t', { label: 'T', emailAddress: 't@example.com', ...signals });
+    engine.listAccounts.mockResolvedValue([twin]);
+    engine.listAllAccounts.mockResolvedValue([twin, { ...E, ...signals }]);
+    engine.listRules.mockResolvedValue([ruleOn(research, { include: ['e'] })]);
+    const r = await runCli(['accounts', 'list']);
+    const lines = r.out.split('\n');
+    const cells = (email: string) =>
+      lines
+        .find((l) => l.includes(email))!
+        .split(/ {2,}/)
+        .map((c) => c.trim());
+    const shared = cells('t@example.com');
+    const reserved = cells('e@example.com');
+    // Shared: [marker?, label, email, plan, billing, ...]; reserved likewise up to billing.
+    const after = (row: string[], email: string) => row.slice(row.indexOf(email) + 1);
+    expect(after(shared, 't@example.com').slice(0, 2)).toEqual([
+      '5x',
+      expect.stringMatching(/\(est\.\)$/),
+    ]);
+    expect(after(reserved, 'e@example.com').slice(0, 2)).toEqual(
+      after(shared, 't@example.com').slice(0, 2),
+    );
+    expect(lines.find((l) => l.includes('INCLUDED BY'))).toMatch(/PLAN\s+BILLING\s+STATUS/);
+  });
+
   it('adds nothing when no folder has a rule', async () => {
     const r = await runCli(['accounts', 'list']);
     expect(r.out).not.toContain('Reserved to folder rules');
