@@ -51,8 +51,15 @@ export function windowsStartMs(raw: string): number | undefined {
   return Number((value - epoch) / 10_000n);
 }
 
-/** Run one query and collect its stdout lines, or none when it cannot run or times out. */
-function queryLines(command: string, args: string[], env: NodeJS.ProcessEnv): Promise<string[]> {
+/** Run one query and collect its stdout lines, or none when it cannot run or times out.
+ *  `detached` is the start-time reader's historical spawn, kept as it was; the process table is read
+ *  attached, because a detached PowerShell on Windows was measured to print nothing to the pipe. */
+function queryLines(
+  command: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  detached: boolean,
+): Promise<string[]> {
   return new Promise((resolve) => {
     let text = '';
     let child;
@@ -62,7 +69,7 @@ function queryLines(command: string, args: string[], env: NodeJS.ProcessEnv): Pr
         stdio: ['ignore', 'pipe', 'ignore'],
         shell: false,
         windowsHide: true,
-        detached: true,
+        detached,
       });
     } catch {
       resolve([]);
@@ -106,12 +113,14 @@ export function readProcessStarts(
                 'ForEach-Object { "$($_.Id) $($_.StartTime.ToFileTimeUtc())" }',
             ],
             process.env,
+            true,
           )
-        : await queryLines('ps', ['-o', 'pid=,lstart=', '-p', list], {
-            ...process.env,
-            LC_ALL: 'C',
-            TZ: 'UTC',
-          });
+        : await queryLines(
+            'ps',
+            ['-o', 'pid=,lstart=', '-p', list],
+            { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
+            true,
+          );
     for (const line of lines) {
       const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
       if (m !== null) out.set(Number(m[1]), m[2]!);
@@ -137,6 +146,7 @@ export async function readProcessTable(): Promise<ProcessRow[]> {
         '"$($_.ProcessId) $($_.ParentProcessId) $(if ($_.CreationDate) { $_.CreationDate.ToFileTimeUtc() } else { 0 })" }',
     ],
     process.env,
+    false,
   );
   return parseProcessTable(lines);
 }
