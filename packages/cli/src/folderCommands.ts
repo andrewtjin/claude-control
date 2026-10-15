@@ -94,6 +94,7 @@ import {
   resumeCommand,
   vscodeProfileNames,
   type FolderRuleView,
+  type FoldersView,
   type GlobalSlotView,
   type PoolEntryView,
   type ReservedAccountView,
@@ -469,6 +470,24 @@ async function buildGlobalView(
   return {
     live: buildLiveView(liveId, undefined, picture.accounts),
     pool: buildPoolView(undefined, pool, liveId, picture.accounts, picture.rules),
+  };
+}
+
+/** What `cctl folders` shows: every rule's view, the global slot's, and the guard footer — read
+ *  once here so the command and the full-screen view render the same picture from one reader. */
+export async function readFoldersView(engine: Engine): Promise<FoldersView> {
+  const [picture, freshness] = await Promise.all([
+    readFolderPicture(engine),
+    engine.getGuardSnapshotFreshness(),
+  ]);
+  const [rules, global] = await Promise.all([
+    Promise.all(picture.rules.map((r) => buildRuleView(engine, r, picture))),
+    picture.rules.length > 0 ? buildGlobalView(engine, picture) : { live: null, pool: [] },
+  ]);
+  return {
+    rules,
+    global,
+    footer: { present: freshness.present, fresh: freshness.fresh, enforce: freshness.enforce },
   };
 }
 
@@ -1051,28 +1070,8 @@ export function buildFolderCommands(program: Command): void {
       'list every folder rule: its folders, includes, excludes, live account and pool in order',
     )
     .action(async () => {
-      const engine = buildEngine();
-      const [picture, freshness] = await Promise.all([
-        readFolderPicture(engine),
-        engine.getGuardSnapshotFreshness(),
-      ]);
-      const [rules, global] = await Promise.all([
-        Promise.all(picture.rules.map((r) => buildRuleView(engine, r, picture))),
-        picture.rules.length > 0 ? buildGlobalView(engine, picture) : { live: null, pool: [] },
-      ]);
       process.stdout.write(
-        renderFolders(
-          {
-            rules,
-            global,
-            footer: {
-              present: freshness.present,
-              fresh: freshness.fresh,
-              enforce: freshness.enforce,
-            },
-          },
-          detectPalette(),
-        ) + '\n',
+        renderFolders(await readFoldersView(buildEngine()), detectPalette()) + '\n',
       );
     });
 

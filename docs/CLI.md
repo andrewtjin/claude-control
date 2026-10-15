@@ -2,9 +2,11 @@
 
 `cctl` runs local, one-shot commands over the switch engine and the daemon's data, plus
 the guided first-run wizard and the background daemon itself. Bare `cctl` (no
-subcommand) prints `Not set up yet. Run: cctl setup` before setup, or a short status
-summary afterward — it never dumps raw command-tree usage. `cctl --help` lists every
-command; this page adds the detail and the unhappy paths.
+subcommand) prints `Not set up yet. Run: cctl setup` before setup. Afterward it opens the
+full-screen view (see [Full-screen view](#full-screen-view)) when both its input and its
+output are a terminal, and prints a short status summary otherwise, so a pipe, a script or
+`cctl > file` gets the same plain text it always did. It never dumps raw command-tree usage.
+`cctl --help` lists every command; this page adds the detail and the unhappy paths.
 
 ## First run
 
@@ -592,6 +594,47 @@ refused as above.
 Folder rules are **not supported on macOS yet** — `cctl folder include|exclude` refuse
 there. The isolation relies on a per-slot credential store, and on macOS each store would
 prompt the Keychain. See `docs/PLATFORM.md`.
+
+## Full-screen view
+
+```
+cctl            # on a terminal, once set up
+cctl tui        # the same view, by name; works before setup too
+```
+
+One screen with four panes, refreshed every 2 seconds and after every action: **Accounts**
+(each account's plan, its 5-hour and weekly usage with reset times, any per-model weekly
+windows, its folder rules, whether it is excluded or quarantined, and how old the reading is),
+**Sessions** (what `cctl session status` shows), **Folders** (`cctl folders`) and **Outages**
+(`cctl outages`). The header says whether the daemon is running, whether auto-switch is on, and
+when it last polled. Everything is read locally from the vault and the daemon's database, the
+same places the commands read; nothing in the view calls Anthropic. A reset marked `~` is
+predicted from history rather than reported.
+
+| Key                 | What it does                                                                                                                                                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| up/down or k/j      | move the selection (Accounts) or scroll (other panes)                                                                                                                                                                                 |
+| PgUp/PgDn, Home/End | move or scroll further                                                                                                                                                                                                                |
+| Tab / Shift-Tab     | next / previous pane                                                                                                                                                                                                                  |
+| Enter               | switch to the selected account (same as `cctl switch`)                                                                                                                                                                                |
+| e                   | exclude the selected account from auto-switch, or include it again                                                                                                                                                                    |
+| r                   | rename the selected account                                                                                                                                                                                                           |
+| a                   | add an account: the screen steps aside for a Claude login window (as `cctl accounts add --fresh`), then comes back                                                                                                                    |
+| d                   | remove the selected account; you type its label to confirm                                                                                                                                                                            |
+| u                   | ask the running daemon to refresh usage now; it still honors each account's poll floor and any rate-limit backoff, and says which accounts it held back and until when. Unavailable, with the reason, while the daemon is not running |
+| l                   | show the command that runs Claude as the selected account, to paste in another terminal                                                                                                                                               |
+| ?                   | the key list                                                                                                                                                                                                                          |
+| q or Esc            | quit                                                                                                                                                                                                                                  |
+
+Ctrl-C also quits. If an action is running, the view quits as soon as it finishes; a second
+Ctrl-C quits at once.
+
+As the terminal narrows, columns give way in a fixed order: per-model windows first, then reset
+times, then the plan. Below 40 columns (or 6 rows) the view shows a one-line notice instead.
+Diagnostics that would normally go to stderr appear on the status line, so they never draw over
+the screen. Quitting, a signal, a closed terminal and an error all give the terminal back as it
+was. `cctl tui` refuses to start when its input or output is redirected, and points at
+`cctl usage` for plain output.
 
 ## Switching and recovery
 

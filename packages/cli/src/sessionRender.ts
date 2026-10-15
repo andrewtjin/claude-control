@@ -10,6 +10,7 @@
 // hold this header and `cctl usage`'s line to the same input and prove they agree.
 
 import type { AccountUsage } from '@claude-control/shared-protocol';
+import type { SessionRow } from '@claude-control/daemon';
 import {
   computeOutlook,
   humanizeDaysUntil,
@@ -174,4 +175,25 @@ function colWidth<K extends string>(
   key: K,
 ): number {
   return Math.max(headers[key].length, ...rows.map((r) => r[key].length));
+}
+
+/** Turn one Store `sessions` row into a display row, resolving the account id to a label and
+ *  tolerating a corrupt/foreign `json` blob (fields simply stay absent). */
+export function sessionRowFromStore(
+  row: SessionRow,
+  labelById: Map<string, string>,
+): SessionStatusRow {
+  let parsed: Record<string, unknown> = {};
+  try {
+    parsed = JSON.parse(row.json) as Record<string, unknown>;
+  } catch {
+    // keep the empty object — the row's top-level columns still render
+  }
+  const accountId =
+    row.accountId ?? (typeof parsed.accountId === 'string' ? parsed.accountId : undefined);
+  const out: SessionStatusRow = { id: row.id, kind: row.kind, state: row.state };
+  if (typeof parsed.label === 'string') out.label = parsed.label;
+  if (typeof parsed.watch === 'boolean') out.watch = parsed.watch;
+  if (accountId !== undefined) out.accountLabel = labelById.get(accountId) ?? accountId;
+  return out;
 }

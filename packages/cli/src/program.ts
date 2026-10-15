@@ -24,7 +24,6 @@ import {
   canonicalizeFolder,
   parsePastedCode,
   resolveAccountRef,
-  type StoredAccount,
 } from '@claude-control/switch-engine';
 import {
   ControlPlaneClient,
@@ -40,7 +39,6 @@ import {
   resumeOpenEpisodes,
   scopeKey,
   scopeOf,
-  readFleetHistory,
   readHeartbeat,
   readTranscriptTurns,
   slotBySessionMap,
@@ -48,14 +46,11 @@ import {
   type OpenEpisode,
   type OutageJudgement,
   type ScopeView,
-  type SessionRow,
 } from '@claude-control/daemon';
-import type { AccountUsage } from '@claude-control/shared-protocol';
 import { DEFAULT_STATS_DAYS } from '@claude-control/shared-protocol';
 import {
   computeOutlook,
   computePlan,
-  planWeight,
   renderOutlook,
   renderPlanSummary,
   timelineInputFromWire,
@@ -81,6 +76,10 @@ import {
   setExcluded,
   switchAccount,
 } from './accountActions.js';
+import { readUsageState, resolvedWeight, type UsageState } from './usageState.js';
+import { StatusLog, runTui } from './tui/run.js';
+import { createTuiSources } from './tui/sources.js';
+import type { OutagesView } from './tui/types.js';
 import { runSessionAliases, runSessionShow, type SessionAliasDeps } from './sessionAliases.js';
 import { runSessionExclude, runSessionInclude, runSessionReset } from './sessionRules.js';
 import { withCaptureDir } from './captureDir.js';
@@ -143,6 +142,7 @@ import {
 } from './render.js';
 import {
   renderSessionStatus,
+  sessionRowFromStore,
   weeklyResetHeader,
   type SessionStatusHeader,
   type SessionStatusRow,
@@ -1018,9 +1018,26 @@ export function buildProgram(): Command {
       ),
     );
 
-  // Bare `cctl` (no subcommand): a short status summary once there are accounts, otherwise a
-  // single nudge to run setup — never Commander's raw usage dump. `--help`/`--version` are
-  // handled by Commander before this ever runs.
+  program
+    .command('tui')
+    .description('full-screen view: accounts and usage, sessions, folders, outages (keys inside)')
+    .action(async () => {
+      // The view draws on the terminal and reads keys from it; with either end redirected there
+      // is no one to draw for, and raw input from a pipe would hang waiting for keys.
+      if (!isInteractiveTerminal()) {
+        fail(
+          'cctl tui needs an interactive terminal (neither input nor output redirected). ' +
+            'For plain output use: cctl usage',
+        );
+      }
+      await openTui();
+    });
+
+  // Bare `cctl` (no subcommand): on an interactive terminal (input AND output), the full-screen
+  // view once there are accounts; anywhere else a short status summary, byte for byte what it
+  // has always printed, so pipes, scripts and `cctl > file` see no change. With no accounts, a
+  // single nudge to run setup either way — never Commander's raw usage dump. `--help`/`--version`
+  // are handled by Commander before this ever runs.
   //
   // Having an action of its own makes Commander read an unmatched first word as an argument to
   // bare `cctl` and refuse it as "too many arguments", never naming it as an unknown command. So
@@ -1041,6 +1058,15 @@ export function buildProgram(): Command {
         { code: 'commander.unknownCommand' },
       );
     }
+    if (isInteractiveTerminal()) {
+      // "Set up" means what the summary's own check means: an account in the shared pool.
+      if ((await buildEngine().listAccounts()).length === 0) {
+        process.stdout.write('Not set up yet. Run: cctl setup\n');
+        return;
+      }
+      await openTui();
+      return;
+    }
     const summary = await readStatusSummary();
     if (summary.accounts.length === 0) {
       process.stdout.write('Not set up yet. Run: cctl setup\n');
@@ -1053,6 +1079,39 @@ export function buildProgram(): Command {
   });
 
   return program;
+}
+
+/** Whether a person is at both ends of this process: input and output are both a terminal. The
+ *  full-screen view needs both — keys in, a screen out — and anything less (a pipe, a file, CI)
+ *  gets plain output. */
+export function isInteractiveTerminal(
+  stdin: { isTTY?: boolean | undefined } = process.stdin,
+  stdout: { isTTY?: boolean | undefined } = process.stdout,
+): boolean {
+  return stdin.isTTY === true && stdout.isTTY === true;
+}
+
+/**
+ * Open the full-screen view on this terminal (composition root: the real engine, data dir and
+ * streams). The engine logs to the view's status line rather than stderr, which would scribble
+ * over the drawn screen; anything else written to stderr while the screen is up is diverted the
+ * same way. A signal that ended the view becomes the exit code it asks for.
+ */
+async function openTui(): Promise<void> {
+  const log = new StatusLog(process.stderr);
+  const engine = buildEngine(defaultPaths(), log);
+  const exit = await runTui({
+    stdin: process.stdin,
+    stdout: process.stdout,
+    sources: createTuiSources({
+      engine,
+      readOutages: (nowMs) => readOutagesView(nowMs, engine),
+    }),
+    palette: detectPalette(),
+    log,
+    stderr: process.stderr,
+  });
+  if (exit.code !== 0) process.exitCode = exit.code;
 }
 
 // ---------------------------------------------------------------------------
@@ -1239,63 +1298,6 @@ async function readStatusSummary(): Promise<SetupSummary> {
   };
 }
 
-/** What `usage` and `timeline` read before rendering: the registry, the daemon's latest
- *  persisted snapshot per account, and the two history-derived measurements the pure advisor
- *  cannot make for itself (each account's predicted weekly reset and the fleet's burn rate).
- *  Works whether or not the daemon is currently running (it shows the last poll), and opening
- *  a not-yet-created db just yields an empty one. A corrupt snapshot row is skipped, never
- *  fatal. */
-interface UsageState {
-  accounts: StoredAccount[];
-  activeId: string | null;
-  usageFor: (accountId: string) => AccountUsage | undefined;
-  /** Next weekly reset predicted from stored history, for accounts the endpoint has stopped
-   *  publishing one for. Absent when the account has no observed reset in history at all. */
-  predictedResetFor: (accountId: string) => number | undefined;
-  /** Fleet burn in Pro-equivalent units/day, or undefined when history cannot measure one. */
-  burnUnitsPerDay: number | undefined;
-}
-
-/** The usage view's state: the shared accounts, the global live account and each account's latest
- *  snapshot. `only` names the accounts to read instead (the outage judgement reads the whole fleet,
- *  reserved accounts included). */
-async function readUsageState(nowMs: number, only?: StoredAccount[]): Promise<UsageState> {
-  const engine = buildEngine();
-  const [accounts, activeId] = await Promise.all([
-    only !== undefined ? Promise.resolve(only) : engine.listAccounts(),
-    engine.getActiveId(),
-  ]);
-  const store = new Store(daemonDbPath());
-  try {
-    const byId = new Map<string, AccountUsage>();
-    for (const a of accounts) {
-      const row = store.latestUsageSnapshot(a.id);
-      if (!row) continue;
-      try {
-        byId.set(a.id, JSON.parse(row.json) as AccountUsage);
-      } catch {
-        // a corrupt row must not crash the whole view
-      }
-    }
-    // The same measurement the daemon makes each poll cycle, over the same store and the one
-    // implementation — so a number the CLI prints can never disagree with the one the phone got.
-    const history = readFleetHistory(
-      store,
-      accounts.map((a) => ({ accountId: a.id, ...resolvedWeight(a) })),
-      nowMs,
-    );
-    return {
-      accounts,
-      activeId,
-      usageFor: (accountId) => byId.get(accountId),
-      predictedResetFor: (accountId) => history.predictedResetByAccount.get(accountId),
-      burnUnitsPerDay: history.burnUnitsPerDay,
-    };
-  } finally {
-    store.close();
-  }
-}
-
 /** Build the advisor's `AccountUsageInput` view shared by `timeline`'s outlook/plan and both
  *  commands' pacing line. Registry data (label/active/quarantined) is authoritative and
  *  current; the persisted snapshot only contributes the limits, so a stale snapshot can't
@@ -1374,15 +1376,32 @@ async function globalSlotAccountsNow(): Promise<Set<string>> {
  *  `outageScopes`), with the latest numbers for the whole fleet, reserved accounts included. */
 async function readOutageScopes(
   nowMs: number,
+  engine: ReturnType<typeof buildEngine> = buildEngine(),
 ): Promise<{ inputs: AccountUsageInput[]; scopes: ScopeView[] }> {
-  const engine = buildEngine();
   const [accounts, rules, liveSlots] = await Promise.all([
     engine.listAllAccounts(),
     engine.listRules(),
     engine.liveSlots(),
   ]);
-  const inputs = buildAdvisorInputs(await readUsageState(nowMs, accounts));
+  const inputs = buildAdvisorInputs(await readUsageState(nowMs, accounts, engine));
   return { inputs, scopes: outageScopes({ accounts, rules, liveSlots }) };
+}
+
+/** Everything `cctl outages` prints with no filter: the log's episodes, where each open one stands,
+ *  and the log's path. The full-screen view reads it through its own engine, so nothing it reads
+ *  writes a diagnostic over the screen. */
+async function readOutagesView(
+  nowMs: number,
+  engine: ReturnType<typeof buildEngine>,
+): Promise<OutagesView> {
+  const log = exhaustionLog();
+  const records = await log.read();
+  const open = await openOutageStatuses(resumeOpenEpisodes(records), nowMs, engine);
+  return {
+    episodes: episodesInWindow(episodesOf(records), nowMs, undefined, open),
+    open,
+    logPath: log.path,
+  };
 }
 
 /**
@@ -1395,12 +1414,13 @@ async function readOutageScopes(
 async function openOutageStatuses(
   opens: Map<string, OpenEpisode>,
   nowMs: number,
+  engine?: ReturnType<typeof buildEngine>,
 ): Promise<OutageStatus[]> {
   if (opens.size === 0) return [];
   let current: { inputs: AccountUsageInput[]; scopes: ScopeView[] } | undefined;
   let policy: AutoSwitchPolicy = {};
   try {
-    current = await readOutageScopes(nowMs);
+    current = await readOutageScopes(nowMs, engine);
     policy = await cliAutoSwitchPolicy();
   } catch {
     current = undefined;
@@ -1463,14 +1483,6 @@ async function exhaustionBanner(
   } catch {
     return undefined;
   }
-}
-
-/** `{ weight }` when the account's plan tier resolves, `{}` when it does not — the same
- *  present-or-absent contract `timelineInputFromWire` relies on to tell a real 1x Pro account
- *  from one whose tier nothing could read. */
-function resolvedWeight(account: StoredAccount): { weight?: number } {
-  const result = planWeight(account);
-  return result.known ? { weight: result.weight } : {};
 }
 
 /** Spread the measured burn into `PacingOptions` only when there IS one. `exactOptionalPropertyTypes`
@@ -2058,24 +2070,6 @@ function sessionAliasDeps(): SessionAliasDeps {
       if (process.stderr.isTTY) process.stderr.write(text + '\n');
     },
   };
-}
-
-/** Turn one Store `sessions` row into a display row, resolving the account id to a label and
- *  tolerating a corrupt/foreign `json` blob (fields simply stay absent). */
-function sessionRowFromStore(row: SessionRow, labelById: Map<string, string>): SessionStatusRow {
-  let parsed: Record<string, unknown> = {};
-  try {
-    parsed = JSON.parse(row.json) as Record<string, unknown>;
-  } catch {
-    // keep the empty object — the row's top-level columns still render
-  }
-  const accountId =
-    row.accountId ?? (typeof parsed.accountId === 'string' ? parsed.accountId : undefined);
-  const out: SessionStatusRow = { id: row.id, kind: row.kind, state: row.state };
-  if (typeof parsed.label === 'string') out.label = parsed.label;
-  if (typeof parsed.watch === 'boolean') out.watch = parsed.watch;
-  if (accountId !== undefined) out.accountLabel = labelById.get(accountId) ?? accountId;
-  return out;
 }
 
 /** Shared driver for register/label/watch: resolve the session id, POST to the daemon with a

@@ -318,11 +318,15 @@ export const ADD_FOLDER_RULE_HINT =
   '          or: cctl folder exclude <folder> <account>[,<account>...]\n' +
   'For one named session: cctl session include <alias> <account>[,<account>...]';
 
+/** Everything the full `cctl folders` view renders. */
+export interface FoldersView {
+  rules: FolderRuleView[];
+  global: GlobalSlotView;
+  footer: FolderGuardFooterView;
+}
+
 /** The full `cctl folders` view: every rule, the global slot, then the guard footer. */
-export function renderFolders(
-  input: { rules: FolderRuleView[]; global: GlobalSlotView; footer: FolderGuardFooterView },
-  palette: Palette = PLAIN_PALETTE,
-): string {
+export function renderFolders(input: FoldersView, palette: Palette = PLAIN_PALETTE): string {
   if (input.rules.length === 0) {
     return (
       'No folder rules: every folder uses the global slot and the shared pool.\n' +

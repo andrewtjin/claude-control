@@ -132,6 +132,15 @@ vi.mock('./daemonControl.js', async (importOriginal) => ({
   startDaemon: controlIo.startDaemon,
   restartDaemon: controlIo.restartDaemon,
 }));
+// The full-screen view takes over the terminal; here only whether the entry opens it is asserted,
+// so it is stubbed (its own runtime tests drive it on fake streams).
+const tuiIo = vi.hoisted(() => ({
+  runTui: vi.fn((): Promise<{ code: number }> => Promise.resolve({ code: 0 })),
+}));
+vi.mock('./tui/run.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./tui/run.js')>()),
+  runTui: tuiIo.runTui,
+}));
 
 /** Run one command through commander with stdout/stderr captured. `fail()` throws a CliFailure
  *  that the entry point turns into an error line and exit 1, so a refusal comes back here as
@@ -2097,5 +2106,135 @@ describe('account commands print exactly what they always have', () => {
         exited: true,
       });
     }
+  });
+});
+
+// Bare `cctl` opens the full-screen view only when a person is at both ends of the terminal; every
+// other caller (a pipe, a file, CI) gets the plain output it always got.
+describe('where bare `cctl` and `cctl tui` go', () => {
+  let root: string;
+  const tty = { stdin: process.stdin.isTTY, stdout: process.stdout.isTTY };
+  /** Make stdin and stdout report themselves as terminals, or not. */
+  function setTty(stdin: boolean, stdout: boolean): void {
+    Object.defineProperty(process.stdin, 'isTTY', { value: stdin, configurable: true });
+    Object.defineProperty(process.stdout, 'isTTY', { value: stdout, configurable: true });
+  }
+  const acct = (label: string): StoredAccount => ({
+    id: `id-${label}`,
+    label,
+    quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+  });
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'cctl-entry-'));
+    pathsIo.dataRoot = root;
+    settingsIo.heartbeatPath = join(root, 'daemon-heartbeat.json');
+    vi.stubEnv('LOCALAPPDATA', root);
+    vi.stubEnv('XDG_DATA_HOME', root);
+    vi.stubEnv('CLAUDE_CONFIG_DIR', join(root, 'claude'));
+    vi.stubEnv('NO_COLOR', '1');
+    tuiIo.runTui.mockClear();
+    tuiIo.runTui.mockResolvedValue({ code: 0 });
+  });
+  afterEach(async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: tty.stdin, configurable: true });
+    Object.defineProperty(process.stdout, 'isTTY', { value: tty.stdout, configurable: true });
+    engine.listAccounts.mockReset().mockResolvedValue([]);
+    pathsIo.dataRoot = '';
+    settingsIo.heartbeatPath = '';
+    process.exitCode = undefined;
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('opens the view on a terminal at both ends, once there are accounts', async () => {
+    setTty(true, true);
+    engine.listAccounts.mockResolvedValue([acct('work')]);
+    const r = await runCli([]);
+    expect(r).toEqual({ out: '', err: '', exited: false });
+    expect(tuiIo.runTui).toHaveBeenCalledTimes(1);
+  });
+
+  it('says to run setup instead, on a terminal with no accounts', async () => {
+    setTty(true, true);
+    expect(await runCli([])).toEqual({
+      out: 'Not set up yet. Run: cctl setup\n',
+      err: '',
+      exited: false,
+    });
+    expect(tuiIo.runTui).not.toHaveBeenCalled();
+  });
+
+  it('refuses a stray word on a terminal exactly as before, without opening anything', async () => {
+    setTty(true, true);
+    engine.listAccounts.mockResolvedValue([acct('work')]);
+    const r = await runCli(['nope']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain("error: unknown command 'nope' - run cctl help for the command list");
+    expect(tuiIo.runTui).not.toHaveBeenCalled();
+  });
+
+  it('prints the same summary whichever end is redirected, and never opens the view', async () => {
+    engine.listAccounts.mockResolvedValue([acct('work'), acct('home')]);
+    const outputs: string[] = [];
+    for (const [stdin, stdout] of [
+      [true, false],
+      [false, true],
+      [false, false],
+    ] as const) {
+      setTty(stdin, stdout);
+      const r = await runCli([]);
+      expect(r.exited).toBe(false);
+      outputs.push(r.out);
+    }
+    expect(tuiIo.runTui).not.toHaveBeenCalled();
+    expect(new Set(outputs).size).toBe(1);
+    expect(outputs[0]).toContain('work');
+    expect(outputs[0]).toMatch(
+      /\n\nCommands: cctl usage · cctl timeline · cctl switch <account> · cctl setup\n$/,
+    );
+  });
+
+  it('prints the setup line when redirected with no accounts', async () => {
+    setTty(false, false);
+    expect((await runCli([])).out).toBe('Not set up yet. Run: cctl setup\n');
+  });
+
+  it.each([
+    [true, false],
+    [false, true],
+    [false, false],
+  ])('refuses `cctl tui` without a terminal at both ends (stdin %s, stdout %s)', async (i, o) => {
+    setTty(i, o);
+    expect(await runCli(['tui'])).toEqual({
+      out: '',
+      err:
+        'error: cctl tui needs an interactive terminal (neither input nor output redirected). ' +
+        'For plain output use: cctl usage\n',
+      exited: true,
+    });
+    expect(tuiIo.runTui).not.toHaveBeenCalled();
+  });
+
+  it('opens the view for `cctl tui` on a terminal, even with no accounts yet', async () => {
+    setTty(true, true);
+    expect(await runCli(['tui'])).toEqual({ out: '', err: '', exited: false });
+    expect(tuiIo.runTui).toHaveBeenCalledTimes(1);
+  });
+
+  it('exits with the code the view ended with (a signal), and 0 otherwise', async () => {
+    setTty(true, true);
+    tuiIo.runTui.mockResolvedValueOnce({ code: 143 });
+    await runCli(['tui']);
+    expect(process.exitCode).toBe(143);
+    process.exitCode = undefined;
+    await runCli(['tui']);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it('lists `tui` in the help', async () => {
+    expect((await runCli(['help'])).out).toMatch(/\n {2}tui {2,}full-screen view/);
   });
 });
