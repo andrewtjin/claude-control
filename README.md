@@ -71,6 +71,11 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
   sessions started on the global account move onto the folder's own account between turns.
   `cctl session include <alias> <account>` gives one named session (its `/rename` title) a
   rule of its own, ahead of its folder's. Windows and Linux; see `docs/CLI.md`.
+- **Run one account in one terminal.** `claude --account work` (through the shell wrapper)
+  runs Claude Code on `work` in that terminal only, without switching any other session.
+  While it runs, `work` is out of every pool; when the terminal exits, its refreshed login
+  returns and `work` rejoins the pool. Windows and Linux; see "Parallel sessions" in
+  `docs/CLI.md`.
 
 ## Local-only (no Discord)
 

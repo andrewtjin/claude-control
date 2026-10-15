@@ -60,6 +60,9 @@
   own Keychain item, and reading a cross-app item can raise a GUI prompt a headless daemon
   cannot answer — the same unsolved constraint the macOS section below describes. See
   `docs/CLI.md` ("Folder rules").
+- **Parallel sessions** (`cctl claude --account`, one account per terminal) need a
+  per-config-dir Keychain item for the same reason, and are refused on macOS except for an
+  account that is already live in the global slot.
 
 Everything else — the daemon, the bot, the CLI, usage polling, remote/managed
 sessions — is portable Node ≥ 22.5.
