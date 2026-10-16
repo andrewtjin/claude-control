@@ -1051,5 +1051,34 @@ describe('ensureBindGuard propagation into group profiles', () => {
         'UNIQUE_PROFILE_EDIT',
       );
     });
+
+    // Taking our hooks out rewrites main as well, so it must keep the profile on main the same way.
+    it.each([
+      [
+        'the last unbind',
+        () =>
+          ensureBindGuard({
+            settingsPath: mainSettings,
+            guardPath,
+            snapshotPath,
+            hasBindings: false,
+            profileSettingsPaths: [profileSettings],
+          }),
+      ],
+      [
+        'an uninstall',
+        () =>
+          uninstallHooks({ settingsPath: mainSettings, profileSettingsPaths: [profileSettings] }),
+      ],
+    ])('keeps the profile on main and every older backup after %s', async (_case, remove) => {
+      await remove();
+      // Checked before the repair, which would otherwise heal an identical severed copy unseen.
+      expect(statSync(mainSettings, { bigint: true }).ino).toBe(
+        statSync(profileSettings, { bigint: true }).ino,
+      );
+      ensureGroupProfile(join(dir, 'profiles', 'g1'), dir);
+      expect(hasGuard(await readFile(profileSettings, 'utf8'))).toBe(false);
+      expect((await readdir(backupDir)).sort()).toEqual(planted);
+    });
   });
 });
