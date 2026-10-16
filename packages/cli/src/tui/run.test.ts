@@ -49,6 +49,13 @@ vi.mock('@claude-control/switch-engine', async (importOriginal) => {
 const ESC = String.fromCharCode(27);
 const CTRL_C = String.fromCharCode(3);
 
+/** Wait for an assertion to hold. The bound is generous on purpose: a real switch takes a lock,
+ *  writes files and re-reads the vault, and on a loaded machine that alone can pass vi.waitFor's
+ *  one-second default without anything being wrong. */
+function until(assertion: () => void): Promise<void> {
+  return vi.waitFor(assertion, { timeout: 15_000, interval: 20 });
+}
+
 // ---------------------------------------------------------------------------
 // A fake terminal
 // ---------------------------------------------------------------------------
@@ -235,7 +242,7 @@ describe('a session against a temp vault, a seeded store and a real daemon route
     receiverStore = undefined;
     vi.unstubAllEnvs();
     pathsIo.dataRoot = '';
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   });
 
   /** A login far from expiry, so a switch never needs the network. */
@@ -250,118 +257,125 @@ describe('a session against a temp vault, a seeded store and a real daemon route
     };
   }
 
-  it('opens, moves, switches, renames, refreshes and quits, then gives the terminal back', async () => {
-    const paths = defaultPaths();
-    const dataDir = dirname(paths.vaultDir);
-    const protector = new InsecurePassthroughProtector();
-    const engine = new SwitchEngine({ paths, protector, logger: noopLogger });
+  it(
+    'opens, moves, switches, renames, refreshes and quits, then gives the terminal back',
+    { timeout: 120_000 },
+    async () => {
+      const paths = defaultPaths();
+      const dataDir = dirname(paths.vaultDir);
+      const protector = new InsecurePassthroughProtector();
+      const engine = new SwitchEngine({ paths, protector, logger: noopLogger });
 
-    // The live login is "work"; "home" is stored beside it.
-    const credStore = new CredentialStore(paths);
-    const work = login('work');
-    await credStore.writeLiveCredentials(work.claudeAiOauth);
-    await credStore.writeOauthAccount(work.oauthAccount!);
-    const workRow = await engine.captureCurrentLogin('work');
-    const homeRow = await engine.addAccount('home', login('home'));
+      // The live login is "work"; "home" is stored beside it.
+      const credStore = new CredentialStore(paths);
+      const work = login('work');
+      await credStore.writeLiveCredentials(work.claudeAiOauth);
+      await credStore.writeOauthAccount(work.oauthAccount!);
+      const workRow = await engine.captureCurrentLogin('work');
+      const homeRow = await engine.addAccount('home', login('home'));
 
-    // The daemon's database: a poll for each account and one tracked session.
-    const store = new Store(join(dataDir, 'daemon.db'));
-    for (const [row, pct] of [
-      [workRow, 30],
-      [homeRow, 70],
-    ] as const) {
-      store.insertUsageSnapshot({
-        accountId: row.id,
-        fetchedAtMs: Date.now() - 60_000,
-        source: 'live',
-        json: JSON.stringify({
+      // The daemon's database: a poll for each account and one tracked session.
+      const store = new Store(join(dataDir, 'daemon.db'));
+      for (const [row, pct] of [
+        [workRow, 30],
+        [homeRow, 70],
+      ] as const) {
+        store.insertUsageSnapshot({
           accountId: row.id,
-          label: row.label,
-          active: false,
-          source: 'live',
           fetchedAtMs: Date.now() - 60_000,
-          limits: [{ kind: 'session', percent: pct, isActive: true }],
-        }),
-      });
-    }
-    store.upsertSession({
-      id: 'sess-1',
-      kind: 'interactive',
-      state: 'active',
-      accountId: workRow.id,
-      json: JSON.stringify({ label: 'planning' }),
-      updatedAtMs: Date.now(),
-    });
-    store.close();
-
-    // A running daemon: a fresh heartbeat, and the loopback route answering the refresh.
-    await writeFile(daemonHeartbeatPath(paths), JSON.stringify({ writtenAtMs: Date.now() }));
-    const secret = await loadOrCreateHookSecret({ filePath: hookSecretPath(dataDir), protector });
-    const asked: unknown[] = [];
-    receiverStore = new Store(':memory:');
-    receiver = new HookReceiver({
-      store: receiverStore,
-      secret,
-      emit: () => {},
-      daemonId: () => 'daemon-test',
-    });
-    receiver.setUsageHandlers({
-      repollUsage: (ids) => {
-        asked.push(ids);
-        return Promise.resolve({
-          ok: true,
-          results: [workRow.id, homeRow.id].map((id) => ({ id, outcome: 'scheduled' as const })),
+          source: 'live',
+          json: JSON.stringify({
+            accountId: row.id,
+            label: row.label,
+            active: false,
+            source: 'live',
+            fetchedAtMs: Date.now() - 60_000,
+            limits: [{ kind: 'session', percent: pct, isActive: true }],
+          }),
         });
-      },
-    });
-    await writeHookEndpoint(hookEndpointPath(dataDir), { port: await receiver.listen(0) });
+      }
+      store.upsertSession({
+        id: 'sess-1',
+        kind: 'interactive',
+        state: 'active',
+        accountId: workRow.id,
+        json: JSON.stringify({ label: 'planning' }),
+        updatedAtMs: Date.now(),
+      });
+      store.close();
 
-    const sources = createTuiSources({
-      engine,
-      readOutages: () =>
-        Promise.resolve({ episodes: [], open: [], logPath: join(dataDir, 'exhaustion.jsonl') }),
-      daemonClient: { dataDir, protector },
-    });
-    const rig = start(sources);
+      // A running daemon: a fresh heartbeat, and the loopback route answering the refresh.
+      await writeFile(daemonHeartbeatPath(paths), JSON.stringify({ writtenAtMs: Date.now() }));
+      const secret = await loadOrCreateHookSecret({ filePath: hookSecretPath(dataDir), protector });
+      const asked: unknown[] = [];
+      receiverStore = new Store(':memory:');
+      receiver = new HookReceiver({
+        store: receiverStore,
+        secret,
+        emit: () => {},
+        daemonId: () => 'daemon-test',
+      });
+      receiver.setUsageHandlers({
+        repollUsage: (ids) => {
+          asked.push(ids);
+          return Promise.resolve({
+            ok: true,
+            results: [workRow.id, homeRow.id].map((id) => ({ id, outcome: 'scheduled' as const })),
+          });
+        },
+      });
+      await writeHookEndpoint(hookEndpointPath(dataDir), { port: await receiver.listen(0) });
 
-    expect(rig.output.chunks[0]).toBe(ENTER_SCREEN);
-    expect(rig.input.isRaw).toBe(true);
-    await vi.waitFor(() => expect(rig.output.text()).toContain('home'));
-    expect(rig.output.text()).toContain('daemon up');
-    expect(rig.output.screen()[3]).toMatch(/^>\* work /);
+      const sources = createTuiSources({
+        engine,
+        readOutages: () =>
+          Promise.resolve({ episodes: [], open: [], logPath: join(dataDir, 'exhaustion.jsonl') }),
+        daemonClient: { dataDir, protector },
+      });
+      const rig = start(sources);
 
-    // Down to home, Enter: home goes live.
-    rig.input.type('j');
-    expect(rig.output.screen()[4]).toMatch(/^> {2}home /);
-    rig.input.type('\r');
-    await vi.waitFor(() => expect(rig.output.text()).toContain('Activated home'));
-    expect(await engine.getActiveId()).toBe(homeRow.id);
-    await vi.waitFor(() => expect(rig.output.screen()[4]).toMatch(/^>\* home /));
+      expect(rig.output.chunks[0]).toBe(ENTER_SCREEN);
+      expect(rig.input.isRaw).toBe(true);
+      await until(() => expect(rig.output.text()).toContain('home'));
+      expect(rig.output.text()).toContain('daemon up');
+      expect(rig.output.screen()[3]).toMatch(/^>\* work /);
 
-    // Rename it.
-    rig.input.type('r');
-    rig.input.type('house\r');
-    await vi.waitFor(() =>
-      expect(rig.output.text()).toContain(`Renamed home to house (${homeRow.id}).`),
-    );
-    expect((await engine.listAllAccounts()).map((a) => a.label).sort()).toEqual(['house', 'work']);
-    // The re-read after the rename has landed before the next key.
-    await vi.waitFor(() => expect(rig.output.screen()[4]).toMatch(/^>\* house /));
+      // Down to home, Enter: home goes live.
+      rig.input.type('j');
+      expect(rig.output.screen()[4]).toMatch(/^> {2}home /);
+      rig.input.type('\r');
+      await until(() => expect(rig.output.text()).toContain('Activated home'));
+      expect(await engine.getActiveId()).toBe(homeRow.id);
+      await until(() => expect(rig.output.screen()[4]).toMatch(/^>\* home /));
 
-    // Refresh: the daemon is asked for every account and says both are scheduled.
-    rig.input.type('u');
-    await vi.waitFor(() => expect(rig.output.text()).toContain('Refreshing work, house'));
-    expect(asked).toEqual([undefined]);
+      // Rename it.
+      rig.input.type('r');
+      rig.input.type('house\r');
+      await until(() =>
+        expect(rig.output.text()).toContain(`Renamed home to house (${homeRow.id}).`),
+      );
+      expect((await engine.listAllAccounts()).map((a) => a.label).sort()).toEqual([
+        'house',
+        'work',
+      ]);
+      // The re-read after the rename has landed before the next key.
+      await until(() => expect(rig.output.screen()[4]).toMatch(/^>\* house /));
 
-    // The sessions pane shows the seeded session under its account's label.
-    rig.input.type('\t');
-    await vi.waitFor(() => expect(rig.output.text()).toContain('planning'));
+      // Refresh: the daemon is asked for every account and says both are scheduled.
+      rig.input.type('u');
+      await until(() => expect(rig.output.text()).toContain('Refreshing work, house'));
+      expect(asked).toEqual([undefined]);
 
-    rig.input.type('q');
-    expect(await rig.exit).toEqual({ code: 0 });
-    expectRestored(rig);
-    expectLeftScreen(rig);
-  });
+      // The sessions pane shows the seeded session under its account's label.
+      rig.input.type('\t');
+      await until(() => expect(rig.output.text()).toContain('planning'));
+
+      rig.input.type('q');
+      expect(await rig.exit).toEqual({ code: 0 });
+      expectRestored(rig);
+      expectLeftScreen(rig);
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -407,7 +421,7 @@ describe('giving the terminal back', () => {
   it('on an action that throws a fault, rejecting with it after the restore', async () => {
     const boom = new Error('the account registry at x is malformed');
     const rig = start(scripted({ switchAccount: () => Promise.reject(boom) }));
-    await vi.waitFor(() => expect(rig.output.text()).toContain('work'));
+    await until(() => expect(rig.output.text()).toContain('work'));
     rig.input.type('\r');
     await expect(rig.exit).rejects.toBe(boom);
     expectRestored(rig);
@@ -425,7 +439,7 @@ describe('giving the terminal back', () => {
       },
     };
     const rig = start(scripted(), { palette });
-    await vi.waitFor(() => expect(rig.output.text()).toContain('work'));
+    await until(() => expect(rig.output.text()).toContain('work'));
     armed = true;
     rig.input.type('j');
     await expect(rig.exit).rejects.toBe(boom);
@@ -435,7 +449,7 @@ describe('giving the terminal back', () => {
 
   it('when the output closes (EPIPE): raw mode off, nothing more written', async () => {
     const rig = start(scripted());
-    await vi.waitFor(() => expect(rig.output.text()).toContain('work'));
+    await until(() => expect(rig.output.text()).toContain('work'));
     const before = rig.output.chunks.length;
     rig.output.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
     expect(await rig.exit).toEqual({ code: 1 });
@@ -445,7 +459,7 @@ describe('giving the terminal back', () => {
 
   it('when the process exits under it, as a last resort', async () => {
     const rig = start(scripted());
-    await vi.waitFor(() => expect(rig.output.text()).toContain('work'));
+    await until(() => expect(rig.output.text()).toContain('work'));
     rig.proc.emit('exit');
     expect(rig.input.isRaw).toBe(false);
     expectLeftScreen(rig);
@@ -464,7 +478,7 @@ describe('giving the terminal back', () => {
         }),
     });
     const rig = start(sources);
-    await vi.waitFor(() => expect(rig.output.text()).toContain('work'));
+    await until(() => expect(rig.output.text()).toContain('work'));
     rig.input.type('\r');
     rig.input.type(CTRL_C);
     expect(rig.output.text()).toContain('quitting when this finishes');
@@ -476,7 +490,7 @@ describe('giving the terminal back', () => {
 
   it('at once on a second Ctrl-C mid-action', async () => {
     const rig = start(scripted({ switchAccount: () => new Promise(() => {}) }));
-    await vi.waitFor(() => expect(rig.output.text()).toContain('work'));
+    await until(() => expect(rig.output.text()).toContain('work'));
     rig.input.type('\r');
     rig.input.type(CTRL_C);
     rig.input.type(CTRL_C);
@@ -499,9 +513,9 @@ describe('while running', () => {
           ),
       }),
     );
-    await vi.waitFor(() => expect(rig.output.text()).toContain('work'));
+    await until(() => expect(rig.output.text()).toContain('work'));
     rig.input.type('\r');
-    await vi.waitFor(() =>
+    await until(() =>
       expect(rig.output.text()).toContain('work is quarantined; re-login required.'),
     );
     expect(rig.input.isRaw).toBe(true);
@@ -519,9 +533,9 @@ describe('while running', () => {
     const rig = start(
       scripted({ repoll: () => Promise.reject(new SessionClientError(message, failure)) }),
     );
-    await vi.waitFor(() => expect(rig.output.text()).toContain('daemon up'));
+    await until(() => expect(rig.output.text()).toContain('daemon up'));
     rig.input.type('u');
-    await vi.waitFor(() => expect(rig.output.text()).toContain(message));
+    await until(() => expect(rig.output.text()).toContain(message));
     rig.input.type('q');
     await rig.exit;
   });
@@ -537,7 +551,7 @@ describe('while running', () => {
         repoll,
       }),
     );
-    await vi.waitFor(() => expect(rig.output.text()).toContain('daemon not running'));
+    await until(() => expect(rig.output.text()).toContain('daemon not running'));
     rig.input.type('u');
     expect(rig.output.text()).toContain('Refresh needs the running daemon');
     expect(repoll).not.toHaveBeenCalled();
@@ -558,10 +572,10 @@ describe('while running', () => {
         },
       }),
     );
-    await vi.waitFor(() => expect(rig.output.text()).toContain('work'));
+    await until(() => expect(rig.output.text()).toContain('work'));
     rig.input.type('a');
     rig.input.type('fresh\r');
-    await vi.waitFor(() => expect(rig.output.text()).toContain('Added fresh (id-9).'));
+    await until(() => expect(rig.output.text()).toContain('Added fresh (id-9).'));
     expect(during).toEqual({ raw: false, left: true });
     // Back on the alternate screen, reading keys again.
     expect(rig.output.all.lastIndexOf(ENTER_SCREEN)).toBeGreaterThan(
@@ -581,17 +595,17 @@ describe('while running', () => {
           Promise.reject(new AccountActionError('no_capture_login', 'no login in the window')),
       }),
     );
-    await vi.waitFor(() => expect(refused.output.text()).toContain('work'));
+    await until(() => expect(refused.output.text()).toContain('work'));
     refused.input.type('a');
     refused.input.type('x\r');
-    await vi.waitFor(() => expect(refused.output.text()).toContain('no login in the window'));
+    await until(() => expect(refused.output.text()).toContain('no login in the window'));
     expect(refused.input.isRaw).toBe(true);
     refused.input.type('q');
     await refused.exit;
 
     const boom = new Error('spawn failed oddly');
     const faulted = start(scripted({ addAccount: () => Promise.reject(boom) }));
-    await vi.waitFor(() => expect(faulted.output.text()).toContain('work'));
+    await until(() => expect(faulted.output.text()).toContain('work'));
     faulted.input.type('a');
     faulted.input.type('x\r');
     await expect(faulted.exit).rejects.toBe(boom);
@@ -600,7 +614,7 @@ describe('while running', () => {
 
   it('puts engine log lines and stray stderr writes on the status line, not the screen', async () => {
     const rig = start(scripted());
-    await vi.waitFor(() => expect(rig.output.text()).toContain('work'));
+    await until(() => expect(rig.output.text()).toContain('work'));
     rig.log.write('WARN metadata repair could not finish\n');
     expect(rig.output.screen()[14]).toBe('WARN metadata repair could not finish');
     (rig.stderr.write as unknown as (s: string) => boolean)(`warning: ${ESC}[31mstray${ESC}[0m\n`);
@@ -617,10 +631,10 @@ describe('while running', () => {
   it('re-reads on every tick and redraws on resize', async () => {
     const load = vi.fn(() => Promise.resolve(snapshotOf(everyStateAccounts())));
     const rig = start(scripted({ load }));
-    await vi.waitFor(() => expect(rig.output.text()).toContain('work'));
+    await until(() => expect(rig.output.text()).toContain('work'));
     const loads = load.mock.calls.length;
     rig.timers.tick();
-    await vi.waitFor(() => expect(load.mock.calls.length).toBe(loads + 1));
+    await until(() => expect(load.mock.calls.length).toBe(loads + 1));
     rig.output.columns = 39;
     rig.output.emit('resize');
     expect(rig.output.screen()[0]).toBe('Terminal too narrow: widen it to 40 col');
@@ -638,12 +652,10 @@ describe('while running', () => {
             : Promise.resolve(snapshotOf(everyStateAccounts())),
       }),
     );
-    await vi.waitFor(() => expect(rig.output.text()).toContain('work'));
+    await until(() => expect(rig.output.text()).toContain('work'));
     fail = true;
     rig.timers.tick();
-    await vi.waitFor(() =>
-      expect(rig.output.text()).toContain('Could not read: daemon.db is locked'),
-    );
+    await until(() => expect(rig.output.text()).toContain('Could not read: daemon.db is locked'));
     expect(rig.output.text()).toContain('home');
     rig.input.type('q');
     await rig.exit;

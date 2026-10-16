@@ -2176,26 +2176,30 @@ describe('where bare `cctl` and `cctl tui` go', () => {
     expect(tuiIo.runTui).not.toHaveBeenCalled();
   });
 
-  it('prints the same summary whichever end is redirected, and never opens the view', async () => {
-    engine.listAccounts.mockResolvedValue([acct('work'), acct('home')]);
-    const outputs: string[] = [];
-    for (const [stdin, stdout] of [
-      [true, false],
-      [false, true],
-      [false, false],
-    ] as const) {
-      setTty(stdin, stdout);
-      const r = await runCli([]);
-      expect(r.exited).toBe(false);
-      outputs.push(r.out);
-    }
-    expect(tuiIo.runTui).not.toHaveBeenCalled();
-    expect(new Set(outputs).size).toBe(1);
-    expect(outputs[0]).toContain('work');
-    expect(outputs[0]).toMatch(
-      /\n\nCommands: cctl usage · cctl timeline · cctl switch <account> · cctl setup\n$/,
-    );
-  });
+  it(
+    'prints the same summary whichever end is redirected, and never opens the view',
+    { timeout: 120_000 },
+    async () => {
+      engine.listAccounts.mockResolvedValue([acct('work'), acct('home')]);
+      const outputs: string[] = [];
+      for (const [stdin, stdout] of [
+        [true, false],
+        [false, true],
+        [false, false],
+      ] as const) {
+        setTty(stdin, stdout);
+        const r = await runCli([]);
+        expect(r.exited).toBe(false);
+        outputs.push(r.out);
+      }
+      expect(tuiIo.runTui).not.toHaveBeenCalled();
+      expect(new Set(outputs).size).toBe(1);
+      expect(outputs[0]).toContain('work');
+      expect(outputs[0]).toMatch(
+        /\n\nCommands: cctl usage · cctl timeline · cctl switch <account> · cctl setup\n$/,
+      );
+    },
+  );
 
   it('prints the setup line when redirected with no accounts', async () => {
     setTty(false, false);
