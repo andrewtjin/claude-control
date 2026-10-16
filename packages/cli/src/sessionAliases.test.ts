@@ -307,6 +307,14 @@ describe('runSessionShow', () => {
       ['main', 1, 20],
       ['client', 1, 300],
     ]);
+    // Shown on its own (by id, or as the current session) the parent is not listed, but its file
+    // is still what says who made the copy.
+    const byId = harness();
+    await runSessionShow(forkId, { json: true }, byId.deps);
+    expect(uses(byId.json().sessions[0])).toEqual([['client', 1, 9]]);
+    const current = harness({ env: { [SESSION_ID_ENV]: forkId } });
+    await runSessionShow(undefined, { json: true }, current.deps);
+    expect(uses(current.json().sessions[0])).toEqual([['client', 1, 9]]);
   });
 
   it('defaults to the current session from CLAUDE_CODE_SESSION_ID, billed from its span alone', async () => {
@@ -510,6 +518,33 @@ describe('runSessionAliases', () => {
       ['client', 1, 300],
     ]);
     expect(uses(out.sessions.find((s) => s.sessionId === S_FORK))).toEqual([['main', 2, 50020]]);
+  });
+
+  it('leaves a named fork of an unlisted session its own turns only', async () => {
+    // Forked from S_HAND (a generated title only, so not listed) after its group-slot turn.
+    const forkId = 'aaaaaaaa-0000-4000-8000-000000000005';
+    const store = new Store(daemonDbPath(paths));
+    try {
+      store.recordSessionSlot(forkId, groupSlot, T0 + 2 * HOUR);
+    } finally {
+      store.close();
+    }
+    await writeSession(
+      here,
+      forkId,
+      [
+        userLine(here, T0 + HOUR),
+        turnLine('msg_h1', T0 + HOUR, 4000),
+        turnLine('msg_f9', T0 + 3 * HOUR, 9),
+        customTitle('mine'),
+      ],
+      T0 + 6 * HOUR,
+    );
+    const h = harness();
+    await runSessionAliases({ json: true }, h.deps);
+    const out = h.json();
+    expect(out.sessions.map((s) => s.sessionId)).not.toContain(S_HAND);
+    expect(uses(out.sessions.find((s) => s.sessionId === forkId))).toEqual([['client', 1, 9]]);
   });
 
   it('includes generated titles with auto', async () => {

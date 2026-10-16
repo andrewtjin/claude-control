@@ -7,7 +7,8 @@
 // the network. Per-turn attribution is the SAME function `cctl stats` uses, so the two can never
 // name different accounts for one turn.
 
-import { realpathSync } from 'node:fs';
+import { readdirSync, realpathSync } from 'node:fs';
+import { dirname } from 'node:path';
 import {
   Store,
   aliasedSessions,
@@ -102,14 +103,25 @@ function lastRecordedSlots(
   return out;
 }
 
-/** Attach each session's per-account use (the expensive half: only these sessions' turns are
- *  read). */
+/** Attach each session's per-account use (the expensive half: only the turns of these sessions'
+ *  project directories are read). */
 async function withAccounts(
   deps: SessionAliasDeps,
   sessions: SessionMeta[],
 ): Promise<AccountsRead> {
   if (sessions.length === 0) return { views: [], recordedSlot: new Map() };
   const sessionIds = new Set(sessions.map((s) => s.sessionId));
+  // A fork's copied turn is only known as a copy once the session that made it is read too, and a
+  // fork's file sits beside its parent's: read every session in the shown ones' directories.
+  for (const dir of new Set(sessions.map((s) => dirname(s.file)))) {
+    try {
+      for (const name of readdirSync(dir)) {
+        if (name.endsWith('.jsonl')) sessionIds.add(name.slice(0, -'.jsonl'.length));
+      }
+    } catch {
+      // Unlistable: the shown sessions are still read, their copies kept as before.
+    }
+  }
   const [accounts, scan] = await Promise.all([
     // Reserved accounts included: an account a folder rule holds must show its name, not its id.
     (deps.engine ?? buildEngine(deps.paths)).listAllAccounts(),
