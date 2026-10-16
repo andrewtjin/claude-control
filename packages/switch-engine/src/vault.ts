@@ -12,7 +12,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, posix, win32 } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { ruleSlotId } from './types.js';
 import type {
@@ -32,6 +32,7 @@ import {
   aliasFitsSessionTitle,
   aliasKey,
   aliasScopeUniquenessKey,
+  canonicalizeFolder,
   folderUniquenessKey,
 } from './folderPath.js';
 import {
@@ -558,6 +559,17 @@ function validateAliasScopes(
     // characters); a hand-edited file carrying one is refused rather than keyed ambiguously.
     if (folder.includes('\u0000') || alias.includes('\u0000')) {
       throw new VaultError(`${at} contains a NUL character`);
+    }
+    // Nor do the verbs store an alias with a control or bidi character (it is echoed into hook
+    // decisions and terminals), or a folder that is relative or that no canonical path could be: a
+    // hand-edited entry carrying one is refused like any other corrupt entry.
+    if (sanitizeTerminalText(alias) !== alias) {
+      throw new VaultError(`${at} alias contains a control or bidirectional character`);
+    }
+    const canon = canonicalizeFolder(folder, { platform, cwd: '' });
+    if (!canon.ok) throw new VaultError(`${at} folder is not usable: ${canon.reason}`);
+    if (!(platform === 'win32' ? win32 : posix).isAbsolute(folder)) {
+      throw new VaultError(`${at} folder is not an absolute path`);
     }
     const key = aliasScopeUniquenessKey(folder, alias, platform);
     if (seen.has(key)) {
