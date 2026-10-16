@@ -756,9 +756,10 @@ function findGroup(groups, id) {
 var LIST_SHOWN_MAX = 3;
 var TEXT_SHOWN_MAX = 160;
 
+// Clipped by code points, so the cut never splits a surrogate pair (an emoji) into a lone half.
 function clip(text) {
-  var t = typeof text === 'string' ? text : '';
-  return t.length > TEXT_SHOWN_MAX ? t.slice(0, TEXT_SHOWN_MAX) + '...' : t;
+  var t = typeof text === 'string' ? Array.from(text) : [];
+  return t.length > TEXT_SHOWN_MAX ? t.slice(0, TEXT_SHOWN_MAX).join('') + '...' : t.join('');
 }
 
 function shortList(items) {
