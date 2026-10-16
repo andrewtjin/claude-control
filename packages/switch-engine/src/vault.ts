@@ -12,7 +12,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { join, posix, win32 } from 'node:path';
+import { join, posix } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { ruleSlotId } from './types.js';
 import type {
@@ -568,7 +568,11 @@ function validateAliasScopes(
     }
     const canon = canonicalizeFolder(folder, { platform, cwd: '' });
     if (!canon.ok) throw new VaultError(`${at} folder is not usable: ${canon.reason}`);
-    if (!(platform === 'win32' ? win32 : posix).isAbsolute(folder)) {
+    // On Windows only a drive or UNC root counts: a rooted, drive-less "\foo" is absolute to
+    // path.win32 but is never what the verbs store, so it would match nothing.
+    if (
+      !(platform === 'win32' ? /^([A-Za-z]:|[\\/])[\\/]/.test(folder) : posix.isAbsolute(folder))
+    ) {
       throw new VaultError(`${at} folder is not an absolute path`);
     }
     const key = aliasScopeUniquenessKey(folder, alias, platform);

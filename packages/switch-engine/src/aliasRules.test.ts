@@ -714,6 +714,8 @@ describe('alias scopes in groups.json', () => {
       [[{ folder: repo, alias: 'go\u202eod' }], 'control or bidirectional character'],
       [[{ folder: repo, alias: 'a\tb' }], 'control or bidirectional character'],
       [[{ folder: 'workproj', alias: 'x' }], 'not an absolute path'],
+      // Rooted but drive-less on Windows: no canonical folder looks like that, so it matches nothing.
+      [[{ folder: '\\workproj', alias: 'x' }], 'not an absolute path'],
       [[{ folder: `${repo}\nelsewhere`, alias: 'x' }], 'control character'],
     ];
     for (const [aliases, message] of bad) {
