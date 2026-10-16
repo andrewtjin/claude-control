@@ -58,7 +58,9 @@ describe('installHooks', () => {
     const sharer = join(dir, 'sharer.json');
     linkSync(settingsPath, sharer);
     await installHooks({ settingsPath, hooks: [spec('Stop')] });
-    expect(statSync(settingsPath).ino).toBe(statSync(sharer).ino);
+    expect(statSync(settingsPath, { bigint: true }).ino).toBe(
+      statSync(sharer, { bigint: true }).ino,
+    );
   });
 
   it('preserves unrelated top-level settings keys', async () => {
@@ -960,7 +962,9 @@ describe('ensureBindGuard propagation into group profiles', () => {
     await ensureBindGuard(opts);
     // An unchanged main must not be rewritten: a temp+rename would give it a fresh inode, and the
     // profile (already carrying the guard) would stay linked to the old one.
-    expect(statSync(mainSettings).ino).toBe(statSync(profileSettings).ino);
+    expect(statSync(mainSettings, { bigint: true }).ino).toBe(
+      statSync(profileSettings, { bigint: true }).ino,
+    );
   });
 
   it('backs up a diverged, guard-less profile copy before the guard re-link (no silent edit loss)', async () => {
