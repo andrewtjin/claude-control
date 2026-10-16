@@ -373,14 +373,15 @@ export function aliasKey(alias: string): string {
  *  {@link claudeCodeSessionTitle}. */
 export const CLAUDE_CODE_TITLE_MAX_LENGTH = 200;
 
-/** Control and format characters and line/paragraph separators: Claude Code records each as a space
- *  in a session name (measured on 2.1.301: tab, newline, U+0001, U+0085, U+200B, U+202E, U+2028 and
- *  U+2029 all become a space; U+00A0, private-use and unassigned code points are kept). */
-const TITLE_SPACED_CHARACTERS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+/** Runs of control and format characters and line/paragraph separators: Claude Code records each run
+ *  as one space in a session name (measured on 2.1.301: tab, newline, U+0001, U+0085, U+200B,
+ *  U+202E, U+2028 and U+2029 all become a space, `\r\n` or two tabs become one space, while a literal
+ *  space beside one stays its own; U+00A0, private-use and unassigned code points are kept). */
+const TITLE_SPACED_CHARACTERS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu;
 
 /** The custom title Claude Code records for `claude --name <name>` (measured on 2.1.301): the name
- *  trimmed, clipped to {@link CLAUDE_CODE_TITLE_MAX_LENGTH} code points, with each
- *  {@link TITLE_SPACED_CHARACTERS} turned into a space, then trimmed again (`'\u0001' + 200 'a'` is
+ *  trimmed, clipped to {@link CLAUDE_CODE_TITLE_MAX_LENGTH} code points, with each run of
+ *  {@link TITLE_SPACED_CHARACTERS} turned into one space, then trimmed again (`'\u0001' + 200 'a'` is
  *  recorded as 199 'a'). Inner runs of spaces are kept. A blank result names nothing: Claude Code then
  *  leaves the session's title as it was. A launch routes on this title, since it is what the
  *  session's hooks and transcript carry. */

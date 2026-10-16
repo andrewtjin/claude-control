@@ -905,6 +905,17 @@ describe('claudeCodeSessionTitle', () => {
     expect(claudeCodeSessionTitle('x   y')).toBe('x   y');
   });
 
+  it('turns each run of them into one space, keeping a literal space beside one', () => {
+    expect(claudeCodeSessionTitle('ab\t\tcd')).toBe('ab cd');
+    expect(claudeCodeSessionTitle('ab\r\ncd')).toBe('ab cd');
+    expect(claudeCodeSessionTitle('ab\u0001\u0001cd')).toBe('ab cd');
+    expect(claudeCodeSessionTitle('ab​​cd')).toBe('ab cd');
+    expect(claudeCodeSessionTitle('x  y')).toBe('x y');
+    expect(claudeCodeSessionTitle('a\u{1F468}‍‍\u{1F469}b')).toBe('a\u{1F468} \u{1F469}b');
+    expect(claudeCodeSessionTitle('ab \tcd')).toBe('ab  cd');
+    expect(claudeCodeSessionTitle('ab\t cd')).toBe('ab  cd');
+  });
+
   it('keeps no-break spaces, private-use and unassigned code points', () => {
     expect(claudeCodeSessionTitle('a\u00a0b\ue000c\u0378d')).toBe('a\u00a0b\ue000c\u0378d');
   });

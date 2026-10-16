@@ -792,8 +792,8 @@ describe('resolveLaunchSessions', () => {
   });
 
   // Claude Code records a --name trimmed, clipped to 200 code points (never splitting a surrogate
-  // pair), with control/format characters and line/paragraph separators turned into spaces, then
-  // trimmed again; the launch must key on that title, as the enforcement guard later does.
+  // pair), with each run of control/format characters and line/paragraph separators turned into one
+  // space, then trimmed again; the launch must key on that title, as the enforcement guard later does.
   it.each([
     ['over 200 code points', 'a'.repeat(260), 'a'.repeat(200)],
     ['leading spaces, then over 200', '   ' + 'a'.repeat(205), 'a'.repeat(200)],
@@ -802,6 +802,9 @@ describe('resolveLaunchSessions', () => {
     ['a control character past the clip', '\u0001' + 'a'.repeat(200), 'a'.repeat(199)],
     ['a tab', 'Auth\tWork', 'Auth Work'],
     ['a zero-width space', 'Auth\u200bWork', 'Auth Work'],
+    ['a CRLF', 'Auth\r\nWork', 'Auth Work'],
+    ['a run of tabs', 'Auth\t\tWork', 'Auth Work'],
+    ['a space beside a tab', 'Auth \tWork', 'Auth  Work'],
   ])('a --name with %s routes by the title Claude Code records', async (_, name, recorded) => {
     const { deps } = store({ byId: { [ID]: facts('Old', 'C:\\x') } });
     const key = recorded.toLowerCase();
