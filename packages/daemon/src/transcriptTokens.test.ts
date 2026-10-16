@@ -131,6 +131,7 @@ describe('readTranscriptTurns', () => {
         // The session id is the transcript's base name (`proj/session.jsonl`) — attribution maps it
         // to the session's slot.
         sessionId: 'session',
+        messageId: 'msg_1',
         model: 'claude-opus-5',
         inputTokens: 3,
         outputTokens: 5,

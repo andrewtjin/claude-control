@@ -173,7 +173,7 @@ the session ("Created a rule for session "auth work" in C:\repo: it uses researc
 the shared pool."); when the command runs inside a session that is now on another slot than its
 rule names, it says so, with the command that resumes it.
 
-Session alias rules need **Claude Code 2.1.283 or newer**: the guard reads a session's name from
+Session alias rules need **Claude Code 2.1.211 or newer**: the guard reads a session's name from
 the `session_title` field Claude Code sends with each prompt, never from the transcript. An
 older Claude Code does not send it, so every session looks unnamed and runs by its folder's rule.
 
@@ -214,6 +214,12 @@ transcript's recorded folder the same way:
   not exist yet or cannot be read — the session counts for the folder it runs in when the project
   directory's name can stand for that folder, and for no alias rule otherwise. The name is lossy
   (`C:\a_b` and `C:\a-b` share one), so it never picks a ruled folder the session does not run in.
+
+A recorded folder is resolved to its real path (junctions, symlinks) with no timeout of cctl's
+own. On a network share whose host is unreachable, the first read waits out the operating
+system's network timeout: about 43 s on one Windows machine, longer with more network
+providers. That wait reaches the guard, `cctl claude`, `cctl session show` and the daemon (which
+blocks meanwhile); the system then remembers the failure for a while, so later reads are quick.
 
 `cctl claude` reads Claude Code's own arguments to see which session it opens — `--resume
 <alias>`, `--resume <session id>`, `--resume <path to a .jsonl transcript>`, `--continue` (it

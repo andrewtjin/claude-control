@@ -254,6 +254,20 @@ describe('include / exclude / remove — moving rows between the two files', () 
     expect((await v.listAccounts()).map((r) => r.id)).toEqual([a.id]);
   });
 
+  it('a released account returns to its place in the registry order, not the end', async () => {
+    const { v } = await vaultAt();
+    await v.addAccount('a', bundle('a'));
+    const b = await v.addAccount('b', bundle('b'));
+    const c = await v.addAccount('c', bundle('c'));
+    const d = await v.addAccount('d', bundle('d'));
+    const rule = await v.createRule({ folders: ['C:\\work'], include: [b.id, c.id] });
+    await v.excludeAccounts(rule.id, [d.id]);
+    await v.removeFromRule(rule.id, [c.id]);
+    expect((await v.listAccounts()).map((r) => r.label)).toEqual(['a', 'c', 'd']);
+    await v.removeRule(rule.id);
+    expect((await v.listAccounts()).map((r) => r.label)).toEqual(['a', 'b', 'c', 'd']);
+  });
+
   it('removeFromRule keeps an account another rule still includes reserved', async () => {
     const { v } = await vaultAt();
     const a = await v.addAccount('a', bundle('a'));

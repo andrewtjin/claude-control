@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { linkSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,6 +14,7 @@ import {
 } from './hookInstaller.js';
 import { BIND_GUARD_MARKER, bindGuardPath, buildBindGuardCommand } from './bindGuard.js';
 import { DEFAULT_HOOK_EVENT_NAMES, DEFAULT_SECRET_HEADER } from './hookReceiver.js';
+import { ensureGroupProfile } from '@claude-control/switch-engine';
 
 async function readJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, 'utf8'));
@@ -50,6 +51,17 @@ describe('installHooks', () => {
     expect(settings.hooks.Stop?.[0]?.hooks).toHaveLength(1);
     expect(settings.hooks.Notification).toHaveLength(1);
     expect(settings.hooks.Notification?.[0]?.hooks).toHaveLength(1);
+  });
+
+  it('does not rewrite a settings.json that already carries every hook', async () => {
+    await installHooks({ settingsPath, hooks: [spec('Stop')] });
+    // A hard link stands in for a group profile sharing main's settings.json.
+    const sharer = join(dir, 'sharer.json');
+    linkSync(settingsPath, sharer);
+    await installHooks({ settingsPath, hooks: [spec('Stop')] });
+    expect(statSync(settingsPath, { bigint: true }).ino).toBe(
+      statSync(sharer, { bigint: true }).ino,
+    );
   });
 
   it('preserves unrelated top-level settings keys', async () => {
@@ -939,6 +951,23 @@ describe('ensureBindGuard propagation into group profiles', () => {
     expect(hasGuard(await readFile(profileSettings, 'utf8'))).toBe(false);
   });
 
+  it('a repeat reconcile with nothing to change leaves main and the profile on one inode', async () => {
+    const opts = {
+      settingsPath: mainSettings,
+      guardPath,
+      snapshotPath,
+      hasBindings: true,
+      profileSettingsPaths: [profileSettings],
+    };
+    await ensureBindGuard(opts);
+    await ensureBindGuard(opts);
+    // An unchanged main must not be rewritten: a temp+rename would give it a fresh inode, and the
+    // profile (already carrying the guard) would stay linked to the old one.
+    expect(statSync(mainSettings, { bigint: true }).ino).toBe(
+      statSync(profileSettings, { bigint: true }).ino,
+    );
+  });
+
   it('backs up a diverged, guard-less profile copy before the guard re-link (no silent edit loss)', async () => {
     // Sever the profile from main and give it a unique local edit but NO guard. writeFileSync in place
     // would keep the shared inode (and mutate main too), so unlink + write a fresh independent file.
@@ -967,5 +996,89 @@ describe('ensureBindGuard propagation into group profiles', () => {
       permissions?: { allow?: string[] };
     };
     expect(backedUp.permissions?.allow).toContain('UNIQUE_PROFILE_EDIT');
+  });
+
+  describe('a genuine hook change to main', () => {
+    const planted = [1, 2, 3, 4, 5].map((n) => `settings.json.100000000000${n}`);
+    const newHook: HookCommandSpec = { event: 'Stop', command: 'node forward.cjs --stop' };
+    let backupDir: string;
+
+    beforeEach(async () => {
+      await ensureBindGuard({
+        settingsPath: mainSettings,
+        guardPath,
+        snapshotPath,
+        hasBindings: true,
+        profileSettingsPaths: [profileSettings],
+      });
+      backupDir = join(dir, 'profiles', 'g1', '.cctl-backup');
+      await mkdir(backupDir, { recursive: true });
+      for (const name of planted) await writeFile(join(backupDir, name), 'older edit', 'utf8');
+    });
+
+    /** Install the new hook as a daemon start does, then run the profile repair. */
+    async function installAndRepair(): Promise<void> {
+      await installHooks({
+        settingsPath: mainSettings,
+        hooks: [newHook],
+        profileSettingsPaths: [profileSettings],
+      });
+      ensureGroupProfile(join(dir, 'profiles', 'g1'), dir);
+    }
+
+    it('keeps the profile on main and every older backup', async () => {
+      await installAndRepair();
+      expect(statSync(mainSettings, { bigint: true }).ino).toBe(
+        statSync(profileSettings, { bigint: true }).ino,
+      );
+      expect(await readFile(profileSettings, 'utf8')).toContain('forward.cjs --stop');
+      expect((await readdir(backupDir)).sort()).toEqual(planted);
+    });
+
+    it('still backs up a hand-edited profile copy', async () => {
+      await rm(profileSettings);
+      await writeFile(
+        profileSettings,
+        JSON.stringify({ permissions: { allow: ['UNIQUE_PROFILE_EDIT'] } }),
+        'utf8',
+      );
+      // Older than main's rewrite, so main wins the repair.
+      await utimes(profileSettings, new Date(0), new Date(0));
+      await installAndRepair();
+      const added = (await readdir(backupDir)).filter((name) => !planted.includes(name));
+      expect(added).toHaveLength(1);
+      expect(await readFile(join(backupDir, added[0] as string), 'utf8')).toContain(
+        'UNIQUE_PROFILE_EDIT',
+      );
+    });
+
+    // Taking our hooks out rewrites main as well, so it must keep the profile on main the same way.
+    it.each([
+      [
+        'the last unbind',
+        () =>
+          ensureBindGuard({
+            settingsPath: mainSettings,
+            guardPath,
+            snapshotPath,
+            hasBindings: false,
+            profileSettingsPaths: [profileSettings],
+          }),
+      ],
+      [
+        'an uninstall',
+        () =>
+          uninstallHooks({ settingsPath: mainSettings, profileSettingsPaths: [profileSettings] }),
+      ],
+    ])('keeps the profile on main and every older backup after %s', async (_case, remove) => {
+      await remove();
+      // Checked before the repair, which would otherwise heal an identical severed copy unseen.
+      expect(statSync(mainSettings, { bigint: true }).ino).toBe(
+        statSync(profileSettings, { bigint: true }).ino,
+      );
+      ensureGroupProfile(join(dir, 'profiles', 'g1'), dir);
+      expect(hasGuard(await readFile(profileSettings, 'utf8'))).toBe(false);
+      expect((await readdir(backupDir)).sort()).toEqual(planted);
+    });
   });
 });

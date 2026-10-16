@@ -325,6 +325,7 @@ export {
   resolveSessionRef,
   aliasedSessions,
   accountsBySession,
+  dropInheritedTurns,
   sameFolder,
   UNATTRIBUTED_SESSION_LABEL,
   type SessionRefResolution,

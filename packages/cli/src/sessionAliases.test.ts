@@ -14,7 +14,7 @@ import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
 import { realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Store, projectDirStem } from '@claude-control/daemon';
+import { Store, projectDirStem, readTranscriptTurns } from '@claude-control/daemon';
 import {
   InsecurePassthroughProtector,
   Vault,
@@ -30,6 +30,12 @@ import {
   type SessionAliasDeps,
 } from './sessionAliases.js';
 
+// The real reader, spied on, so a test can see which sessions' files a command read.
+vi.mock('@claude-control/daemon', async (importOriginal) => {
+  const real = await importOriginal<typeof import('@claude-control/daemon')>();
+  return { ...real, readTranscriptTurns: vi.fn(real.readTranscriptTurns) };
+});
+
 const HOUR = 3_600_000;
 /** Every account went live at T0; turns before it belong to nobody. */
 const T0 = Date.parse('2026-09-01T00:00:00.000Z');
@@ -41,6 +47,7 @@ const S_FORK = 'aaaaaaaa-0000-4000-8000-000000000003';
 const S_AWAY = 'bbbbbbbb-0000-4000-8000-000000000001';
 const S_DUP1 = 'cccccccc-0000-4000-8000-000000000001';
 const S_DUP2 = 'cccccccc-0000-4000-8000-000000000002';
+const S_OLD = 'dddddddd-0000-4000-8000-000000000001';
 
 const bundle = (token: string): CredentialBundle => ({
   claudeAiOauth: { accessToken: token, refreshToken: 'r-' + token, expiresAt: 999 },
@@ -275,6 +282,76 @@ describe('runSessionShow', () => {
     expect(h.notes).toEqual([]);
   });
 
+  it('leaves a fork its own turns only, once the daemon saw its parent run the copied one', async () => {
+    // Forked from S_RESUMED after its group-slot turn: Claude Code copies that turn (same message
+    // id, same timestamp) into the fork's file, and the daemon first saw the fork after it was made.
+    const forkId = 'aaaaaaaa-0000-4000-8000-000000000004';
+    const store = new Store(daemonDbPath(paths));
+    try {
+      store.recordSessionSlot(forkId, groupSlot, T0 + 3.5 * HOUR);
+    } finally {
+      store.close();
+    }
+    await writeSession(
+      here,
+      forkId,
+      [
+        userLine(here, T0 - HOUR),
+        turnLine('msg_r3', T0 + 3 * HOUR, 300),
+        turnLine('msg_f2', T0 + 4 * HOUR, 9),
+        customTitle('Auth Work'),
+      ],
+      T0 + 6 * HOUR,
+    );
+    const h = harness();
+    await runSessionShow('auth work', { json: true }, h.deps);
+    const out = h.json();
+    expect(out.sessions.map((s) => s.sessionId).sort()).toEqual([S_RESUMED, forkId].sort());
+    // The copy is the parent's spend: neither billed again nor to the global account.
+    expect(uses(out.sessions.find((s) => s.sessionId === forkId))).toEqual([['client', 1, 9]]);
+    expect(uses(out.sessions.find((s) => s.sessionId === S_RESUMED))).toEqual([
+      ['unattributed', 1, 1],
+      ['main', 1, 20],
+      ['client', 1, 300],
+    ]);
+    // Shown on its own (by id, or as the current session) the parent is not listed, but its file
+    // is still what says who made the copy.
+    const byId = harness();
+    await runSessionShow(forkId, { json: true }, byId.deps);
+    expect(uses(byId.json().sessions[0])).toEqual([['client', 1, 9]]);
+    const current = harness({ env: { [SESSION_ID_ENV]: forkId } });
+    await runSessionShow(undefined, { json: true }, current.deps);
+    expect(uses(current.json().sessions[0])).toEqual([['client', 1, 9]]);
+  });
+
+  it('reads no other transcript for a session recorded from its first turn', async () => {
+    vi.mocked(readTranscriptTurns).mockClear();
+    const h = harness();
+    await runSessionShow(S_HAND, { json: true }, h.deps);
+    expect(uses(h.json().sessions[0])).toEqual([['client', 1, 4000]]);
+    const read = vi.mocked(readTranscriptTurns).mock.calls.map((c) => [...(c[0].sessionIds ?? [])]);
+    expect(read).toEqual([[S_HAND]]);
+  });
+
+  it('reads no other transcript for a session older than every recorded span', async () => {
+    await writeSession(
+      here,
+      S_OLD,
+      [
+        userLine(here, T0 - 10 * HOUR),
+        turnLine('msg_o1', T0 - 10 * HOUR, 5),
+        customTitle('old one'),
+      ],
+      T0 - 9 * HOUR,
+    );
+    vi.mocked(readTranscriptTurns).mockClear();
+    const h = harness();
+    await runSessionShow('old one', { json: true }, h.deps);
+    expect(uses(h.json().sessions[0])).toEqual([['unattributed', 1, 5]]);
+    const read = vi.mocked(readTranscriptTurns).mock.calls.map((c) => [...(c[0].sessionIds ?? [])]);
+    expect(read).toEqual([[S_OLD]]);
+  });
+
   it('defaults to the current session from CLAUDE_CODE_SESSION_ID, billed from its span alone', async () => {
     const h = harness({ env: { [SESSION_ID_ENV]: S_HAND } });
     await runSessionShow(undefined, { json: true }, h.deps);
@@ -476,6 +553,33 @@ describe('runSessionAliases', () => {
       ['client', 1, 300],
     ]);
     expect(uses(out.sessions.find((s) => s.sessionId === S_FORK))).toEqual([['main', 2, 50020]]);
+  });
+
+  it('leaves a named fork of an unlisted session its own turns only', async () => {
+    // Forked from S_HAND (a generated title only, so not listed) after its group-slot turn.
+    const forkId = 'aaaaaaaa-0000-4000-8000-000000000005';
+    const store = new Store(daemonDbPath(paths));
+    try {
+      store.recordSessionSlot(forkId, groupSlot, T0 + 2 * HOUR);
+    } finally {
+      store.close();
+    }
+    await writeSession(
+      here,
+      forkId,
+      [
+        userLine(here, T0 + HOUR),
+        turnLine('msg_h1', T0 + HOUR, 4000),
+        turnLine('msg_f9', T0 + 3 * HOUR, 9),
+        customTitle('mine'),
+      ],
+      T0 + 6 * HOUR,
+    );
+    const h = harness();
+    await runSessionAliases({ json: true }, h.deps);
+    const out = h.json();
+    expect(out.sessions.map((s) => s.sessionId)).not.toContain(S_HAND);
+    expect(uses(out.sessions.find((s) => s.sessionId === forkId))).toEqual([['client', 1, 9]]);
   });
 
   it('includes generated titles with auto', async () => {

@@ -12,7 +12,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { ruleSlotId } from './types.js';
 import type {
@@ -32,6 +32,7 @@ import {
   aliasFitsSessionTitle,
   aliasKey,
   aliasScopeUniquenessKey,
+  canonicalizeFolder,
   folderUniquenessKey,
 } from './folderPath.js';
 import {
@@ -558,6 +559,21 @@ function validateAliasScopes(
     // characters); a hand-edited file carrying one is refused rather than keyed ambiguously.
     if (folder.includes('\u0000') || alias.includes('\u0000')) {
       throw new VaultError(`${at} contains a NUL character`);
+    }
+    // Nor do the verbs store an alias with a control or bidi character (it is echoed into hook
+    // decisions and terminals), or a folder that is relative or that no canonical path could be: a
+    // hand-edited entry carrying one is refused like any other corrupt entry.
+    if (sanitizeTerminalText(alias) !== alias) {
+      throw new VaultError(`${at} alias contains a control or bidirectional character`);
+    }
+    const canon = canonicalizeFolder(folder, { platform, cwd: '' });
+    if (!canon.ok) throw new VaultError(`${at} folder is not usable: ${canon.reason}`);
+    // On Windows only a drive or UNC root counts: a rooted, drive-less "\foo" is absolute to
+    // path.win32 but is never what the verbs store, so it would match nothing.
+    if (
+      !(platform === 'win32' ? /^([A-Za-z]:|[\\/])[\\/]/.test(folder) : posix.isAbsolute(folder))
+    ) {
+      throw new VaultError(`${at} folder is not an absolute path`);
     }
     const key = aliasScopeUniquenessKey(folder, alias, platform);
     if (seen.has(key)) {
@@ -1515,7 +1531,7 @@ export class Vault {
     }
     const released = this.releasable(st, rule, [...ids]);
     if (released.length > 0) {
-      st.shared.push(...released);
+      this.returnSharedRows(st, released);
       await this.saveShared(st); // accounts.json FIRST
     }
     rule.include = include;
@@ -1537,7 +1553,7 @@ export class Vault {
     const rule = this.mustRule(st, ruleId);
     const released = this.releasable(st, rule, rule.include);
     if (released.length > 0) {
-      st.shared.push(...released);
+      this.returnSharedRows(st, released);
       await this.saveShared(st); // accounts.json FIRST
     }
     st.rules = st.rules.filter((r) => r !== rule);
@@ -1721,6 +1737,17 @@ export class Vault {
     const ids = new Set(rows.map((r) => r.id));
     st.shared = st.shared.filter((a) => !ids.has(a.id));
     if (st.activeId !== null && ids.has(st.activeId)) st.activeId = null;
+  }
+
+  /** Put released rows back on the shared side where they were added, before the first row added
+   *  after them, not at the end: listings and tie-breaks follow the registry order, which a reserve
+   *  and release must leave as it was. */
+  private returnSharedRows(st: RegistryState, rows: readonly StoredAccount[]): void {
+    for (const row of rows) {
+      const at = st.shared.findIndex((a) => a.createdAtMs > row.createdAtMs);
+      if (at === -1) st.shared.push(row);
+      else st.shared.splice(at, 0, row);
+    }
   }
 
   /** Drop released rows from the reserved side (after the shared side gained them). */

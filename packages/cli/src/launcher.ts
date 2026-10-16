@@ -32,7 +32,12 @@
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { existsSync as nodeExistsSync, readFileSync as nodeReadFileSync } from 'node:fs';
 import { extname, posix, win32 } from 'node:path';
-import { aliasKey, canonicalizeFolder, isWithin } from '@claude-control/switch-engine';
+import {
+  aliasKey,
+  canonicalizeFolder,
+  claudeCodeSessionTitle,
+  isWithin,
+} from '@claude-control/switch-engine';
 
 /** How to invoke a resolved claude candidate, or why we refuse to. */
 export type LaunchTarget =
@@ -566,8 +571,9 @@ export interface ClaudeSessionArgs {
   /** `--continue/-c`: the most recent session in the folder. It beats `--resume` when both are
    *  given — Claude Code checks it first. */
   continue: boolean;
-  /** `--name/-n <name>`: the new session's (or the opened one's new) custom title. An empty name
-   *  names nothing, so `--name ""` leaves this absent. */
+  /** `--name/-n <name>`: the new session's (or the opened one's new) custom title, as Claude Code
+   *  records it (claudeCodeSessionTitle). A blank name names nothing, so `--name ""` leaves this
+   *  absent. */
   name?: string;
   /** `--session-id <uuid>`. */
   sessionId?: string;
@@ -696,7 +702,9 @@ export function parseClaudeSessionArgs(args: readonly string[]): ClaudeSessionAr
     unrecognized ??= { token, index };
   }
 
-  // An empty name names nothing (measured: `--name "" --resume X` keeps X's title).
+  // The name as Claude Code records it; a blank one names nothing (measured: `--name "" --resume X`
+  // and `--name " \t " --resume X` keep X's title).
+  if (out.name !== undefined) out.name = claudeCodeSessionTitle(out.name);
   if (out.name === '') delete out.name;
 
   // An unrecognized option may take a value in the Claude Code actually installed; if a session

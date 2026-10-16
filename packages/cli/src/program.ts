@@ -90,6 +90,7 @@ import {
   superviseDaemon,
 } from './daemonSupervise.js';
 import { resolveCctlShimPath } from './daemonInstall.js';
+import { resolveGuardProfileSettingsPaths } from './guardProfiles.js';
 import {
   canWriteManagedDir,
   cctlDropInPath,
@@ -564,7 +565,12 @@ export function buildProgram(): Command {
         // Every account, reserved ones included: a reserved account's turns must be labeled
         // with its name, not its raw id.
         buildEngine(paths).listAllAccounts(),
-        readTranscriptTurns({ claudeDir: paths.claudeDir, sinceMs: windowStartMs }),
+        // Per session, so a fork's copied turn reaches the attribution beside the original.
+        readTranscriptTurns({
+          claudeDir: paths.claudeDir,
+          sinceMs: windowStartMs,
+          dedupe: 'session',
+        }),
       ]);
 
       // Attribution comes from the daemon's journal, read offline like `usage`/`timeline` do:
@@ -988,9 +994,14 @@ export function buildProgram(): Command {
       // Best-effort: the task removal above already succeeded, so a hook-removal failure
       // (e.g. a corrupt settings.json, which uninstallHooks refuses to touch) downgrades to
       // a warning instead of turning that success into a failure exit.
-      const settingsPath = join(defaultPaths().claudeDir, 'settings.json');
+      const paths = defaultPaths();
+      const settingsPath = join(paths.claudeDir, 'settings.json');
       try {
-        const hooks = await uninstallHooks({ settingsPath });
+        const hooks = await uninstallHooks({
+          settingsPath,
+          // Every profile dir, as the daemon's install passes; only those on main's inode move.
+          profileSettingsPaths: resolveGuardProfileSettingsPaths(paths.vaultDir, [], false),
+        });
         process.stdout.write(
           hooks === 'removed'
             ? 'Removed the daemon hook entries from settings.json. A daemon still ' +

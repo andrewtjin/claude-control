@@ -709,6 +709,14 @@ describe('alias scopes in groups.json', () => {
       [[{ folder: repo, alias: '  ' }], 'has no alias'],
       [[{ folder: repo, alias: 'x'.repeat(513) }], 'longer than 512'],
       [[{ folder: repo, alias: 'a\u0000b' }], 'NUL'],
+      // What the verbs refuse to store: a control or bidi character in the alias, a folder that is
+      // relative or that no canonical path could be.
+      [[{ folder: repo, alias: 'go\u202eod' }], 'control or bidirectional character'],
+      [[{ folder: repo, alias: 'a\tb' }], 'control or bidirectional character'],
+      [[{ folder: 'workproj', alias: 'x' }], 'not an absolute path'],
+      // Rooted but drive-less on Windows: no canonical folder looks like that, so it matches nothing.
+      [[{ folder: '\\workproj', alias: 'x' }], 'not an absolute path'],
+      [[{ folder: `${repo}\nelsewhere`, alias: 'x' }], 'control character'],
     ];
     for (const [aliases, message] of bad) {
       const file = structuredClone(good);

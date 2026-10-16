@@ -10,6 +10,7 @@ import type { SessionMeta } from './sessionCatalog.js';
 import {
   accountsBySession,
   aliasedSessions,
+  dropInheritedTurns,
   resolveSessionRef,
   sameFolder,
   UNATTRIBUTED_SESSION_LABEL,
@@ -376,5 +377,39 @@ describe('accountsBySession', () => {
 
   it('returns an empty map for no turns', () => {
     expect(accountsBySession([], accountFor, labels).size).toBe(0);
+  });
+});
+
+describe('dropInheritedTurns', () => {
+  const turn = (sessionId: string, tsMs: number, messageId: string | null): TranscriptTurn => ({
+    tsMs,
+    sessionId,
+    messageId,
+    model: 'm',
+    inputTokens: 1,
+    outputTokens: 0,
+    cacheCreationTokens: 0,
+    cacheReadTokens: 0,
+  });
+  const ids = (turns: TranscriptTurn[]) => turns.map((t) => `${t.sessionId}:${t.messageId}`);
+
+  it('keeps a copied turn only in the session recorded running when it was made', () => {
+    const turns = [turn('fork', 100, 'm1'), turn('parent', 100, 'm1'), turn('fork', 300, 'm2')];
+    const spans = [
+      { sessionId: 'parent', startedAtMs: 50 },
+      { sessionId: 'fork', startedAtMs: 200 },
+    ];
+    expect(ids(dropInheritedTurns(turns, spans))).toEqual(['parent:m1', 'fork:m2']);
+  });
+
+  it('keeps every copy when no record says which session made the turn', () => {
+    const turns = [turn('fork', 100, 'm1'), turn('parent', 100, 'm1'), turn('x', 100, null)];
+    // The parent was first recorded after its own turn (the daemon was not running yet).
+    const spans = [
+      { sessionId: 'parent', startedAtMs: 150 },
+      { sessionId: 'fork', startedAtMs: 200 },
+    ];
+    expect(ids(dropInheritedTurns(turns, spans))).toEqual(['fork:m1', 'parent:m1', 'x:null']);
+    expect(ids(dropInheritedTurns(turns, []))).toHaveLength(3);
   });
 });

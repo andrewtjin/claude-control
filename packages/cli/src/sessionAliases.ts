@@ -7,11 +7,13 @@
 // the network. Per-turn attribution is the SAME function `cctl stats` uses, so the two can never
 // name different accounts for one turn.
 
-import { realpathSync } from 'node:fs';
+import { readdirSync, realpathSync } from 'node:fs';
+import { dirname } from 'node:path';
 import {
   Store,
   aliasedSessions,
   accountsBySession,
+  dropInheritedTurns,
   buildTurnAttributor,
   projectDirMatches,
   readSessionCatalog,
@@ -23,6 +25,7 @@ import {
   type SessionMeta,
   type SessionRefResolution,
   type SessionSlotSpanRow,
+  type TranscriptTurn,
 } from '@claude-control/daemon';
 import {
   aliasKey,
@@ -101,8 +104,65 @@ function lastRecordedSlots(
   return out;
 }
 
+/**
+ * The turns of the sessions beside the shown ones that may have made a shown fork's copied turns. A
+ * fork's file sits beside its parent's, and a copy is only known as one once its maker is read too.
+ * Only a turn before its own session's first recorded span can be a copy, and only a session with a
+ * span can be known as its maker (from that span on), so an ordinary session, or one older than
+ * every span, reads nothing more, and a fork reads only its recorded siblings, from its earliest
+ * such turn on.
+ */
+async function makerTurns(
+  deps: SessionAliasDeps,
+  sessions: SessionMeta[],
+  turns: readonly TranscriptTurn[],
+  spans: readonly SessionSlotSpanRow[],
+): Promise<TranscriptTurn[]> {
+  const firstSpan = new Map<string, number>();
+  // A maker is only known from its first span on, so a turn older than every span has none to find.
+  let earliestSpan = Infinity;
+  for (const span of spans) {
+    firstSpan.set(
+      span.sessionId,
+      Math.min(span.startedAtMs, firstSpan.get(span.sessionId) ?? Infinity),
+    );
+    earliestSpan = Math.min(earliestSpan, span.startedAtMs);
+  }
+  let sinceMs = Infinity;
+  for (const turn of turns) {
+    if (
+      turn.sessionId != null &&
+      turn.tsMs >= earliestSpan &&
+      turn.tsMs < (firstSpan.get(turn.sessionId) ?? Infinity)
+    ) {
+      sinceMs = Math.min(sinceMs, turn.tsMs);
+    }
+  }
+  if (sinceMs === Infinity) return [];
+  const shown = new Set(sessions.map((s) => s.sessionId));
+  const siblings = new Set<string>();
+  for (const dir of new Set(sessions.map((s) => dirname(s.file)))) {
+    try {
+      for (const name of readdirSync(dir)) {
+        const id = name.slice(0, -'.jsonl'.length);
+        if (name.endsWith('.jsonl') && !shown.has(id) && firstSpan.has(id)) siblings.add(id);
+      }
+    } catch {
+      // Unlistable: the shown sessions are still read, their copies kept as before.
+    }
+  }
+  if (siblings.size === 0) return [];
+  const scan = await readTranscriptTurns({
+    claudeDir: deps.paths.claudeDir,
+    sinceMs,
+    sessionIds: siblings,
+    dedupe: 'session',
+  });
+  return scan.turns;
+}
+
 /** Attach each session's per-account use (the expensive half: only these sessions' turns are
- *  read). */
+ *  read, plus a shown fork's possible makers). */
 async function withAccounts(
   deps: SessionAliasDeps,
   sessions: SessionMeta[],
@@ -112,7 +172,8 @@ async function withAccounts(
   const [accounts, scan] = await Promise.all([
     // Reserved accounts included: an account a folder rule holds must show its name, not its id.
     (deps.engine ?? buildEngine(deps.paths)).listAllAccounts(),
-    // Per-session de-dup: a forked session's inherited turns belong to its history too.
+    // Per-session de-dup, so a fork's inherited turns survive whichever file is read first; the
+    // copies whose maker is known are dropped below.
     readTranscriptTurns({
       claudeDir: deps.paths.claudeDir,
       sinceMs: 0,
@@ -123,9 +184,10 @@ async function withAccounts(
   const store = new Store(daemonDbPath(deps.paths));
   let accountFor;
   let recordedSlot: Map<string, string>;
+  let slotSpans: SessionSlotSpanRow[];
   try {
     const slotBySession = slotBySessionMap(store.listSessions());
-    const slotSpans = store.listSessionSlotSpans();
+    slotSpans = store.listSessionSlotSpans();
     accountFor = buildTurnAttributor({
       intervals: store.listActivationIntervals(),
       slotBySession,
@@ -135,8 +197,9 @@ async function withAccounts(
   } finally {
     store.close();
   }
+  const turns = [...scan.turns, ...(await makerTurns(deps, sessions, scan.turns, slotSpans))];
   const uses = accountsBySession(
-    scan.turns,
+    dropInheritedTurns(turns, slotSpans),
     accountFor,
     new Map(accounts.map((a) => [a.id, a.label] as const)),
   );

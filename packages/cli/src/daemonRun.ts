@@ -342,8 +342,12 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // this resolver, not cached at construction — so a live `cctl settings set CCTL_BIND_ENFORCE ...`
   // takes effect on the next snapshot the daemon writes (a bind, a repair, a refresh) rather than
   // being reverted by a daemon-side rewrite until the next restart.
-  const engine = buildEngine(paths, DAEMON_LOG_SINK, loggingEnv, () =>
-    resolveBindEnforce(loggingEnv),
+  const engine = buildEngine(
+    paths,
+    DAEMON_LOG_SINK,
+    loggingEnv,
+    () => resolveBindEnforce(loggingEnv),
+    {},
   );
   // Two rows for one login would be polled as two accounts and shown twice on the phone;
   // resolve any left by an older build before the first poll (logged, never fatal).
@@ -583,6 +587,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
         settingsPath,
         hooks: buildDaemonHookSpecs({ secret: hookSecret, forwarderPath }),
         ownedCommandMarker: DEFAULT_SECRET_HEADER,
+        // Every profile dir, read without the rules so a registry that fails to load still gets the
+        // forwarder; only those sharing main's inode are touched.
+        profileSettingsPaths: resolveGuardProfileSettingsPaths(paths.vaultDir, [], false),
       });
       // Reconcile the enforcement guard beside the forwarder, keyed off whether any folder is bound.
       // Without this the guard is never installed and folder rules are recorded but never enforced
@@ -608,7 +615,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     publishHookEndpoint: (port) => writeHookEndpoint(hookEndpointPath(dataDir), { port }),
     // Absolute token counts for `/stats` on the phone, read from the transcripts Claude Code
     // writes under this same config dir. Local file reads only; the bot receives only the sums.
-    scanTranscripts: (sinceMs) => readTranscriptTurns({ claudeDir: paths.claudeDir, sinceMs }),
+    // Per session, as `cctl stats` reads them, so a fork's copies are billed to their maker.
+    scanTranscripts: (sinceMs) =>
+      readTranscriptTurns({ claudeDir: paths.claudeDir, sinceMs, dedupe: 'session' }),
     // Real SDK adapter with the daemon's logger on the accountId fall-through — see
     // makeAgentSdkClientFactory for the shared-config/hot-swap tradeoff behind its deps.
     createAgentSdkClient: makeAgentSdkClientFactory(logger),

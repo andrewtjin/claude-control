@@ -4,6 +4,7 @@ import {
   aliasScopeUniquenessKey,
   canonicalizeFolder,
   canonicalStoredFolder,
+  claudeCodeSessionTitle,
   projectDirMatches,
   projectDirStem,
   shellQuoteArg,
@@ -883,5 +884,43 @@ describe('shellQuoteArg', () => {
     expect(shellQuoteArg('Auth Work', 'linux')).toBe("'Auth Work'");
     expect(shellQuoteArg("it's", 'darwin')).toBe("'it'\\''s'");
     expect(shellQuoteArg('$(calc) `id` "x"', 'linux')).toBe(`'$(calc) \`id\` "x"'`);
+  });
+});
+
+// Pins the measured Claude Code behaviour for a --name: what it records is what a launch routes on.
+describe('claudeCodeSessionTitle', () => {
+  it('trims, clips to 200 code points (an emoji at the cut kept whole), then trims again', () => {
+    expect(claudeCodeSessionTitle('   ' + 'a'.repeat(205))).toBe('a'.repeat(200));
+    expect(claudeCodeSessionTitle('a'.repeat(199) + '\u{1F680}bbb')).toBe(
+      'a'.repeat(199) + '\u{1F680}',
+    );
+    expect(claudeCodeSessionTitle('a'.repeat(199) + ' bbbbb')).toBe('a'.repeat(199));
+  });
+
+  it('spaces out control, format and separator characters after the clip, keeping inner runs', () => {
+    expect(claudeCodeSessionTitle('ab\tc\nd\u0085e\u200bf\u202eg\u2028h\u2029i')).toBe(
+      'ab c d e f g h i',
+    );
+    expect(claudeCodeSessionTitle('\u0001' + 'a'.repeat(200))).toBe('a'.repeat(199));
+    expect(claudeCodeSessionTitle('x   y')).toBe('x   y');
+  });
+
+  it('turns each run of them into one space, keeping a literal space beside one', () => {
+    expect(claudeCodeSessionTitle('ab\t\tcd')).toBe('ab cd');
+    expect(claudeCodeSessionTitle('ab\r\ncd')).toBe('ab cd');
+    expect(claudeCodeSessionTitle('ab\u0001\u0001cd')).toBe('ab cd');
+    expect(claudeCodeSessionTitle('ab​​cd')).toBe('ab cd');
+    expect(claudeCodeSessionTitle('x  y')).toBe('x y');
+    expect(claudeCodeSessionTitle('a\u{1F468}‍‍\u{1F469}b')).toBe('a\u{1F468} \u{1F469}b');
+    expect(claudeCodeSessionTitle('ab \tcd')).toBe('ab  cd');
+    expect(claudeCodeSessionTitle('ab\t cd')).toBe('ab  cd');
+  });
+
+  it('keeps no-break spaces, private-use and unassigned code points', () => {
+    expect(claudeCodeSessionTitle('a\u00a0b\ue000c\u0378d')).toBe('a\u00a0b\ue000c\u0378d');
+  });
+
+  it('a name of only blanks and controls records as blank', () => {
+    expect(claudeCodeSessionTitle(' \t\u0001 ')).toBe('');
   });
 });

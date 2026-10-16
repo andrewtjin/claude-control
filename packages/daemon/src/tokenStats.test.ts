@@ -333,6 +333,42 @@ describe('aggregateTokenStats', () => {
       expect(tokensFor(stats, 'main')).toBe(10 + 2 + 4 + 8);
       expect(tokensFor(stats, 'spare')).toBe(1000 + 2 + 4 + 8);
     });
+
+    it.each([
+      ['the parent first', false],
+      ['the fork first', true],
+    ])("bills a fork's copied turn to its maker once, with %s", (_order, forkFirst) => {
+      const intervals: ActivationWindow[] = [
+        { accountId: 'acct-a', startedAtMs: T0 - 5 * HOUR, endedAtMs: null, slot: 'global' },
+        { accountId: 'acct-b', startedAtMs: T0 - 5 * HOUR, endedAtMs: null, slot: 'group:g1' },
+      ];
+      const made = turn({ tsMs: T0, sessionId: 'parent', messageId: 'msg_1', inputTokens: 100 });
+      const copy = { ...made, sessionId: 'fork' };
+      const stats = aggregateTokenStats({
+        scan: scanOf(forkFirst ? [copy, made] : [made, copy]),
+        intervals,
+        windowStartMs: T0 - 7 * 24 * HOUR,
+        windowEndMs: T0 + 24 * HOUR,
+        labelById: new Map([
+          ['acct-a', 'main'],
+          ['acct-b', 'spare'],
+        ]),
+        slotSpans: [
+          { sessionId: 'parent', slot: 'group:g1', startedAtMs: T0 - HOUR },
+          { sessionId: 'fork', slot: 'group:g1', startedAtMs: T0 + HOUR },
+        ],
+      });
+      expect(tokensFor(stats, 'spare')).toBe(114);
+      expect(tokensFor(stats, 'main')).toBeUndefined();
+      expect(stats.coverage.duplicateTurns).toBe(1);
+    });
+
+    it('counts a copy whose maker was never recorded once', () => {
+      const made = turn({ tsMs: T0, sessionId: 'parent', messageId: 'msg_1' });
+      const stats = aggregate([made, { ...made, sessionId: 'fork' }]);
+      expect(stats.overall.turns).toBe(1);
+      expect(stats.coverage.duplicateTurns).toBe(1);
+    });
   });
 });
 

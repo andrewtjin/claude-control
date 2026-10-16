@@ -1019,14 +1019,17 @@ function repairHardLink(
   maxBackups: number,
   now: () => number,
 ): void {
+  // A losing copy identical to the winner loses nothing on re-link; backing it up would only push
+  // the meaningful backups out of the bounded set.
+  const identical = fs.readFileBuffer(file.target).equals(fs.readFileBuffer(file.link));
   if (file.winner === 'profile') {
     const profileData = fs.readFileBuffer(file.link);
     // Back up main's losing content, then push the profile's newer bytes into main's own inode.
-    backupFile(file.name, file.target, profileDir, fs, maxBackups, now);
+    if (!identical) backupFile(file.name, file.target, profileDir, fs, maxBackups, now);
     fs.writeFileInPlace(file.target, profileData);
   } else {
     // Main wins: back up the profile's losing content before it is replaced.
-    backupFile(file.name, file.link, profileDir, fs, maxBackups, now);
+    if (!identical) backupFile(file.name, file.link, profileDir, fs, maxBackups, now);
   }
   fs.removePath(file.link);
   fs.createHardLink(file.target, file.link);

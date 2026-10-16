@@ -791,6 +791,39 @@ describe('resolveLaunchSessions', () => {
     expect(bad.asked).toEqual([]);
   });
 
+  // Claude Code records a --name trimmed, clipped to 200 code points (never splitting a surrogate
+  // pair), with each run of control/format characters and line/paragraph separators turned into one
+  // space, then trimmed again; the launch must key on that title, as the enforcement guard later does.
+  it.each([
+    ['over 200 code points', 'a'.repeat(260), 'a'.repeat(200)],
+    ['leading spaces, then over 200', '   ' + 'a'.repeat(205), 'a'.repeat(200)],
+    ['an emoji at the cut', 'a'.repeat(199) + '\u{1F680}' + 'tail', 'a'.repeat(199) + '\u{1F680}'],
+    ['a space at the cut', 'a'.repeat(199) + ' bbbbb', 'a'.repeat(199)],
+    ['a control character past the clip', '\u0001' + 'a'.repeat(200), 'a'.repeat(199)],
+    ['a tab', 'Auth\tWork', 'Auth Work'],
+    ['a zero-width space', 'Auth\u200bWork', 'Auth Work'],
+    ['a CRLF', 'Auth\r\nWork', 'Auth Work'],
+    ['a run of tabs', 'Auth\t\tWork', 'Auth Work'],
+    ['a space beside a tab', 'Auth \tWork', 'Auth  Work'],
+  ])('a --name with %s routes by the title Claude Code records', async (_, name, recorded) => {
+    const { deps } = store({ byId: { [ID]: facts('Old', 'C:\\x') } });
+    const key = recorded.toLowerCase();
+    expect(await candidates(['--name', name], deps, ctx(key))).toEqual([
+      { title: recorded, folder: 'C:\\work' },
+    ]);
+    expect(await candidates(['--resume', ID, '--name', name], deps, ctx(key))).toEqual([
+      { title: recorded, folder: 'C:\\x' },
+    ]);
+  });
+
+  // Measured: `claude --resume X --name " \t "` keeps X's title, like an empty name.
+  it('a --name that is blank once recorded leaves the resumed session’s title', async () => {
+    const { deps } = store({ titled: [facts('Auth Work')] });
+    expect(
+      await candidates(['--name', ' \t\u0001', '--resume', 'Auth Work'], deps, ctx('auth work')),
+    ).toEqual([{ title: 'Auth Work', folder: 'C:\\work' }]);
+  });
+
   it('a subcommand opens no session and reads nothing', async () => {
     const { deps, asked } = store({});
     expect(await candidates(['mcp', 'list'], deps, ctx('x'))).toEqual([]);

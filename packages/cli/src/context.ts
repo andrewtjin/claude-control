@@ -10,10 +10,12 @@ import { dirname, join } from 'node:path';
 import { createLogger, type LogSink } from '@claude-control/shared-protocol';
 import { sessionIdentities } from '@claude-control/daemon';
 import {
+  LOCK_STALE_MS,
   SwitchEngine,
   defaultPaths,
   sanitizeTerminalText,
   type BindEnforceMode,
+  type LockOptions,
   type Logger,
   type Paths,
 } from '@claude-control/switch-engine';
@@ -89,6 +91,11 @@ export function buildEngine(
   // snapshot write re-reads the operator's current setting, and a live `cctl settings set
   // bind-enforce <mode>` is not reverted by a daemon-side rewrite.
   bindEnforce?: BindEnforceMode | (() => BindEnforceMode),
+  // How long to wait for the credential lock. A command is an edit the operator is waiting on, and
+  // concurrent edits queue on the lock for seconds each on a busy machine: it waits as long as one
+  // live holder may hold before being presumed dead, not the engine's shorter default. The daemon
+  // passes {} to keep that default for its own background work.
+  lockOptions: LockOptions = { timeoutMs: LOCK_STALE_MS },
 ): SwitchEngine {
   const adapter: Logger = createLogger({ defaultLevel: 'warn', sink: logSink, env });
   // The switch-cadence guard defaults to 60s; operators can tune (or 0-disable) it via env.
@@ -100,6 +107,7 @@ export function buildEngine(
   const options: ConstructorParameters<typeof SwitchEngine>[0] = {
     paths,
     logger: adapter,
+    lockOptions,
     // The enforcement mode baked into any guard snapshot this engine writes (see resolveBindEnforce).
     bindEnforce: resolveBindEnforce(env),
     // How the running-session scan learns a session's title and recorded folder: its transcript,
