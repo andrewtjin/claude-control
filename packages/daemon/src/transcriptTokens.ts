@@ -57,6 +57,10 @@ export interface TranscriptTurn {
    *  that never tracked sessions (older callers, some tests) is unaffected — the reader always sets
    *  it, and an absent value attributes to the global slot exactly as `null` does. */
   sessionId?: string | null;
+  /** `message.id`, or `null` when the line has none. A forked session's file holds copies of its
+   *  parent's turns under the fork's session id but with the same message id, so this is the only
+   *  link between a copy and the turn it copies. Optional for the same reason as `sessionId`. */
+  messageId?: string | null;
   /** `message.model`, verbatim. Never normalized or filtered: model ids change without notice, and
    *  silently dropping an unrecognized one would understate the totals. */
   model: string;
@@ -168,18 +172,19 @@ function turnFromLine(
   const u = usage as Record<string, unknown>;
   const message2 = message as Record<string, unknown>;
   const model = message2.model;
-  const messageId = message2.id;
+  const messageId = typeof message2.id === 'string' && message2.id !== '' ? message2.id : null;
   return {
     turn: {
       tsMs,
       sessionId,
+      messageId,
       model: typeof model === 'string' && model !== '' ? model : 'unknown',
       inputTokens: countOf(u.input_tokens),
       outputTokens: countOf(u.output_tokens),
       cacheCreationTokens: countOf(u.cache_creation_input_tokens),
       cacheReadTokens: countOf(u.cache_read_input_tokens),
     },
-    messageId: typeof messageId === 'string' && messageId !== '' ? messageId : null,
+    messageId,
   };
 }
 

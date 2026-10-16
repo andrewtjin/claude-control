@@ -158,6 +158,37 @@ export interface SessionAccountUse {
 export const UNATTRIBUTED_SESSION_LABEL = 'unattributed';
 
 /**
+ * Drop the copies a forked session carries of turns another session made. A fork's file repeats
+ * its parent's turns (same message id and timestamp) under the fork's id, and the fork's slot
+ * timeline does not reach back to them, so counting them there bills the parent's spend twice and
+ * to the wrong account. A turn is known to be made by a session the daemon had already recorded
+ * (a slot span starting at or before the turn): no fork of it can exist yet, so every other copy
+ * of that message id is inherited. Without such a record every copy is kept, as before. Pure.
+ */
+export function dropInheritedTurns(
+  turns: readonly TranscriptTurn[],
+  spans: readonly { sessionId: string; startedAtMs: number }[],
+): TranscriptTurn[] {
+  const firstSeen = new Map<string, number>();
+  for (const span of spans) {
+    const seen = firstSeen.get(span.sessionId);
+    if (seen === undefined || span.startedAtMs < seen) {
+      firstSeen.set(span.sessionId, span.startedAtMs);
+    }
+  }
+  const madeBy = new Map<string, string>();
+  for (const turn of turns) {
+    if (turn.messageId == null || turn.sessionId == null) continue;
+    const seen = firstSeen.get(turn.sessionId);
+    if (seen !== undefined && seen <= turn.tsMs) madeBy.set(turn.messageId, turn.sessionId);
+  }
+  return turns.filter((turn) => {
+    const maker = turn.messageId == null ? undefined : madeBy.get(turn.messageId);
+    return maker === undefined || maker === turn.sessionId;
+  });
+}
+
+/**
  * Total each session's turns per account. Accounts come out in the order the session first used
  * them — the natural reading of "which accounts has this session run on" — with the unattributed
  * bucket wherever its first turn falls. Pure.

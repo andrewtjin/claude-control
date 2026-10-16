@@ -275,6 +275,40 @@ describe('runSessionShow', () => {
     expect(h.notes).toEqual([]);
   });
 
+  it('leaves a fork its own turns only, once the daemon saw its parent run the copied one', async () => {
+    // Forked from S_RESUMED after its group-slot turn: Claude Code copies that turn (same message
+    // id, same timestamp) into the fork's file, and the daemon first saw the fork after it was made.
+    const forkId = 'aaaaaaaa-0000-4000-8000-000000000004';
+    const store = new Store(daemonDbPath(paths));
+    try {
+      store.recordSessionSlot(forkId, groupSlot, T0 + 3.5 * HOUR);
+    } finally {
+      store.close();
+    }
+    await writeSession(
+      here,
+      forkId,
+      [
+        userLine(here, T0 - HOUR),
+        turnLine('msg_r3', T0 + 3 * HOUR, 300),
+        turnLine('msg_f2', T0 + 4 * HOUR, 9),
+        customTitle('Auth Work'),
+      ],
+      T0 + 6 * HOUR,
+    );
+    const h = harness();
+    await runSessionShow('auth work', { json: true }, h.deps);
+    const out = h.json();
+    expect(out.sessions.map((s) => s.sessionId).sort()).toEqual([S_RESUMED, forkId].sort());
+    // The copy is the parent's spend: neither billed again nor to the global account.
+    expect(uses(out.sessions.find((s) => s.sessionId === forkId))).toEqual([['client', 1, 9]]);
+    expect(uses(out.sessions.find((s) => s.sessionId === S_RESUMED))).toEqual([
+      ['unattributed', 1, 1],
+      ['main', 1, 20],
+      ['client', 1, 300],
+    ]);
+  });
+
   it('defaults to the current session from CLAUDE_CODE_SESSION_ID, billed from its span alone', async () => {
     const h = harness({ env: { [SESSION_ID_ENV]: S_HAND } });
     await runSessionShow(undefined, { json: true }, h.deps);

@@ -12,6 +12,7 @@ import {
   Store,
   aliasedSessions,
   accountsBySession,
+  dropInheritedTurns,
   buildTurnAttributor,
   projectDirMatches,
   readSessionCatalog,
@@ -112,7 +113,8 @@ async function withAccounts(
   const [accounts, scan] = await Promise.all([
     // Reserved accounts included: an account a folder rule holds must show its name, not its id.
     (deps.engine ?? buildEngine(deps.paths)).listAllAccounts(),
-    // Per-session de-dup: a forked session's inherited turns belong to its history too.
+    // Per-session de-dup, so a fork's inherited turns survive whichever file is read first; the
+    // copies whose maker is known are dropped below.
     readTranscriptTurns({
       claudeDir: deps.paths.claudeDir,
       sinceMs: 0,
@@ -123,9 +125,10 @@ async function withAccounts(
   const store = new Store(daemonDbPath(deps.paths));
   let accountFor;
   let recordedSlot: Map<string, string>;
+  let slotSpans: SessionSlotSpanRow[];
   try {
     const slotBySession = slotBySessionMap(store.listSessions());
-    const slotSpans = store.listSessionSlotSpans();
+    slotSpans = store.listSessionSlotSpans();
     accountFor = buildTurnAttributor({
       intervals: store.listActivationIntervals(),
       slotBySession,
@@ -136,7 +139,7 @@ async function withAccounts(
     store.close();
   }
   const uses = accountsBySession(
-    scan.turns,
+    dropInheritedTurns(scan.turns, slotSpans),
     accountFor,
     new Map(accounts.map((a) => [a.id, a.label] as const)),
   );
