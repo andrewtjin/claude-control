@@ -52,6 +52,15 @@ describe('installHooks', () => {
     expect(settings.hooks.Notification?.[0]?.hooks).toHaveLength(1);
   });
 
+  it('does not rewrite a settings.json that already carries every hook', async () => {
+    await installHooks({ settingsPath, hooks: [spec('Stop')] });
+    // A hard link stands in for a group profile sharing main's settings.json.
+    const sharer = join(dir, 'sharer.json');
+    linkSync(settingsPath, sharer);
+    await installHooks({ settingsPath, hooks: [spec('Stop')] });
+    expect(statSync(settingsPath).ino).toBe(statSync(sharer).ino);
+  });
+
   it('preserves unrelated top-level settings keys', async () => {
     await writeFile(
       settingsPath,
@@ -937,6 +946,21 @@ describe('ensureBindGuard propagation into group profiles', () => {
       profileSettingsPaths: [profileSettings],
     });
     expect(hasGuard(await readFile(profileSettings, 'utf8'))).toBe(false);
+  });
+
+  it('a repeat reconcile with nothing to change leaves main and the profile on one inode', async () => {
+    const opts = {
+      settingsPath: mainSettings,
+      guardPath,
+      snapshotPath,
+      hasBindings: true,
+      profileSettingsPaths: [profileSettings],
+    };
+    await ensureBindGuard(opts);
+    await ensureBindGuard(opts);
+    // An unchanged main must not be rewritten: a temp+rename would give it a fresh inode, and the
+    // profile (already carrying the guard) would stay linked to the old one.
+    expect(statSync(mainSettings).ino).toBe(statSync(profileSettings).ino);
   });
 
   it('backs up a diverged, guard-less profile copy before the guard re-link (no silent edit loss)', async () => {
