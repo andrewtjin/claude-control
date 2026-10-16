@@ -4,42 +4,68 @@
 // Pure. It reads only its inputs (the folder lookup and the engine's scope check are passed in), so
 // every collision rule is testable without a vault, and `--dry-run` prints the plan the real run
 // then executes: the same skips, for the same reasons, including the refusals the engine would
-// make (a folder no rule may cover, the rule cap, a reservation that would leave this machine's
-// main login with nothing). What a plan cannot know is decided at run time and reported then: which
-// account each slot ends up running, and `--replace`'s "is the file's copy newer", which needs the
-// decrypted stored bundle and so is decided by the engine under its lock.
+// make — a folder no rule may cover, the rule cap, a rule's account caps and the cap on reserved
+// accounts, tokens that cannot be shown to be the stored login, and a reservation that would leave
+// some slot here (this machine's main login or a rule's) with no account to move to, chosen for
+// all the slots together the way the engine chooses. What a plan cannot know is decided at run
+// time and reported then: which account each slot ends up running, `--replace`'s "is the file's
+// copy newer" (it needs the decrypted stored bundle), a slot whose live login is not the one
+// recorded for it, and an exclusion refused because sessions run in a slot it would empty.
 
 import {
+  MAX_RESERVED_ACCOUNTS,
   MAX_RULES,
+  MAX_RULE_ACCOUNTS,
   aliasScopeUniquenessKey,
+  allSlots,
+  assignDistinct,
+  availableInOrder,
   describeRuleScopes,
   exactAliasRule,
   exactFolderRule,
   folderUniquenessKey,
+  importIdentityRefusal,
+  ruleSlotId,
   sanitizeTerminalText,
+  shellQuoteArg,
+  slotPool,
   type AccountView,
   type FolderRule,
   type RuleScopeRef,
+  type RulesPicture,
+  type SlotId,
+  type StoredAccount,
 } from '@claude-control/switch-engine';
 import { loginOf, type ExportPayload, type ExportedAccount } from './exportPayload.js';
-import { checkSettingValue, findDaemonEnvSetting, type DaemonFileConfig } from './settings.js';
+import {
+  blankAsUnset,
+  checkSettingValue,
+  findDaemonEnvSetting,
+  type DaemonFileConfig,
+} from './settings.js';
 
 /** What the import does with one account of the file. */
 export type AccountStep =
-  /** Store it as a new account under `label` (the file's label, numbered when taken here). With
-   *  `withTokens` false it is stored waiting for a login. `autoSwitchExcluded` is stored with it;
-   *  `heldBack` says it was set because the rule the account is reserved to on the other machine
-   *  is not made here, so the account would otherwise land in the shared pool auto-switch draws on. */
+  /** Store it as a new account under `label` (the file's label, numbered when taken here), and
+   *  under `id` (its id on the other machine) when no account here has that id. With `withTokens`
+   *  false it is stored waiting for a login. `autoSwitchExcluded` is stored with it. `heldBack`
+   *  says that was set because the rule the account is reserved to on the other machine is not
+   *  made here, so the account would otherwise land in the shared pool auto-switch draws on.
+   *  `awaitsRule` says the file reserves it to a rule this plan makes: it is stored kept out of
+   *  auto-switch, and handed back once that rule includes it, so a rule refused at run time cannot
+   *  leave it in the shared pool either. */
   | {
       kind: 'add';
       entry: number;
       label: string;
+      id?: string;
       renamedFrom?: string;
       withTokens: boolean;
       autoSwitchExcluded: boolean;
       heldBack?: true;
+      awaitsRule?: true;
     }
-  /** The same login is already stored here as `existing`; it is left as it is. */
+  /** The same account is already stored here as `existing`; it is left as it is. */
   | { kind: 'skip'; entry: number; existing: AccountView; reason: string }
   /** The same login is already stored here as `existing`; its credentials are replaced by the
    *  file's when the file's are newer or the stored login is quarantined (`--replace`). */
@@ -63,14 +89,18 @@ export interface ScopePlan {
   alias?: string;
   /** Why this scope is left out of the rule, when it is. */
   skip?: string;
+  /** Set on a scope the rule here ({@link RuleStep.into}) does not hold yet and gains. */
+  joins?: true;
 }
 
 /**
  * What the import does with one rule of the file. A rule is rebuilt WHOLE — one rule here with
- * every scope that can be used here — or, when this machine already has a rule on exactly those
- * scopes (an earlier import of the same rule, or of another file from the same machine), the
- * members it lacks are added to that rule. It is never split: a rule is one slot, so a split would
- * change which account each of its folders runs on.
+ * every scope that can be used here — or added to a rule this machine already has: one on exactly
+ * those scopes (an earlier import of the same rule, or of another file from the same machine), or
+ * one holding only some of them and only members of the file's rule (an earlier import that
+ * stopped part way, before a folder of it existed here), which gains the scopes it lacks. It is
+ * never split: a rule is one slot, so a split would change which account each of its folders runs
+ * on.
  */
 export interface RuleStep {
   /** The rule's display name, for a rule this creates, when it is not just the default. */
@@ -91,11 +121,11 @@ export interface RuleStep {
   skip?: string;
 }
 
-/** What the import does with one setting. */
+/** What the import does with one setting. `overridden` says the environment here sets it too,
+ *  and the environment wins, so the value from the file is not the one the daemon runs with. */
 export type SettingStep =
-  /** Saved. `overridden` says the environment here sets it too, and the environment wins. */
   | { kind: 'set'; name: string; value: string; previous?: string; overridden?: true }
-  | { kind: 'same'; name: string; value: string }
+  | { kind: 'same'; name: string; value: string; overridden?: true }
   /** This machine already has another value, which it keeps (`--replace` takes the file's). */
   | { kind: 'kept'; name: string; value: string; here: string }
   | { kind: 'skip'; name: string; reason: string };
@@ -107,6 +137,8 @@ export interface ImportPlan {
   settings: SettingStep[];
   /** Facts about the file worth saying before the plan (another platform, and so on). */
   notes: string[];
+  /** The platform the commands the plan prints are quoted for. */
+  platform: NodeJS.Platform;
 }
 
 /** A folder from the file, looked up here. */
@@ -149,40 +181,42 @@ function storedLabel(label: string): string {
 }
 
 /**
- * The account already stored here that `entry` is: the same login (uuid). An entry with no login
- * recorded can only be matched by email, and only against a row that has no login either — two
- * rows with the same address but different logins are different accounts. An entry with neither
- * is matched by label against a row with neither, so importing it twice does not store it twice.
+ * The account already stored here that `entry` is. First by id: an account keeps its id when it is
+ * imported, so the id finds it again however it was relabelled here and whatever identity it
+ * carries — unless the two name different logins, which no copy of one account can. Then by login
+ * (uuid). An entry with no login recorded is matched by email, and only against a row that has no
+ * login either: two rows with the same address but different logins are different accounts. A
+ * label is never enough: two machines can each have a different account called "work".
  */
 function existingFor(
   entry: ExportedAccount,
   accounts: readonly AccountView[],
 ): AccountView | undefined {
   const login = loginOf(entry);
+  const byId = entry.id !== undefined ? accounts.find((a) => a.id === entry.id) : undefined;
+  if (
+    byId !== undefined &&
+    (login === undefined || byId.accountUuid === undefined || byId.accountUuid === login)
+  ) {
+    return byId;
+  }
   if (login !== undefined) return accounts.find((a) => a.accountUuid === login);
   const fromBundle = entry.bundle?.oauthAccount?.emailAddress;
   const email = entry.emailAddress ?? (typeof fromBundle === 'string' ? fromBundle : undefined);
-  if (email !== undefined) {
-    return accounts.find(
-      (a) => a.accountUuid === undefined && a.emailAddress?.toLowerCase() === email.toLowerCase(),
-    );
-  }
-  const label = storedLabel(entry.label).toLowerCase();
+  if (email === undefined) return undefined;
   return accounts.find(
-    (a) =>
-      a.accountUuid === undefined &&
-      a.emailAddress === undefined &&
-      a.label.toLowerCase() === label,
+    (a) => a.accountUuid === undefined && a.emailAddress?.toLowerCase() === email.toLowerCase(),
   );
 }
 
 /**
- * The account steps. A login already stored here is never stored twice: it is skipped, or with
- * `--replace` its credentials may be replaced — but only by tokens whose identity block names their
- * login, since nothing else in the file can be checked against them. Every other entry is added,
- * under its own label when that is free here and otherwise under the next free `label (n)` — the
- * numbering the vault's own duplicate repair uses — never a name any account here (or any earlier
- * entry) answers to, by label in any case or by id.
+ * The account steps. An account already stored here is never stored twice: it is skipped, or with
+ * `--replace` its credentials may be replaced — but only by tokens whose identity block proves
+ * they are the stored login (the engine's own check, see importIdentityRefusal), since nothing
+ * else in the file can be checked against them. Every other entry is added, under its own label
+ * when that is free here and otherwise under the next free `label (n)` — the numbering the vault's
+ * own duplicate repair uses — never a name any account here (or any earlier entry) answers to, by
+ * label in any case or by id.
  */
 function planAccounts(input: PlanInput): AccountStep[] {
   const taken = new Set(input.accounts.map((a) => a.label.toLowerCase()));
@@ -192,28 +226,37 @@ function planAccounts(input: PlanInput): AccountStep[] {
   return input.payload.accounts.map((entry, i): AccountStep => {
     const existing = existingFor(entry, input.accounts);
     if (existing !== undefined) {
-      if (input.replace && entry.bundle?.oauthAccount !== undefined)
-        return { kind: 'replace', entry: i, existing };
+      if (input.replace && entry.bundle !== undefined) {
+        const refusal = importIdentityRefusal(existing, entry.bundle.oauthAccount);
+        if (refusal === undefined) return { kind: 'replace', entry: i, existing };
+        return {
+          kind: 'skip',
+          entry: i,
+          existing,
+          reason: `already stored here, and ${refusal}, so they cannot replace the stored ones`,
+        };
+      }
       return {
         kind: 'skip',
         entry: i,
         existing,
-        reason: !input.replace
-          ? 'already stored here'
-          : entry.bundle === undefined
-            ? 'already stored here, and the file has no tokens for it'
-            : "already stored here, and the file's tokens do not say which login they belong to, " +
-              'so they cannot replace the stored ones',
+        reason: input.replace
+          ? 'already stored here, and the file has no tokens for it'
+          : 'already stored here',
       };
     }
     const wanted = storedLabel(entry.label);
     let label = wanted;
     for (let n = 2; isTaken(label); n += 1) label = `${wanted} (${n})`;
     taken.add(label.toLowerCase());
+    // An id another account here already has stays behind (that account is not this one: they
+    // name different logins); the vault then makes a new one.
+    const keepId = entry.id !== undefined && !input.accounts.some((a) => a.id === entry.id);
     return {
       kind: 'add',
       entry: i,
       label,
+      ...(keepId ? { id: entry.id } : {}),
       ...(label !== wanted ? { renamedFrom: wanted } : {}),
       withTokens: entry.bundle !== undefined,
       autoSwitchExcluded: entry.autoSwitchExcluded,
@@ -252,6 +295,24 @@ function localIdOf(target: MemberTarget, steps: readonly AccountStep[]): string 
   return step !== undefined && step.kind !== 'add' ? step.existing.id : undefined;
 }
 
+/** One key per account, however a member names it: its id here, or — for an account the import
+ *  adds, which has no id here yet — its entry in the file. Two references to one account (its login
+ *  and its label, say) get the same key. */
+function memberKey(target: MemberTarget, steps: readonly AccountStep[]): string {
+  return localIdOf(target, steps) ?? `entry\u0000${target.entry}`;
+}
+
+/** `targets` with each account once (the first reference to it kept). */
+function uniqueMembers(targets: MemberTarget[], steps: readonly AccountStep[]): MemberTarget[] {
+  const seen = new Set<string>();
+  return targets.filter((t) => {
+    const key = memberKey(t, steps);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 /** The name a rule gets by default from its first scope — the same default the vault uses — so
  *  that a default name is not carried across as if it had been chosen. */
 function defaultRuleLabel(rule: ExportPayload['rules'][number]): string {
@@ -280,14 +341,6 @@ function ruleHolding(scope: ScopePlan, input: PlanInput): FolderRule | undefined
   return scope.kind === 'folder'
     ? exactFolderRule(scope.folder!, input.rules, input.platform)
     : exactAliasRule(scope.folder!, scope.alias!, input.rules, input.platform);
-}
-
-/** Whether `rule` holds exactly `scopes`, no more and no fewer. */
-function holdsExactly(rule: FolderRule, scopes: readonly ScopePlan[], input: PlanInput): boolean {
-  return (
-    rule.folders.length + (rule.aliases?.length ?? 0) === scopes.length &&
-    scopes.every((s) => ruleHolding(s, input)?.id === rule.id)
-  );
 }
 
 /** The scopes of a rule from the file, as the file names them. */
@@ -347,6 +400,7 @@ function earlySkip(
   rule: ExportPayload['rules'][number],
   step: RuleStep,
   input: PlanInput,
+  steps: readonly AccountStep[],
 ): string | undefined {
   if (input.platform === 'darwin') return 'folder rules are not supported on macOS yet';
   const blocked =
@@ -355,6 +409,12 @@ function earlySkip(
       ? (input.rulesBlocked?.alias ?? input.rulesBlocked?.folder)
       : undefined);
   if (blocked !== undefined) return blocked;
+  // The file named the same account on both sides under two names (its login and its label): no
+  // vault can hold that, and dropping either side would change what the rule means.
+  const both = step.include.find((t) =>
+    step.exclude.some((x) => memberKey(x, steps) === memberKey(t, steps)),
+  );
+  if (both !== undefined) return `it both includes and excludes ${both.label}`;
   if (step.include.length + step.exclude.length === 0) return 'none of its accounts came along';
   // A rule that includes accounts and keeps only its exclusions would open its folders to every
   // shared account, where the source pinned them to its own.
@@ -362,6 +422,35 @@ function earlySkip(
     return 'none of the accounts it includes is in the file or on this machine';
   }
   return undefined;
+}
+
+/**
+ * The rule here the file's rule is added to, if any. Every usable scope held here must be held by
+ * this one rule, and the rule must hold nothing else. When it holds all of them it is the same
+ * rule (as before, whatever its members). When it holds only some, it is taken for the same rule
+ * only while its members are all members of the file's rule: then it is what an earlier import of
+ * this rule made before the rest of its folders existed here, and it gains them. A rule of this
+ * machine's own that happens to hold one of the folders is left as it is.
+ */
+function intoRule(
+  usable: readonly ScopePlan[],
+  holders: readonly (FolderRule | undefined)[],
+  step: RuleStep,
+  steps: readonly AccountStep[],
+): FolderRule | undefined {
+  const held = [...new Set(holders.filter((h): h is FolderRule => h !== undefined))];
+  if (held.length !== 1) return undefined;
+  const rule = held[0]!;
+  const holds = holders.filter((h) => h === rule).length;
+  if (holds !== rule.folders.length + (rule.aliases?.length ?? 0)) return undefined;
+  if (holds === usable.length) return rule;
+  const ids = (targets: readonly MemberTarget[]): Set<string | undefined> =>
+    new Set(targets.map((t) => localIdOf(t, steps)));
+  const include = ids(step.include);
+  const exclude = ids(step.exclude);
+  return rule.include.every((id) => include.has(id)) && rule.exclude.every((id) => exclude.has(id))
+    ? rule
+    : undefined;
 }
 
 /**
@@ -395,17 +484,43 @@ function narrowMembers(step: RuleStep, steps: readonly AccountStep[], input: Pla
   });
 }
 
+/** Why a rule would break one of the vault's account caps — a rule's includes or excludes, or the
+ *  accounts reserved to rules in all (`reserved`: what this machine and the rules planned before
+ *  this one reserve) — or undefined when it would not. */
+function accountCapRefusal(
+  step: RuleStep,
+  steps: readonly AccountStep[],
+  reserved: ReadonlySet<string>,
+): string | undefined {
+  const including = (step.into?.include.length ?? 0) + step.include.length;
+  if (including > MAX_RULE_ACCOUNTS) {
+    return `the rule would include more than ${MAX_RULE_ACCOUNTS} accounts`;
+  }
+  if ((step.into?.exclude.length ?? 0) + step.exclude.length > MAX_RULE_ACCOUNTS) {
+    return `the rule would exclude more than ${MAX_RULE_ACCOUNTS} accounts`;
+  }
+  const reserving = step.include.filter((t) => !reserved.has(memberKey(t, steps)));
+  if (reserved.size + reserving.length > MAX_RESERVED_ACCOUNTS) {
+    return `this machine would have more than ${MAX_RESERVED_ACCOUNTS} accounts reserved to rules`;
+  }
+  return undefined;
+}
+
 /**
  * The rule steps (see {@link RuleStep}). A rule is not made, with the reason, when rules cannot be
- * written here, none of its scopes can be used here, none of its members came along, it includes
- * accounts of which none is in the file or here, this machine would pass the rule cap, or a rule
- * here already holds exactly its scopes and every member. A scope a different rule here holds is
- * left to that rule.
+ * written here, it names one account on both sides, none of its scopes can be used here, none of
+ * its members came along, it includes accounts of which none is in the file or here, it would pass
+ * an account cap or the rule cap, or a rule here already holds its scopes and every member. A
+ * scope a different rule here holds is left to that rule. The caps count what the rules before it
+ * add, in file order, as the engine counts them.
  */
 function planRules(input: PlanInput, steps: readonly AccountStep[]): RuleStep[] {
   const labels = labelsByEntry(steps);
   const planned = new Set<string>();
   let creates = 0;
+  const reserved = new Set(
+    input.accounts.filter((a) => reservedHere(input, a.id)).map((a) => a.id),
+  );
   return input.payload.rules.map((rule): RuleStep => {
     const step: RuleStep = {
       scopes: sourceScopes(rule),
@@ -425,20 +540,24 @@ function planRules(input: PlanInput, steps: readonly AccountStep[]): RuleStep[] 
         else into.push(target);
       }
     }
-    const early = earlySkip(rule, step, input);
+    step.include = uniqueMembers(step.include, steps);
+    step.exclude = uniqueMembers(step.exclude, steps);
+    const early = earlySkip(rule, step, input, steps);
     if (early !== undefined) return { ...step, skip: early };
 
     step.scopes = lookUpScopes(rule, input, planned);
     const noScope = noScopeLeft(step.scopes);
     if (noScope !== undefined) return { ...step, skip: noScope };
 
-    // The members are added to a rule here that holds exactly these scopes; otherwise a scope some
-    // other rule here holds stays that rule's, and the rule is made on the rest.
+    // The members are added to the rule here that is this rule (see intoRule), which gains any
+    // scope it lacks; otherwise a scope some other rule here holds stays that rule's, and the rule
+    // is made on the rest.
     const usable = step.scopes.filter((s) => s.skip === undefined);
     const holders = usable.map((s) => ruleHolding(s, input));
-    const first = holders[0];
-    if (first !== undefined && holdsExactly(first, usable, input)) {
-      step.into = first;
+    const into = intoRule(usable, holders, step, steps);
+    if (into !== undefined) {
+      step.into = into;
+      for (const [i, scope] of usable.entries()) if (holders[i] === undefined) scope.joins = true;
     } else {
       for (const [i, scope] of usable.entries()) {
         if (holders[i] !== undefined)
@@ -449,7 +568,8 @@ function planRules(input: PlanInput, steps: readonly AccountStep[]): RuleStep[] 
     }
 
     narrowMembers(step, steps, input);
-    if (step.include.length + step.exclude.length === 0) {
+    const joins = step.scopes.some((s) => s.joins === true);
+    if (step.include.length + step.exclude.length === 0 && !joins) {
       return {
         ...step,
         skip:
@@ -458,10 +578,13 @@ function planRules(input: PlanInput, steps: readonly AccountStep[]): RuleStep[] 
             : 'another rule here reserves every account it excludes, so it would change nothing',
       };
     }
+    if (step.into === undefined && input.rules.length + creates >= MAX_RULES) {
+      return { ...step, skip: `this machine would have more than ${MAX_RULES} rules` };
+    }
+    const capped = accountCapRefusal(step, steps, reserved);
+    if (capped !== undefined) return { ...step, skip: capped };
+    for (const t of step.include) reserved.add(memberKey(t, steps));
     if (step.into === undefined) {
-      if (input.rules.length + creates >= MAX_RULES) {
-        return { ...step, skip: `this machine would have more than ${MAX_RULES} rules` };
-      }
       creates += 1;
       if (rule.label.trim() !== '' && rule.label !== defaultRuleLabel(rule))
         step.label = rule.label;
@@ -471,64 +594,103 @@ function planRules(input: PlanInput, steps: readonly AccountStep[]): RuleStep[] 
 }
 
 /**
- * Foresee what the rules do to the slots already here, from who is recorded live in each: a rule
- * that reserves an account live on this machine's main login moves that login to another shared
- * account, and when none would be left the engine refuses the rule — so the plan skips it, saying
- * why, and the real run does the same. A rule slot here that runs an account a rule reserves is
- * moved too, which the plan notes. Which account each slot then runs is decided at run time.
+ * Foresee what the rules do to the slots already here, the way the engine decides it (its
+ * slotPool, availableInOrder and assignDistinct, over the same picture): every slot holding an
+ * account some rule reserves, and that may not keep it, is moved to an account still available to
+ * it, and the replacements are chosen for all those slots together, so two slots needing the one
+ * spare account are seen as such. When some slot is left with none, every rule reserving the
+ * account it is stuck on is skipped, saying why, and the choice is made again without them; the
+ * engine refuses those same rules. Each move is noted on the rules that cause it. Who is live in
+ * each slot is read from what is recorded for it; which account each slot then runs is decided at
+ * run time.
  */
 function foreseeHandOffs(input: PlanInput, steps: readonly AccountStep[], rules: RuleStep[]): void {
-  const labelOf = (id: string): string => input.accounts.find((a) => a.id === id)?.label ?? id;
-  const made = (): RuleStep[] => rules.filter((r) => r.skip === undefined);
-  const reservedBy = (id: string): RuleStep[] =>
-    made().filter((r) => r.include.some((t) => localIdOf(t, steps) === id));
-  const live = input.globalLive ?? null;
-  if (live !== null && !reservedHere(input, live) && reservedBy(live).length > 0) {
-    const reserving = new Set(
-      made().flatMap((r) => r.include.flatMap((t) => localIdOf(t, steps) ?? [])),
-    );
-    const inSlots = new Set(input.rules.flatMap((r) => (r.activeId !== null ? [r.activeId] : [])));
-    const includedEntries = new Set(made().flatMap((r) => r.include.map((t) => t.entry)));
-    const others =
-      input.accounts.filter(
-        (a) =>
-          a.id !== live &&
-          !reservedHere(input, a.id) &&
-          !a.quarantined &&
-          !reserving.has(a.id) &&
-          !inSlots.has(a.id),
-      ).length +
-      steps.filter((s) => s.kind === 'add' && s.withTokens && !includedEntries.has(s.entry)).length;
-    for (const rule of reservedBy(live)) {
-      if (others === 0) {
-        rule.skip =
-          `including ${labelOf(live)} would leave this machine's main login with no shared ` +
-          'account to run on; add or log in another account here first';
-      } else {
-        rule.notes.push(
-          `this machine's main login moves off ${labelOf(live)}, which this rule reserves`,
-        );
-      }
-    }
+  const key = (t: MemberTarget): string => memberKey(t, steps);
+  // The accounts the import adds join the shared pool before the rules are written, as rows only
+  // the plan knows (with tokens they can take a slot; without, they are quarantined).
+  const added: StoredAccount[] = steps.flatMap((s) =>
+    s.kind === 'add'
+      ? [
+          {
+            id: key({ entry: s.entry, label: s.label }),
+            label: s.label,
+            quarantined: !s.withTokens,
+            ...(s.autoSwitchExcluded ? { autoSwitchExcluded: true } : {}),
+            createdAtMs: 0,
+            updatedAtMs: 0,
+          },
+        ]
+      : [],
+  );
+  const shared = [...input.accounts.filter((a) => !reservedHere(input, a.id)), ...added];
+  const reserved = input.accounts.filter((a) => reservedHere(input, a.id));
+  const occupancy = new Map<SlotId, Set<string>>();
+  for (const slot of allSlots(input.rules)) {
+    const live =
+      slot === 'global'
+        ? (input.globalLive ?? null)
+        : (input.rules.find((r) => ruleSlotId(r.id) === slot)?.activeId ?? null);
+    occupancy.set(slot, new Set(live !== null ? [live] : []));
   }
-  for (const here of input.rules) {
-    const id = here.activeId;
-    if (id === null || reservedHere(input, id) || here.include.includes(id)) continue;
-    for (const rule of reservedBy(id)) {
-      if (rule.into?.id === here.id) continue;
-      rule.notes.push(
-        `the slot of ${describeRuleScopes(here)} moves off ${labelOf(id)}, which this rule reserves`,
+  const made = (): RuleStep[] => rules.filter((r) => r.skip === undefined);
+  const describeSlot = (slot: SlotId): string => {
+    const rule = input.rules.find((r) => ruleSlotId(r.id) === slot);
+    return rule !== undefined ? `the slot of ${describeRuleScopes(rule)}` : slot;
+  };
+  for (;;) {
+    const reservingKeys = new Set(made().flatMap((r) => r.include.map(key)));
+    const reserving = shared.filter((a) => reservingKeys.has(a.id));
+    const after: RulesPicture = {
+      shared: shared.filter((a) => !reservingKeys.has(a.id)),
+      reserved: [...reserved, ...reserving],
+      rules: input.rules,
+    };
+    const mayKeep = (slot: SlotId, id: string): boolean =>
+      made().some(
+        (r) =>
+          r.into !== undefined &&
+          ruleSlotId(r.into.id) === slot &&
+          r.include.some((t) => key(t) === id),
       );
+    const moving: Array<{ slot: SlotId; from: StoredAccount; options: string[] }> = [];
+    for (const [slot, owners] of occupancy) {
+      const from = reserving.find((a) => owners.has(a.id) && !mayKeep(slot, a.id));
+      if (from === undefined) continue;
+      const options = availableInOrder(slotPool(slot, after, occupancy)).map((a) => a.id);
+      moving.push({ slot, from, options });
     }
+    const assigned = assignDistinct(moving.map((m) => m.options));
+    const reservers = (id: string): RuleStep[] =>
+      made().filter((r) => r.include.some((t) => key(t) === id));
+    if (assigned.ok) {
+      for (const m of moving) {
+        const which = m.slot === 'global' ? "this machine's main login" : describeSlot(m.slot);
+        for (const rule of reservers(m.from.id)) {
+          rule.notes.push(`${which} moves off ${m.from.label}, which this rule reserves`);
+        }
+      }
+      return;
+    }
+    const short = moving[assigned.unserved]!;
+    const reason =
+      short.slot === 'global'
+        ? `including ${short.from.label} would leave this machine's main login with no shared ` +
+          'account to run on; add or log in another account here first'
+        : `including ${short.from.label} would leave ${describeSlot(short.slot)} with no other ` +
+          'account to run on';
+    for (const rule of reservers(short.from.id)) rule.skip = reason;
   }
 }
 
 /**
- * Hold back from auto-switch an account the file reserves to a rule that is not made here: on the
- * other machine it ran only in that rule's folders, and here, with the rule missing, it would join
- * the shared pool auto-switch draws on — spending, say, a client's quota on unrelated work. It is
- * still listed and can be switched to by hand; `cctl accounts include <account>` hands it back to
- * auto-switch.
+ * Keep out of auto-switch every account the file reserves to a rule (unless the file already
+ * excludes it). On the other machine it ran only in that rule's folders; here, without the rule, it
+ * would join the shared pool auto-switch draws on — spending, say, a client's quota on unrelated
+ * work. When the plan does not make the rule, the account is held back for good (`heldBack`); it
+ * is still listed and can be switched to by hand, and `cctl accounts include <account>` hands it
+ * back to auto-switch. When the plan makes the rule, the account is still stored held back and only
+ * handed back once that rule includes it (`awaitsRule`), so a rule the engine refuses at run time
+ * leaves it held back too.
  */
 function holdBackOrphans(input: PlanInput, steps: AccountStep[], rules: readonly RuleStep[]): void {
   const labels = labelsByEntry(steps);
@@ -543,8 +705,12 @@ function holdBackOrphans(input: PlanInput, steps: AccountStep[], rules: readonly
       .flatMap((r) => r.include.flatMap((t) => (t.entry !== undefined ? [t.entry] : []))),
   );
   for (const step of steps) {
-    if (step.kind !== 'add' || step.autoSwitchExcluded) continue;
-    if (reservedOnSource.has(step.entry) && !reservedByPlan.has(step.entry)) {
+    if (step.kind !== 'add' || step.autoSwitchExcluded || !reservedOnSource.has(step.entry)) {
+      continue;
+    }
+    if (reservedByPlan.has(step.entry)) {
+      step.awaitsRule = true;
+    } else {
       step.autoSwitchExcluded = true;
       step.heldBack = true;
     }
@@ -555,8 +721,12 @@ function holdBackOrphans(input: PlanInput, steps: AccountStep[], rules: readonly
  * The setting steps. Each name must be a setting this build persists, must not be the relay (it is
  * paired to each machine) or name a path (a path on another machine means nothing here), and its
  * value must pass the same check `cctl settings set` makes. A value equal to the one stored here is
- * left alone; a different one stored here is kept unless `--replace`, the way accounts and rules
- * already here are kept.
+ * left alone. A value that guards less than the one in force here (one that weakens a guard, or
+ * sends more off this machine) is never taken from a file, with or without `--replace`: the report
+ * names the command that sets it here. A
+ * different value stored here is kept unless `--replace`, the way accounts and rules already here
+ * are kept. A setting the environment here also sets (a blank value counts as unset, as the daemon
+ * reads it) is marked overridden: the file's value is not the one the daemon runs with.
  */
 function planSettings(input: PlanInput): SettingStep[] {
   const steps: SettingStep[] = [];
@@ -570,7 +740,10 @@ function planSettings(input: PlanInput): SettingStep[] {
       continue;
     }
     if (setting.name === RELAY) {
-      steps.push({ kind: 'skip', name: RELAY, reason: RELAY_REASON });
+      // Said once, however many ways the file spells the relay.
+      if (!steps.some((s) => s.name === RELAY)) {
+        steps.push({ kind: 'skip', name: RELAY, reason: RELAY_REASON });
+      }
       continue;
     }
     if (setting.kind === 'path') {
@@ -587,18 +760,30 @@ function planSettings(input: PlanInput): SettingStep[] {
       continue;
     }
     const previous = input.config?.env?.[setting.name];
+    const overridden =
+      blankAsUnset(input.env?.[setting.name]) !== undefined ? { overridden: true as const } : {};
     if (previous === checked.value) {
-      steps.push({ kind: 'same', name: setting.name, value: checked.value });
+      steps.push({ kind: 'same', name: setting.name, value: checked.value, ...overridden });
+    } else if (
+      setting.guard !== undefined &&
+      setting.guard.strength(checked.value) < setting.guard.strength(previous)
+    ) {
+      steps.push({
+        kind: 'skip',
+        name: setting.name,
+        reason:
+          `${setting.guard.what}, so it is not taken from a file; to set it here: ` +
+          `cctl settings set ${setting.alias} ${checked.value}`,
+      });
     } else if (previous !== undefined && !input.replace) {
       steps.push({ kind: 'kept', name: setting.name, value: checked.value, here: previous });
     } else {
-      const fromEnv = input.env?.[setting.name];
       steps.push({
         kind: 'set',
         name: setting.name,
         value: checked.value,
         ...(previous !== undefined ? { previous } : {}),
-        ...(fromEnv !== undefined && fromEnv !== '' ? { overridden: true as const } : {}),
+        ...overridden,
       });
     }
   }
@@ -618,7 +803,7 @@ export function planImport(input: PlanInput): ImportPlan {
   const rules = planRules(input, accounts);
   foreseeHandOffs(input, accounts, rules);
   holdBackOrphans(input, accounts, rules);
-  return { accounts, rules, settings: planSettings(input), notes };
+  return { accounts, rules, settings: planSettings(input), notes, platform: input.platform };
 }
 
 // ---------------------------------------------------------------------------
@@ -667,44 +852,59 @@ export function describeRuleExtras(step: Pick<RuleStep, 'label' | 'dropped' | 'l
   );
 }
 
-/** The scopes of a rule that is made but left out of it, each as a line. */
-export function leftOutScopeLines(step: RuleStep): string[] {
+/** The scopes of a rule that is made but left out of it, and the scopes a rule here gains, each
+ *  as a line. */
+export function scopeDetailLines(step: RuleStep): string[] {
   if (step.skip !== undefined) return [];
-  return step.scopes
-    .filter((s) => s.skip !== undefined)
-    .map((s) => `${describeScope(s)}: left out - ${safe(s.skip!)}`);
+  return [
+    ...step.scopes
+      .filter((s) => s.joins === true)
+      .map((s) => `${describeScope(s)}: joins the rule here`),
+    ...step.scopes
+      .filter((s) => s.skip !== undefined)
+      .map((s) => `${describeScope(s)}: left out - ${safe(s.skip!)}`),
+  ];
 }
 
-/** The lines under a rule's line in the plan: scopes left out of it, and what it moves. */
+/** The lines under a rule's line in the plan: scopes left out of it or joining it, and what it
+ *  moves. */
 function ruleDetailLines(step: RuleStep): string[] {
   if (step.skip !== undefined) return [];
-  return [...leftOutScopeLines(step), ...step.notes.map(safe)].map((l) => `    ${l}`);
+  return [...scopeDetailLines(step), ...step.notes.map(safe)].map((l) => `    ${l}`);
+}
+
+/** The command that hands an account kept out of auto-switch back to it, quoted for the shell. */
+export function includeCommand(label: string, platform: NodeJS.Platform): string {
+  return `cctl accounts include ${shellQuoteArg(safe(label), platform)}`;
 }
 
 /** How an added account stands with auto-switch, as a clause (empty when it is in the pool). */
-export function autoSwitchPhrase(step: Extract<AccountStep, { kind: 'add' }>): string {
+export function autoSwitchPhrase(
+  step: Extract<AccountStep, { kind: 'add' }>,
+  platform: NodeJS.Platform,
+): string {
   if (step.heldBack === true) {
     return (
       ', kept out of auto-switch (the rule it is reserved to is not made here; ' +
-      `cctl accounts include ${safe(step.label)} lets auto-switch use it)`
+      `${includeCommand(step.label, platform)} lets auto-switch use it)`
     );
   }
   return step.autoSwitchExcluded ? ', excluded from auto-switch' : '';
 }
 
 /** What an account step will do, as a phrase. */
-function describeAccountStep(step: AccountStep): string {
+function describeAccountStep(step: AccountStep, platform: NodeJS.Platform): string {
   switch (step.kind) {
     case 'add':
       return (
         `${safe(step.label)}: add, ${step.withTokens ? 'with its tokens' : 'waiting for a login (no tokens in the file)'}` +
-        autoSwitchPhrase(step) +
+        autoSwitchPhrase(step, platform) +
         (step.renamedFrom !== undefined
           ? ` (the label "${safe(step.renamedFrom)}" is taken here)`
           : '')
       );
     case 'skip':
-      return `${safe(step.existing.label)}: ${step.reason} - left as it is`;
+      return `${safe(step.existing.label)}: ${safe(step.reason)} - left as it is`;
     case 'replace':
       return (
         `${safe(step.existing.label)}: already stored here - its tokens are replaced if the file's ` +
@@ -721,8 +921,16 @@ export function keptSettingLine(step: Extract<SettingStep, { kind: 'kept' }>): s
   );
 }
 
-/** The clause a saved setting the environment overrides gets. */
+/** The clause a setting the environment overrides gets. */
 export const OVERRIDDEN_CLAUSE = ' (the environment here sets it, and wins)';
+
+/** The line for a setting already set here to the file's value. */
+export function sameSettingLine(step: Extract<SettingStep, { kind: 'same' }>): string {
+  return (
+    `${step.name}=${safe(step.value)}: already set` +
+    (step.overridden === true ? OVERRIDDEN_CLAUSE : '')
+  );
+}
 
 /** What a setting step will do, as a phrase. */
 function describeSettingStep(step: SettingStep): string {
@@ -734,7 +942,7 @@ function describeSettingStep(step: SettingStep): string {
         (step.overridden === true ? OVERRIDDEN_CLAUSE : '')
       );
     case 'same':
-      return `${step.name}=${safe(step.value)}: already set`;
+      return sameSettingLine(step);
     case 'kept':
       return keptSettingLine(step);
     case 'skip':
@@ -747,7 +955,8 @@ function describeRulePlan(step: RuleStep): string {
   const where = describeRuleStep(step);
   if (step.skip !== undefined) return `${where}: skipped - ${safe(step.skip)}`;
   const verb = step.into !== undefined ? 'add to the rule here' : 'create';
-  return `${where}: ${verb}, ${describeMembers(step)}${describeRuleExtras(step)}`;
+  const members = describeMembers(step);
+  return `${where}: ${verb}${members !== '' ? `, ${members}` : ''}${describeRuleExtras(step)}`;
 }
 
 /** The plan in full, as `--dry-run` prints it: one line per rule (however many scopes it has). */
@@ -755,7 +964,7 @@ export function renderImportPlan(plan: ImportPlan): string {
   const lines: string[] = plan.notes.map(safe);
   lines.push('Accounts:');
   if (plan.accounts.length === 0) lines.push('  (none in the file)');
-  for (const step of plan.accounts) lines.push(`  ${describeAccountStep(step)}`);
+  for (const step of plan.accounts) lines.push(`  ${describeAccountStep(step, plan.platform)}`);
   lines.push('Rules:');
   if (plan.rules.length === 0) lines.push('  (none in the file)');
   for (const step of plan.rules) {

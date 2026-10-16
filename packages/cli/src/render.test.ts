@@ -48,6 +48,24 @@ describe('renderAccountsTable', () => {
     expect(out).toContain(']52;c;AAAAa@b.c');
   });
 
+  it('prints a billing type holding terminal controls as plain text', () => {
+    // The BILLING cell shows an unknown billing type as it is; a row stored before imports were
+    // checked (or written by a provider) may hold anything.
+    const esc = String.fromCharCode(27);
+    for (const billingType of [`${esc}]52;c;QUE=${String.fromCharCode(7)}`, `${esc}[2J${esc}[3J`]) {
+      const out = renderAccountsTable([acct('id-1', 'w', { billingType })], null);
+      expect(out).not.toContain(esc);
+      expect(out).not.toContain(String.fromCharCode(7));
+    }
+    const rlo = String.fromCharCode(0x202e);
+    expect(renderAccountsTable([acct('id-1', 'w', { billingType: `${rlo}evil` })], null)).toContain(
+      'evil',
+    );
+    expect(
+      renderAccountsTable([acct('id-1', 'w', { billingType: `${rlo}evil` })], null),
+    ).not.toContain(rlo);
+  });
+
   it('prompts to add when empty', () => {
     expect(renderAccountsTable([], null)).toMatch(/No accounts yet/);
   });

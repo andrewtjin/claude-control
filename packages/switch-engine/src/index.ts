@@ -79,6 +79,7 @@ export {
   MAX_RULE_ALIASES,
   MAX_ALIAS_LENGTH,
   MAX_RESERVED_ACCOUNTS,
+  ACCOUNT_ID_PATTERN,
   needsMetadataBackfill,
   type DedupeReport,
   type NewRuleOptions,
@@ -88,6 +89,7 @@ export {
 // and the daemon decide with exactly the engine's rules.
 export {
   allSlots,
+  assignDistinct,
   availableInOrder,
   exactFolderRule,
   exactAliasRule,
@@ -177,6 +179,7 @@ export { AuditLog, type AuditEntry, type SwitchOrigin } from './audit.js';
 export {
   SwitchEngine,
   DEFAULT_MIN_SWITCH_INTERVAL_MS,
+  importIdentityRefusal,
   type SwitchEngineOptions,
   type ActivateOptions,
   type BindFs,

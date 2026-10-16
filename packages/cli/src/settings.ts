@@ -132,7 +132,7 @@ function envSource(overridden: boolean): SettingSource {
 /** A blank or whitespace-only override is an ABSENT one. Without this, `CCTL_RELAY_URL=` in a
  *  shell profile or an unsubstituted `--relay "$UNSET"` wins a `??` chain with '' and the
  *  daemon dials nothing — the same typo-tolerance envNumber applies to numbers. */
-function blankAsUnset(value: string | undefined): string | undefined {
+export function blankAsUnset(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed === undefined || trimmed === '' ? undefined : trimmed;
 }
@@ -167,7 +167,21 @@ export interface DaemonEnvSetting {
    *  equal to any env var name, so a ref can only ever mean one setting. */
   alias: string;
   kind: SettingKind;
+  /** For a setting that guards something: how strongly a value (undefined: none set, so the
+   *  default) guards it, higher being safer, and what a weaker value does. An import never takes a
+   *  value from a file that guards less than the one in force here. */
+  guard?: { strength: (value: string | undefined) => number; what: string };
 }
+
+/** A guard's strength for a bool setting whose safe side is `safe` (and its default): 1 unless the
+ *  value reads as the other side (see envBool). */
+const boolGuard =
+  (safe: boolean) =>
+  (value: string | undefined): number =>
+    envBool({ value }, 'value') === !safe ? 0 : 1;
+
+/** The folder guard's modes, weakest first. */
+const BIND_ENFORCE_STRENGTH = ['off', 'warn', 'block'] as const;
 
 /** Every daemon knob `cctl settings set` may persist. Names match the `detail` column of the
  *  daemon rows one for one (a test holds the two lists together), so `cctl settings` doubles
@@ -188,8 +202,24 @@ export const DAEMON_ENV_SETTINGS: readonly DaemonEnvSetting[] = [
   { name: 'CCTL_PERMISSION_HOLD_MS', alias: 'permission-hold', kind: 'number' },
   { name: 'CCTL_QUESTION_HOLD_MS', alias: 'question-hold', kind: 'number' },
   { name: 'CCTL_COMMAND_OUTPUT', alias: 'command-output', kind: 'bool' },
-  { name: 'CCTL_IDENTITY_CHECK', alias: 'identity-check', kind: 'bool' },
-  { name: 'CCTL_TOOL_OUTPUT_FULL', alias: 'full-output', kind: 'bool' },
+  {
+    name: 'CCTL_IDENTITY_CHECK',
+    alias: 'identity-check',
+    kind: 'bool',
+    guard: {
+      strength: boolGuard(true),
+      what: 'it turns off the check that each stored token belongs to its account',
+    },
+  },
+  {
+    name: 'CCTL_TOOL_OUTPUT_FULL',
+    alias: 'full-output',
+    kind: 'bool',
+    guard: {
+      strength: boolGuard(false),
+      what: "it sends each tool's complete output to the phone, not an excerpt",
+    },
+  },
   { name: RELAY_ENV_NAME, alias: 'relay', kind: 'url' },
   { name: 'CCTL_LOG_LEVEL', alias: 'log-level', kind: 'log-level' },
   { name: 'CCTL_PROBE_UNKNOWN', alias: 'probe-unknown', kind: 'bool' },
@@ -198,7 +228,15 @@ export const DAEMON_ENV_SETTINGS: readonly DaemonEnvSetting[] = [
   { name: 'CCTL_AUTO_CONTINUE_MAX', alias: 'auto-continue-max', kind: 'number' },
   { name: 'CCTL_LOG_FORMAT', alias: 'log-format', kind: 'log-format' },
   { name: 'CCTL_LOG_FILE', alias: 'log-file', kind: 'path' },
-  { name: 'CCTL_BIND_ENFORCE', alias: 'bind-enforce', kind: 'bind-enforce' },
+  {
+    name: 'CCTL_BIND_ENFORCE',
+    alias: 'bind-enforce',
+    kind: 'bind-enforce',
+    guard: {
+      strength: (value) => BIND_ENFORCE_STRENGTH.indexOf(parseBindEnforce(value) ?? 'block'),
+      what: 'it weakens the folder guard, which blocks a session on an account its rule rules out',
+    },
+  },
 ];
 
 /** Look a setting up by alias or env var name, case-insensitively and with `_`/`-` read as

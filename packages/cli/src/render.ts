@@ -42,14 +42,16 @@ export function renderAccountsTable(
 ): string {
   if (accounts.length === 0) return 'No accounts yet. Add one with: cctl accounts add <label>';
 
-  // The label and the email are printed as stored. Neither is trusted to be plain: an email comes
-  // from a login's identity block or an import file, and a row may predate label sanitizing.
+  // No stored text is trusted to be plain: the email and the billing type come from a login's
+  // identity block or an import file (the billing cell shows an unknown type as it is), and a row
+  // may predate label sanitizing. Every cell built from a row is sanitized, as the reserved-accounts
+  // table does.
   const rows = accounts.map((a) => ({
     active: a.id === activeId ? '*' : ' ',
     label: sanitizeForTerminal(a.label),
     email: sanitizeForTerminal(a.emailAddress ?? '-'),
-    plan: planLabel(a),
-    billing: billingLabel(a, nowMs),
+    plan: sanitizeForTerminal(planLabel(a)),
+    billing: sanitizeForTerminal(billingLabel(a, nowMs)),
     // Quarantine wins when both apply: it is the reason the account CANNOT be used, which
     // outranks the operator's choice about where auto-switch may go.
     status: a.quarantined ? 'quarantined' : a.autoSwitchExcluded ? 'excluded' : 'ok',

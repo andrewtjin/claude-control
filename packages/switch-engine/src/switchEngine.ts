@@ -63,6 +63,7 @@ import {
   folderUniquenessKey,
   isWellFormedText,
   isWithin,
+  shellQuoteArg,
 } from './folderPath.js';
 import { projectDirMatches, recordedFolderFor } from './recordedFolder.js';
 import { sanitizeTerminalText } from './terminalSafe.js';
@@ -102,6 +103,7 @@ import type {
   AccountView,
   ActivateResult,
   AddAccountOptions,
+  AddPendingAccountOptions,
   ClaudeOauth,
   CredentialBundle,
   ExcludeResult,
@@ -134,6 +136,8 @@ import type {
 } from './types.js';
 import {
   MAX_ALIAS_LENGTH,
+  MAX_RESERVED_ACCOUNTS,
+  MAX_RULES,
   needsMetadataBackfill,
   Vault,
   type DedupeReport,
@@ -569,6 +573,48 @@ function reloginIdentityRefusal(
 }
 
 /**
+ * Why credentials an import file brings may not replace the ones stored for `existing`, as a
+ * clause, or undefined when they may. Stricter than a re-login's check
+ * ({@link reloginIdentityRefusal}): there the provider has just answered for the tokens, so a
+ * partial identity that contradicts nothing is believed; a file vouches only for itself, so the
+ * tokens' own identity block has to PROVE they are this login. A row with a login (uuid) needs a
+ * block naming that same login. A row without one needs a block that echoes every anchor the row
+ * has, and a row with no anchor at all has nothing to check against, so it is refused too. The
+ * import planner calls this as well, so its dry run skips exactly what this refuses.
+ */
+export function importIdentityRefusal(
+  existing: Pick<StoredAccount, IdentityAnchor>,
+  brought: OauthAccount | undefined,
+): string | undefined {
+  if (brought === undefined) return "the file's tokens do not say which login they belong to";
+  const claimed = (key: IdentityAnchor): string | undefined => anchorValue(brought[key]);
+  if (existing.accountUuid !== undefined) {
+    const uuid = claimed('accountUuid');
+    if (uuid === undefined) return "the file's tokens do not name the login they belong to";
+    return uuid === existing.accountUuid
+      ? undefined
+      : `the file's tokens belong to another login (${uuid})`;
+  }
+  const anchors = IDENTITY_ANCHORS.filter((key) => existing[key] !== undefined);
+  if (anchors.length === 0) {
+    return "the account stored here records no login to check the file's tokens against";
+  }
+  const unmatched = anchors.filter((key) => claimed(key) !== existing[key]);
+  if (unmatched.length === 0) return undefined;
+  return `the file's tokens do not show the ${unmatched.join('/')} stored here`;
+}
+
+/** The identity anchors a row holds, as an identity block. */
+function rowAnchors(row: Pick<StoredAccount, IdentityAnchor>): OauthAccount {
+  const out: OauthAccount = {};
+  for (const key of IDENTITY_ANCHORS) {
+    const value = row[key];
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
+/**
  * The per-slot IO surface, derived purely from a {@link SlotId} (no vault read).
  *
  * A slot is one credential seat: a live-credential location, plus the crash-recovery state that
@@ -838,7 +884,7 @@ export class SwitchEngine {
   addPendingAccount(
     label: string,
     identity: AccountIdentity,
-    opts: Pick<AddAccountOptions, 'autoSwitchExcluded'> = {},
+    opts: AddPendingAccountOptions = {},
   ): Promise<StoredAccount> {
     return this.withCredentialLock(async () => {
       const account = await this.vault.addPendingAccount(
@@ -876,22 +922,41 @@ export class SwitchEngine {
       const untrusted = await this.settleForAccountsLocked([accountId]);
       const existing = await this.vault.getAccount(accountId);
       if (!existing) throw new UnknownAccountError(accountId);
+      const refusal = importIdentityRefusal(existing, bundle.oauthAccount);
+      if (refusal !== undefined) {
+        throw new RefreshError(
+          `the tokens were not replaced: ${refusal}`,
+          'relogin_identity_mismatch',
+        );
+      }
       // Read before anything is written, for the reason reloginFromConfigDirLocked gives.
       const liveSlot = await this.liveSlotOf(accountId);
       await this.adoptLiveRotationOf(accountId, untrusted);
       let reason: ImportBundleResult['reason'];
+      let stored: CredentialBundle | undefined;
       if (existing.quarantined) {
         reason = 'quarantined';
+        // Read only for its identity block below: a dead login's copy that cannot be read costs
+        // nothing, so it does not hold the import up.
+        stored = await this.readStoredForImport(existing).catch(() => undefined);
       } else {
-        const stored = await this.readStoredForImport(existing);
+        stored = await this.readStoredForImport(existing);
         if (stored === undefined) reason = 'missing';
         else if (bundle.claudeAiOauth.expiresAt > stored.claudeAiOauth.expiresAt) reason = 'newer';
         else return { replaced: false, reason: 'stored_newer', healedLiveLogin: false };
       }
+      // The brought block is laid over what is known here (the row's anchors, then the stored
+      // block), so a replace never shrinks the identity the vault and the live files carry: a file
+      // whose block names only the login cannot erase the email or organization stored here.
+      const identity: OauthAccount = {
+        ...rowAnchors(existing),
+        ...stored?.oauthAccount,
+        ...bundle.oauthAccount,
+      };
       const { healedLiveLogin } = await this.applyReloginBundle(
         existing,
         bundle.claudeAiOauth,
-        bundle.oauthAccount,
+        identity,
         liveSlot,
         bundle.oauthAccount,
       );
@@ -912,7 +977,7 @@ export class SwitchEngine {
       throw new VaultError(
         `could not read the tokens stored for "${existing.label}" (${errorReason(err)}), so they ` +
           "were not compared with the file's; nothing was replaced - try again, or log it in again " +
-          `with cctl accounts relogin ${existing.label}`,
+          `with cctl accounts relogin ${shellQuoteArg(existing.label, this.platform)}`,
         { cause: err },
       );
     }
@@ -1481,20 +1546,24 @@ export class SwitchEngine {
 
   /**
    * Rebuild rules brought from another machine (`cctl import`), each WHOLE: one rule per spec with
-   * every one of its scopes, or the spec's members added to the existing rule that holds exactly
-   * those scopes. Done as one batch under one lock, because the per-scope verbs, run rule after rule,
+   * every one of its scopes, or the spec's members (and the scopes it lacks) added to an existing
+   * rule whose scopes are all among the spec's: the rule an earlier, part-way import of the same
+   * rule made, which is grown rather than split from. Done as one batch under one lock, because the
+   * per-scope verbs, run rule after rule,
    * cannot rebuild what the source had: each seats its slot at once, so an earlier rule's slot can
    * take an account a later rule includes (which that include then refuses), and an exclusion the
    * source keeps on record for an account another rule reserves can no longer be made once that
    * reservation exists. Here, in order:
-   *   1. every spec's refusals run first (scopes, caps, the target rule still holding exactly its
-   *      scopes, an exclusion that would empty a slot sessions run in); a refused spec is reported
-   *      and the rest go on.
+   *   1. every spec's refusals run first (scopes, caps, the target rule still holding only scopes of
+   *      the spec, an exclusion that would empty a slot sessions run in); a refused spec is reported
+   *      and the rest go on. The rule cap and the reserved-account cap are counted over the batch in
+   *      spec order, so a spec that passes here is never refused for them half-way through step 3.
    *   2. hand off every slot that holds an account some spec reserves and may not keep it — all of
    *      them chosen together. A spec whose reservation would leave some slot with nothing is refused
    *      (its own refusal), and the choice is made again without it.
-   *   3. write every exclusion, then every inclusion: an account a later rule reserves is still
-   *      shared while the exclusions are written, as it was on the source when they were made.
+   *   3. add the scopes a grown rule lacks, then write every exclusion, then every inclusion: an
+   *      account a later rule reserves is still shared while the exclusions are written, as it was
+   *      on the source when they were made.
    *   4. seat each written rule's slot, once every reservation is in place, so no slot is given an
    *      account another rule of the batch includes.
    *   5. write the guard snapshot LAST.
@@ -1524,11 +1593,27 @@ export class SwitchEngine {
       await this.settleForAccountsLocked(allIds);
       const picture = await this.vault.readPicture();
 
-      // 1. Refusals, before anything moves.
+      // 1. Refusals, before anything moves. The caps count what the specs before this one add.
+      let creates = 0;
+      const reservedByBatch = new Set<string>();
       for (const [i, spec] of specs.entries()) {
         if (!open(i)) continue;
         try {
+          if (spec.intoRuleId === undefined && picture.rules.length + creates >= MAX_RULES) {
+            throw new VaultError(`cannot create another folder rule (max ${MAX_RULES})`);
+          }
+          const reserving = spec.include.filter(
+            (id) => picture.shared.some((a) => a.id === id) && !reservedByBatch.has(id),
+          );
+          if (
+            picture.reserved.length + reservedByBatch.size + reserving.length >
+            MAX_RESERVED_ACCOUNTS
+          ) {
+            throw new VaultError(`cannot reserve more than ${MAX_RESERVED_ACCOUNTS} accounts`);
+          }
           await this.checkImportSpecLocked(spec, scopes[i]!, picture);
+          if (spec.intoRuleId === undefined) creates += 1;
+          for (const id of reserving) reservedByBatch.add(id);
         } catch (err) {
           refuse(i, err);
         }
@@ -1558,9 +1643,19 @@ export class SwitchEngine {
       }
       const handedOff = await this.executeHandOffLocked(steps);
 
-      // 3. Exclusions, then inclusions.
+      // 3. The scopes a grown rule lacks, then exclusions, then inclusions.
       const ruleIds = specs.map((spec) => spec.intoRuleId);
       const created = new Set<number>();
+      for (const [i, spec] of specs.entries()) {
+        const rule = picture.rules.find((r) => r.id === spec.intoRuleId);
+        const lacking = rule !== undefined ? this.scopesLacking(rule, scopes[i]!) : undefined;
+        if (!open(i) || lacking === undefined || lacking.length === 0) continue;
+        try {
+          await this.vault.addScopesToRule(rule!.id, newRuleScopes(lacking));
+        } catch (err) {
+          refuse(i, err);
+        }
+      }
       for (const verb of ['exclude', 'include'] as const) {
         for (const [i, spec] of specs.entries()) {
           const ids = spec[verb];
@@ -1639,9 +1734,11 @@ export class SwitchEngine {
       return;
     }
     const rule = picture.rules.find((r) => r.id === spec.intoRuleId);
-    if (!rule || !this.holdsExactly(rule, scopes)) {
+    const lacking = rule !== undefined ? this.scopesLacking(rule, scopes) : undefined;
+    if (!rule || lacking === undefined) {
       throw new VaultError('the rule here changed while the import ran; run it again');
     }
+    if (lacking.length > 0) await this.vault.checkAddScopes(rule.id, newRuleScopes(lacking));
     await this.vault.checkInclude(rule.id, spec.include);
     await this.vault.checkExclude(rule.id, spec.exclude);
     const slotId = ruleSlotId(rule.id);
@@ -1664,8 +1761,13 @@ export class SwitchEngine {
     }
   }
 
-  /** Whether `rule` holds exactly `scopes` — no more, no fewer — by the store's uniqueness keys. */
-  private holdsExactly(rule: FolderRule, scopes: readonly RuleScopeRef[]): boolean {
+  /** The scopes of `scopes` that `rule` does not hold yet, or undefined when the rule holds one
+   *  that is not among them (it is then not the rule `scopes` describe). By the store's uniqueness
+   *  keys. */
+  private scopesLacking(
+    rule: FolderRule,
+    scopes: readonly RuleScopeRef[],
+  ): RuleScopeRef[] | undefined {
     const keyOf = (scope: RuleScopeRef): string =>
       scope.kind === 'folder'
         ? `f\u0000${folderUniquenessKey(scope.folder, this.platform)}`
@@ -1675,7 +1777,8 @@ export class SwitchEngine {
       ...(rule.aliases ?? []).map((a) => keyOf({ kind: 'alias', ...a })),
     ]);
     const want = new Set(scopes.map(keyOf));
-    return have.size === want.size && [...want].every((k) => have.has(k));
+    if ([...have].some((k) => !want.has(k))) return undefined;
+    return scopes.filter((scope) => !have.has(keyOf(scope)));
   }
 
   /**

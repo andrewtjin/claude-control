@@ -342,7 +342,7 @@ describe('describeInclude', () => {
       },
     );
     expect(out).toContain('no working account');
-    expect(out).toContain('the login of E expired; re-login one: cctl accounts relogin E');
+    expect(out).toContain("the login of E expired; re-login one: cctl accounts relogin 'E'");
   });
 
   it('flags a quarantined account kept live for want of another', () => {

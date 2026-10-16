@@ -134,7 +134,8 @@ export function nothingUsableReason(
   if (dead.length > 0) {
     const names = dead.map((e) => sanitizeForTerminal(e.label));
     parts.push(
-      `the login of ${names.join(', ')} expired; re-login one: cctl accounts relogin ${names[0]}`,
+      `the login of ${names.join(', ')} expired; re-login one: ` +
+        `cctl accounts relogin ${shellQuote(names[0]!)}`,
     );
   }
   return parts.join('; ');
@@ -204,7 +205,9 @@ export function describeSlotLive(
   }
   const name = sanitizeForTerminal(live.label);
   if (live.quarantined) {
-    return palette.red(`${name} (quarantined; re-login it: cctl accounts relogin ${name})`);
+    return palette.red(
+      `${name} (quarantined; re-login it: cctl accounts relogin ${shellQuote(name)})`,
+    );
   }
   if (live.source === 'outside') {
     return palette.yellow(`${name} (not in this pool any more; the daemon moves the slot off it)`);

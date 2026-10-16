@@ -316,3 +316,152 @@ describe('parseExportPayload: what a crafted file cannot carry', () => {
     expect(refusal(p)).toContain('more than 64');
   });
 });
+
+describe('parseExportPayload: every string a row or the screen can get is plain text', () => {
+  const ESC = String.fromCharCode(27);
+  const BEL = String.fromCharCode(7);
+  const C1_CSI = String.fromCharCode(0x9b);
+  const RLO = String.fromCharCode(0x202e);
+
+  /** A payload whose first account's tokens carry `extra` in their identity block. */
+  function withIdentity(extra: Record<string, unknown>): ExportPayload {
+    const p = payload();
+    Object.assign(p.accounts[0]!.bundle!.oauthAccount!, extra);
+    return p;
+  }
+
+  it('refuses a control in any field of the identity block, not only the login and email', () => {
+    for (const bad of [
+      `${ESC}]52;c;QUE=${BEL}`,
+      `${ESC}[2J${ESC}[3J`,
+      `${C1_CSI}2J`,
+      `${RLO}evil`,
+    ]) {
+      for (const key of [
+        'billingType',
+        'organizationRateLimitTier',
+        'subscriptionCreatedAt',
+        'claudeCodeTrialEndsAt',
+        'organizationName',
+        'displayName',
+      ]) {
+        expect(refusal(withIdentity({ [key]: bad }))).toContain(
+          `accounts[0].bundle.oauthAccount.${key} holds a control or bidirectional character`,
+        );
+      }
+    }
+  });
+
+  it('refuses one nested inside the identity block too', () => {
+    expect(refusal(withIdentity({ onboarding: { flags: [`x${ESC}[31m`] } }))).toContain(
+      'oauthAccount.onboarding.flags[0] holds a control',
+    );
+  });
+
+  it('refuses a control in the plan fields and scopes of the token block', () => {
+    for (const key of ['subscriptionType', 'rateLimitTier']) {
+      const p = payload();
+      (p.accounts[0]!.bundle!.claudeAiOauth as unknown as Record<string, unknown>)[key] =
+        `max${ESC}[2J`;
+      expect(refusal(p)).toContain(`claudeAiOauth.${key} holds a control`);
+    }
+    const p = payload();
+    p.accounts[0]!.bundle!.claudeAiOauth.scopes = [`user:inference${ESC}[2J`];
+    expect(refusal(p)).toContain('claudeAiOauth.scopes[0] holds a control');
+  });
+
+  it('keeps plain text that only looks unusual: a right-to-left name, an emoji with joiners', () => {
+    const p = withIdentity({
+      organizationName: 'שלום',
+      displayName: 'family 👨‍👩‍👧',
+      billingType: 'apple_subscription',
+    });
+    expect(parseExportPayload(JSON.stringify(p)).accounts[0]!.bundle!.oauthAccount).toMatchObject({
+      organizationName: 'שלום',
+      displayName: 'family 👨‍👩‍👧',
+    });
+  });
+});
+
+describe('the plan facts of an account that travels without tokens', () => {
+  const pending = account('2c9a1f04-5b7e-4c2a-9d3e-111111111111', 'away', {
+    accountUuid: 'u-away',
+    subscriptionType: 'max',
+    rateLimitTier: 'default_claude_max_20x',
+    organizationRateLimitTier: 'org_tier',
+    billingType: 'stripe_subscription',
+    subscriptionCreatedAt: '2026-01-02T00:00:00Z',
+  });
+
+  it('carries them, and its id, and reads them back', () => {
+    const p = buildExportPayload({
+      accounts: [pending],
+      bundles: new Map(),
+      rules: [],
+      allAccounts: [pending],
+      config: undefined,
+      nowMs: 1,
+      cctlVersion: '1.1.0',
+      platform: 'linux',
+    });
+    expect(p.accounts[0]).toEqual({
+      label: 'away',
+      id: '2c9a1f04-5b7e-4c2a-9d3e-111111111111',
+      accountUuid: 'u-away',
+      plan: {
+        subscriptionType: 'max',
+        rateLimitTier: 'default_claude_max_20x',
+        organizationRateLimitTier: 'org_tier',
+        billingType: 'stripe_subscription',
+        subscriptionCreatedAt: '2026-01-02T00:00:00Z',
+      },
+      autoSwitchExcluded: false,
+    });
+    expect(parseExportPayload(JSON.stringify(p)).accounts[0]).toEqual(p.accounts[0]);
+  });
+
+  it('refuses a plan field that is not one, or that is not plain text', () => {
+    const p = payload();
+    p.accounts[1]!.plan = { billingType: `x${String.fromCharCode(27)}[2J` };
+    expect(refusal(p)).toContain('accounts[1].plan.billingType holds a control');
+    const q = payload() as unknown as { accounts: Array<Record<string, unknown>> };
+    q.accounts[1]!['plan'] = { accessToken: 'smuggled' };
+    expect(refusal(q)).toContain('accounts[1].plan has a field accessToken');
+  });
+});
+
+describe('parseExportPayload: account ids', () => {
+  it('refuses an id that is not a uuid (it names a file here) or one listed twice', () => {
+    const p = payload();
+    p.accounts[0]!.id = '../../evil';
+    expect(refusal(p)).toContain('accounts[0].id is not an account id');
+    const q = payload();
+    q.accounts[0]!.id = '2c9a1f04-5b7e-4c2a-9d3e-111111111111';
+    q.accounts[1]!.id = '2c9a1f04-5b7e-4c2a-9d3e-111111111111';
+    expect(refusal(q)).toContain('is listed twice');
+  });
+});
+
+describe('parseExportPayload: what all the rules together may hold', () => {
+  it('refuses rules whose scopes together pass the bound, though each rule is within its own', () => {
+    const p = payload();
+    const aliases = Array.from({ length: 200 }, (_, j) => ({ folder: '/p', alias: `s${j}` }));
+    p.rules = Array.from({ length: 6 }, (_, r) => ({
+      ...p.rules[0]!,
+      folders: [`/r${r}`],
+      aliases: aliases.map((a) => ({ ...a, alias: `${a.alias}-${r}` })),
+    }));
+    expect(refusal(p)).toContain(
+      `the rules hold more than ${PAYLOAD_LIMITS.scopes} folders and session aliases in all`,
+    );
+  });
+
+  it('takes rules up to the bound', () => {
+    const p = payload();
+    p.rules = Array.from({ length: 4 }, (_, r) => ({
+      ...p.rules[0]!,
+      folders: Array.from({ length: PAYLOAD_LIMITS.scopes / 4 }, (_x, j) => `/r${r}/${j}`),
+    }));
+    expect(parseExportPayload(JSON.stringify(p)).rules).toHaveLength(4);
+  });
+});

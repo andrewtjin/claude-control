@@ -25,6 +25,7 @@ import {
 import { CliFailure } from './context.js';
 import { SCRYPT_LIMITS, sealExport } from './exportEnvelope.js';
 import { shellQuote } from './folderRender.js';
+import { renderAccountsTable } from './render.js';
 import {
   ONE_MACHINE_WARNING,
   readCapped,
@@ -1191,6 +1192,7 @@ describe('accounts brought by a file', () => {
         accounts: [
           {
             label: 'nb',
+            id: '0b0b0b0b-0000-4000-8000-000000000001',
             accountUuid: 'u-nb',
             autoSwitchExcluded: false,
             bundle: {
@@ -1201,7 +1203,7 @@ describe('accounts brought by a file', () => {
               },
             },
           },
-          { label: 'anon', autoSwitchExcluded: false },
+          { label: 'anon', id: '0b0b0b0b-0000-4000-8000-000000000002', autoSwitchExcluded: false },
         ],
       }),
     );
@@ -1295,5 +1297,553 @@ describe('accounts brought by a file', () => {
     const msg = await refusal(runExport(join(a.root, 'f'), exportAll, a.deps));
     expect(msg).toContain('another cctl process');
     expect(msg).not.toContain('--accounts');
+  });
+});
+
+describe('what a file cannot plant in the accounts list', () => {
+  const ESC = String.fromCharCode(27);
+
+  it('refuses a billing type, or any identity field, holding terminal controls', async () => {
+    for (const [key, value] of [
+      ['billingType', `${ESC}]52;c;QUE=${String.fromCharCode(7)}`],
+      ['billingType', `${ESC}[2J${ESC}[3J`],
+      ['organizationName', `${String.fromCharCode(0x202e)}evil`],
+    ] as const) {
+      const b = await machine();
+      const entry = {
+        label: 'w',
+        accountUuid: 'u-w',
+        autoSwitchExcluded: false,
+        bundle: { ...bundle('W1', 'u-w'), oauthAccount: { accountUuid: 'u-w', [key]: value } },
+      };
+      const file = await sealedFile(b, filePayload({ accounts: [entry] }));
+      expect(await refusal(importInto(b, file))).toContain(
+        `accounts[0].bundle.oauthAccount.${key} holds a control or bidirectional character`,
+      );
+      expect(await b.engine.listAllAccounts()).toEqual([]);
+    }
+  });
+});
+
+describe('--replace takes only tokens that prove the login', () => {
+  /** Machine b with 'x' (a full identity) live on its main login, and a file whose entry for x
+   *  carries later tokens with `block` as their identity. */
+  async function setUp(
+    block: Record<string, unknown>,
+  ): Promise<{ b: Machine; id: string; file: string }> {
+    const b = await machine();
+    const full = bundle('X1', 'u-x', Date.now() + HOUR);
+    full.oauthAccount!.organizationUuid = 'org-x';
+    const x = await b.engine.addAccount('x', full);
+    await b.engine.activate(x.id);
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: [
+          {
+            label: 'x',
+            accountUuid: 'u-x',
+            autoSwitchExcluded: false,
+            bundle: {
+              claudeAiOauth: {
+                accessToken: 'Y1',
+                refreshToken: 'r-Y1',
+                expiresAt: Date.now() + 9 * HOUR,
+              },
+              oauthAccount: block,
+            },
+          },
+        ],
+      }),
+    );
+    return { b, id: x.id, file };
+  }
+
+  it('leaves the stored and live login alone for a block that does not name it', async () => {
+    for (const block of [
+      {},
+      { accountUuid: 42 },
+      { emailAddress: 'u-x@x.com' },
+      { displayName: 'Y' },
+    ]) {
+      const { b, id, file } = await setUp(block);
+      expect(await importInto(b, file, { replace: true })).toEqual({ failed: 0 });
+      expect(b.out.join('')).toContain("the file's tokens do not name the login they belong to");
+      const stored = await b.vault.readBundle(id);
+      expect(stored.claudeAiOauth.accessToken).toBe('X1');
+      expect(stored.oauthAccount).toMatchObject({ accountUuid: 'u-x', organizationUuid: 'org-x' });
+      expect(await b.engine.getActiveId('global')).toBe(id);
+      const live = JSON.parse(await readFile(b.paths.claudeJsonPath, 'utf8')) as {
+        oauthAccount?: { accountUuid?: string };
+      };
+      expect(live.oauthAccount?.accountUuid).toBe('u-x');
+    }
+  });
+
+  it('replaces for a block naming the login, keeping the identity stored and live', async () => {
+    const { b, id, file } = await setUp({ accountUuid: 'u-x' });
+    expect(await importInto(b, file, { replace: true })).toEqual({ failed: 0 });
+    expect(b.out.join('')).toContain("x: tokens replaced (the file's were newer)");
+    expect((await b.vault.readBundle(id)).oauthAccount).toMatchObject({
+      accountUuid: 'u-x',
+      emailAddress: 'u-x@x.com',
+      organizationUuid: 'org-x',
+    });
+    const live = JSON.parse(await readFile(b.paths.claudeJsonPath, 'utf8')) as {
+      oauthAccount?: Record<string, unknown>;
+    };
+    expect(live.oauthAccount).toMatchObject({ accountUuid: 'u-x', organizationUuid: 'org-x' });
+  });
+});
+
+describe('a passphrase that cannot be typed again', () => {
+  it('refuses a passphrase file with a space before its line ending, so --move removes nothing', async () => {
+    const a = await machine({ env: {}, confirm: () => Promise.resolve(true), interactive: true });
+    await a.engine.addAccount('spare', bundle('S1', 'u-s'));
+    const work = await a.engine.addAccount('work', bundle('W1', 'u-work'));
+    const passFile = join(a.root, 'pass.txt');
+    // What `echo a long enough passphrase > pass.txt` writes in cmd.exe.
+    await writeFile(passFile, PASS + ' \r\n');
+    const file = join(a.root, 'm.cctl');
+    const msg = await refusal(
+      runExport(file, { ...exportAll, move: true, yes: true, passphraseFile: passFile }, a.deps),
+    );
+    expect(msg).toContain(`the passphrase in ${passFile} starts or ends with a space`);
+    expect(existsSync(file)).toBe(false);
+    expect((await a.engine.listAllAccounts()).map((r) => r.id)).toContain(work.id);
+  });
+
+  it('refuses one from the environment with a stray carriage return, sealing or opening', async () => {
+    const a = await machine({ env: { CCTL_EXPORT_PASSPHRASE: PASS + '\r' } });
+    await a.engine.addAccount('work', bundle('W1', 'u-work'));
+    const file = join(a.root, 'f');
+    expect(await refusal(runExport(file, exportAll, a.deps))).toContain(
+      'CCTL_EXPORT_PASSPHRASE holds a control or invisible character',
+    );
+    expect(existsSync(file)).toBe(false);
+    const b = await machine({ env: { CCTL_EXPORT_PASSPHRASE: ' ' + PASS } });
+    const sealed = await sealedFile(b, filePayload());
+    expect(await refusal(importInto(b, sealed))).toContain(
+      'CCTL_EXPORT_PASSPHRASE starts or ends with a space; nothing was imported',
+    );
+  });
+
+  it('refuses a doubled byte-order mark, and reads a file whose line ends in a bare CR', async () => {
+    const a = await machine({ env: {} });
+    await a.engine.addAccount('work', bundle('W1', 'u-work'));
+    const doubled = join(a.root, 'doubled.txt');
+    await writeFile(
+      doubled,
+      Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf, 0xef, 0xbb, 0xbf]), Buffer.from(PASS)]),
+    );
+    expect(
+      await refusal(
+        runExport(join(a.root, 'f1'), { ...exportAll, passphraseFile: doubled }, a.deps),
+      ),
+    ).toContain('holds a control or invisible character');
+    const cr = join(a.root, 'cr.txt');
+    await writeFile(cr, PASS + '\r');
+    const file = join(a.root, 'f2');
+    await runExport(file, { ...exportAll, passphraseFile: cr }, a.deps);
+    const b = await machine();
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+  });
+});
+
+describe('a rule an earlier import made part way', () => {
+  it('grows into the whole rule once its missing folder exists, never a second rule', async () => {
+    const a = await machine();
+    const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
+    const alpha = await a.engine.addAccount('alpha', bundle('A1', 'u-alpha'));
+    const eps = await a.engine.addAccount('eps', bundle('E1', 'u-eps'));
+    await a.engine.addAccount('s', bundle('S1', 'u-s'));
+    const f1 = await folder(a, 'f1');
+    const f2 = await folder(a, 'f2');
+    await a.vault.createRule({
+      folders: [f1, f2],
+      aliases: [{ folder: f1, alias: 'deploy' }],
+      include: [x.id, alpha.id],
+      exclude: [eps.id],
+      label: 'work-rule',
+    });
+    const file = join(a.root, 'f');
+    await runExport(file, exportAll, a.deps);
+
+    // Machine b has the same folders (the same paths), but f2 only after the first import.
+    const b = await machine();
+    await rm(f2, { recursive: true, force: true });
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    expect(b.out.join('')).toContain(`folder ${f2}: left out - the folder does not exist`);
+    expect(await b.engine.listRules()).toHaveLength(1);
+
+    await mkdir(f2, { recursive: true });
+    b.out.length = 0;
+    await importInto(b, file, { dryRun: true });
+    expect(b.out.join('')).toContain(`folder ${f2}: joins the rule here`);
+    expect(b.out.join('')).not.toContain(': create');
+    b.out.length = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    const rules = await b.engine.listRules();
+    expect(rules).toHaveLength(1);
+    expect(rules[0]).toMatchObject({ label: 'work-rule' });
+    expect(rules[0]!.folders).toHaveLength(2);
+    expect(rules[0]!.aliases).toHaveLength(1);
+    const xb = (await b.engine.listAllAccounts()).find((r) => r.label === 'x')!;
+    expect(rules[0]!.activeId).toBe(xb.id);
+    expect(await picture(b)).toEqual(await picture(a));
+  });
+});
+
+describe('importing the same file again', () => {
+  /** A bundle whose tokens name no login. */
+  function bare(access: string): CredentialBundle {
+    return {
+      claudeAiOauth: {
+        accessToken: access,
+        refreshToken: 'r-' + access,
+        expiresAt: Date.now() + HOUR,
+      },
+    };
+  }
+
+  it('finds an account it stored under a numbered label, though it names no login', async () => {
+    const a = await machine();
+    await a.engine.addAccount('anon', bare('F1'));
+    const file = join(a.root, 'f');
+    await runExport(file, exportAll, a.deps);
+    const b = await machine();
+    await b.engine.addAccount('anon', bundle('L1', 'u-local'));
+    for (let i = 0; i < 3; i += 1) expect(await importInto(b, file)).toEqual({ failed: 0 });
+    const rows = await b.engine.listAllAccounts();
+    expect(rows.map((r) => r.label).sort()).toEqual(['anon', 'anon (2)']);
+  });
+
+  it('finds an account whose tokens name only part of its identity', async () => {
+    const b = await machine();
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: [
+          {
+            label: 'p',
+            accountUuid: 'u-p',
+            autoSwitchExcluded: false,
+            bundle: { ...bare('P1'), oauthAccount: { emailAddress: 'p@x.com' } },
+          },
+        ],
+      }),
+    );
+    await importInto(b, file);
+    await importInto(b, file);
+    const rows = await b.engine.listAllAccounts();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ label: 'p', accountUuid: 'u-p', emailAddress: 'p@x.com' });
+  });
+
+  it('adds an account that only shares a label with one here, rather than skipping it', async () => {
+    const a = await machine();
+    await a.engine.addAccount('main', bare('FROMFILE'));
+    const file = join(a.root, 'f');
+    await runExport(file, exportAll, a.deps);
+    const b = await machine();
+    await b.engine.addAccount('main', bare('LOCAL'));
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    const rows = await b.engine.listAllAccounts();
+    expect(rows.map((r) => r.label).sort()).toEqual(['main', 'main (2)']);
+    const added = rows.find((r) => r.label === 'main (2)')!;
+    expect((await b.vault.readBundle(added.id)).claudeAiOauth.accessToken).toBe('FROMFILE');
+  });
+});
+
+describe('what the dry run promises, the real run does', () => {
+  it("skips a rule that would leave another rule's slot with no account, in both runs", async () => {
+    const a = await machine();
+    const client = await a.engine.addAccount('client', bundle('C1', 'u-client'));
+    await a.engine.includeInFolder(await folder(a, 'proj'), [client.id]);
+    const file = join(a.root, 'f');
+    await runExport(file, exportAll, a.deps);
+
+    const b = await machine();
+    const other = await b.engine.addAccount('other', bundle('O1', 'u-other'));
+    await b.engine.addAccount('client', bundle('C2', 'u-client'));
+    await b.engine.activate(other.id);
+    const side = await folder(b, 'side');
+    // The side rule excludes 'other', so its slot runs 'client', the one account left to it.
+    await b.engine.excludeInFolder(side, [other.id]);
+    const why = `including client would leave the slot of ${side} with no other account to run on`;
+    await importInto(b, file, { dryRun: true });
+    expect(b.out.join('')).toContain(why);
+    b.out.length = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    expect(b.out.join('')).toContain(why);
+    expect(await b.engine.listRules()).toHaveLength(1);
+  });
+
+  it('skips adding accounts past what one rule may include, in both runs', async () => {
+    const b = await machine();
+    const proj = await folder(b, 'proj');
+    const held: string[] = [];
+    for (let i = 0; i < 31; i += 1) {
+      held.push((await b.vault.addPendingAccount(`h${i}`, { accountUuid: `u-h${i}` }, 'w')).id);
+    }
+    await b.vault.createRule({ folders: [proj], include: held });
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: ['n0', 'n1', 'n2'].map((l) => ({
+          label: l,
+          accountUuid: `u-${l}`,
+          autoSwitchExcluded: false,
+          bundle: bundle(l.toUpperCase(), `u-${l}`),
+        })),
+        rules: [
+          {
+            label: 'r',
+            folders: [proj],
+            aliases: [],
+            include: ['u-n0', 'u-n1', 'u-n2'],
+            exclude: [],
+          },
+        ],
+      }),
+    );
+    const why = `folder ${proj}: skipped - the rule would include more than 32 accounts`;
+    await importInto(b, file, { dryRun: true });
+    expect(b.out.join('')).toContain(why);
+    b.out.length = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    expect(b.out.join('')).toContain(why);
+    expect((await b.engine.listRules())[0]!.include).toHaveLength(31);
+  });
+
+  it('skips a rule that names one account on both sides under two names, in both runs', async () => {
+    const b = await machine();
+    const proj = await folder(b, 'proj');
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: ['f', 'g'].map((l) => ({
+          label: l,
+          accountUuid: `u-${l}`,
+          autoSwitchExcluded: false,
+          bundle: bundle(l.toUpperCase(), `u-${l}`),
+        })),
+        rules: [
+          { label: 'r', folders: [proj], aliases: [], include: ['u-f', 'u-g'], exclude: ['f'] },
+        ],
+      }),
+    );
+    const why = `folder ${proj}: skipped - it both includes and excludes f`;
+    await importInto(b, file, { dryRun: true });
+    expect(b.out.join('')).toContain(why);
+    b.out.length = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    expect(b.out.join('')).toContain(why);
+    expect(await b.engine.listRules()).toEqual([]);
+  });
+});
+
+describe('settings that guard something', () => {
+  it('never saves from a file a value that weakens a guard, and says how to set it here', async () => {
+    for (const replace of [false, true]) {
+      const b = await machine();
+      const file = await sealedFile(
+        b,
+        filePayload({
+          settings: {
+            env: { 'bind-enforce': 'off', CCTL_IDENTITY_CHECK: '0', CCTL_AUTOSWITCH: 'off' },
+          },
+        }),
+      );
+      expect(await importInto(b, file, { replace })).toEqual({ failed: 0 });
+      expect((await configOf(b)).env).toEqual({ CCTL_AUTOSWITCH: 'off' });
+      const report = b.out.join('');
+      expect(report).toContain('to set it here: cctl settings set bind-enforce off');
+      expect(report).toContain('to set it here: cctl settings set identity-check 0');
+    }
+  });
+});
+
+describe('the environment over a setting already set', () => {
+  it('says the environment wins over a value the file and this machine agree on', async () => {
+    const b = await machine({ env: { CCTL_EXPORT_PASSPHRASE: PASS, CCTL_AUTOSWITCH: '1' } });
+    await writeFile(b.configPath, JSON.stringify({ env: { CCTL_AUTOSWITCH: 'off' } }));
+    const file = await sealedFile(
+      b,
+      filePayload({ settings: { env: { CCTL_AUTOSWITCH: 'off' } } }),
+    );
+    await importInto(b, file);
+    const report = b.out.join('');
+    expect(report).toContain(
+      'CCTL_AUTOSWITCH=off: already set (the environment here sets it, and wins)',
+    );
+    expect(report).toContain('A value set in the environment still wins over the file.');
+  });
+
+  it('reads a blank environment value as unset', async () => {
+    const b = await machine({ env: { CCTL_EXPORT_PASSPHRASE: PASS, CCTL_AUTOSWITCH: '  ' } });
+    const file = await sealedFile(
+      b,
+      filePayload({ settings: { env: { CCTL_AUTOSWITCH: 'off' } } }),
+    );
+    await importInto(b, file);
+    expect(b.out.join('')).toContain('CCTL_AUTOSWITCH=off: saved\n');
+  });
+});
+
+describe('accounts a rule of the file reserves', () => {
+  /** A file whose rule reserves 'client' and whose 'work' is shared. */
+  async function clientFile(): Promise<string> {
+    const a = await machine();
+    await a.engine.addAccount('work', bundle('W1', 'u-work'));
+    const client = await a.engine.addAccount('client', bundle('C1', 'u-client'));
+    await a.engine.includeInFolder(await folder(a, 'proj'), [client.id]);
+    const file = join(a.root, 'f');
+    await runExport(file, exportAll, a.deps);
+    return file;
+  }
+
+  it('hands the account back to auto-switch once its rule is made', async () => {
+    const b = await machine();
+    await importInto(b, await clientFile());
+    const row = (await b.engine.listAllAccounts()).find((r) => r.label === 'client')!;
+    expect(row.ruleIds).toHaveLength(1);
+    expect(row.autoSwitchExcluded).toBeUndefined();
+  });
+
+  it('keeps it out of auto-switch when the engine refuses its rule at run time', async () => {
+    const b = await machine();
+    b.deps.engine = engineWith(b.engine, {
+      importRules: (specs) =>
+        Promise.resolve({
+          rules: specs.map(() => ({ ok: false as const, message: 'refused here' })),
+          handedOff: [],
+        }),
+    });
+    const file = await clientFile();
+    expect((await importInto(b, file)).failed).toBe(1);
+    const row = (await b.engine.listAllAccounts()).find((r) => r.label === 'client')!;
+    expect(row.autoSwitchExcluded).toBe(true);
+    expect(b.out.join('')).toContain(
+      "client: kept out of auto-switch (the rule it is reserved to was not made here; cctl accounts include 'client' lets auto-switch use it)",
+    );
+    expect(b.out.join('')).not.toContain("cctl switch 'client'");
+  });
+
+  it('keeps it out of auto-switch when the whole batch of rules fails', async () => {
+    const b = await machine();
+    b.deps.engine = engineWith(b.engine, {
+      importRules: () => Promise.reject(new LockTimeoutError('could not acquire credential lock')),
+    });
+    await importInto(b, await clientFile());
+    const row = (await b.engine.listAllAccounts()).find((r) => r.label === 'client')!;
+    expect(row.autoSwitchExcluded).toBe(true);
+    expect(b.out.join('')).toContain('client: kept out of auto-switch');
+  });
+
+  it('quotes the command that hands it back', async () => {
+    const a = await machine();
+    const client = await a.engine.addAccount('client', bundle('C1', 'u-client'));
+    const proj = await folder(a, 'proj');
+    await a.engine.includeInFolder(proj, [client.id]);
+    const file = join(a.root, 'f');
+    await runExport(file, exportAll, a.deps);
+    await rm(proj, { recursive: true, force: true });
+    const b = await machine();
+    await b.engine.addAccount('client', bundle('L1', 'u-local'));
+    await importInto(b, file, { dryRun: true });
+    expect(b.out.join('')).toContain("cctl accounts include 'client (2)' lets auto-switch use it");
+    b.out.length = 0;
+    await importInto(b, file);
+    expect(b.out.join('')).toContain("cctl accounts include 'client (2)' lets auto-switch use it");
+  });
+});
+
+describe("the main login's hint after an import", () => {
+  it('never names an account a rule reserves', async () => {
+    const a = await machine();
+    const client = await a.engine.addAccount('client', bundle('C1', 'u-client'));
+    const personal = await a.engine.addAccount('personal', bundle('P1', 'u-personal'));
+    await a.engine.includeInFolder(await folder(a, 'proj'), [client.id]);
+    await a.vault.quarantine(personal.id, 'refresh token died');
+    const all = join(a.root, 'all');
+    const one = join(a.root, 'one');
+    await runExport(all, exportAll, a.deps);
+    await runExport(one, { ...exportAll, accounts: 'client' }, a.deps);
+    for (const file of [all, one]) {
+      const b = await machine();
+      await importInto(b, file);
+      const report = b.out.join('');
+      expect(report).not.toContain("cctl switch 'client'");
+      expect(report).toContain(
+        "Nothing is live on this machine's main login yet, and no shared account here can take it",
+      );
+      expect(report).toContain('cctl accounts add <label>');
+    }
+  });
+
+  it('names a shared account already here when the import brought none', async () => {
+    const a = await machine();
+    const client = await a.engine.addAccount('client', bundle('C1', 'u-client'));
+    await a.engine.includeInFolder(await folder(a, 'proj'), [client.id]);
+    const file = join(a.root, 'f');
+    await runExport(file, exportAll, a.deps);
+    const b = await machine();
+    await b.vault.addAccount('mine', bundle('M1', 'u-mine'));
+    await importInto(b, file);
+    expect(b.out.join('')).toContain("cctl switch 'mine'");
+  });
+});
+
+describe('an account that travels without tokens', () => {
+  it('keeps its plan, shown until its first login', async () => {
+    const a = await machine();
+    const max = bundle('W1', 'u-work');
+    max.claudeAiOauth.subscriptionType = 'max';
+    max.claudeAiOauth.rateLimitTier = 'default_claude_max_20x';
+    await a.engine.addAccount('work', max);
+    const file = join(a.root, 'f');
+    await runExport(file, { ...exportAll, tokens: false }, a.deps);
+    const b = await machine();
+    await importInto(b, file);
+    const [row] = await b.engine.listAllAccounts();
+    expect(row).toMatchObject({
+      quarantined: true,
+      subscriptionType: 'max',
+      rateLimitTier: 'default_claude_max_20x',
+    });
+    expect(renderAccountsTable(await b.engine.listAllAccounts(), null)).toContain('20x');
+  });
+});
+
+describe('a file larger than any setup', () => {
+  it('refuses rules holding too many folders in all, before looking any up', async () => {
+    let lookups = 0;
+    const b = await machine({
+      resolveFolder: (f) => {
+        lookups += 1;
+        return resolveFolderHere(f, process.platform);
+      },
+    });
+    const there = await folder(b, 'many');
+    const rules = Array.from({ length: 8 }, (_, r) => ({
+      label: `r${r}`,
+      folders: [],
+      aliases: Array.from({ length: 200 }, (_x, j) => ({ folder: there, alias: `s${r}_${j}` })),
+      include: ['u-a'],
+      exclude: [],
+    }));
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: [{ label: 'a', accountUuid: 'u-a', autoSwitchExcluded: false }],
+        rules,
+      }),
+    );
+    expect(await refusal(importInto(b, file, { dryRun: true }))).toContain(
+      'the rules hold more than 1024 folders and session aliases in all',
+    );
+    expect(lookups).toBe(0);
+    expect(await b.engine.listAllAccounts()).toEqual([]);
   });
 });

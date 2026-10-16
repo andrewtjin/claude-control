@@ -14,11 +14,12 @@ import { randomUUID } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { ruleSlotId } from './types.js';
+import { ACCOUNT_PLAN_KEYS, ruleSlotId } from './types.js';
 import type {
   AccountIdentity,
   AccountView,
   AddAccountOptions,
+  AddPendingAccountOptions,
   CredentialBundle,
   FolderRule,
   OauthAccount,
@@ -35,6 +36,7 @@ import {
   aliasKey,
   aliasScopeUniquenessKey,
   folderUniquenessKey,
+  shellQuoteArg,
 } from './folderPath.js';
 import {
   describeRuleScopes,
@@ -250,6 +252,10 @@ export const MAX_RULE_ALIASES = 256;
 export const MAX_ALIAS_LENGTH = 512;
 /** The most reserved rows `groups.json` may hold across all rules. */
 export const MAX_RESERVED_ACCOUNTS = 256;
+
+/** What an account id looks like: the lower-case uuid `randomUUID` makes. A caller-supplied id (an
+ *  import) must have this shape, since the id names the account's bundle file. */
+export const ACCOUNT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Property names that, if copied onto an object literal or used as a plain-object map key, reach
  *  through to `Object.prototype` (prototype pollution). Registry files are operator-editable and,
@@ -822,13 +828,7 @@ type IdentityKey = 'accountUuid' | 'emailAddress' | 'organizationUuid';
 
 /** Registry fields describing an account's CURRENT plan/billing state — mutable, and meaningful
  *  by their absence. See `setOrDelete`. */
-type PlanKey =
-  | 'subscriptionType'
-  | 'rateLimitTier'
-  | 'organizationRateLimitTier'
-  | 'billingType'
-  | 'subscriptionCreatedAt'
-  | 'claudeCodeTrialEndsAt';
+type PlanKey = (typeof ACCOUNT_PLAN_KEYS)[number];
 
 /** Every field below is copied out of upstream JSON that nothing validates (`oauthAccount` is an
  *  open index-signature block read straight off `~/.claude.json`), so a value of any JSON type
@@ -1645,6 +1645,71 @@ export class Vault {
     return rule;
   }
 
+  /**
+   * Add scopes to an existing rule: folders and session aliases it does not hold yet, which no other
+   * rule holds either (an import growing the rule an earlier, part-way import of the same rule made,
+   * so the rule stays one slot rather than being split into two). The same checks a new rule's
+   * scopes get, plus the rule's scope caps. One groups.json write, nothing when there is nothing to
+   * add.
+   */
+  async addScopesToRule(
+    ruleId: string,
+    scopes: { folders: readonly string[]; aliases?: readonly StoredAliasScope[] },
+  ): Promise<FolderRule> {
+    const st = await this.loadState();
+    const rule = this.mustRule(st, ruleId);
+    const { folders, aliases } = this.planAddScopes(st, rule, scopes);
+    if (folders.length + aliases.length === 0) return rule;
+    rule.folders = [...rule.folders, ...folders];
+    if (aliases.length > 0) rule.aliases = [...(rule.aliases ?? []), ...aliases];
+    rule.updatedAtMs = this.clock();
+    await this.saveRules(st);
+    return rule;
+  }
+
+  /** Run every refusal {@link addScopesToRule} would make, writing nothing. */
+  async checkAddScopes(
+    ruleId: string,
+    scopes: { folders: readonly string[]; aliases?: readonly StoredAliasScope[] },
+  ): Promise<void> {
+    const st = await this.loadState();
+    this.planAddScopes(st, this.mustRule(st, ruleId), scopes);
+  }
+
+  /** The scopes {@link addScopesToRule} would add, checked. Pure over `st`. */
+  private planAddScopes(
+    st: RegistryState,
+    rule: FolderRule,
+    scopes: { folders: readonly string[]; aliases?: readonly StoredAliasScope[] },
+  ): { folders: string[]; aliases: StoredAliasScope[] } {
+    const folders = this.checkNewFolders(st, scopes.folders, rule.id);
+    const aliases = this.checkNewAliases(st, scopes.aliases ?? []);
+    if (rule.folders.length + folders.length > MAX_RULE_FOLDERS) {
+      throw new VaultError(`a folder rule cannot hold more than ${MAX_RULE_FOLDERS} folders`);
+    }
+    if ((rule.aliases?.length ?? 0) + aliases.length > MAX_RULE_ALIASES) {
+      throw new VaultError(
+        `a folder rule cannot hold more than ${MAX_RULE_ALIASES} session aliases`,
+      );
+    }
+    return { folders, aliases };
+  }
+
+  /** The id a new account row gets: the one asked for (an import keeping the account's id from the
+   *  machine it came from) when it is a uuid no row here has, else a fresh one. The id names the
+   *  account's bundle file, so nothing but a uuid is ever taken from a caller. */
+  private newAccountId(allRows: readonly StoredAccount[], requested: string | undefined): string {
+    if (requested === undefined) return randomUUID();
+    if (!ACCOUNT_ID_PATTERN.test(requested)) {
+      throw new VaultError('an account id must be a lower-case uuid');
+    }
+    const holder = allRows.find((a) => a.id === requested);
+    if (holder !== undefined) {
+      throw new VaultError(`account "${holder.label}" already has the id ${requested}`);
+    }
+    return requested;
+  }
+
   /** Validate a set of NEW folders against the current rules: each must be a non-empty string,
    *  unique within the set, not already held by a DIFFERENT rule, and not already held by the rule
    *  being grown (`ignoreRuleId`). Returns them unchanged.
@@ -1757,9 +1822,10 @@ export class Vault {
    *
    * `opts` is for a caller that knows more than the bundle says (an import): the auto-switch
    * exclusion lands in this same write, so no crash or lock timeout can leave the account stored
-   * without it; and when the bundle carries no identity block at all, the identity the caller states
-   * is recorded instead, so the row can be recognized again (a second import of it is then a no-op,
-   * and the login refusal below applies to it).
+   * without it; each identity anchor the bundle's block does not carry (all of them, when it has no
+   * block) is taken from the identity the caller states, so the row can be recognized again (a
+   * second import of it is then a no-op, and the login refusal below applies to it); and the account
+   * can keep the id it had where it came from.
    */
   async addAccount(
     label: string,
@@ -1774,21 +1840,24 @@ export class Vault {
     if (next === '') throw new VaultError('a label cannot be empty');
     const allRows = allRowsOf(st);
     assertLabelFree(allRows, next, undefined);
+    const id = this.newAccountId(allRows, opts.id);
     // The same login stored twice is the other way two rows come to answer to one name (and
     // to poll one quota twice). The identity block names the login; when it names a row that
-    // is already here, that row is the one to refresh, never a second copy.
-    const stated = bundle.oauthAccount === undefined ? opts.identity : undefined;
-    const uuid = bundle.oauthAccount?.accountUuid ?? stated?.accountUuid;
+    // is already here, that row is the one to refresh, never a second copy. A block that names
+    // no login (or not as text) leaves the stated one to decide.
+    const blockUuid = bundle.oauthAccount?.accountUuid;
+    const uuid = typeof blockUuid === 'string' ? blockUuid : opts.identity?.accountUuid;
     const stored = uuid !== undefined ? allRows.find((a) => a.accountUuid === uuid) : undefined;
     if (stored) {
       throw new VaultError(
         `this login is account ${stored.id} ("${stored.label}"), which is already stored; run ` +
-          `\`cctl accounts relogin ${stored.label}\` to refresh it instead of adding a duplicate`,
+          `\`cctl accounts relogin ${shellQuoteArg(stored.label, this.platform)}\` to refresh it ` +
+          'instead of adding a duplicate',
       );
     }
     const now = this.clock();
     const account: StoredAccount = {
-      id: randomUUID(),
+      id,
       label: next,
       quarantined: false,
       ...(opts.autoSwitchExcluded === true ? { autoSwitchExcluded: true } : {}),
@@ -1801,7 +1870,12 @@ export class Vault {
     // response missing one degrades to "unknown" in the CLI rather than crashing or forcing a
     // re-login (see planWeight() / `cctl accounts list` for how absence renders).
     applyBundleMetadata(account, bundle, this.log);
-    if (stated !== undefined) Object.assign(account, definedIdentity(stated));
+    // Filled per anchor, never all-or-nothing: a partial block (an email and no login) must not
+    // cost the row the login the caller knows, or the row could not be found again.
+    for (const [key, value] of Object.entries(definedIdentity(opts.identity ?? {}))) {
+      const anchor = key as keyof AccountIdentity;
+      if (account[anchor] === undefined) account[anchor] = value;
+    }
     // Writes the blob only — the row is not in the registry yet, so its metadata refresh is a
     // no-op here; `saveShared` below is what persists the row built above.
     await this.writeBundle(account.id, bundle);
@@ -1820,20 +1894,22 @@ export class Vault {
    *
    * The same label and login refusals as {@link addAccount} apply, across the whole registry. The
    * row is stamped with the current metadata revision: there is no bundle to recompute it from, and
-   * the first bundle write fills in the plan fields anyway. `opts.autoSwitchExcluded` is written in
-   * the same write, as {@link addAccount} does.
+   * the first bundle write replaces the plan fields anyway. `opts.autoSwitchExcluded` is written in
+   * the same write, as {@link addAccount} does; `opts.plan` (the facts the account had where it came
+   * from) is shown until that first write; `opts.id` is {@link addAccount}'s.
    */
   async addPendingAccount(
     label: string,
     identity: AccountIdentity,
     reason: string,
-    opts: Pick<AddAccountOptions, 'autoSwitchExcluded'> = {},
+    opts: AddPendingAccountOptions = {},
   ): Promise<StoredAccount> {
     const st = await this.loadState();
     const next = sanitizeTerminalText(label).trim();
     if (next === '') throw new VaultError('a label cannot be empty');
     const allRows = allRowsOf(st);
     assertLabelFree(allRows, next, undefined);
+    const id = this.newAccountId(allRows, opts.id);
     const uuid = identity.accountUuid;
     const stored = uuid !== undefined ? allRows.find((a) => a.accountUuid === uuid) : undefined;
     if (stored) {
@@ -1842,10 +1918,16 @@ export class Vault {
       );
     }
     const now = this.clock();
+    const plan: Partial<Record<PlanKey, string>> = {};
+    for (const key of ACCOUNT_PLAN_KEYS) {
+      const value = opts.plan?.[key];
+      if (typeof value === 'string') plan[key] = value;
+    }
     const account: StoredAccount = {
-      id: randomUUID(),
+      id,
       label: next,
       ...definedIdentity(identity),
+      ...plan,
       ...(opts.autoSwitchExcluded === true ? { autoSwitchExcluded: true } : {}),
       metadataRev: ACCOUNT_METADATA_REV,
       quarantined: true,

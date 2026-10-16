@@ -14,11 +14,14 @@
 // Settings that name a path are dropped too: a path on this machine means nothing on another.
 
 import {
+  ACCOUNT_ID_PATTERN,
+  ACCOUNT_PLAN_KEYS,
   MAX_RULES,
   MAX_RULE_ACCOUNTS,
   MAX_RULE_ALIASES,
   MAX_RULE_FOLDERS,
   sanitizeTerminalText,
+  type AccountPlanFacts,
   type AccountView,
   type ClaudeOauth,
   type CredentialBundle,
@@ -31,11 +34,17 @@ import { findDaemonEnvSetting, type DaemonFileConfig } from './settings.js';
 /** One account as it travels. Members of rules point at it by `accountUuid ?? label`. */
 export interface ExportedAccount {
   label: string;
+  /** The account's id on the machine it was exported from. The import stores it under the same
+   *  id, so a second import finds it whatever it is labelled and whatever identity it carries. */
+  id?: string;
   accountUuid?: string;
   emailAddress?: string;
   /** Kept for an account that travels without tokens, so its row here carries every identity
    *  anchor a re-login is checked against. */
   organizationUuid?: string;
+  /** The plan facts of an account that travels without tokens (its bundle would carry them), so
+   *  its row here shows its plan before its first login. */
+  plan?: AccountPlanFacts;
   autoSwitchExcluded: boolean;
   /** Absent when the export was made with `--no-tokens`, or when the account was quarantined
    *  (its login is dead, so its tokens are worth nothing): the import then stores it as an account
@@ -112,11 +121,15 @@ export function buildExportPayload(source: ExportSource): ExportPayload {
   );
   const accounts: ExportedAccount[] = source.accounts.map((a) => {
     const bundle = source.bundles.get(a.id);
+    const plan = bundle === undefined ? planFacts(a) : undefined;
     return {
       label: a.label,
+      // Every id the vault makes is a uuid; one that is not (a hand-edited registry) stays here.
+      ...(ACCOUNT_ID_PATTERN.test(a.id) ? { id: a.id } : {}),
       ...(a.accountUuid !== undefined ? { accountUuid: a.accountUuid } : {}),
       ...(a.emailAddress !== undefined ? { emailAddress: a.emailAddress } : {}),
       ...(a.organizationUuid !== undefined ? { organizationUuid: a.organizationUuid } : {}),
+      ...(plan !== undefined ? { plan } : {}),
       autoSwitchExcluded: a.autoSwitchExcluded === true,
       ...(bundle !== undefined ? { bundle } : {}),
     };
@@ -146,6 +159,16 @@ export function buildExportPayload(source: ExportSource): ExportPayload {
   };
 }
 
+/** The plan facts a row holds, or undefined when it holds none. */
+function planFacts(account: AccountPlanFacts): AccountPlanFacts | undefined {
+  const out: AccountPlanFacts = {};
+  for (const key of ACCOUNT_PLAN_KEYS) {
+    const value = account[key];
+    if (value !== undefined) out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /** The login an entry belongs to: the uuid recorded with it, else the one its tokens name. */
 export function loginOf(entry: ExportedAccount): string | undefined {
   const fromBundle = entry.bundle?.oauthAccount?.accountUuid;
@@ -167,6 +190,11 @@ export const PAYLOAD_LIMITS = {
   text: 1024,
   /** Folder paths. */
   path: 4096,
+  /** Scopes (folders and session aliases) of all the rules together. Each one is looked up on
+   *  the disk and checked on its own, so this bounds what a file can make an import spend on them.
+   *  The per-rule caps alone allow tens of thousands, which takes minutes; no real setup scopes
+   *  this many folders. */
+  scopes: 1024,
   /** One token. */
   token: 16 * 1024,
   /** Keys of an identity block (it is upstream JSON kept verbatim), and of any object in it. */
@@ -191,9 +219,6 @@ const PLATFORMS: ReadonlySet<string> = new Set([
   'sunos',
   'win32',
 ]);
-
-/** The identity fields a registry row keeps and the CLI prints: they must be plain text. */
-const ANCHORS = ['accountUuid', 'emailAddress', 'organizationUuid'] as const;
 
 /** Keys that would reach an object's prototype if a payload were ever merged naively. */
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -275,12 +300,13 @@ function parseOauth(value: unknown, where: string): ClaudeOauth {
   }
   if (o['scopes'] !== undefined) {
     oauth.scopes = arr(o['scopes'], `${where}.scopes`, 64).map((s, i) =>
-      str(s, `${where}.scopes[${i}]`),
+      plainText(str(s, `${where}.scopes[${i}]`), `${where}.scopes[${i}]`),
     );
   }
-  const subscriptionType = optStr(o['subscriptionType'], `${where}.subscriptionType`);
+  // The plan facts are copied onto the account's row, like the identity block's.
+  const subscriptionType = optPlain(o['subscriptionType'], `${where}.subscriptionType`);
   if (subscriptionType !== undefined) oauth.subscriptionType = subscriptionType;
-  const rateLimitTier = optStr(o['rateLimitTier'], `${where}.rateLimitTier`);
+  const rateLimitTier = optPlain(o['rateLimitTier'], `${where}.rateLimitTier`);
   if (rateLimitTier !== undefined) oauth.rateLimitTier = rateLimitTier;
   return oauth;
 }
@@ -288,13 +314,15 @@ function parseOauth(value: unknown, where: string): ClaudeOauth {
 /** The identity block, kept verbatim: it is Claude Code's own JSON (which nests — its onboarding
  *  flags are an object), and the vault preserves keys it does not know. Bounded instead: its depth,
  *  its keys per object and its values in all, each string's length, and no key that reaches a
- *  prototype. The anchors a row stores and the CLI prints must be plain text. */
+ *  prototype. Every string in it must be plain text: the vault copies a row's identity and plan
+ *  facts out of it (the email, the billing type) and the CLI prints them, it is written into the
+ *  live config Claude Code reads, and the fields printed today are not the only ones ever to be. */
 function parseIdentity(value: unknown, where: string): OauthAccount {
   let budget = PAYLOAD_LIMITS.identityValues;
   const walk = (v: unknown, at: string, depth: number): unknown => {
     budget -= 1;
     if (budget < 0) bad(`${where} holds too many values`);
-    if (typeof v === 'string') return str(v, at);
+    if (typeof v === 'string') return plainText(str(v, at), at);
     if (v === null || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)))
       return v;
     if (depth >= PAYLOAD_LIMITS.identityDepth) bad(`${at} is nested too deeply`);
@@ -311,12 +339,23 @@ function parseIdentity(value: unknown, where: string): OauthAccount {
     for (const key of keys) out[key] = walk(o[key], `${at}.${key}`, depth + 1);
     return out;
   };
-  const out = walk(obj(value, where), where, 0) as OauthAccount;
-  for (const key of ANCHORS) {
-    const v = out[key];
-    if (typeof v === 'string') plainText(v, `${where}.${key}`);
+  return walk(obj(value, where), where, 0) as OauthAccount;
+}
+
+/** An account's plan facts: only the keys a row keeps, each plain text (the row is printed). */
+function parsePlan(value: unknown, where: string): AccountPlanFacts {
+  const o = obj(value, where);
+  for (const key of Object.keys(o)) {
+    if (!(ACCOUNT_PLAN_KEYS as readonly string[]).includes(key)) {
+      bad(`${where} has a field ${sanitizeTerminalText(key)}`);
+    }
   }
-  return out;
+  const plan: AccountPlanFacts = {};
+  for (const key of ACCOUNT_PLAN_KEYS) {
+    const v = optPlain(o[key], `${where}.${key}`);
+    if (v !== undefined) plan[key] = v;
+  }
+  return plan;
 }
 
 /**
@@ -329,13 +368,18 @@ function parseAccount(value: unknown, i: number): ExportedAccount {
   const accountUuid = optPlain(o['accountUuid'], `${where}.accountUuid`);
   const emailAddress = optPlain(o['emailAddress'], `${where}.emailAddress`);
   const organizationUuid = optPlain(o['organizationUuid'], `${where}.organizationUuid`);
+  const id = optStr(o['id'], `${where}.id`);
+  if (id !== undefined && !ACCOUNT_ID_PATTERN.test(id)) bad(`${where}.id is not an account id`);
+  const plan = o['plan'] === undefined ? undefined : parsePlan(o['plan'], `${where}.plan`);
   const autoSwitchExcluded = o['autoSwitchExcluded'];
   if (typeof autoSwitchExcluded !== 'boolean') bad(`${where}.autoSwitchExcluded is not true/false`);
   const account: ExportedAccount = {
     label: nonEmpty(o['label'], `${where}.label`),
+    ...(id !== undefined ? { id } : {}),
     ...(accountUuid !== undefined ? { accountUuid } : {}),
     ...(emailAddress !== undefined ? { emailAddress } : {}),
     ...(organizationUuid !== undefined ? { organizationUuid } : {}),
+    ...(plan !== undefined ? { plan } : {}),
     autoSwitchExcluded,
   };
   if (o['bundle'] !== undefined) {
@@ -433,11 +477,21 @@ export function parseExportPayload(text: string): ExportPayload {
   const platform = platformText as NodeJS.Platform;
   const accounts = arr(o['accounts'], 'accounts', PAYLOAD_LIMITS.accounts).map(parseAccount);
   const seen = new Set<string>();
+  const ids = new Set<string>();
   for (const a of accounts) {
+    if (a.id !== undefined) {
+      if (ids.has(a.id)) bad(`the account id ${a.id} is listed twice`);
+      ids.add(a.id);
+    }
     const login = loginOf(a);
     if (login === undefined) continue;
     if (seen.has(login)) bad(`the login ${sanitizeTerminalText(login)} is listed twice`);
     seen.add(login);
+  }
+  const rules = arr(o['rules'], 'rules', PAYLOAD_LIMITS.rules).map(parseRule);
+  const scopes = rules.reduce((n, r) => n + r.folders.length + r.aliases.length, 0);
+  if (scopes > PAYLOAD_LIMITS.scopes) {
+    bad(`the rules hold more than ${PAYLOAD_LIMITS.scopes} folders and session aliases in all`);
   }
   const exportedAtMs = num(o['exportedAtMs'], 'exportedAtMs');
   if (Math.abs(exportedAtMs) > MAX_DATE_MS) bad('exportedAtMs is not a date');
@@ -446,7 +500,7 @@ export function parseExportPayload(text: string): ExportPayload {
     cctlVersion: str(o['cctlVersion'], 'cctlVersion'),
     platform,
     accounts,
-    rules: arr(o['rules'], 'rules', PAYLOAD_LIMITS.rules).map(parseRule),
+    rules,
     settings: parseSettings(o['settings']),
   };
 }

@@ -92,6 +92,7 @@ import {
   renderWhere,
   nothingUsableReason,
   resumeCommand,
+  shellQuote,
   vscodeProfileNames,
   type FolderRuleView,
   type GlobalSlotView,
@@ -575,7 +576,7 @@ function liveAndSessionLines(
       live.noWorkingAccount
         ? ctx.palette.red(
             `  live in ${slot}: ${label}, which is quarantined; re-login it: ` +
-              `cctl accounts relogin ${label}`,
+              `cctl accounts relogin ${shellQuote(label)}`,
           )
         : `  live in ${slot}: ${label} (${why})`,
     );

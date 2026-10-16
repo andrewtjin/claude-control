@@ -989,6 +989,18 @@ describe('toUsageSnapshotPayload — what actually goes on the wire', () => {
     expect(payload.accounts.find((a) => a.accountId === 'acct-2')?.planWeight).toBeUndefined();
     expect(payload.accounts.find((a) => a.accountId === 'acct-2')?.billing).toBeUndefined();
   });
+
+  it('puts an unknown billing type on the wire as plain text', async () => {
+    const snapshot = await pollTwoAccounts();
+    const esc = String.fromCharCode(27);
+    const payload = toUsageSnapshotPayload(
+      snapshot,
+      { predictedResetByAccount: new Map() },
+      [{ id: 'acct-1', billingType: `${esc}[2Jx${String.fromCharCode(0x202e)}` }],
+      NOW,
+    );
+    expect(payload.accounts.find((a) => a.accountId === 'acct-1')?.billing).toBe('[2Jx');
+  });
 });
 
 describe('assemble — one set of inputs behind the plan', () => {

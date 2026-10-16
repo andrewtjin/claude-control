@@ -14,7 +14,7 @@ import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
 import { Vault } from './vault.js';
 import { sandboxPaths, type Paths } from './paths.js';
 import { RefreshError, UnknownAccountError, VaultError } from './errors.js';
-import type { ClaudeOauth, CredentialBundle } from './types.js';
+import type { ClaudeOauth, CredentialBundle, OauthAccount } from './types.js';
 
 const NOW = 100_000_000;
 const HOUR = 3_600_000;
@@ -243,7 +243,7 @@ describe('importBundle', () => {
     const a = await h.engine.addAccount('work', bundle('A1', 'u-work', NOW + HOUR));
     await expect(
       h.engine.importBundle(a.id, bundle('EVIL', 'u-other', NOW + 9 * HOUR)),
-    ).rejects.toThrow(/different account/);
+    ).rejects.toThrow("the tokens were not replaced: the file's tokens belong to another login");
     expect((await h.vault.readBundle(a.id)).claudeAiOauth.accessToken).toBe('A1');
   });
 });
@@ -389,5 +389,283 @@ describe('importRules', () => {
     expect(res.rules[0]).toMatchObject({ ok: false });
     expect(await h.engine.listRules()).toEqual([]);
     expect(await h.engine.getActiveId('global')).toBe(only.id);
+  });
+});
+
+describe('importBundle: the file has to prove the login', () => {
+  /** A stored account with a full identity, live on the main login. */
+  async function stored(h: Harness): Promise<string> {
+    const full: CredentialBundle = {
+      claudeAiOauth: { accessToken: 'X1', refreshToken: 'r-X1', expiresAt: NOW + HOUR },
+      oauthAccount: {
+        accountUuid: 'u-x',
+        emailAddress: 'u-x@x.com',
+        organizationUuid: 'org-x',
+        displayName: 'X person',
+      },
+    };
+    const x = await h.engine.addAccount('x', full);
+    await h.engine.activate(x.id);
+    return x.id;
+  }
+
+  it('refuses tokens whose block is missing, empty, or names no login as text, writing nothing', async () => {
+    const h = await harness();
+    const id = await stored(h);
+    for (const block of [
+      undefined,
+      {},
+      { accountUuid: 42 },
+      { emailAddress: 'u-x@x.com' },
+      { displayName: 'Y person' },
+    ]) {
+      const brought: CredentialBundle = {
+        claudeAiOauth: { accessToken: 'Y1', refreshToken: 'r-Y1', expiresAt: NOW + 9 * HOUR },
+        ...(block !== undefined ? { oauthAccount: block as OauthAccount } : {}),
+      };
+      await expect(h.engine.importBundle(id, brought)).rejects.toThrow(
+        /the tokens were not replaced: the file's tokens do not (say|name)/,
+      );
+      const kept = await h.vault.readBundle(id);
+      expect(kept.claudeAiOauth.accessToken).toBe('X1');
+      expect(kept.oauthAccount).toMatchObject({ accountUuid: 'u-x', organizationUuid: 'org-x' });
+      expect((await h.live.readLiveCredentials())?.accessToken).toBe('X1');
+      expect((await h.live.readOauthAccount())?.accountUuid).toBe('u-x');
+    }
+  });
+
+  it('never shrinks the identity: a block naming only the login keeps what was stored', async () => {
+    const h = await harness();
+    const id = await stored(h);
+    const res = await h.engine.importBundle(id, {
+      claudeAiOauth: { accessToken: 'X2', refreshToken: 'r-X2', expiresAt: NOW + 9 * HOUR },
+      oauthAccount: { accountUuid: 'u-x', billingType: 'stripe_subscription' },
+    });
+    expect(res).toMatchObject({ replaced: true, healedLiveLogin: true });
+    expect((await h.vault.readBundle(id)).oauthAccount).toEqual({
+      accountUuid: 'u-x',
+      emailAddress: 'u-x@x.com',
+      organizationUuid: 'org-x',
+      displayName: 'X person',
+      billingType: 'stripe_subscription',
+    });
+    expect(await h.live.readOauthAccount()).toMatchObject({
+      accountUuid: 'u-x',
+      emailAddress: 'u-x@x.com',
+      organizationUuid: 'org-x',
+    });
+    expect(await h.vault.getAccount(id)).toMatchObject({
+      accountUuid: 'u-x',
+      emailAddress: 'u-x@x.com',
+      organizationUuid: 'org-x',
+    });
+  });
+
+  it('for a row with no login, takes only a block echoing every anchor the row has', async () => {
+    const h = await harness();
+    const row = await h.engine.addPendingAccount('m', {
+      emailAddress: 'm@x.com',
+      organizationUuid: 'org-m',
+    });
+    const brought = (block: Record<string, string>): CredentialBundle => ({
+      claudeAiOauth: { accessToken: 'M1', refreshToken: 'r-M1', expiresAt: NOW + HOUR },
+      oauthAccount: block,
+    });
+    await expect(
+      h.engine.importBundle(row.id, brought({ emailAddress: 'm@x.com' })),
+    ).rejects.toThrow('do not show the organizationUuid stored here');
+    const res = await h.engine.importBundle(
+      row.id,
+      brought({ emailAddress: 'm@x.com', organizationUuid: 'org-m', accountUuid: 'u-m' }),
+    );
+    expect(res.replaced).toBe(true);
+    expect((await h.vault.getAccount(row.id))?.accountUuid).toBe('u-m');
+  });
+});
+
+describe('adding an account brought from another machine', () => {
+  const OTHER_ID = '5f0e8a2c-1d3b-4c5e-9f7a-0123456789ab';
+
+  it('fills each anchor a partial identity block lacks from the stated identity', async () => {
+    const h = await harness();
+    const partial: CredentialBundle = {
+      claudeAiOauth: { accessToken: 'P1', refreshToken: 'r-P1', expiresAt: NOW + HOUR },
+      oauthAccount: { emailAddress: 'p@x.com' },
+    };
+    const row = await h.engine.addAccount('p', partial, {
+      identity: { accountUuid: 'u-p', emailAddress: 'other@x.com', organizationUuid: 'org-p' },
+    });
+    // The block's own email wins; what it lacks comes from the caller.
+    expect(row).toMatchObject({
+      accountUuid: 'u-p',
+      emailAddress: 'p@x.com',
+      organizationUuid: 'org-p',
+    });
+    await expect(
+      h.engine.addAccount('p again', partial, { identity: { accountUuid: 'u-p' } }),
+    ).rejects.toThrow(/already stored/);
+  });
+
+  it('keeps the id it had, refusing one that is not a uuid or that another account has', async () => {
+    const h = await harness();
+    const row = await h.engine.addAccount('a', bundle('A1', 'u-a', NOW + HOUR), { id: OTHER_ID });
+    expect(row.id).toBe(OTHER_ID);
+    expect((await h.vault.readBundle(OTHER_ID)).claudeAiOauth.accessToken).toBe('A1');
+    await expect(
+      h.engine.addPendingAccount('b', { accountUuid: 'u-b' }, { id: OTHER_ID }),
+    ).rejects.toThrow(`account "a" already has the id ${OTHER_ID}`);
+    await expect(
+      h.engine.addAccount('c', bundle('C1', 'u-c', NOW + HOUR), { id: '../escape' }),
+    ).rejects.toThrow('an account id must be a lower-case uuid');
+    expect((await h.engine.listAllAccounts()).map((r) => r.label)).toEqual(['a']);
+  });
+
+  it('shows the plan of an account waiting for a login until its first login replaces it', async () => {
+    const h = await harness();
+    const row = await h.engine.addPendingAccount(
+      'away',
+      { accountUuid: 'u-away' },
+      { plan: { subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x' } },
+    );
+    expect(row).toMatchObject({ subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x' });
+    await h.engine.importBundle(row.id, {
+      claudeAiOauth: {
+        accessToken: 'W1',
+        refreshToken: 'r-W1',
+        expiresAt: NOW + HOUR,
+        subscriptionType: 'pro',
+      },
+      oauthAccount: { accountUuid: 'u-away' },
+    });
+    const after = await h.vault.getAccount(row.id);
+    expect(after?.subscriptionType).toBe('pro');
+    expect(after?.rateLimitTier).toBeUndefined();
+  });
+});
+
+describe('importRules: a rule an earlier import made part way', () => {
+  it('grows that rule with the scopes it lacks, as one rule and one slot', async () => {
+    const h = await harness();
+    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+    await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
+    const p1 = await ruleFolder(h, 'p1');
+    const p2 = await ruleFolder(h, 'p2');
+    const first = await h.engine.importRules([
+      { scopes: [{ kind: 'folder', folder: p1 }], include: [x.id], exclude: [], label: 'Client' },
+    ]);
+    const ruleId = (first.rules[0] as { rule: { id: string } }).rule.id;
+    const res = await h.engine.importRules([
+      {
+        scopes: [
+          { kind: 'folder', folder: p1 },
+          { kind: 'folder', folder: p2 },
+          { kind: 'alias', folder: p1, alias: 'deploy' },
+        ],
+        include: [],
+        exclude: [],
+        intoRuleId: ruleId,
+      },
+    ]);
+    expect(res.rules[0]).toMatchObject({ ok: true, created: false });
+    const rules = await h.engine.listRules();
+    expect(rules).toHaveLength(1);
+    expect(rules[0]).toMatchObject({ id: ruleId, label: 'Client', include: [x.id] });
+    expect(rules[0]!.folders).toHaveLength(2);
+    expect(rules[0]!.aliases).toHaveLength(1);
+    expect(rules[0]!.activeId).toBe(x.id);
+  });
+
+  it('refuses, writing nothing, when that rule holds a scope the spec does not', async () => {
+    const h = await harness();
+    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+    await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
+    const p1 = await ruleFolder(h, 'p1');
+    const p2 = await ruleFolder(h, 'p2');
+    const p3 = await ruleFolder(h, 'p3');
+    const made = await h.engine.importRules([
+      {
+        scopes: [
+          { kind: 'folder', folder: p1 },
+          { kind: 'folder', folder: p3 },
+        ],
+        include: [x.id],
+        exclude: [],
+      },
+    ]);
+    const ruleId = (made.rules[0] as { rule: { id: string } }).rule.id;
+    const res = await h.engine.importRules([
+      {
+        scopes: [
+          { kind: 'folder', folder: p1 },
+          { kind: 'folder', folder: p2 },
+        ],
+        include: [],
+        exclude: [],
+        intoRuleId: ruleId,
+      },
+    ]);
+    expect(res.rules[0]).toMatchObject({ ok: false });
+    expect((await h.engine.listRules())[0]!.folders).toHaveLength(2);
+  });
+});
+
+describe('importRules: the caps, counted over the batch', () => {
+  it('creates rules in spec order up to the rule cap, never an exclusion-only one first', async () => {
+    const h = await harness();
+    const a = await h.engine.addAccount('a', bundle('A1', 'u-a', NOW + HOUR));
+    const b = await h.engine.addAccount('b', bundle('B1', 'u-b', NOW + HOUR));
+    await h.engine.addAccount('c', bundle('C1', 'u-c', NOW + HOUR));
+    for (let i = 0; i < 63; i += 1) {
+      await h.vault.createRule({ folders: [await ruleFolder(h, `r${i}`)], exclude: [b.id] });
+    }
+    const res = await h.engine.importRules([
+      {
+        scopes: [{ kind: 'folder', folder: await ruleFolder(h, 'inc') }],
+        include: [a.id],
+        exclude: [],
+      },
+      {
+        scopes: [{ kind: 'folder', folder: await ruleFolder(h, 'exc') }],
+        include: [],
+        exclude: [b.id],
+      },
+    ]);
+    expect(res.rules.map((r) => r.ok)).toEqual([true, false]);
+    expect((res.rules[1] as { message: string }).message).toContain('max 64');
+    expect(await h.engine.listRules()).toHaveLength(64);
+  });
+
+  it('refuses up front, writing nothing, a rule that would pass the reserved-account cap', async () => {
+    const h = await harness();
+    const ids: string[] = [];
+    for (let i = 0; i < 255; i += 1) {
+      ids.push((await h.vault.addPendingAccount(`p${i}`, {}, 'waiting')).id);
+    }
+    for (let r = 0; r * 32 < ids.length; r += 1) {
+      await h.vault.createRule({
+        folders: [await ruleFolder(h, `held${r}`)],
+        include: ids.slice(r * 32, r * 32 + 32),
+      });
+    }
+    const one = await h.engine.addAccount('one', bundle('O1', 'u-one', NOW + HOUR));
+    const two = await h.engine.addAccount('two', bundle('T1', 'u-two', NOW + HOUR));
+    await h.engine.addAccount('free', bundle('F1', 'u-free', NOW + HOUR));
+    const before = (await h.engine.listRules()).length;
+    const res = await h.engine.importRules([
+      {
+        scopes: [{ kind: 'folder', folder: await ruleFolder(h, 'n1') }],
+        include: [one.id],
+        exclude: [],
+      },
+      // Its exclusion would be written before its inclusion is refused: a rule half made.
+      {
+        scopes: [{ kind: 'folder', folder: await ruleFolder(h, 'n2') }],
+        include: [two.id],
+        exclude: [one.id],
+      },
+    ]);
+    expect(res.rules[0]).toMatchObject({ ok: true });
+    expect(res.rules[1]).toEqual({ ok: false, message: 'cannot reserve more than 256 accounts' });
+    expect(await h.engine.listRules()).toHaveLength(before + 1);
   });
 });

@@ -28,6 +28,7 @@ import {
   describeStatus,
   withOverloadRetry,
   OVERLOAD_STATUSES,
+  sanitizeTerminalText,
   type OverloadRetryDeps,
 } from '@claude-control/switch-engine';
 import { parseUsageEndpointResponse, parseCachedUsage, type ParsedUsage } from './usageParse.js';
@@ -128,7 +129,8 @@ function registryFields(
   const weight = planWeight(facts);
   return {
     ...(weight.known ? { planWeight: weight.weight } : {}),
-    billing: billingLabel(facts, nowMs),
+    // An unknown billing type is shown as the login's identity block gave it: never as raw text.
+    billing: sanitizeTerminalText(billingLabel(facts, nowMs)),
     // Group fields are omitted (not nulled) when absent, matching the additive/tolerant wire
     // contract: a shared account carries none and reads exactly as "not reserved".
     ...(facts.groupId !== undefined ? { groupId: facts.groupId } : {}),

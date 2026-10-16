@@ -365,12 +365,38 @@ export type AccountIdentity = Pick<
   'accountUuid' | 'emailAddress' | 'organizationUuid'
 >;
 
+/** The plan and billing facts a registry row keeps, copied from a login's bundle. */
+export const ACCOUNT_PLAN_KEYS = [
+  'subscriptionType',
+  'rateLimitTier',
+  'organizationRateLimitTier',
+  'billingType',
+  'subscriptionCreatedAt',
+  'claudeCodeTrialEndsAt',
+] as const;
+
+/** A row's plan and billing facts (see {@link ACCOUNT_PLAN_KEYS}). */
+export type AccountPlanFacts = Pick<StoredAccount, (typeof ACCOUNT_PLAN_KEYS)[number]>;
+
 /** What a caller adding an account knows beyond its bundle (see `Vault.addAccount`). */
 export interface AddAccountOptions {
   /** Store the account excluded from auto-switch, in the same write that adds it. */
   autoSwitchExcluded?: boolean;
-  /** The identity to record when the bundle carries no identity block at all. */
+  /** The identity to record for each anchor the bundle's identity block does not carry. */
   identity?: AccountIdentity;
+  /** The id to store the account under: an import keeps the id the account has on the machine it
+   *  came from, so importing it again finds it. A uuid no row here has; absent, one is made. */
+  id?: string;
+}
+
+/** What a caller adding an account that has no login yet knows (see `Vault.addPendingAccount`). */
+export interface AddPendingAccountOptions extends Pick<
+  AddAccountOptions,
+  'autoSwitchExcluded' | 'id'
+> {
+  /** The plan facts the account had where it came from, shown until its first login replaces
+   *  them. */
+  plan?: AccountPlanFacts;
 }
 
 /** What a removal that follows handing an account to another machine checks first (see
@@ -390,7 +416,8 @@ export interface ImportRuleSpec {
   exclude: string[];
   /** The display name of a rule this creates. */
   label?: string;
-  /** Add the members to this rule, which holds exactly these scopes, instead of creating one. */
+  /** Add the members to this rule instead of creating one. Every scope it holds is among
+   *  `scopes`; the ones of `scopes` it lacks are added to it. */
   intoRuleId?: string;
 }
 

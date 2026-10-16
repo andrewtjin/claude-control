@@ -20,6 +20,7 @@ import {
   SwitchEngineError,
   canonicalizeFolder,
   defaultPaths,
+  isWellFormedText,
   sanitizeTerminalText,
   type AccountView,
   type CredentialBundle,
@@ -51,10 +52,12 @@ import {
   describeMembers,
   describeRuleExtras,
   describeRuleStep,
+  includeCommand,
   keptSettingLine,
-  leftOutScopeLines,
   planImport,
   renderImportPlan,
+  sameSettingLine,
+  scopeDetailLines,
   scopeRef,
   type FolderLookup,
   type ImportPlan,
@@ -92,6 +95,7 @@ export type TransferEngine = Pick<
   | 'importBundle'
   | 'checkRuleScope'
   | 'importRules'
+  | 'setAutoSwitchExcluded'
   | 'removeAccount'
 >;
 
@@ -171,9 +175,11 @@ export const ONE_MACHINE_WARNING =
 
 /**
  * A passphrase file's first line. The file is decoded the way a shell or editor may have written
- * it — UTF-16 by its byte-order mark, a UTF-8 byte-order mark dropped — so the passphrase is the
- * one the person typed into it, not one with an invisible mark or NUL bytes sealed in (which no
- * one could type on the other machine). Bytes that are not text are refused.
+ * it — UTF-16 by its byte-order mark, a UTF-8 byte-order mark dropped — and its first line ends at
+ * any line ending (CRLF, LF or a bare CR), so the passphrase is the one the person typed into it,
+ * not one with an invisible mark, a carriage return or NUL bytes sealed in (which no one could type
+ * on the other machine). Bytes that are not text are refused; what the line itself may hold is
+ * {@link passphraseProblem}'s to say.
  */
 export function passphraseFromFile(bytes: Buffer, path: string): string {
   const text = decodeExportText(bytes);
@@ -183,7 +189,27 @@ export function passphraseFromFile(bytes: Buffer, path: string): string {
         'byte-order mark)',
     );
   }
-  return text.split(/\r?\n/)[0] ?? '';
+  return text.split(/\r\n|\r|\n/)[0] ?? '';
+}
+
+/**
+ * Why `passphrase` cannot seal or open a file, as a phrase, or undefined when it can. A passphrase
+ * has to be one a person can type again on the other machine, so it may not hold a control or
+ * invisible character (a carriage return, a second byte-order mark), text that is not well formed
+ * (a lone surrogate, which the key derivation reads as a replacement character, so different ones
+ * collapse into the same key), or a space at either end: `echo secret > file` in cmd.exe writes
+ * "secret " and that space cannot be seen. Nothing is trimmed silently, so a passphrase read from a
+ * file, the environment or the prompt means the same everywhere; the person is told to fix the
+ * source instead. Applied to every source, sealing and opening alike.
+ */
+export function passphraseProblem(passphrase: string): string | undefined {
+  if (passphrase === '') return 'is empty';
+  if (!isWellFormedText(passphrase)) return 'is not valid text';
+  if (sanitizeTerminalText(passphrase) !== passphrase) {
+    return 'holds a control or invisible character (a carriage return or a byte-order mark, say)';
+  }
+  if (/^\s|\s$/u.test(passphrase)) return 'starts or ends with a space';
+  return undefined;
 }
 
 /**
@@ -198,6 +224,7 @@ async function readPassphrase(
   mode: { sealing: boolean; stdinBusy: boolean },
 ): Promise<string> {
   let passphrase: string;
+  let source: string;
   if (passphraseFile !== undefined) {
     let bytes: Buffer | undefined;
     try {
@@ -207,8 +234,10 @@ async function readPassphrase(
     }
     if (bytes === undefined) fail(`the passphrase file ${passphraseFile} is too large`);
     passphrase = passphraseFromFile(bytes, passphraseFile);
+    source = `the passphrase in ${passphraseFile}`;
   } else if ((deps.env[PASSPHRASE_ENV] ?? '') !== '') {
     passphrase = deps.env[PASSPHRASE_ENV]!;
+    source = PASSPHRASE_ENV;
   } else if (!deps.interactive || mode.stdinBusy) {
     fail(
       'no passphrase: pass --passphrase-file <file>, or set ' +
@@ -218,12 +247,19 @@ async function readPassphrase(
     passphrase = await deps.promptHidden(
       mode.sealing ? 'Passphrase for the file: ' : 'Passphrase: ',
     );
+    source = 'the passphrase';
     if (mode.sealing) {
       const again = await deps.promptHidden('The same passphrase again: ');
       if (again !== passphrase) fail('the two passphrases differ; nothing was written');
     }
   }
-  if (passphrase === '') fail('the passphrase is empty');
+  const problem = passphraseProblem(passphrase);
+  if (problem !== undefined) {
+    fail(
+      `${source} ${problem}; nothing was ${mode.sealing ? 'written' : 'imported'}` +
+        (problem === 'is empty' ? '' : ' (no passphrase that can be typed again holds one)'),
+    );
+  }
   if (mode.sealing && passphrase.length < MIN_PASSPHRASE_LENGTH) {
     fail(`the passphrase must be at least ${MIN_PASSPHRASE_LENGTH} characters`);
   }
@@ -597,6 +633,7 @@ export async function runImport(
   lines.push('Rules:');
   const rulesChanged = await importRules(plan, accounts.localIds, engine, report);
   if (rulesChanged) await deps.reconcileGuard();
+  await settleAwaitingAccounts(plan, accounts.localIds, engine, report);
   lines.push('Settings:');
   const changed = await importSettings(plan, deps.configPath, report);
 
@@ -605,6 +642,8 @@ export async function runImport(
     lines.push(
       `Changed settings apply when the daemon next starts: cctl daemon restart. ${ENV_WINS_NOTE}`,
     );
+  } else if (plan.settings.some((s) => 'overridden' in s && s.overridden === true)) {
+    lines.push(ENV_WINS_NOTE);
   }
   if (accounts.pending.length > 0) {
     lines.push('Log in to each account that came without tokens:');
@@ -612,20 +651,85 @@ export async function runImport(
       lines.push(`  cctl accounts relogin ${shellQuote(safe(label), deps.platform)}`);
     }
   }
-  const usable = accounts.addedWithTokens[0];
-  if (usable !== undefined && (await engine.getActiveId('global')) === null) {
-    lines.push(
-      "Nothing is live on this machine's main login yet; to start using an account here: " +
-        `cctl switch ${shellQuote(safe(usable), deps.platform)}`,
-    );
-  }
+  lines.push(...(await mainLoginHint(accounts, deps)));
   if (accounts.tokensArrived) lines.push(ONE_MACHINE_WARNING);
   deps.out(lines.join('\n') + '\n');
   return { failed };
 }
 
+/**
+ * What to say when nothing is live on this machine's main login after the import: the account to
+ * switch it to — a shared, working account auto-switch may use, one this import added first — or,
+ * when there is none, that the main login needs one. An account a rule reserves is never named:
+ * switching to it would only seat it in its rule's slot and leave the main login as it was, and an
+ * account kept out of auto-switch (one the file reserves to a rule that was not made) is not named
+ * either, so the hint does not spend a client's account on the main login.
+ */
+async function mainLoginHint(
+  accounts: { addedIds: readonly string[]; tokensArrived: boolean },
+  deps: TransferDeps,
+): Promise<string[]> {
+  if ((await deps.engine.getActiveId('global')) !== null) return [];
+  const free = (await deps.engine.listAllAccounts()).filter(
+    (a) => (a.ruleIds ?? []).length === 0 && !a.quarantined && a.autoSwitchExcluded !== true,
+  );
+  const pick = free.find((a) => accounts.addedIds.includes(a.id)) ?? free[0];
+  if (pick !== undefined) {
+    return [
+      "Nothing is live on this machine's main login yet; to start using an account here: " +
+        `cctl switch ${shellQuote(safe(pick.label), deps.platform)}`,
+    ];
+  }
+  if (!accounts.tokensArrived) return [];
+  return [
+    "Nothing is live on this machine's main login yet, and no shared account here can take it " +
+      '(the accounts this import brought are reserved to folder rules or kept out of ' +
+      'auto-switch); log in one for it with: cctl accounts add <label>',
+  ];
+}
+
+/**
+ * Settle the accounts the plan stored kept out of auto-switch until their rule took them
+ * (`awaitsRule`): one a rule here now reserves goes back to auto-switch, as it was on the other
+ * machine; one whose rule was not made after all (the engine refused it, or the batch failed)
+ * stays kept out, said so, rather than joining the shared pool unannounced.
+ */
+async function settleAwaitingAccounts(
+  plan: ImportPlan,
+  localIds: ReadonlyMap<number, string>,
+  engine: TransferEngine,
+  report: (line: string, ok: boolean) => void,
+): Promise<void> {
+  const waiting = plan.accounts.filter((s) => s.kind === 'add' && s.awaitsRule === true);
+  if (waiting.length === 0) return;
+  const stored = await engine.listAllAccounts();
+  for (const step of waiting) {
+    const account = stored.find((a) => a.id === localIds.get(step.entry));
+    if (account === undefined) continue;
+    const include = includeCommand(account.label, plan.platform);
+    if ((account.ruleIds ?? []).length === 0) {
+      report(
+        `${safe(account.label)}: kept out of auto-switch (the rule it is reserved to was not ` +
+          `made here; ${include} lets auto-switch use it)`,
+        true,
+      );
+      continue;
+    }
+    try {
+      await engine.setAutoSwitchExcluded(account.id, false);
+    } catch (err) {
+      if (!(err instanceof SwitchEngineError)) throw err;
+      report(
+        `${safe(account.label)}: still kept out of auto-switch - ${safe(err.message)}; ${include} ` +
+          'lets auto-switch use it',
+        false,
+      );
+    }
+  }
+}
+
 /** Carry out the account steps. Returns the id each entry has here, the accounts that wait for a
- *  login, the ones added with their tokens, and whether any tokens arrived. */
+ *  login, the ones added with their tokens (labels and ids), and whether any tokens arrived. */
 async function importAccounts(
   plan: ImportPlan,
   payload: ExportPayload,
@@ -634,12 +738,12 @@ async function importAccounts(
 ): Promise<{
   localIds: Map<number, string>;
   pending: string[];
-  addedWithTokens: string[];
+  addedIds: string[];
   tokensArrived: boolean;
 }> {
   const localIds = new Map<number, string>();
   const pending: string[] = [];
-  const addedWithTokens: string[] = [];
+  const addedIds: string[] = [];
   let tokensArrived = false;
   for (const step of plan.accounts) {
     const entry = payload.accounts[step.entry]!;
@@ -647,7 +751,7 @@ async function importAccounts(
     try {
       if (step.kind === 'skip') {
         localIds.set(step.entry, step.existing.id);
-        report(`${name}: ${step.reason} - left as it is`, true);
+        report(`${name}: ${safe(step.reason)} - left as it is`, true);
       } else if (step.kind === 'replace') {
         localIds.set(step.entry, step.existing.id);
         const res = await engine.importBundle(step.existing.id, entry.bundle!);
@@ -666,7 +770,10 @@ async function importAccounts(
         );
       } else {
         // The exclusion goes into the same write as the account: a lock timeout or a crash between
-        // two writes would leave it stored in the pool auto-switch draws on.
+        // two writes would leave it stored in the pool auto-switch draws on. An account the file
+        // reserves to a rule is stored kept out too, until that rule has it (settleAwaitingAccounts).
+        const autoSwitchExcluded = step.autoSwitchExcluded || step.awaitsRule === true;
+        const kept = { autoSwitchExcluded, ...(step.id !== undefined ? { id: step.id } : {}) };
         const identity = {
           ...(entry.accountUuid !== undefined ? { accountUuid: entry.accountUuid } : {}),
           ...(entry.emailAddress !== undefined ? { emailAddress: entry.emailAddress } : {}),
@@ -675,23 +782,21 @@ async function importAccounts(
             : {}),
         };
         const account = step.withTokens
-          ? await engine.addAccount(step.label, entry.bundle!, {
-              autoSwitchExcluded: step.autoSwitchExcluded,
-              identity,
-            })
+          ? await engine.addAccount(step.label, entry.bundle!, { ...kept, identity })
           : await engine.addPendingAccount(step.label, identity, {
-              autoSwitchExcluded: step.autoSwitchExcluded,
+              ...kept,
+              ...(entry.plan !== undefined ? { plan: entry.plan } : {}),
             });
         localIds.set(step.entry, account.id);
+        addedIds.push(account.id);
         if (step.withTokens) {
           tokensArrived = true;
-          addedWithTokens.push(account.label);
         } else {
           pending.push(account.label);
         }
         report(
           `${safe(account.label)}: added${step.withTokens ? '' : ', waiting for a login'}` +
-            autoSwitchPhrase(step) +
+            autoSwitchPhrase(step, plan.platform) +
             (step.renamedFrom !== undefined
               ? ` (the label "${safe(step.renamedFrom)}" is taken here)`
               : ''),
@@ -704,7 +809,7 @@ async function importAccounts(
     }
   }
   if (plan.accounts.length === 0) report('(none in the file)', true);
-  return { localIds, pending, addedWithTokens, tokensArrived };
+  return { localIds, pending, addedIds, tokensArrived };
 }
 
 /** A rule step narrowed to the members that have an id here, with those ids. */
@@ -716,8 +821,11 @@ interface RuleWrite {
 
 /** The line a rule step gets when it was carried out, naming the members actually written. */
 function doneLine(write: RuleWrite, verb: string): string {
-  const members = { include: [...write.include.keys()], exclude: [...write.exclude.keys()] };
-  return `${describeRuleStep(write.step)}: ${verb}, ${describeMembers(members)}${describeRuleExtras(write.step)}`;
+  const members = describeMembers({
+    include: [...write.include.keys()],
+    exclude: [...write.exclude.keys()],
+  });
+  return `${describeRuleStep(write.step)}: ${verb}${members !== '' ? `, ${members}` : ''}${describeRuleExtras(write.step)}`;
 }
 
 /**
@@ -756,7 +864,10 @@ async function importRules(
         text: [`${where}: not created - none of the accounts it includes could be imported`],
         ok: false,
       });
-    } else if (write.include.size + write.exclude.size === 0) {
+    } else if (
+      write.include.size + write.exclude.size === 0 &&
+      !step.scopes.some((s) => s.joins === true)
+    ) {
       lines.set(step, {
         text: [`${where}: skipped - none of its accounts were imported`],
         ok: true,
@@ -802,7 +913,7 @@ async function importRules(
         lines.set(write.step, {
           text: [
             doneLine(write, outcome.created ? 'created' : 'added to the rule here'),
-            ...leftOutScopeLines(write.step),
+            ...scopeDetailLines(write.step),
             ...slotLines(
               outcome.rule,
               outcome.live?.liveAccount ?? null,
@@ -866,7 +977,7 @@ async function importSettings(
     if (step.kind === 'skip') {
       report(`${safe(step.name)}: skipped - ${safe(step.reason)}`, true);
     } else if (step.kind === 'same') {
-      report(`${step.name}=${safe(step.value)}: already set`, true);
+      report(sameSettingLine(step), true);
     } else if (step.kind === 'kept') {
       report(keptSettingLine(step), true);
     } else {
@@ -895,42 +1006,93 @@ const ETX = String.fromCharCode(3);
 const BACKSPACE = String.fromCharCode(8);
 const DELETE = String.fromCharCode(127);
 
+/** The 8-bit forms of the CSI and SS3 introducers (ESC `[` and ESC `O` as one character). */
+const CSI_8BIT = String.fromCharCode(0x9b);
+const SS3_8BIT = String.fromCharCode(0x8f);
+
 /**
  * The keys of a hidden prompt, as typed in raw mode. Enter ends it, Backspace removes the last
- * character, Ctrl-C abandons it. A terminal sends a cursor or editing key (an arrow, Home, End,
- * Delete) as an escape sequence; with nothing echoed the prompt cannot honor it, so the whole
- * sequence is dropped — never typed into the passphrase as invisible `[D` or `[3~`. A sequence may
+ * character, Ctrl-C abandons it. A terminal sends a cursor, editing or function key (an arrow,
+ * Home, End, Delete, F1) as an escape sequence; with nothing echoed the prompt cannot honor it, so
+ * the whole sequence is dropped — never typed into the passphrase as invisible `[D`, `[3~` or `A`.
+ * Every form a terminal uses is read whole: CSI (ESC `[`, parameters, one final byte), the Linux
+ * console's function keys (ESC `[` `[` and one letter), SS3 (ESC `O`, one byte), their 8-bit
+ * forms, and an ESC sent twice (Alt with an arrow, or Esc pressed before one). A sequence may
  * arrive split across reads, so where one stands is kept between them.
+ *
+ * Nothing typed is lost to a sequence: a byte no sequence can hold (Enter, Ctrl-C, Backspace in
+ * the middle of one) ends it and counts as the key it is. The Esc key pressed on its own (its ESC
+ * is the last thing read) is ignored and the next key is typed as usual; ESC followed by a
+ * printable key in the same read is an Alt chord, dropped whole.
  */
 export class HiddenInput {
   value = '';
   state: 'typing' | 'done' | 'cancelled' = 'typing';
-  /** Where in an escape sequence the input stands: none, just after ESC, in a CSI sequence (ESC
-   *  `[` parameters, then one final byte), or in an SS3 one (ESC `O`, then one byte). */
-  private escape: 'none' | 'start' | 'csi' | 'ss3' = 'none';
+  /** Where in an escape sequence the input stands: none, just after ESC, just after the CSI
+   *  introducer, among a CSI sequence's parameters, in a Linux console function key (one letter
+   *  to come), or in an SS3 sequence. */
+  private escape: 'none' | 'start' | 'csi-first' | 'csi' | 'fkey' | 'ss3' = 'none';
+  /** Whether the ESC that began the pending sequence came in the read being fed. */
+  private escapeInRead = false;
 
   feed(chunk: string): void {
+    this.escapeInRead = false;
     for (const ch of chunk) {
       if (this.state !== 'typing') return;
-      if (this.escape === 'start') {
-        this.escape = ch === '[' ? 'csi' : ch === 'O' ? 'ss3' : 'none';
-        continue;
-      }
-      if (this.escape === 'ss3') {
-        this.escape = 'none';
-        continue;
-      }
-      if (this.escape === 'csi') {
-        if (ch >= '@' && ch <= '~') this.escape = 'none';
-        continue;
-      }
-      if (ch === ESC) this.escape = 'start';
-      else if (ch === '\r' || ch === '\n') this.state = 'done';
-      else if (ch === ETX) this.state = 'cancelled';
-      else if (ch === BACKSPACE || ch === DELETE)
-        this.value = [...this.value].slice(0, -1).join('');
-      else if (ch >= ' ') this.value += ch;
+      if (!this.inSequence(ch)) this.key(ch);
     }
+  }
+
+  /** Feed `ch` to the escape sequence in progress: true when it belonged to it, false when it is a
+   *  key of its own (no sequence is in progress, or `ch` ended one it cannot be part of). */
+  private inSequence(ch: string): boolean {
+    const code = ch.codePointAt(0)!;
+    const printable = code >= 0x20 && code <= 0x7e;
+    switch (this.escape) {
+      case 'none':
+        return false;
+      case 'start':
+        if (ch === '[') this.escape = 'csi-first';
+        else if (ch === 'O') this.escape = 'ss3';
+        else if (ch === ESC) this.escapeInRead = true;
+        else {
+          this.escape = 'none';
+          return this.escapeInRead && printable;
+        }
+        return true;
+      case 'csi-first':
+        if (ch === '[') {
+          this.escape = 'fkey';
+          return true;
+        }
+        this.escape = 'csi';
+        return this.inSequence(ch);
+      case 'csi':
+        if (code >= 0x20 && code <= 0x3f) return true;
+        this.escape = 'none';
+        return code >= 0x40 && code <= 0x7e;
+      case 'ss3':
+        if (code >= 0x30 && code <= 0x3f) return true;
+        this.escape = 'none';
+        return printable;
+      case 'fkey':
+        this.escape = 'none';
+        return printable;
+    }
+  }
+
+  /** A key typed outside any escape sequence. */
+  private key(ch: string): void {
+    const code = ch.codePointAt(0)!;
+    if (ch === ESC) {
+      this.escape = 'start';
+      this.escapeInRead = true;
+    } else if (ch === CSI_8BIT) this.escape = 'csi-first';
+    else if (ch === SS3_8BIT) this.escape = 'ss3';
+    else if (ch === '\r' || ch === '\n') this.state = 'done';
+    else if (ch === ETX) this.state = 'cancelled';
+    else if (ch === BACKSPACE || ch === DELETE) this.value = [...this.value].slice(0, -1).join('');
+    else if (code >= 0x20 && !(code >= 0x80 && code <= 0x9f)) this.value += ch;
   }
 }
 
