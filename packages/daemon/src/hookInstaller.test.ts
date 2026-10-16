@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { linkSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,6 +14,7 @@ import {
 } from './hookInstaller.js';
 import { BIND_GUARD_MARKER, bindGuardPath, buildBindGuardCommand } from './bindGuard.js';
 import { DEFAULT_HOOK_EVENT_NAMES, DEFAULT_SECRET_HEADER } from './hookReceiver.js';
+import { ensureGroupProfile } from '@claude-control/switch-engine';
 
 async function readJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, 'utf8'));
@@ -995,5 +996,60 @@ describe('ensureBindGuard propagation into group profiles', () => {
       permissions?: { allow?: string[] };
     };
     expect(backedUp.permissions?.allow).toContain('UNIQUE_PROFILE_EDIT');
+  });
+
+  describe('a genuine hook change to main', () => {
+    const planted = [1, 2, 3, 4, 5].map((n) => `settings.json.100000000000${n}`);
+    const newHook: HookCommandSpec = { event: 'Stop', command: 'node forward.cjs --stop' };
+    let backupDir: string;
+
+    beforeEach(async () => {
+      await ensureBindGuard({
+        settingsPath: mainSettings,
+        guardPath,
+        snapshotPath,
+        hasBindings: true,
+        profileSettingsPaths: [profileSettings],
+      });
+      backupDir = join(dir, 'profiles', 'g1', '.cctl-backup');
+      await mkdir(backupDir, { recursive: true });
+      for (const name of planted) await writeFile(join(backupDir, name), 'older edit', 'utf8');
+    });
+
+    /** Install the new hook as a daemon start does, then run the profile repair. */
+    async function installAndRepair(): Promise<void> {
+      await installHooks({
+        settingsPath: mainSettings,
+        hooks: [newHook],
+        profileSettingsPaths: [profileSettings],
+      });
+      ensureGroupProfile(join(dir, 'profiles', 'g1'), dir);
+    }
+
+    it('keeps the profile on main and every older backup', async () => {
+      await installAndRepair();
+      expect(statSync(mainSettings, { bigint: true }).ino).toBe(
+        statSync(profileSettings, { bigint: true }).ino,
+      );
+      expect(await readFile(profileSettings, 'utf8')).toContain('forward.cjs --stop');
+      expect((await readdir(backupDir)).sort()).toEqual(planted);
+    });
+
+    it('still backs up a hand-edited profile copy', async () => {
+      await rm(profileSettings);
+      await writeFile(
+        profileSettings,
+        JSON.stringify({ permissions: { allow: ['UNIQUE_PROFILE_EDIT'] } }),
+        'utf8',
+      );
+      // Older than main's rewrite, so main wins the repair.
+      await utimes(profileSettings, new Date(0), new Date(0));
+      await installAndRepair();
+      const added = (await readdir(backupDir)).filter((name) => !planted.includes(name));
+      expect(added).toHaveLength(1);
+      expect(await readFile(join(backupDir, added[0] as string), 'utf8')).toContain(
+        'UNIQUE_PROFILE_EDIT',
+      );
+    });
   });
 });
