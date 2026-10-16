@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  acquireLock,
   sandboxPaths,
   type CredentialBundle,
   type Paths,
@@ -109,6 +110,30 @@ describe('buildEngine: where the engine writes its diagnostics', () => {
 
     expect(stdout.join('')).toContain('duplicate-account check did not run');
     expect(stderr).toEqual([]);
+  });
+});
+
+describe('buildEngine: how long a command waits for the credential lock', () => {
+  it('waits behind a holder past the engine default instead of failing the edit', async () => {
+    // Concurrent rule edits queue on the lock, each holding it for seconds on a busy machine: a
+    // command the operator is waiting on must outlast that queue, not give up after 15 s.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] });
+    try {
+      const paths = sandboxPaths(freshTempDir());
+      const engine = buildEngine(paths);
+      const held = await acquireLock(join(paths.vaultDir, '.lock'));
+      const outcome = engine.refreshSnapshot().then(
+        () => 'written',
+        (err: unknown) => err,
+      );
+      await vi.advanceTimersByTimeAsync(30_000);
+      held.release();
+      await vi.advanceTimersByTimeAsync(1_000);
+      vi.useRealTimers();
+      expect(await outcome).toBe('written');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

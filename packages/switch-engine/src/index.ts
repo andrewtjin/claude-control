@@ -172,7 +172,7 @@ export {
   FileCredentialChannel,
   type LiveCredentialChannel,
 } from './credentialStore.js';
-export { acquireLock, Lock, type LockOptions } from './lock.js';
+export { LOCK_STALE_MS, acquireLock, Lock, type LockOptions } from './lock.js';
 export { IntentStore } from './intent.js';
 export { AuditLog, type AuditEntry, type SwitchOrigin } from './audit.js';
 export {

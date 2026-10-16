@@ -342,8 +342,12 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // this resolver, not cached at construction — so a live `cctl settings set CCTL_BIND_ENFORCE ...`
   // takes effect on the next snapshot the daemon writes (a bind, a repair, a refresh) rather than
   // being reverted by a daemon-side rewrite until the next restart.
-  const engine = buildEngine(paths, DAEMON_LOG_SINK, loggingEnv, () =>
-    resolveBindEnforce(loggingEnv),
+  const engine = buildEngine(
+    paths,
+    DAEMON_LOG_SINK,
+    loggingEnv,
+    () => resolveBindEnforce(loggingEnv),
+    {},
   );
   // Two rows for one login would be polled as two accounts and shown twice on the phone;
   // resolve any left by an older build before the first poll (logged, never fatal).
