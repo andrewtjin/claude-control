@@ -444,6 +444,22 @@ describe('ensureGroupProfile (real filesystem)', () => {
     expect(lstatSync(join(profile, '.cctl-backup'), { throwIfNoEntry: false })).toBeUndefined();
   });
 
+  it('re-links without a backup when an unchanged MAIN rewrite severed the link', () => {
+    const { main, profile } = sandbox();
+    writeFileSync(join(main, 'settings.json'), 'SAME');
+    ensureGroupProfile(profile, main);
+    // A temp+rename of main with the same bytes severs the link and leaves main the newer side.
+    breakLinkWithNewInode(join(main, 'settings.json'), 'SAME');
+    utimesSync(join(profile, 'settings.json'), new Date('2020-01-01'), new Date('2020-01-01'));
+    utimesSync(join(main, 'settings.json'), new Date('2030-01-01'), new Date('2030-01-01'));
+
+    const report = ensureGroupProfile(profile, main);
+
+    expect(report.repaired).toContain('settings.json');
+    expect(ino(join(profile, 'settings.json'))).toBe(ino(join(main, 'settings.json')));
+    expect(lstatSync(join(profile, '.cctl-backup'), { throwIfNoEntry: false })).toBeUndefined();
+  });
+
   it('bounds the number of backups kept per file', () => {
     const { main, profile } = sandbox();
     writeFileSync(join(main, 'settings.json'), 'v0');
