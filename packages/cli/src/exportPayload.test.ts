@@ -465,3 +465,52 @@ describe('parseExportPayload: what all the rules together may hold', () => {
     expect(parseExportPayload(JSON.stringify(p)).rules).toHaveLength(4);
   });
 });
+
+describe("a rule's identity (its origin)", () => {
+  const MADE_HERE = '1a1a1a1a-1a1a-4a1a-8a1a-1a1a1a1a1a1a';
+  const CAME_FROM = '2b2b2b2b-2b2b-4b2b-8b2b-2b2b2b2b2b2b';
+  const built = (rules: FolderRule[]): ExportPayload =>
+    buildExportPayload({
+      accounts: [work],
+      bundles: new Map(),
+      rules,
+      allAccounts: [work],
+      config: undefined,
+      nowMs: 1,
+      cctlVersion: '1.1.0',
+      platform: 'linux',
+    });
+
+  it('is a rule made by hand its id, and a rule an import brought keeps the one it came with', () => {
+    const p = built([
+      rule(MADE_HERE, { folders: ['/a'], include: ['id-work'] }),
+      rule('3c3c3c3c-3c3c-4c3c-8c3c-3c3c3c3c3c3c', {
+        origin: CAME_FROM,
+        folders: ['/b'],
+        include: ['id-work'],
+      }),
+      rule('r-hand-edited', { folders: ['/c'], include: ['id-work'] }),
+    ]);
+    expect(p.rules.map((r) => r.origin)).toEqual([MADE_HERE, CAME_FROM, undefined]);
+    expect(parseExportPayload(JSON.stringify(p)).rules.map((r) => r.origin)).toEqual([
+      MADE_HERE,
+      CAME_FROM,
+      undefined,
+    ]);
+  });
+
+  it('refuses an identity that is not a uuid, or one rule listed twice', () => {
+    const p = built([rule(MADE_HERE, { folders: ['/a'], include: ['id-work'] })]);
+    p.rules[0]!.origin = '../x';
+    expect(refusal(p)).toContain('rules[0].origin is not a rule id');
+    const q = built([
+      rule(MADE_HERE, { folders: ['/a'], include: ['id-work'] }),
+      rule('3c3c3c3c-3c3c-4c3c-8c3c-3c3c3c3c3c3c', {
+        origin: MADE_HERE,
+        folders: ['/b'],
+        include: ['id-work'],
+      }),
+    ]);
+    expect(refusal(q)).toContain(`the rule ${MADE_HERE} is listed twice`);
+  });
+});

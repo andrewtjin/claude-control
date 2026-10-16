@@ -182,6 +182,12 @@ export interface FolderRule {
   id: string;
   /** Display name. Defaults to the folder the rule was created on. */
   label: string;
+  /** Which rule this one is on the machine an import brought it from: that rule's own origin, else
+   *  its id. Set on a rule an import made, or took to be the file's rule. Absent on a rule made here
+   *  by hand. A later import finds the rule by it whatever changed since on either machine (members,
+   *  folders, name), so a rule brought over part way is grown rather than made again beside itself.
+   *  A lower-case uuid; unlike the id it names nothing on disk. */
+  origin?: string;
   /** Canonical folder paths this rule applies to (see `folderPath.ts`). Unique across all rules.
    *  Empty for a rule that applies only to a session alias. */
   folders: string[];
@@ -419,6 +425,8 @@ export interface ImportRuleSpec {
   /** Add the members to this rule instead of creating one; the ones of `scopes` it lacks are added
    *  to it, and the scopes it holds beyond them stay its own. */
   intoRuleId?: string;
+  /** The {@link FolderRule.origin} of a rule this creates. */
+  origin?: string;
 }
 
 /** What {@link SwitchEngine.importRules} did with one {@link ImportRuleSpec}. */

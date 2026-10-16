@@ -1575,6 +1575,167 @@ describe('a rule an earlier import made part way', () => {
     expect(work.activeId).toBe(xb.id);
     expect(rules.find((r) => r.label === 'mine')!.folders).toEqual([f1]);
   });
+
+  /** A source rule on two folders including x, exported while only the first exists on `b`, then
+   *  imported there; returns both machines and what the second export needs. */
+  async function partWay(): Promise<{
+    a: Machine;
+    b: Machine;
+    rule: Awaited<ReturnType<Vault['createRule']>>;
+    ids: Record<'x' | 'y', string>;
+    f1: string;
+    f2: string;
+  }> {
+    const a = await machine();
+    const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
+    const y = await a.engine.addAccount('y', bundle('Y1', 'u-y'));
+    await a.engine.addAccount('s', bundle('S1', 'u-s'));
+    const f1 = await folder(a, 'w1');
+    const f2 = await folder(a, 'w2');
+    const rule = await a.vault.createRule({ folders: [f1, f2], include: [x.id], label: 'work' });
+    const first = join(a.root, 'first');
+    await runExport(first, exportAll, a.deps);
+    const b = await machine();
+    await rm(f2, { recursive: true, force: true });
+    expect(await importInto(b, first)).toEqual({ failed: 0 });
+    await mkdir(f2, { recursive: true });
+    b.out.length = 0;
+    return { a, b, rule, ids: { x: x.id, y: y.id }, f1, f2 };
+  }
+
+  it('grows the rule though every member changed on the source since the first import', async () => {
+    const { a, b, rule, ids, f2 } = await partWay();
+    await a.engine.includeInFolder(rule.folders[0]!, [ids.y]);
+    await a.vault.removeFromRule(rule.id, [ids.x]);
+    const second = join(a.root, 'second');
+    await runExport(second, exportAll, a.deps);
+
+    await importInto(b, second, { dryRun: true });
+    const dry = b.out.join('');
+    expect(dry).toContain(`folder ${f2}: joins the rule here`);
+    expect(dry).not.toContain(': create');
+    expect(dry).not.toContain('another rule there');
+    expect(await importInto(b, second)).toEqual({ failed: 0 });
+    const rules = await b.engine.listRules();
+    expect(rules).toHaveLength(1);
+    expect(rules[0]!.folders).toHaveLength(2);
+    const labels = await b.engine.listAllAccounts();
+    const idOf = (l: string): string => labels.find((r) => r.label === l)!.id;
+    expect(rules[0]!.include.sort()).toEqual([idOf('x'), idOf('y')].sort());
+  });
+
+  it('grows the rule though this machine changed it since: a folder added, a member swapped', async () => {
+    const { a, b, f1, f2 } = await partWay();
+    const here = (await b.engine.listRules())[0]!;
+    const extra = await folder(b, 'w3');
+    await b.vault.addScopesToRule(here.id, { folders: [extra] });
+    const z = await b.engine.addAccount('z', bundle('Z1', 'u-z'));
+    await b.engine.includeInFolder(f1, [z.id]);
+    await b.vault.removeFromRule(here.id, [here.include.find((id) => id !== z.id)!]);
+    expect(await importInto(b, join(a.root, 'first'))).toEqual({ failed: 0 });
+    const rules = await b.engine.listRules();
+    expect(rules).toHaveLength(1);
+    expect(rules[0]!.folders.sort()).toEqual([f1, f2, extra].sort());
+  });
+
+  it("never takes a rule of this machine's own for the file's because they share accounts", async () => {
+    const a = await machine();
+    const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
+    const eps = await a.engine.addAccount('eps', bundle('E1', 'u-eps'));
+    await a.engine.addAccount('s', bundle('S1', 'u-s'));
+    const f1 = await folder(a, 'o1');
+    const f3 = await folder(a, 'o3');
+    await a.vault.createRule({ folders: [f1, f3], include: [x.id], exclude: [eps.id] });
+    const file = join(a.root, 'f');
+    await runExport(file, exportAll, a.deps);
+
+    // b's own rule on o3 excludes the same account and includes the same one the file's does.
+    const b = await machine();
+    const xb = await b.engine.addAccount('x', bundle('X2', 'u-x'));
+    const q = await b.engine.addAccount('q', bundle('Q1', 'u-q'));
+    const epsb = await b.engine.addAccount('eps', bundle('E2', 'u-eps'));
+    await b.engine.addAccount('s2', bundle('S2', 'u-s2'));
+    await b.engine.includeInFolder(f3, [q.id, xb.id], { label: 'mine' });
+    await b.engine.excludeInFolder(f3, [epsb.id]);
+    const before = (await b.engine.listRules())[0]!;
+
+    await importInto(b, file, { dryRun: true });
+    const dry = b.out.join('');
+    expect(dry).toContain(`folder ${f3}: left out - this machine has another rule there`);
+    expect(dry).not.toContain('joins the rule here');
+    b.out.length = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    const rules = await b.engine.listRules();
+    expect(rules).toHaveLength(2);
+    const mine = rules.find((r) => r.id === before.id)!;
+    expect(mine.folders).toEqual([f3]);
+    expect(mine.include).toEqual(before.include);
+    expect(mine.exclude).toEqual(before.exclude);
+    expect(mine.origin).toBeUndefined();
+    expect(rules.find((r) => r.id !== before.id)!.folders).toEqual([f1]);
+  });
+
+  it('grows a rule of its own the first import took by its folders, once the source adds one', async () => {
+    const a = await machine();
+    const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
+    await a.engine.addAccount('s', bundle('S1', 'u-s'));
+    const f1 = await folder(a, 'e1');
+    const rule = await a.vault.createRule({ folders: [f1], include: [x.id] });
+    const first = join(a.root, 'first');
+    await runExport(first, exportAll, a.deps);
+
+    // b's own rule on exactly e1, with every member the file's has: nothing to add, but it is
+    // taken for the file's rule all the same.
+    const b = await machine();
+    const xb = await b.engine.addAccount('x', bundle('X2', 'u-x'));
+    await b.engine.addAccount('s2', bundle('S2', 'u-s2'));
+    await b.engine.includeInFolder(f1, [xb.id]);
+    expect(await importInto(b, first)).toEqual({ failed: 0 });
+    expect(b.out.join('')).toContain('this machine already has this rule, with these accounts');
+    expect((await b.engine.listRules())[0]!.origin).toBe(rule.id);
+
+    const f2 = await folder(a, 'e2');
+    await a.vault.addScopesToRule(rule.id, { folders: [f2] });
+    const second = join(a.root, 'second');
+    await runExport(second, exportAll, a.deps);
+    b.out.length = 0;
+    expect(await importInto(b, second)).toEqual({ failed: 0 });
+    expect(b.out.join('')).toContain(`folder ${f2}: joins the rule here`);
+    const rules = await b.engine.listRules();
+    expect(rules).toHaveLength(1);
+    expect(rules[0]!.folders).toEqual([f1, f2]);
+  });
+
+  it('finds the rule again on the machine it came from, and on a third machine', async () => {
+    const { a, b, rule, f2 } = await partWay();
+    expect(await importInto(b, join(a.root, 'first'))).toEqual({ failed: 0 });
+    const onB = (await b.engine.listRules())[0]!;
+    expect(onB.origin).toBe(rule.id);
+
+    // b adds a folder; its export carries the source rule's identity, so a finds its own rule.
+    const extra = await folder(b, 'w4');
+    await b.vault.addScopesToRule(onB.id, { folders: [extra] });
+    const back = join(b.root, 'back');
+    await runExport(back, exportAll, b.deps);
+    a.out.length = 0;
+    expect(await importInto(a, back)).toEqual({ failed: 0 });
+    const onA = await a.engine.listRules();
+    expect(onA).toHaveLength(1);
+    expect(onA[0]!.id).toBe(rule.id);
+    expect(onA[0]!.folders).toContain(extra);
+    expect(onA[0]!.origin).toBeUndefined();
+
+    // A third machine that took the rule from b, then the file from a: still one rule.
+    const c = await machine();
+    await rm(f2, { recursive: true, force: true });
+    expect(await importInto(c, back)).toEqual({ failed: 0 });
+    await mkdir(f2, { recursive: true });
+    expect(await importInto(c, join(a.root, 'first'))).toEqual({ failed: 0 });
+    const onC = await c.engine.listRules();
+    expect(onC).toHaveLength(1);
+    expect(onC[0]!.origin).toBe(rule.id);
+    expect(onC[0]!.folders).toContain(f2);
+  });
 });
 
 describe('importing the same file again', () => {
@@ -1768,6 +1929,100 @@ describe('what the dry run promises, the real run does', () => {
       expect(c.out.join('')).toMatch(/switched off client \(now reserved\) and is on other/);
       expect(await c.engine.listRules()).toHaveLength(1);
     }
+  });
+
+  it('sees the main login moving when --replace gives a stored row the login running there', async () => {
+    const CID = '5e5e5e5e-5e5e-4e5e-8e5e-5e5e5e5e5e5e';
+    const tokens = (access: string, hours: number): Record<string, unknown> => ({
+      accessToken: access,
+      refreshToken: 'r-' + access,
+      expiresAt: Date.now() + hours * HOUR,
+    });
+    /** A machine holding client from an export made before its login was known, whose main login
+     *  then runs that login, which no row here is recognized as. */
+    async function target(spare: boolean): Promise<Machine> {
+      const b = await machine();
+      const first = await sealedFile(
+        b,
+        filePayload({
+          accounts: [
+            {
+              label: 'client',
+              id: CID,
+              emailAddress: 'c@x.com',
+              autoSwitchExcluded: false,
+              bundle: {
+                claudeAiOauth: tokens('C0', 10),
+                oauthAccount: { emailAddress: 'c@x.com' },
+              },
+            },
+          ],
+        }),
+        'first.cctl',
+      );
+      expect(await importInto(b, first)).toEqual({ failed: 0 });
+      expect((await b.engine.listAllAccounts())[0]).toMatchObject({ id: CID });
+      if (spare) {
+        const other = await b.engine.addAccount('other', bundle('O1', 'u-other'));
+        await b.engine.activate(other.id);
+      }
+      const live = new CredentialStore(b.paths);
+      await live.writeLiveCredentials(bundle('C-LIVE', 'u-c').claudeAiOauth);
+      await live.writeOauthAccount({ accountUuid: 'u-c', emailAddress: 'c@x.com' });
+      expect(await b.engine.getActiveId('global')).toBeNull();
+      b.out.length = 0;
+      return b;
+    }
+    async function second(m: Machine): Promise<string> {
+      return sealedFile(
+        m,
+        filePayload({
+          accounts: [
+            {
+              label: 'client',
+              id: CID,
+              accountUuid: 'u-c',
+              emailAddress: 'c@x.com',
+              autoSwitchExcluded: false,
+              bundle: {
+                claudeAiOauth: tokens('C1', 20),
+                oauthAccount: { accountUuid: 'u-c', emailAddress: 'c@x.com' },
+              },
+            },
+          ],
+          rules: [
+            {
+              label: 'r',
+              folders: [await folder(m, 'proj')],
+              aliases: [],
+              include: ['u-c'],
+              exclude: [],
+            },
+          ],
+        }),
+        'second.cctl',
+      );
+    }
+
+    const b = await target(false);
+    const file = await second(b);
+    const why = "including client would leave this machine's main login with no shared account";
+    await importInto(b, file, { dryRun: true, replace: true });
+    expect(b.out.join('')).toContain(why);
+    b.out.length = 0;
+    expect(await importInto(b, file, { replace: true })).toEqual({ failed: 0 });
+    expect(b.out.join('')).toContain(why);
+    expect(await b.engine.listRules()).toEqual([]);
+    expect(await b.engine.getActiveId('global')).toBe(CID);
+
+    const c = await target(true);
+    const fileC = await second(c);
+    await importInto(c, fileC, { dryRun: true, replace: true });
+    expect(c.out.join('')).toContain("this machine's main login moves off client");
+    c.out.length = 0;
+    expect(await importInto(c, fileC, { replace: true })).toEqual({ failed: 0 });
+    expect(c.out.join('')).toMatch(/switched off client \(now reserved\) and is on other/);
+    expect(await c.engine.listRules()).toHaveLength(1);
   });
 
   it('makes the rule it promised when one account is labelled with the id another keeps', async () => {

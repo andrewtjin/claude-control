@@ -96,6 +96,7 @@ export type TransferEngine = Pick<
   | 'importBundle'
   | 'checkRuleScope'
   | 'importRules'
+  | 'recordRuleOrigin'
   | 'setAutoSwitchExcluded'
   | 'removeAccount'
 >;
@@ -835,6 +836,24 @@ function doneLine(write: RuleWrite, verb: string): string {
 }
 
 /**
+ * Record, on each rule here the plan took to be a rule of the file by its scopes alone, which rule
+ * of the other machine it is (see RuleStep.takesOrigin) — whether or not the step wrote anything,
+ * since what the rule IS does not depend on that. Bookkeeping only: it changes nothing a rule does,
+ * so a refusal (the rule was removed meanwhile) is not reported, and the next import of the file
+ * makes the same choice again.
+ */
+async function recordOrigins(plan: ImportPlan, engine: TransferEngine): Promise<void> {
+  for (const step of plan.rules) {
+    if (step.takesOrigin !== true || step.into === undefined || step.origin === undefined) continue;
+    try {
+      await engine.recordRuleOrigin(step.into.id, step.origin);
+    } catch (err) {
+      if (!(err instanceof SwitchEngineError)) throw err;
+    }
+  }
+}
+
+/**
  * Carry out the rule steps, all in one engine call (see SwitchEngine.importRules for why one call:
  * a rule is rebuilt whole, every exclusion before any inclusion, and no slot is seated until every
  * reservation is in place). A rule whose included accounts all failed to import is not made — with
@@ -891,7 +910,11 @@ async function importRules(
       include: [...include.values()],
       exclude: [...exclude.values()],
       ...(step.label !== undefined ? { label: step.label } : {}),
-      ...(step.into !== undefined ? { intoRuleId: step.into.id } : {}),
+      ...(step.into !== undefined
+        ? { intoRuleId: step.into.id }
+        : step.origin !== undefined
+          ? { origin: step.origin }
+          : {}),
     }));
     // An account the file reserves to a rule runs in no slot here but that rule's: not as the
     // replacement for a slot a rule moves, nor as the seat of a rule the import makes.
@@ -950,6 +973,7 @@ async function importRules(
       }
     }
   }
+  await recordOrigins(plan, engine);
   for (const step of plan.rules) {
     const entry = lines.get(step)!;
     const [first, ...rest] = entry.text;

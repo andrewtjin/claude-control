@@ -98,16 +98,21 @@ export interface ScopePlan {
 
 /**
  * What the import does with one rule of the file. A rule is rebuilt WHOLE — one rule here with
- * every scope that can be used here — or added to a rule this machine already has: one on exactly
- * those scopes (an earlier import of the same rule, or of another file from the same machine), or
- * one holding some of them that shares a member with it (an earlier import that stopped part way,
- * before a folder of it existed here, whatever changed since), which gains the scopes it lacks. It
+ * every scope that can be used here — or added to the rule this machine already has that IS it:
+ * the one an earlier import of it made or took (found by the rule's identity, whatever changed
+ * since on either machine), which gains the scopes it lacks, or else one on exactly its scopes. It
  * is never split: a rule is one slot, so a split would change which account each of its folders
  * runs on. See intoRule.
  */
 export interface RuleStep {
   /** The rule's display name, for a rule this creates, when it is not just the default. */
   label?: string;
+  /** The rule's identity across machines (see ExportedRule.origin), stored on a rule this
+   *  creates. */
+  origin?: string;
+  /** Set when {@link into} was taken for this rule by its scopes alone and has no identity yet:
+   *  the import records `origin` on it, so a later import finds it after either side changed. */
+  takesOrigin?: true;
   scopes: ScopePlan[];
   /** The members to include and exclude: for a rule this adds to, only the ones it lacks. */
   include: MemberTarget[];
@@ -454,42 +459,37 @@ function earlySkip(
 /**
  * Which rule here, if any, the file's rule IS — the one it is added to rather than made beside.
  *
- * A rule here holding exactly the file rule's usable scopes, and nothing else, is that rule,
- * whatever its members. Otherwise a rule here holding some of the scopes is that rule when it
- * shares a member with it on the same side: an account both include, or both exclude. That is what
- * an earlier import of this rule left (made before the rest of its folders existed here, then
- * changed on either machine since: a member added or dropped, a folder added or removed), and
- * making a second rule beside it would split the file's rule in two — two slots, so the account
- * both include could run in only one of them, and the other folders would quietly run on some
- * other account. A rule here that shares no member is this machine's own; the scopes it holds stay
- * its own. When two or more rules here share members with it (a split an older build made), there
- * is no one rule to grow, and making a third would split it further: `ambiguous` names them.
+ * First by identity: the rule an earlier import of it made, or took to be it (its origin is the
+ * file rule's), or the rule itself when the file came from this machine (its id is). That holds
+ * whatever changed since on either machine — members added, dropped or swapped, folders added or
+ * removed, a folder of it taken by a rule of this machine's own — so a rule brought over part way
+ * (before all its folders existed here) is grown, never made a second time beside itself, which
+ * would split it into two slots. Failing that, a rule here holding exactly the file rule's usable
+ * scopes, and nothing else, is that rule, whatever its members. A rule here that is neither is
+ * this machine's own however many members it shares with the file's: the scopes it holds stay its
+ * own. Two rules here with the one identity (only a hand edit makes them) leave no one rule to grow,
+ * and making a third would split it further: `ambiguous` names them.
  */
 function intoRule(
   usable: readonly ScopePlan[],
   holders: readonly (FolderRule | undefined)[],
-  step: RuleStep,
-  steps: readonly AccountStep[],
+  origin: string | undefined,
+  rules: readonly FolderRule[],
 ): { rule?: FolderRule; ambiguous?: FolderRule[] } {
-  const held = [...new Set(holders.filter((h): h is FolderRule => h !== undefined))];
-  if (held.length === 0) return {};
-  const only = held[0]!;
+  if (origin !== undefined) {
+    const same = rules.filter((r) => r.origin === origin || r.id === origin);
+    if (same.length > 1) return { ambiguous: same };
+    if (same.length === 1) return { rule: same[0]! };
+  }
+  const only = holders[0];
   if (
-    held.length === 1 &&
+    only !== undefined &&
     holders.every((h) => h === only) &&
     usable.length === only.folders.length + (only.aliases?.length ?? 0)
   ) {
     return { rule: only };
   }
-  const ids = (targets: readonly MemberTarget[]): Set<string> =>
-    new Set(targets.flatMap((t) => localIdOf(t, steps) ?? []));
-  const include = ids(step.include);
-  const exclude = ids(step.exclude);
-  const same = held.filter(
-    (r) => r.include.some((id) => include.has(id)) || r.exclude.some((id) => exclude.has(id)),
-  );
-  if (same.length > 1) return { ambiguous: same };
-  return same.length === 1 ? { rule: same[0]! } : {};
+  return {};
 }
 
 /**
@@ -593,7 +593,7 @@ function planRules(input: PlanInput, steps: readonly AccountStep[]): RuleStep[] 
     // rule here holds stays that rule's.
     const usable = step.scopes.filter((s) => s.skip === undefined);
     const holders = usable.map((s) => ruleHolding(s, input));
-    const { rule: into, ambiguous } = intoRule(usable, holders, step, steps);
+    const { rule: into, ambiguous } = intoRule(usable, holders, rule.origin, input.rules);
     if (ambiguous !== undefined) {
       return {
         ...step,
@@ -603,7 +603,13 @@ function planRules(input: PlanInput, steps: readonly AccountStep[]): RuleStep[] 
           '; it is left as it is (remove all but one with cctl folder reset, then import again)',
       };
     }
-    if (into !== undefined) step.into = into;
+    if (rule.origin !== undefined) step.origin = rule.origin;
+    if (into !== undefined) {
+      step.into = into;
+      if (rule.origin !== undefined && into.origin === undefined && into.id !== rule.origin) {
+        step.takesOrigin = true;
+      }
+    }
     for (const [i, scope] of usable.entries()) {
       if (holders[i] === undefined) {
         if (into !== undefined) scope.joins = true;
@@ -685,15 +691,13 @@ function foreseeHandOffs(input: PlanInput, steps: readonly AccountStep[], rules:
         ? (input.globalLive ?? null)
         : (input.rules.find((r) => ruleSlotId(r.id) === slot)?.activeId ?? null);
     const owners = new Set(live !== null ? [live] : []);
-    // A login this machine runs but has not stored, which the import stores: live there once added.
+    // A login this slot runs that no account here is recognized as, which the import gives to an
+    // account: that account is live there once written.
     const login = input.unstoredLogins?.get(slot);
     for (const s of steps) {
-      if (
-        login !== undefined &&
-        s.kind === 'add' &&
-        loginOf(input.payload.accounts[s.entry]!) === login
-      )
-        owners.add(key({ entry: s.entry, label: s.label }));
+      if (login !== undefined && newLoginOf(s, input) === login) {
+        owners.add(s.kind === 'add' ? key({ entry: s.entry, label: s.label }) : s.existing.id);
+      }
     }
     occupancy.set(slot, owners);
   }
@@ -731,9 +735,11 @@ function foreseeHandOffs(input: PlanInput, steps: readonly AccountStep[], rules:
     if (assigned.ok) {
       for (const m of moving) {
         const which = m.slot === 'global' ? "this machine's main login" : describeSlot(m.slot);
-        for (const rule of reservers(m.from.id)) {
-          rule.notes.push(`${which} moves off ${m.from.label}, which this rule reserves`);
-        }
+        // Said once, on the first rule that reserves the account, as the real run reports each
+        // move once: noted on every such rule, the plan would grow with slots times rules.
+        reservers(m.from.id)[0]?.notes.push(
+          `${which} moves off ${m.from.label}, which this rule reserves`,
+        );
       }
       return;
     }
@@ -746,6 +752,22 @@ function foreseeHandOffs(input: PlanInput, steps: readonly AccountStep[], rules:
           'account to run on';
     for (const rule of reservers(short.from.id)) rule.skip = reason;
   }
+}
+
+/**
+ * The login the import gives an account step's account, which it is recognized by from then on in
+ * any slot running that login: an added account's entry's login, and, for a replaced row that
+ * records no login yet, the login its new tokens prove (the engine lays the brought identity over
+ * the stored one). A skipped row, or one that records a login already, is recognized as before.
+ * A replace is foreseen as written: whether the file's copy is the newer one is known only at run
+ * time, and assuming it is can make the plan cautious but never promises a rule the real run
+ * refuses.
+ */
+function newLoginOf(step: AccountStep, input: PlanInput): string | undefined {
+  const login = loginOf(input.payload.accounts[step.entry]!);
+  if (step.kind === 'add') return login;
+  if (step.kind === 'replace' && step.existing.accountUuid === undefined) return login;
+  return undefined;
 }
 
 /** The entries of the file some rule of it includes: accounts reserved to a rule on the machine the

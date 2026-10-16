@@ -4,7 +4,7 @@
 // (importBundle).
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -741,6 +741,76 @@ describe('importRules: a rule an earlier import made part way', () => {
     expect(rules).toHaveLength(1);
     expect(rules[0]!.folders).toHaveLength(3);
     expect(rules[0]!.activeId).toBe(x.id);
+  });
+});
+
+describe("a rule's identity across machines (its origin)", () => {
+  const ORIGIN = '0a0a0a0a-0a0a-4a0a-8a0a-0a0a0a0a0a0a';
+
+  it('is stored on a rule an import creates, and read back from disk', async () => {
+    const h = await harness();
+    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+    await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
+    const p1 = await ruleFolder(h, 'p1');
+    const res = await h.engine.importRules([
+      { scopes: [{ kind: 'folder', folder: p1 }], include: [x.id], exclude: [], origin: ORIGIN },
+    ]);
+    expect(res.rules[0]).toMatchObject({ ok: true, created: true });
+    expect((await h.vault.listRules())[0]!.origin).toBe(ORIGIN);
+  });
+
+  it('refuses, before anything moves, a rule naming an identity a rule here already has', async () => {
+    const h = await harness();
+    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+    await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
+    const p1 = await ruleFolder(h, 'p1');
+    const p2 = await ruleFolder(h, 'p2');
+    const mine = await h.vault.createRule({ folders: [p1], exclude: [x.id] });
+    for (const origin of [mine.id, 'not-a-uuid']) {
+      const res = await h.engine.importRules([
+        { scopes: [{ kind: 'folder', folder: p2 }], include: [x.id], exclude: [], origin },
+      ]);
+      expect(res.rules[0]).toMatchObject({ ok: false });
+    }
+    expect(await h.engine.listRules()).toHaveLength(1);
+    expect((await h.engine.listAllAccounts()).find((a) => a.id === x.id)?.ruleIds ?? []).toEqual(
+      [],
+    );
+  });
+
+  it('is recorded on a rule taken for the file rule, once, and never over another', async () => {
+    const h = await harness();
+    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+    const p1 = await ruleFolder(h, 'p1');
+    const p2 = await ruleFolder(h, 'p2');
+    const one = await h.vault.createRule({ folders: [p1], exclude: [x.id] });
+    const two = await h.vault.createRule({ folders: [p2], exclude: [x.id] });
+    expect((await h.engine.recordRuleOrigin(one.id, ORIGIN)).origin).toBe(ORIGIN);
+    // Kept as it is: a second identity, or the rule's own id.
+    const other = '0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b';
+    expect((await h.engine.recordRuleOrigin(one.id, other)).origin).toBe(ORIGIN);
+    expect((await h.engine.recordRuleOrigin(two.id, two.id)).origin).toBeUndefined();
+    // One rule per identity, and only a uuid.
+    await expect(h.engine.recordRuleOrigin(two.id, ORIGIN)).rejects.toThrow(VaultError);
+    await expect(h.engine.recordRuleOrigin(two.id, one.id)).rejects.toThrow(VaultError);
+    await expect(h.engine.recordRuleOrigin(two.id, 'x/../y')).rejects.toThrow(VaultError);
+    const rules = await h.vault.listRules();
+    expect(rules.map((r) => r.origin)).toEqual([ORIGIN, undefined]);
+  });
+
+  it('refuses a registry whose rule carries an origin that is not a uuid', async () => {
+    const h = await harness();
+    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+    const p1 = await ruleFolder(h, 'p1');
+    await h.vault.createRule({ folders: [p1], exclude: [x.id], origin: ORIGIN });
+    const file = join(h.paths.vaultDir, 'groups.json');
+    const raw = JSON.parse(await readFile(file, 'utf8')) as { rules: { origin: unknown }[] };
+    expect(raw.rules[0]!.origin).toBe(ORIGIN);
+    raw.rules[0]!.origin = 7;
+    await writeFile(file, JSON.stringify(raw));
+    await expect(
+      new Vault(h.paths.vaultDir, new InsecurePassthroughProtector(), () => NOW).listRules(),
+    ).rejects.toThrow('origin is not a rule id');
   });
 });
 

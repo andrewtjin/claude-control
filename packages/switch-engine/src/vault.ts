@@ -93,6 +93,8 @@ export interface NewRuleOptions {
   exclude?: readonly string[];
   /** Display name; defaults to the first folder. */
   label?: string;
+  /** The rule's identity on the machine an import brought it from (see {@link FolderRule.origin}). */
+  origin?: string;
 }
 
 /** The scopes of some rules as a display list, for "reserved to <folders>" messages. */
@@ -119,6 +121,17 @@ function assertLabelFree(rows: StoredAccount[], label: string, exceptId: string 
       `"${label}" already refers to account ${taken.id} ("${taken.label}"); ` +
         'two accounts answering to one name could not be told apart on switch',
     );
+  }
+}
+
+/** Refuse an origin (see {@link FolderRule.origin}) that is not a rule id, or that some rule here
+ *  already answers to, as its origin or its own id: one rule per identity, so an import can never
+ *  find two rules that are both the file's rule. */
+function assertRuleOrigin(st: RegistryState, origin: string): void {
+  if (!ACCOUNT_ID_PATTERN.test(origin)) throw new VaultError('a rule origin must be a rule id');
+  const holder = st.rules.find((r) => r.origin === origin || r.id === origin);
+  if (holder !== undefined) {
+    throw new VaultError(`the rule on ${describeRuleScopes(holder)} is already that rule`);
   }
 }
 
@@ -487,9 +500,16 @@ function validateRulesFile(
     if (activeId !== null && (typeof activeId !== 'string' || activeId === '')) {
       throw new VaultError(`${where} (${r.id}) activeId is not an account id or null`);
     }
+    // A hand-edited origin that is not a uuid could never match a file's; refused like any other
+    // malformed field rather than carried as a key no import could name.
+    const origin = r.origin;
+    if (origin !== undefined && (typeof origin !== 'string' || !ACCOUNT_ID_PATTERN.test(origin))) {
+      throw new VaultError(`${where} (${r.id}) origin is not a rule id`);
+    }
     rules.push({
       id: r.id,
       label: r.label,
+      ...(origin !== undefined ? { origin } : {}),
       folders,
       // Kept only when non-empty, so a rule without alias scopes keeps the older file shape.
       ...(aliases.length > 0 ? { aliases } : {}),
@@ -753,6 +773,7 @@ const ALIAS_SCOPE_KEYS: ReadonlySet<string> = new Set(['folder', 'alias']);
 const RULE_KEYS: ReadonlySet<string> = new Set([
   'id',
   'label',
+  'origin',
   'folders',
   'aliases',
   'include',
@@ -1320,6 +1341,7 @@ export class Vault {
     const rule: FolderRule = {
       id: randomUUID(),
       label,
+      ...(opts.origin !== undefined ? { origin: opts.origin } : {}),
       folders: plan.folders,
       ...(plan.aliases.length > 0 ? { aliases: plan.aliases } : {}),
       include: plan.include,
@@ -1364,6 +1386,7 @@ export class Vault {
     if (st.rules.length >= MAX_RULES) {
       throw new VaultError(`cannot create another folder rule (max ${MAX_RULES})`);
     }
+    if (opts.origin !== undefined) assertRuleOrigin(st, opts.origin);
     const include = [...new Set(opts.include ?? [])];
     const exclude = [...new Set(opts.exclude ?? [])];
     if (include.length === 0 && exclude.length === 0) {
@@ -1634,6 +1657,23 @@ export class Vault {
     }
     rule.activeId = accountId;
     rule.updatedAtMs = this.clock();
+    await this.saveRules(st);
+    return rule;
+  }
+
+  /**
+   * Record that a rule here is the rule `origin` names on another machine (see
+   * {@link FolderRule.origin}): an import took it to be the file's rule (it holds exactly that
+   * rule's folders), so a later import of the same rule finds it again after either side changed.
+   * A rule that already has an origin, or whose own id is `origin`, keeps what it has. Returns the
+   * rule; one groups.json write, none when nothing changes.
+   */
+  async recordRuleOrigin(ruleId: string, origin: string): Promise<FolderRule> {
+    const st = await this.loadState();
+    const rule = this.mustRule(st, ruleId);
+    if (rule.origin !== undefined || rule.id === origin) return rule;
+    assertRuleOrigin(st, origin);
+    rule.origin = origin;
     await this.saveRules(st);
     return rule;
   }

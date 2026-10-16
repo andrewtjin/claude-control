@@ -1706,6 +1706,7 @@ export class SwitchEngine {
                 ...newRuleScopes(scopes[i]!),
                 [verb]: ids,
                 ...(spec.label !== undefined ? { label: spec.label } : {}),
+                ...(spec.origin !== undefined ? { origin: spec.origin } : {}),
               });
               ruleIds[i] = rule.id;
               created.add(i);
@@ -1757,6 +1758,15 @@ export class SwitchEngine {
     });
   }
 
+  /**
+   * Record that the rule `ruleId` is the rule `origin` names on another machine (an import took it
+   * to be the file's rule; see Vault.recordRuleOrigin). Changes no folder, member or slot, so the
+   * guard snapshot is untouched; taken under the credential lock all rule writes share.
+   */
+  async recordRuleOrigin(ruleId: string, origin: string): Promise<FolderRule> {
+    return this.withCredentialLock(() => this.vault.recordRuleOrigin(ruleId, origin));
+  }
+
   /** The refusals one {@link importRules} spec meets before anything moves. Holds the lock. */
   private async checkImportSpecLocked(
     spec: ImportRuleSpec,
@@ -1769,6 +1779,7 @@ export class SwitchEngine {
         include: spec.include,
         exclude: spec.exclude,
         ...(spec.label !== undefined ? { label: spec.label } : {}),
+        ...(spec.origin !== undefined ? { origin: spec.origin } : {}),
       });
       return;
     }

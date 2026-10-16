@@ -121,14 +121,14 @@ What an import does with each part, printed in full by `--dry-run`:
   a slot onto it, or seat a rule it makes with it. `cctl accounts include <account>` hands it
   back to auto-switch.
 - **Rules** are rebuilt whole: one rule with every folder and session scope the source rule
-  had, on one slot, with the same included and excluded accounts. When this machine already has
-  a rule on exactly those scopes (an earlier import of the same file, or of another file from
-  the same machine), the accounts it lacks are added to it; when it has the rule an earlier
-  import made before one of its folders existed here (one holding some of the scopes and
-  sharing an included or excluded account with it, whatever changed on either machine since),
-  that rule gains the folder rather than a second rule being made. When this machine already
-  has the rule split between two such rules, the rule is skipped and listed rather than split
-  further. A scope is left out, and listed,
+  had, on one slot, with the same included and excluded accounts. A rule keeps its identity
+  across machines: a rule the import makes (or adds to) remembers which rule it is, and the
+  export of a rule carries it. So when this machine already has that rule (an earlier import
+  made it, say before one of its folders existed here; or the file came from this machine),
+  the accounts and scopes it lacks are added to it, whatever changed on either machine since,
+  rather than a second rule being made beside it. Otherwise a rule here on exactly those scopes
+  is taken to be it and gains the accounts it lacks. Any other rule here is this machine's own,
+  whatever accounts it shares with the file's, and keeps its scopes. A scope is left out, and listed,
   when its folder does not exist here, is a network folder (those are never looked up from a
   file), is a folder of another platform, or is one no rule may cover (a drive root, the home
   folder, cctl's own folders); a scope another rule here holds is left to that rule. A rule is

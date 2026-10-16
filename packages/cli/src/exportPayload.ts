@@ -62,6 +62,10 @@ export interface ExportedAliasScope {
  *  exported account. */
 export interface ExportedRule {
   label: string;
+  /** The rule's identity across machines: its origin, or for a rule made by hand, its id (see
+   *  FolderRule.origin). An import finds by it the rule an earlier import of this one made. Absent
+   *  for a rule whose id is not a uuid (a hand-edited registry). */
+  origin?: string;
   folders: string[];
   aliases: ExportedAliasScope[];
   include: string[];
@@ -141,7 +145,17 @@ export function buildExportPayload(source: ExportSource): ExportPayload {
     const exclude = rule.exclude.flatMap((id) => refById.get(id) ?? []);
     const aliases = (rule.aliases ?? []).map((a) => ({ folder: a.folder, alias: a.alias }));
     if (rule.folders.length + aliases.length === 0) continue;
-    rules.push({ label: rule.label, folders: [...rule.folders], aliases, include, exclude });
+    // A rule made here by hand is known elsewhere by its own id; one an import brought keeps the
+    // identity it came with, so a rule passed on from machine to machine stays one rule.
+    const origin = rule.origin ?? rule.id;
+    rules.push({
+      label: rule.label,
+      ...(ACCOUNT_ID_PATTERN.test(origin) ? { origin } : {}),
+      folders: [...rule.folders],
+      aliases,
+      include,
+      exclude,
+    });
   }
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(source.config?.env ?? {})) {
@@ -420,8 +434,12 @@ function parseRule(value: unknown, i: number): ExportedRule {
   const exclude = [...new Set(strList(o['exclude'], `${where}.exclude`, MAX_RULE_ACCOUNTS))];
   const both = include.find((ref) => exclude.includes(ref));
   if (both !== undefined) bad(`${where} both includes and excludes ${both}`);
+  const origin = optStr(o['origin'], `${where}.origin`);
+  if (origin !== undefined && !ACCOUNT_ID_PATTERN.test(origin))
+    bad(`${where}.origin is not a rule id`);
   return {
     label: str(o['label'], `${where}.label`),
+    ...(origin !== undefined ? { origin } : {}),
     folders: strList(o['folders'], `${where}.folders`, MAX_RULE_FOLDERS, PAYLOAD_LIMITS.path),
     aliases: arr(o['aliases'], `${where}.aliases`, MAX_RULE_ALIASES).map((a, j) => {
       const scope = obj(a, `${where}.aliases[${j}]`);
@@ -489,6 +507,13 @@ export function parseExportPayload(text: string): ExportPayload {
     seen.add(login);
   }
   const rules = arr(o['rules'], 'rules', PAYLOAD_LIMITS.rules).map(parseRule);
+  // One rule per identity: two would both be the rule an earlier import made here.
+  const origins = new Set<string>();
+  for (const r of rules) {
+    if (r.origin === undefined) continue;
+    if (origins.has(r.origin)) bad(`the rule ${r.origin} is listed twice`);
+    origins.add(r.origin);
+  }
   const scopes = rules.reduce((n, r) => n + r.folders.length + r.aliases.length, 0);
   if (scopes > PAYLOAD_LIMITS.scopes) {
     bad(`the rules hold more than ${PAYLOAD_LIMITS.scopes} folders and session aliases in all`);
