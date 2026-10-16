@@ -573,6 +573,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
         settingsPath,
         hooks: buildDaemonHookSpecs({ secret: hookSecret, forwarderPath }),
         ownedCommandMarker: DEFAULT_SECRET_HEADER,
+        // Every profile dir, read without the rules so a registry that fails to load still gets the
+        // forwarder; only those sharing main's inode are touched.
+        profileSettingsPaths: resolveGuardProfileSettingsPaths(paths.vaultDir, [], false),
       });
       // Reconcile the enforcement guard beside the forwarder, keyed off whether any folder is bound.
       // Without this the guard is never installed and folder bindings are recorded but never enforced
