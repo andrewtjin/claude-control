@@ -128,4 +128,87 @@ describe('cctl stats', () => {
       expect(byAccount).not.toContain('shared-acct');
     },
   );
+
+  // A fork's file repeats its parent's turn under the fork's id. Which file is read first follows
+  // the session ids, so both orders must bill that turn to the parent's account alone.
+  it.skipIf(process.platform === 'darwin').each([
+    [
+      'the parent sorts first',
+      'aaaaaaaa-0000-4000-8000-000000000001',
+      'ffffffff-0000-4000-8000-000000000002',
+    ],
+    [
+      'the fork sorts first',
+      'ffffffff-0000-4000-8000-000000000001',
+      'aaaaaaaa-0000-4000-8000-000000000002',
+    ],
+  ])("bills a fork's copied turn to its maker when %s", async (_order, parent, fork) => {
+    const now = Date.now();
+    const vault = new Vault(paths.vaultDir, new InsecurePassthroughProtector());
+    const shared = await vault.addAccount('shared-acct', bundle('a'));
+    const reserved = await vault.addAccount('rule-acct', bundle('b'));
+    const folder = join(root, 'ruled');
+    await mkdir(folder, { recursive: true });
+    const rule = await vault.createRule({ include: [reserved.id], folders: [folder] });
+    const ruleSlot = `group:${rule.id}`;
+    const store = new Store(daemonDbPath(paths));
+    try {
+      store.replaceActivationIntervals([
+        {
+          accountId: shared.id,
+          startedAtMs: now - 4 * HOUR,
+          endedAtMs: null,
+          origin: null,
+          slot: 'global',
+        },
+        {
+          accountId: reserved.id,
+          startedAtMs: now - 4 * HOUR,
+          endedAtMs: null,
+          origin: null,
+          slot: ruleSlot,
+        },
+      ]);
+      // Both ran in the rule's slot; the fork's record starts after the turn it copied.
+      store.recordSessionSlot(parent, ruleSlot, now - 3 * HOUR);
+      store.recordSessionSlot(fork, ruleSlot, now - 90 * 60_000);
+    } finally {
+      store.close();
+    }
+    const dir = join(paths.claudeDir, 'projects', projectDirStem(folder));
+    await mkdir(dir, { recursive: true });
+    const copied = assistantLine('msg_p', now - 2 * HOUR, 1000);
+    await writeFile(join(dir, `${parent}.jsonl`), copied, 'utf8');
+    await writeFile(
+      join(dir, `${fork}.jsonl`),
+      copied + assistantLine('msg_f', now - HOUR, 10),
+      'utf8',
+    );
+
+    const out = await runStats();
+    const byAccount = out.slice(out.indexOf('By account'), out.indexOf('By model'));
+    expect(byAccount).toContain('rule-acct');
+    expect(byAccount).not.toContain('shared-acct');
+    expect(out).toContain('1 duplicate turns skipped');
+  });
 });
+
+/** One assistant turn line in Claude Code's transcript shape. */
+function assistantLine(id: string, tsMs: number, inputTokens: number): string {
+  return (
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: new Date(tsMs).toISOString(),
+      message: {
+        id,
+        model: 'claude-sonnet-5',
+        usage: {
+          input_tokens: inputTokens,
+          output_tokens: 0,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        },
+      },
+    }) + '\n'
+  );
+}

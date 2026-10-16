@@ -15,6 +15,7 @@ import type {
   TokenTotals,
 } from '@claude-control/shared-protocol';
 import type { TranscriptScan, TranscriptTurn } from './transcriptTokens.js';
+import { dropInheritedTurns } from './sessionLookup.js';
 
 /** The slice of an activation interval attribution needs. `ActivationIntervalRow` (store.ts)
  *  satisfies it structurally, so callers pass `store.listActivationIntervals()` unchanged while
@@ -211,6 +212,7 @@ export function buildTurnAttributor(
 /** Aggregate one scan into the wire payload. Pure: same inputs, same output, no clock read. */
 export function aggregateTokenStats(options: AggregateTokenStatsOptions): TokenStatsSnapshot {
   const accountFor = buildTurnAttributor(options);
+  const turns = countOnce(dropInheritedTurns(options.scan.turns, options.slotSpans ?? []));
 
   const overall = emptyTotals();
   // `null` keys the unattributed bucket. A Map (not two variables) so it sorts alongside the
@@ -219,7 +221,7 @@ export function aggregateTokenStats(options: AggregateTokenStatsOptions): TokenS
   const byModel = new Map<string, TokenTotals>();
   const byDay = new Map<string, TokenTotals>();
 
-  for (const turn of options.scan.turns) {
+  for (const turn of turns) {
     addTurn(overall, turn);
     const accountId = accountFor(turn);
     addTurn(getOrCreate(byAccount, accountId), turn);
@@ -233,7 +235,7 @@ export function aggregateTokenStats(options: AggregateTokenStatsOptions): TokenS
     filesUnreadable: options.scan.filesUnreadable,
     dirsUnreadable: options.scan.dirsUnreadable,
     malformedLines: options.scan.malformedLines,
-    duplicateTurns: options.scan.duplicateTurns,
+    duplicateTurns: options.scan.duplicateTurns + options.scan.turns.length - turns.length,
   };
 
   return {
@@ -257,6 +259,19 @@ export function aggregateTokenStats(options: AggregateTokenStatsOptions): TokenS
       .sort((a, b) => a.label.localeCompare(b.label)),
     coverage,
   };
+}
+
+/** Each message id once across sessions. A scan de-duplicated per session keeps a fork's copies of
+ *  its parent's turns so {@link dropInheritedTurns} can give each to its maker whichever file was
+ *  read first; a copy whose maker is unknown still must not count twice in the totals. */
+function countOnce(turns: readonly TranscriptTurn[]): TranscriptTurn[] {
+  const seen = new Set<string>();
+  return turns.filter((turn) => {
+    if (turn.messageId == null) return true;
+    if (seen.has(turn.messageId)) return false;
+    seen.add(turn.messageId);
+    return true;
+  });
 }
 
 function getOrCreate<K>(map: Map<K, TokenTotals>, key: K): TokenTotals {

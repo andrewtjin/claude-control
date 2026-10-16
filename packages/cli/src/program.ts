@@ -564,7 +564,12 @@ export function buildProgram(): Command {
         // Every account, reserved ones included: a reserved account's turns must be labeled
         // with its name, not its raw id.
         buildEngine(paths).listAllAccounts(),
-        readTranscriptTurns({ claudeDir: paths.claudeDir, sinceMs: windowStartMs }),
+        // Per session, so a fork's copied turn reaches the attribution beside the original.
+        readTranscriptTurns({
+          claudeDir: paths.claudeDir,
+          sinceMs: windowStartMs,
+          dedupe: 'session',
+        }),
       ]);
 
       // Attribution comes from the daemon's journal, read offline like `usage`/`timeline` do:

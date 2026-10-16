@@ -612,7 +612,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     publishHookEndpoint: (port) => writeHookEndpoint(hookEndpointPath(dataDir), { port }),
     // Absolute token counts for `/stats` on the phone, read from the transcripts Claude Code
     // writes under this same config dir. Local file reads only; the bot receives only the sums.
-    scanTranscripts: (sinceMs) => readTranscriptTurns({ claudeDir: paths.claudeDir, sinceMs }),
+    // Per session, as `cctl stats` reads them, so a fork's copies are billed to their maker.
+    scanTranscripts: (sinceMs) =>
+      readTranscriptTurns({ claudeDir: paths.claudeDir, sinceMs, dedupe: 'session' }),
     // Real SDK adapter with the daemon's logger on the accountId fall-through — see
     // makeAgentSdkClientFactory for the shared-config/hot-swap tradeoff behind its deps.
     createAgentSdkClient: makeAgentSdkClientFactory(logger),
