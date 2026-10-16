@@ -1531,7 +1531,7 @@ export class Vault {
     }
     const released = this.releasable(st, rule, [...ids]);
     if (released.length > 0) {
-      st.shared.push(...released);
+      this.returnSharedRows(st, released);
       await this.saveShared(st); // accounts.json FIRST
     }
     rule.include = include;
@@ -1553,7 +1553,7 @@ export class Vault {
     const rule = this.mustRule(st, ruleId);
     const released = this.releasable(st, rule, rule.include);
     if (released.length > 0) {
-      st.shared.push(...released);
+      this.returnSharedRows(st, released);
       await this.saveShared(st); // accounts.json FIRST
     }
     st.rules = st.rules.filter((r) => r !== rule);
@@ -1737,6 +1737,17 @@ export class Vault {
     const ids = new Set(rows.map((r) => r.id));
     st.shared = st.shared.filter((a) => !ids.has(a.id));
     if (st.activeId !== null && ids.has(st.activeId)) st.activeId = null;
+  }
+
+  /** Put released rows back on the shared side where they were added, before the first row added
+   *  after them, not at the end: listings and tie-breaks follow the registry order, which a reserve
+   *  and release must leave as it was. */
+  private returnSharedRows(st: RegistryState, rows: readonly StoredAccount[]): void {
+    for (const row of rows) {
+      const at = st.shared.findIndex((a) => a.createdAtMs > row.createdAtMs);
+      if (at === -1) st.shared.push(row);
+      else st.shared.splice(at, 0, row);
+    }
   }
 
   /** Drop released rows from the reserved side (after the shared side gained them). */
