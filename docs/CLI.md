@@ -173,7 +173,7 @@ the session ("Created a rule for session "auth work" in C:\repo: it uses researc
 the shared pool."); when the command runs inside a session that is now on another slot than its
 rule names, it says so, with the command that resumes it.
 
-Session alias rules need **Claude Code 2.1.283 or newer**: the guard reads a session's name from
+Session alias rules need **Claude Code 2.1.211 or newer**: the guard reads a session's name from
 the `session_title` field Claude Code sends with each prompt, never from the transcript. An
 older Claude Code does not send it, so every session looks unnamed and runs by its folder's rule.
 
