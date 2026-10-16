@@ -124,6 +124,7 @@ export {
   aliasFitsSessionTitle,
   isWellFormedText,
   CLAUDE_CODE_TITLE_MAX_LENGTH,
+  claudeCodeSessionTitle,
   aliasScopeUniquenessKey,
   exactAliasBinding,
   resolveSessionBinding,

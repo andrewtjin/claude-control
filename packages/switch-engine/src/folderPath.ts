@@ -368,8 +368,26 @@ export function aliasKey(alias: string): string {
 /** The longest custom title Claude Code keeps, in CODE POINTS: it stores the first 200 characters of a
  *  name (measured on 2.1.283: `claude --name "<278 characters>"` records a 200-character customTitle;
  *  195 ASCII characters and 5 emoji — 200 code points, 205 UTF-16 units — are stored whole, and 201
- *  code points are stored as the first 200 code points, not the first 200 units). */
+ *  code points are stored as the first 200 code points, not the first 200 units; 2.1.301 does the
+ *  same and keeps an emoji at the cut whole). It clips the name only after trimming it: see
+ *  {@link claudeCodeSessionTitle}. */
 export const CLAUDE_CODE_TITLE_MAX_LENGTH = 200;
+
+/** Control and format characters and line/paragraph separators: Claude Code records each as a space
+ *  in a session name (measured on 2.1.301: tab, newline, U+0001, U+0085, U+200B, U+202E, U+2028 and
+ *  U+2029 all become a space; U+00A0, private-use and unassigned code points are kept). */
+const TITLE_SPACED_CHARACTERS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+
+/** The custom title Claude Code records for `claude --name <name>` (measured on 2.1.301): the name
+ *  trimmed, clipped to {@link CLAUDE_CODE_TITLE_MAX_LENGTH} code points, with each
+ *  {@link TITLE_SPACED_CHARACTERS} turned into a space, then trimmed again (`'\u0001' + 200 'a'` is
+ *  recorded as 199 'a'). Inner runs of spaces are kept. A blank result names nothing: Claude Code then
+ *  leaves the session's title as it was. A launch routes on this title, since it is what the
+ *  session's hooks and transcript carry. */
+export function claudeCodeSessionTitle(name: string): string {
+  const clipped = [...name.trim()].slice(0, CLAUDE_CODE_TITLE_MAX_LENGTH).join('');
+  return clipped.replace(TITLE_SPACED_CHARACTERS, ' ').trim();
+}
 
 /** Whether `text` is well-formed UTF-16 — carries no unpaired (lone) surrogate. Claude Code stores a
  *  lone surrogate in a session name as the Unicode replacement character U+FFFD (measured on 2.1.283:
