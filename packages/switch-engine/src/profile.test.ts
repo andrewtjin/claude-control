@@ -430,6 +430,20 @@ describe('ensureGroupProfile (real filesystem)', () => {
     );
   });
 
+  it('re-links a broken hard link without a backup when both copies are identical', () => {
+    const { main, profile } = sandbox();
+    writeFileSync(join(main, 'settings.json'), 'SAME');
+    ensureGroupProfile(profile, main);
+    // A rewrite that changed nothing still severs the link; the re-link must not spend a backup slot.
+    breakLinkWithNewInode(join(profile, 'settings.json'), 'SAME');
+
+    const report = ensureGroupProfile(profile, main);
+
+    expect(report.repaired).toContain('settings.json');
+    expect(ino(join(profile, 'settings.json'))).toBe(ino(join(main, 'settings.json')));
+    expect(lstatSync(join(profile, '.cctl-backup'), { throwIfNoEntry: false })).toBeUndefined();
+  });
+
   it('bounds the number of backups kept per file', () => {
     const { main, profile } = sandbox();
     writeFileSync(join(main, 'settings.json'), 'v0');
