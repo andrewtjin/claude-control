@@ -25,6 +25,7 @@ import {
   type SessionMeta,
   type SessionRefResolution,
   type SessionSlotSpanRow,
+  type TranscriptTurn,
 } from '@claude-control/daemon';
 import {
   aliasKey,
@@ -103,25 +104,63 @@ function lastRecordedSlots(
   return out;
 }
 
-/** Attach each session's per-account use (the expensive half: only the turns of these sessions'
- *  project directories are read). */
+/**
+ * The turns of the sessions beside the shown ones that may have made a shown fork's copied turns. A
+ * fork's file sits beside its parent's, and a copy is only known as one once its maker is read too.
+ * Only a turn before its own session's first recorded span can be a copy, and only a session with a
+ * span can be known as its maker, so an ordinary session reads nothing more, and a fork reads only
+ * its recorded siblings, from its earliest such turn on.
+ */
+async function makerTurns(
+  deps: SessionAliasDeps,
+  sessions: SessionMeta[],
+  turns: readonly TranscriptTurn[],
+  spans: readonly SessionSlotSpanRow[],
+): Promise<TranscriptTurn[]> {
+  const firstSpan = new Map<string, number>();
+  for (const span of spans) {
+    firstSpan.set(
+      span.sessionId,
+      Math.min(span.startedAtMs, firstSpan.get(span.sessionId) ?? Infinity),
+    );
+  }
+  let sinceMs = Infinity;
+  for (const turn of turns) {
+    if (turn.sessionId != null && turn.tsMs < (firstSpan.get(turn.sessionId) ?? Infinity)) {
+      sinceMs = Math.min(sinceMs, turn.tsMs);
+    }
+  }
+  if (sinceMs === Infinity) return [];
+  const shown = new Set(sessions.map((s) => s.sessionId));
+  const siblings = new Set<string>();
+  for (const dir of new Set(sessions.map((s) => dirname(s.file)))) {
+    try {
+      for (const name of readdirSync(dir)) {
+        const id = name.slice(0, -'.jsonl'.length);
+        if (name.endsWith('.jsonl') && !shown.has(id) && firstSpan.has(id)) siblings.add(id);
+      }
+    } catch {
+      // Unlistable: the shown sessions are still read, their copies kept as before.
+    }
+  }
+  if (siblings.size === 0) return [];
+  const scan = await readTranscriptTurns({
+    claudeDir: deps.paths.claudeDir,
+    sinceMs,
+    sessionIds: siblings,
+    dedupe: 'session',
+  });
+  return scan.turns;
+}
+
+/** Attach each session's per-account use (the expensive half: only these sessions' turns are
+ *  read, plus a shown fork's possible makers). */
 async function withAccounts(
   deps: SessionAliasDeps,
   sessions: SessionMeta[],
 ): Promise<AccountsRead> {
   if (sessions.length === 0) return { views: [], recordedSlot: new Map() };
   const sessionIds = new Set(sessions.map((s) => s.sessionId));
-  // A fork's copied turn is only known as a copy once the session that made it is read too, and a
-  // fork's file sits beside its parent's: read every session in the shown ones' directories.
-  for (const dir of new Set(sessions.map((s) => dirname(s.file)))) {
-    try {
-      for (const name of readdirSync(dir)) {
-        if (name.endsWith('.jsonl')) sessionIds.add(name.slice(0, -'.jsonl'.length));
-      }
-    } catch {
-      // Unlistable: the shown sessions are still read, their copies kept as before.
-    }
-  }
   const [accounts, scan] = await Promise.all([
     // Reserved accounts included: an account a folder rule holds must show its name, not its id.
     (deps.engine ?? buildEngine(deps.paths)).listAllAccounts(),
@@ -150,8 +189,9 @@ async function withAccounts(
   } finally {
     store.close();
   }
+  const turns = [...scan.turns, ...(await makerTurns(deps, sessions, scan.turns, slotSpans))];
   const uses = accountsBySession(
-    dropInheritedTurns(scan.turns, slotSpans),
+    dropInheritedTurns(turns, slotSpans),
     accountFor,
     new Map(accounts.map((a) => [a.id, a.label] as const)),
   );

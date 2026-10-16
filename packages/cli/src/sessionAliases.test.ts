@@ -14,7 +14,7 @@ import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
 import { realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Store, projectDirStem } from '@claude-control/daemon';
+import { Store, projectDirStem, readTranscriptTurns } from '@claude-control/daemon';
 import {
   InsecurePassthroughProtector,
   Vault,
@@ -29,6 +29,12 @@ import {
   SESSION_ID_ENV,
   type SessionAliasDeps,
 } from './sessionAliases.js';
+
+// The real reader, spied on, so a test can see which sessions' files a command read.
+vi.mock('@claude-control/daemon', async (importOriginal) => {
+  const real = await importOriginal<typeof import('@claude-control/daemon')>();
+  return { ...real, readTranscriptTurns: vi.fn(real.readTranscriptTurns) };
+});
 
 const HOUR = 3_600_000;
 /** Every account went live at T0; turns before it belong to nobody. */
@@ -315,6 +321,15 @@ describe('runSessionShow', () => {
     const current = harness({ env: { [SESSION_ID_ENV]: forkId } });
     await runSessionShow(undefined, { json: true }, current.deps);
     expect(uses(current.json().sessions[0])).toEqual([['client', 1, 9]]);
+  });
+
+  it('reads no other transcript for a session recorded from its first turn', async () => {
+    vi.mocked(readTranscriptTurns).mockClear();
+    const h = harness();
+    await runSessionShow(S_HAND, { json: true }, h.deps);
+    expect(uses(h.json().sessions[0])).toEqual([['client', 1, 4000]]);
+    const read = vi.mocked(readTranscriptTurns).mock.calls.map((c) => [...(c[0].sessionIds ?? [])]);
+    expect(read).toEqual([[S_HAND]]);
   });
 
   it('defaults to the current session from CLAUDE_CODE_SESSION_ID, billed from its span alone', async () => {
