@@ -155,6 +155,9 @@ export interface InstallHooksOptions {
 
 export async function installHooks(options: InstallHooksOptions): Promise<void> {
   const settings = await readSettings(options.settingsPath);
+  // Serialized before the merge so an install that changes nothing writes nothing: a temp+rename
+  // gives main a fresh inode, cutting the hard links that share it into group profiles.
+  const before = JSON.stringify(settings, null, 2);
 
   // Self-healing: an unrecognizable `hooks` value (missing, null, a string, ...) is replaced
   // with a fresh object rather than erroring — the rest of the file is untouched either way.
@@ -171,7 +174,8 @@ export async function installHooks(options: InstallHooksOptions): Promise<void> 
     mergeOneHook(hooksSection, spec);
   }
 
-  await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+  const after = JSON.stringify(settings, null, 2);
+  if (after !== before) await atomicWriteFile(options.settingsPath, after);
 }
 
 // ---------------------------------------------------------------------------
@@ -193,13 +197,15 @@ export interface InstallBindGuardOptions {
  * {@link installHooks}: it prunes only PRIOR GENERATIONS OF THE GUARD (recognized by the script
  * filename, so a node/script/snapshot path change is replaced, not accumulated) and leaves every
  * other entry — the forwarder, other tools' hooks, foreign keys — byte-value-equivalent. Idempotent:
- * a settings.json already carrying the current guard command is rewritten to the same shape.
+ * a settings.json already carrying the current guard command is left as it is.
  *
  * "Upgrade from a settings.json that only has the old hooks" is exactly this path: the forwarder
  * entry is present, no guard is, and this adds one without disturbing the forwarder.
  */
 export async function installBindGuard(options: InstallBindGuardOptions): Promise<void> {
   const settings = await readSettings(options.settingsPath);
+  // As in installHooks: skip the write when nothing changed, so the profile hard links survive.
+  const before = JSON.stringify(settings, null, 2);
   const hooksSection: JsonObject = isRecord(settings.hooks) ? settings.hooks : {};
   settings.hooks = hooksSection;
 
@@ -226,7 +232,8 @@ export async function installBindGuard(options: InstallBindGuardOptions): Promis
   }
 
   hooksSection[event] = groups;
-  await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+  const after = JSON.stringify(settings, null, 2);
+  if (after !== before) await atomicWriteFile(options.settingsPath, after);
 }
 
 // ---------------------------------------------------------------------------
