@@ -960,9 +960,12 @@ describe('ensureBindGuard propagation into group profiles', () => {
       profileSettingsPaths: [profileSettings],
     };
     await ensureBindGuard(opts);
+    const inoBefore = statSync(mainSettings, { bigint: true }).ino;
     await ensureBindGuard(opts);
-    // An unchanged main must not be rewritten: a temp+rename would give it a fresh inode, and the
-    // profile (already carrying the guard) would stay linked to the old one.
+    // An unchanged main must not be rewritten: a temp+rename would give it a fresh inode and cut
+    // the link of any profile the caller did not pass. Main's own inode pins that, since the
+    // re-link of the passed profile would keep the pair below equal even after a needless rewrite.
+    expect(statSync(mainSettings, { bigint: true }).ino).toBe(inoBefore);
     expect(statSync(mainSettings, { bigint: true }).ino).toBe(
       statSync(profileSettings, { bigint: true }).ino,
     );
