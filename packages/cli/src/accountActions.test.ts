@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   CadenceError,
+  LockTimeoutError,
   QuarantineError,
   RefreshError,
   SharedTokenError,
@@ -720,5 +721,48 @@ describe('runAccountAction', () => {
   it('lets anything else escape as itself', async () => {
     const boom = new Error('disk on fire');
     await expect(runAccountAction(() => Promise.reject(boom))).rejects.toBe(boom);
+  });
+});
+
+describe('contention is a refusal, not a fault', () => {
+  const busy = () =>
+    new LockTimeoutError('could not acquire credential lock at /v/.lock within 15000ms');
+
+  it('refuses a switch, an exclude, a rename and a remove that waited out the lock', async () => {
+    engine.activate.mockRejectedValueOnce(busy());
+    engine.setAutoSwitchExcluded.mockRejectedValueOnce(busy());
+    engine.renameAccount.mockRejectedValueOnce(busy());
+    engine.removeAccount.mockRejectedValueOnce(busy());
+    for (const run of [
+      switchAccount('Work', {}, ctx),
+      setExcluded('Work', true, ctx),
+      renameAccount('Work', 'home', ctx),
+      removeAccount('Work', ctx),
+    ]) {
+      const err = await refusal(run);
+      expect(err.code).toBe('busy');
+      expect(err.message).toBe(
+        'could not acquire credential lock at /v/.lock within 15000ms - another cctl ' +
+          'operation is holding it. Nothing was changed; try again in a moment.',
+      );
+    }
+  });
+
+  it('refuses a remove an unsettled switch blocks, in the engine words', async () => {
+    engine.removeAccount.mockRejectedValueOnce(
+      new UnsettledSwitchError('an earlier switch did not settle; run cctl switch to finish it'),
+    );
+    await expectRefused(
+      removeAccount('Work', ctx),
+      'switch_failed',
+      'an earlier switch did not settle; run cctl switch to finish it',
+    );
+  });
+
+  it('refuses an exclude or rename of an account removed in between', async () => {
+    engine.setAutoSwitchExcluded.mockRejectedValueOnce(new UnknownAccountError('id-1'));
+    expect((await refusal(setExcluded('Work', true, ctx))).code).toBe('unknown_account');
+    engine.renameAccount.mockRejectedValueOnce(new UnknownAccountError('id-1'));
+    expect((await refusal(renameAccount('Work', 'x', ctx))).code).toBe('unknown_account');
   });
 });

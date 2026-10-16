@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import type { AccountUsage } from '@claude-control/shared-protocol';
-import { renderSessionStatus, weeklyResetHeader, type SessionStatusRow } from './sessionRender.js';
+import {
+  renderSessionStatus,
+  sessionRowFromStore,
+  weeklyResetHeader,
+  type SessionStatusRow,
+} from './sessionRender.js';
+import { displayWidth } from './textWidth.js';
 import { renderUsage } from './render.js';
 
 const NOW = Date.parse('2026-07-16T12:00:00.000Z');
@@ -111,5 +117,53 @@ describe('renderSessionStatus', () => {
     ]);
     // The watch column carries "off"; the label column carries the label.
     expect(out).toMatch(/quiet.*off/s);
+  });
+});
+
+describe('session rows from the store, as a terminal will draw them', () => {
+  const ESC = String.fromCharCode(27);
+  const BEL = String.fromCharCode(7);
+
+  it('strips terminal controls from a stored label and from a raw account id', () => {
+    const row = sessionRowFromStore(
+      {
+        id: 's1',
+        kind: 'interactive',
+        state: 'active',
+        accountId: `acct${ESC}]0;PWNED${BEL}`,
+        json: JSON.stringify({ label: `evil${ESC}[?1049l${ESC}[2Jx\rOVER` }),
+        updatedAtMs: 0,
+      },
+      new Map(),
+    );
+    const hasControl = (t: string | undefined): boolean =>
+      [...(t ?? '')].some((c) => c.charCodeAt(0) < 0x20);
+    expect(hasControl(row.label)).toBe(false);
+    expect(row.label).toContain('evil');
+    expect(hasControl(row.accountLabel)).toBe(false);
+  });
+
+  it('lines columns up by terminal width, so a CJK label does not push its row over', () => {
+    const out = renderSessionStatus(
+      [
+        {
+          id: 'a',
+          kind: 'interactive',
+          state: 'idle',
+          label: '仕事のセッション',
+          accountLabel: 'w',
+        },
+        { id: 'b', kind: 'interactive', state: 'idle', label: 'plain', accountLabel: 'w' },
+      ],
+      {},
+    );
+    const lines = out.split('\n');
+    const header = lines.find((l) => l.startsWith('SESSION'))!;
+    const kindAt = (line: string): number =>
+      displayWidth(line.slice(0, line.indexOf('interactive')));
+    const cjk = lines.find((l) => l.startsWith('仕事'))!;
+    const plain = lines.find((l) => l.startsWith('plain'))!;
+    expect(kindAt(cjk)).toBe(header.indexOf('KIND'));
+    expect(kindAt(plain)).toBe(header.indexOf('KIND'));
   });
 });

@@ -77,6 +77,7 @@ import {
   switchAccount,
 } from './accountActions.js';
 import { readUsageState, resolvedWeight, type UsageState } from './usageState.js';
+import { fullScreenBlocker, isInteractiveTerminal } from './terminalSupport.js';
 import { StatusLog, runTui } from './tui/run.js';
 import { createTuiSources } from './tui/sources.js';
 import type { OutagesView } from './tui/types.js';
@@ -1030,6 +1031,9 @@ export function buildProgram(): Command {
             'For plain output use: cctl usage',
         );
       }
+      const blocker = fullScreenBlocker();
+      if (blocker !== undefined)
+        fail(`cctl tui cannot run here: ${blocker}. For plain output use: cctl usage`);
       await openTui();
     });
 
@@ -1058,7 +1062,9 @@ export function buildProgram(): Command {
         { code: 'commander.unknownCommand' },
       );
     }
-    if (isInteractiveTerminal()) {
+    // A terminal that cannot draw the view (TERM=dumb, the legacy Windows console) gets the
+    // summary, as a pipe does.
+    if (isInteractiveTerminal() && fullScreenBlocker() === undefined) {
       // "Set up" means what the summary's own check means: an account in the shared pool.
       if ((await buildEngine().listAccounts()).length === 0) {
         process.stdout.write('Not set up yet. Run: cctl setup\n');
@@ -1081,16 +1087,6 @@ export function buildProgram(): Command {
   return program;
 }
 
-/** Whether a person is at both ends of this process: input and output are both a terminal. The
- *  full-screen view needs both — keys in, a screen out — and anything less (a pipe, a file, CI)
- *  gets plain output. */
-export function isInteractiveTerminal(
-  stdin: { isTTY?: boolean | undefined } = process.stdin,
-  stdout: { isTTY?: boolean | undefined } = process.stdout,
-): boolean {
-  return stdin.isTTY === true && stdout.isTTY === true;
-}
-
 /**
  * Open the full-screen view on this terminal (composition root: the real engine, data dir and
  * streams). The engine logs to the view's status line rather than stderr, which would scribble
@@ -1100,18 +1096,23 @@ export function isInteractiveTerminal(
 async function openTui(): Promise<void> {
   const log = new StatusLog(process.stderr);
   const engine = buildEngine(defaultPaths(), log);
-  const exit = await runTui({
-    stdin: process.stdin,
-    stdout: process.stdout,
-    sources: createTuiSources({
-      engine,
-      readOutages: (nowMs) => readOutagesView(nowMs, engine),
-    }),
-    palette: detectPalette(),
-    log,
-    stderr: process.stderr,
+  const sources = createTuiSources({
+    engine,
+    readOutages: (nowMs, usage) => readOutagesView(nowMs, engine, usage),
   });
-  if (exit.code !== 0) process.exitCode = exit.code;
+  try {
+    const exit = await runTui({
+      stdin: process.stdin,
+      stdout: process.stdout,
+      sources,
+      palette: detectPalette(),
+      log,
+      stderr: process.stderr,
+    });
+    if (exit.code !== 0) process.exitCode = exit.code;
+  } finally {
+    sources.close?.();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1377,13 +1378,16 @@ async function globalSlotAccountsNow(): Promise<Set<string>> {
 async function readOutageScopes(
   nowMs: number,
   engine: ReturnType<typeof buildEngine> = buildEngine(),
+  usage?: UsageState,
 ): Promise<{ inputs: AccountUsageInput[]; scopes: ScopeView[] }> {
   const [accounts, rules, liveSlots] = await Promise.all([
     engine.listAllAccounts(),
     engine.listRules(),
     engine.liveSlots(),
   ]);
-  const inputs = buildAdvisorInputs(await readUsageState(nowMs, accounts, engine));
+  // A caller that has just read the whole fleet's usage (the full-screen view, every couple of
+  // seconds) hands it over rather than have it read, and the history measured, a second time.
+  const inputs = buildAdvisorInputs(usage ?? (await readUsageState(nowMs, accounts, engine)));
   return { inputs, scopes: outageScopes({ accounts, rules, liveSlots }) };
 }
 
@@ -1393,10 +1397,11 @@ async function readOutageScopes(
 async function readOutagesView(
   nowMs: number,
   engine: ReturnType<typeof buildEngine>,
+  usage?: UsageState,
 ): Promise<OutagesView> {
   const log = exhaustionLog();
   const records = await log.read();
-  const open = await openOutageStatuses(resumeOpenEpisodes(records), nowMs, engine);
+  const open = await openOutageStatuses(resumeOpenEpisodes(records), nowMs, engine, usage);
   return {
     episodes: episodesInWindow(episodesOf(records), nowMs, undefined, open),
     open,
@@ -1415,12 +1420,13 @@ async function openOutageStatuses(
   opens: Map<string, OpenEpisode>,
   nowMs: number,
   engine?: ReturnType<typeof buildEngine>,
+  usage?: UsageState,
 ): Promise<OutageStatus[]> {
   if (opens.size === 0) return [];
   let current: { inputs: AccountUsageInput[]; scopes: ScopeView[] } | undefined;
   let policy: AutoSwitchPolicy = {};
   try {
-    current = await readOutageScopes(nowMs, engine);
+    current = await readOutageScopes(nowMs, engine, usage);
     policy = await cliAutoSwitchPolicy();
   } catch {
     current = undefined;

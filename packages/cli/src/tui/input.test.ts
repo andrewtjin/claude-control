@@ -1,7 +1,7 @@
 // Raw-mode bytes to named keys: every spelling the view binds, and the junk it must drop.
 
 import { describe, it, expect } from 'vitest';
-import { parseKeys } from './input.js';
+import { KeyDecoder, parseKeys } from './input.js';
 
 const ESC = String.fromCharCode(27);
 
@@ -56,8 +56,13 @@ describe('parseKeys', () => {
     ]);
   });
 
-  it('reads ESC followed by a plain key as Escape, then that key', () => {
-    expect(parseKeys(`${ESC}q`)).toEqual([{ name: 'escape' }, { name: 'char', char: 'q' }]);
+  it('drops an Alt chord (ESC then a printable key) whole: it is not Escape and then a key', () => {
+    expect(parseKeys(`${ESC}q`)).toEqual([]);
+    expect(parseKeys(`${ESC}jk`)).toEqual([{ name: 'char', char: 'k' }]);
+  });
+
+  it('reads ESC ESC as Escape, then whatever the second one starts', () => {
+    expect(parseKeys(`${ESC}${ESC}[A`)).toEqual([{ name: 'escape' }, { name: 'up' }]);
   });
 
   it('drops sequences it does not bind and control bytes nobody types on purpose', () => {
@@ -67,5 +72,52 @@ describe('parseKeys', () => {
 
   it('drops a sequence cut off at the end of the read', () => {
     expect(parseKeys(`a${ESC}[`)).toEqual([{ name: 'char', char: 'a' }]);
+  });
+});
+
+describe('KeyDecoder across reads', () => {
+  it('holds a lone ESC at the end of a read instead of calling it Escape', () => {
+    const decoder = new KeyDecoder();
+    expect(decoder.feed(ESC)).toEqual([]);
+    expect(decoder.pending).toBe(true);
+    expect(decoder.feed('[A')).toEqual([{ name: 'up' }]);
+    expect(decoder.pending).toBe(false);
+  });
+
+  it('joins a sequence split inside its parameters', () => {
+    const decoder = new KeyDecoder();
+    expect(decoder.feed(`${ESC}[5`)).toEqual([]);
+    expect(decoder.feed('~j')).toEqual([{ name: 'pageup' }, { name: 'char', char: 'j' }]);
+  });
+
+  it('reads a held ESC as Escape once nothing followed it', () => {
+    const decoder = new KeyDecoder();
+    decoder.feed(`j${ESC}`);
+    expect(decoder.flush()).toEqual([{ name: 'escape' }]);
+    expect(decoder.pending).toBe(false);
+  });
+
+  it('drops a held, unfinished sequence on flush', () => {
+    const decoder = new KeyDecoder();
+    decoder.feed(`${ESC}[1;`);
+    expect(decoder.flush()).toEqual([]);
+  });
+});
+
+describe('bracketed paste', () => {
+  it('reads a pasted block as one paste, newlines and all, never as keys', () => {
+    expect(parseKeys(`${ESC}[200~rachel\n${ESC}[201~`)).toEqual([
+      { name: 'paste', text: 'rachel\n' },
+    ]);
+  });
+
+  it('joins a paste split over several reads, end marker included', () => {
+    const decoder = new KeyDecoder();
+    expect(decoder.feed(`${ESC}[200~ab`)).toEqual([]);
+    expect(decoder.feed(`c\rd${ESC}[20`)).toEqual([]);
+    expect(decoder.feed(`1~q`)).toEqual([
+      { name: 'paste', text: 'abc\rd' },
+      { name: 'char', char: 'q' },
+    ]);
   });
 });

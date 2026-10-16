@@ -476,9 +476,29 @@ describe('a daemon that takes the request and never answers', () => {
     expect((err as SessionClientError).failure).toBe('hung');
   });
 
-  it('defaults to the five-second bound daemon stop uses', async () => {
-    const { DEFAULT_REQUEST_TIMEOUT_MS } = await import('./daemonControl.js');
-    expect(DEFAULT_REQUEST_TIMEOUT_MS).toBe(5_000);
+  it('by default outlasts the database lock wait a healthy daemon can be in', async () => {
+    const { DAEMON_REQUEST_TIMEOUT_MS } = await import('./sessionClient.js');
+    const { STORE_BUSY_TIMEOUT_MS } = await import('@claude-control/daemon');
+    expect(DAEMON_REQUEST_TIMEOUT_MS).toBeGreaterThan(STORE_BUSY_TIMEOUT_MS);
+  });
+
+  it('waits for a daemon that answers late because a write waited on the lock', async () => {
+    const h = await harness(() => ({ ok: true, status: 'applied', session: view }));
+    h.receiver.setCliHandlers({
+      registerSession: () =>
+        new Promise((resolve) =>
+          setTimeout(() => resolve({ ok: true, status: 'applied', session: view }), 5_500),
+        ),
+      labelSession: () => Promise.reject(new Error('unused')),
+      watchSession: () => Promise.reject(new Error('unused')),
+      unregisterSession: () => Promise.reject(new Error('unused')),
+    });
+    const result = await callDaemonSession(
+      'register',
+      { sessionId: 's', idempotencyKey: 'k' },
+      { dataDir: h.dataDir, protector: h.protector },
+    );
+    expect(result).toMatchObject({ ok: true, status: 'applied' });
   });
 });
 

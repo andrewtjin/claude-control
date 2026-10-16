@@ -14,7 +14,7 @@ import {
 } from './state.js';
 import { PANES, type Key, type PaneId, type TuiState, type Transition } from './types.js';
 
-const key = (name: Exclude<Key['name'], 'char'>): Key => ({ name });
+const key = (name: Exclude<Key['name'], 'char' | 'paste'>): Key => ({ name });
 const char = (c: string): Key => ({ name: 'char', char: c });
 
 /** Run keys in order, returning the last transition (and every effect seen). */
@@ -95,7 +95,7 @@ describe('every key in every pane', () => {
     expect(reduce(s, char('q')).effect).toEqual({ kind: 'quit' });
     expect(reduce(s, key('escape')).effect).toEqual({ kind: 'quit' });
     expect(reduce(s, key('ctrl-c')).effect).toEqual({ kind: 'quit' });
-    expect(reduce(s, char('?')).state.mode).toEqual({ kind: 'help' });
+    expect(reduce(s, char('?')).state.mode).toEqual({ kind: 'help', scroll: 0 });
     expect(reduce(s, char('a')).state.mode).toEqual({ kind: 'prompt', purpose: 'add', input: '' });
     // u: the daemon in the fixture is up, so the refresh starts and the view is busy with it.
     const u = reduce(s, char('u'));
@@ -284,11 +284,12 @@ describe('overlays and prompts', () => {
     expect(add.state.busy).toBe('Adding new...');
   });
 
-  it('does nothing for an empty rename or add', () => {
+  it('keeps an empty rename or add open, saying what it needs', () => {
     for (const opener of [char('r'), char('a')]) {
       const t = press(base(), opener, char(' '), key('enter'));
       expect(t.effects).toEqual([]);
-      expect(t.state.status?.text).toBe('Cancelled: no label given.');
+      expect(t.state.mode).toMatchObject({ kind: 'prompt', input: ' ' });
+      expect(t.state.mode).toHaveProperty('note', 'Type a label first, or Esc to cancel.');
     }
   });
 
@@ -299,10 +300,12 @@ describe('overlays and prompts', () => {
     for (const wrong of ['wor', 'Work', 'work ', '']) {
       const t = typed(wrong);
       expect(t.effects).toEqual([]);
-      expect(t.state.status).toEqual({
-        text: 'Not removed: the label typed was not work.',
-        tone: 'warn',
-      });
+      // The prompt stays open, so the label can be corrected rather than retyped.
+      expect(t.state.mode).toMatchObject({ kind: 'prompt', purpose: 'remove', input: wrong });
+      expect(t.state.mode).toHaveProperty(
+        'note',
+        'Not removed: the label typed was not work. Fix it, or Esc to cancel.',
+      );
     }
   });
 
@@ -359,5 +362,122 @@ describe('reads', () => {
     expect(failed.snapshot).toBeDefined();
     expect(failed.loadError).toBe('disk on fire');
     expect(applySnapshot(failed, snapshotOf([])).loadError).toBeUndefined();
+  });
+});
+
+describe('keys that must not reach the account under the cursor', () => {
+  it('a second Enter after a refused remove does not switch', () => {
+    const t = press(base(), char('d'), ...[...'Work'].map(char), key('enter'), key('enter'));
+    expect(t.effects).toEqual([]);
+    expect(t.state.busy).toBeUndefined();
+  });
+
+  it('a second Enter after an empty rename or add does not switch', () => {
+    for (const opener of [char('r'), char('a')]) {
+      expect(press(base(), opener, key('enter'), key('enter')).effects).toEqual([]);
+    }
+  });
+
+  it('refuses an add whose label another account already answers to, before any login', () => {
+    const t = press(base(), char('a'), ...[...'WORK'].map(char), key('enter'));
+    expect(t.effects).toEqual([]);
+    expect(t.state.mode).toMatchObject({ kind: 'prompt', purpose: 'add' });
+    expect(t.state.mode).toHaveProperty(
+      'note',
+      '"WORK" is already the label of work. Pick another, or Esc to cancel.',
+    );
+  });
+
+  it('a remove prompt follows a rename made elsewhere while it is open', () => {
+    const open = press(base(), char('d')).state;
+    // Another process swaps the two labels.
+    const swapped = everyStateAccounts().map((a) =>
+      a.id === 'id-work'
+        ? { ...a, label: 'home' }
+        : a.id === 'id-home'
+          ? { ...a, label: 'work' }
+          : a,
+    );
+    const after = applySnapshot(open, snapshotOf(swapped));
+    expect(after.mode).toMatchObject({
+      purpose: 'remove',
+      account: { id: 'id-work', label: 'home' },
+    });
+    // Typing the label the prompt first showed no longer removes the account that lost it.
+    const t = press(after, ...[...'work'].map(char), key('enter'));
+    expect(t.effects).toEqual([]);
+  });
+
+  it('a prompt whose account is gone closes, saying so', () => {
+    const open = press(base(), char('r')).state;
+    const after = applySnapshot(
+      open,
+      snapshotOf(everyStateAccounts().filter((a) => a.id !== 'id-work')),
+    );
+    expect(after.mode).toEqual({ kind: 'browse' });
+    expect(after.status?.text).toBe('work is no longer stored, so the prompt was closed.');
+  });
+
+  it('keeps the selection through a read that could not read the accounts', () => {
+    const onThird = press(base(), key('down'), key('down')).state;
+    expect(onThird.selectedId).toBe('id-dead');
+    const failed = applySnapshot(onThird, {
+      ...snapshotOf([]),
+      accounts: { ok: false, error: 'database is locked' },
+    });
+    expect(failed.selectedId).toBe('id-dead');
+    const back = applySnapshot(failed, snapshotOf(everyStateAccounts()));
+    expect(back.selectedId).toBe('id-dead');
+    expect(reduce(back, key('enter')).effect).toMatchObject({ kind: 'switch', id: 'id-dead' });
+  });
+
+  it('says the accounts are still being read, not that there are none, and drops it once read', () => {
+    const early = initialState(NOW, 'linux');
+    const t = reduce(early, key('enter'));
+    expect(t.effect).toBeUndefined();
+    expect(t.state.status?.text).toBe('The accounts are still being read.');
+    expect(applySnapshot(t.state, snapshotOf(everyStateAccounts())).status).toBeUndefined();
+    const failed = stateWith({ ...snapshotOf([]), accounts: { ok: false, error: 'boom' } });
+    expect(reduce(failed, char('e')).state.status?.text).toBe(
+      'The accounts could not be read, so there is nothing to exclude or include.',
+    );
+  });
+});
+
+describe('pasted text', () => {
+  it('goes into an open prompt whole, without submitting it', () => {
+    const t = press(base(), char('a'), { name: 'paste', text: 'new\nlabel' });
+    expect(t.effects).toEqual([]);
+    expect(t.state.mode).toMatchObject({ kind: 'prompt', input: 'newlabel' });
+  });
+
+  it('acts on nothing outside a prompt', () => {
+    const t = press(base(), { name: 'paste', text: 'rachel\n' });
+    expect(t.effects).toEqual([]);
+    expect(t.state.mode).toEqual({ kind: 'browse' });
+    expect(t.state.selectedId).toBe('id-work');
+  });
+});
+
+describe('the help overlay', () => {
+  it('scrolls with the movement keys and closes on any other key', () => {
+    const open = reduce(base(), char('?')).state;
+    const down = press(open, key('down'), char('j'), key('pagedown')).state;
+    expect(down.mode).toEqual({ kind: 'help', scroll: 12 });
+    expect(press(down, key('up'), char('k')).state.mode).toEqual({ kind: 'help', scroll: 10 });
+    expect(reduce(down, char('x')).state.mode).toEqual({ kind: 'browse' });
+  });
+});
+
+describe('warnings logged while an action ran', () => {
+  it('are kept with its outcome rather than overwritten by it', () => {
+    const busy = reduce(base(), key('enter')).state;
+    const s = settleAction(busy, { ok: true, message: 'Activated work.' }, [
+      'refused to adopt the live token',
+    ]);
+    expect(s.status).toEqual({
+      text: 'Activated work. Warning: refused to adopt the live token',
+      tone: 'warn',
+    });
   });
 });

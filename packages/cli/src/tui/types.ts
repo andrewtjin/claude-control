@@ -89,6 +89,9 @@ export interface TuiSnapshot {
   sessions: Section<TuiSessions>;
   folders: Section<FoldersView>;
   outages: Section<OutagesView>;
+  /** Why the usage numbers (the daemon's database) could not be read, when they could not. The
+   *  accounts themselves come from the vault and are listed either way, without usage. */
+  usageError?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -113,10 +116,14 @@ export interface TuiSources {
   renameAccount(id: string, label: string): Promise<TuiActionResult>;
   removeAccount(id: string): Promise<TuiActionResult>;
   /** Log a NEW account in, in a window that owns the terminal while it runs: the caller must have
-   *  stepped its own screen aside first. */
-  addAccount(label: string): Promise<TuiActionResult>;
+   *  stepped its own screen aside first. `onStored` is told as soon as the account is stored,
+   *  before the add's own cleanup (which can take seconds), so the caller can take the terminal
+   *  back then rather than leave the person looking at a screen that seems hung. */
+  addAccount(label: string, onStored?: (message: string) => void): Promise<TuiActionResult>;
   /** Ask the running daemon to refresh every account's usage now. */
   repoll(): Promise<UsageRepollResult>;
+  /** Let go of anything held open between reads (the database connection). */
+  close?(): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +143,8 @@ export type PromptPurpose = 'rename' | 'add' | 'remove';
 /** What the screen is doing: browsing a pane, or showing something over it. */
 export type TuiMode =
   | { kind: 'browse' }
-  | { kind: 'help' }
+  /** `scroll`: how many lines of the key table are scrolled off the top, for a short terminal. */
+  | { kind: 'help'; scroll: number }
   | { kind: 'launch'; label: string }
   | {
       kind: 'prompt';
@@ -144,15 +152,20 @@ export type TuiMode =
       /** The account the prompt is about (rename, remove); absent for an add. */
       account?: { id: string; label: string };
       input: string;
+      /** Why the last Enter did not go through (an empty label, a mistyped confirmation), shown
+       *  with the prompt, which stays open so the input can be fixed. */
+      note?: string;
     };
 
 /** How a status line reads. */
 export type TuiTone = 'info' | 'ok' | 'warn' | 'error';
 
-/** The one-line message under the body. */
+/** The message under the body. */
 export interface TuiStatus {
   text: string;
   tone: TuiTone;
+  /** Only true until the next read lands (a message about the read itself), then dropped. */
+  untilRead?: boolean;
 }
 
 /** Everything the screen is drawn from. Plain data, so the reducer and renderer stay pure. */
@@ -197,7 +210,9 @@ export type Key =
         | 'backspace'
         | 'ctrl-c';
     }
-  | { name: 'char'; char: string };
+  | { name: 'char'; char: string }
+  /** A block the terminal marked as pasted: text to type into a prompt, never key commands. */
+  | { name: 'paste'; text: string };
 
 /** Something the reducer asks the runtime to do; the runtime reports back through the state. */
 export type Effect =

@@ -19,7 +19,16 @@ import { renderOutages } from '../outagesView.js';
 import { renderSessionStatus } from '../sessionRender.js';
 import { sanitizeForTerminal, severityPaint, type Palette } from '../ansi.js';
 import { accountsOf, selectedAccount } from './state.js';
-import { clip, displayWidth, fit, truncateAnsi, visibleWidth } from './text.js';
+import {
+  clip,
+  cutTail,
+  displayWidth,
+  fit,
+  keepColorOnly,
+  truncateAnsi,
+  visibleWidth,
+  wrap,
+} from './text.js';
 import { PANES, type PaneId, type TuiAccount, type TuiState, type TuiTag } from './types.js';
 
 /** Narrower than this, the columns cannot hold an account row worth reading. */
@@ -28,6 +37,12 @@ export const MIN_COLS = 40;
 export const MIN_ROWS = 6;
 /** Header, tabs, status line and hints: the rows that are not body. */
 const CHROME_ROWS = 4;
+/** A long status message wraps onto at most this many rows (taken from the body) rather than
+ *  being cut at the edge, where its remedy usually sits. */
+const MAX_STATUS_ROWS = 3;
+/** Separator between header parts and between key hints. ASCII: a middle dot is ambiguous width,
+ *  two columns on a terminal set up for CJK text, and would push the hints past the edge. */
+const SEP = ' | ';
 
 /** Pane names as the tabs show them. */
 const PANE_TITLES: Readonly<Record<PaneId, string>> = {
@@ -291,7 +306,7 @@ function accountRow(
 function accountsBody(state: TuiState, cols: number, height: number, palette: Palette): string[] {
   const section = state.snapshot?.accounts;
   if (section === undefined) return [palette.dim('Reading accounts...')];
-  if (!section.ok) return [palette.red(`Could not read the accounts: ${section.error}`)];
+  if (!section.ok) return failedLines('the accounts', section.error, cols, palette);
   const accounts = section.value;
   if (accounts.length === 0) {
     return [
@@ -300,7 +315,16 @@ function accountsBody(state: TuiState, cols: number, height: number, palette: Pa
     ];
   }
   const columns = planAccountColumns(accounts, cols, state.nowMs);
-  const visible = Math.max(1, height - 1);
+  // The accounts come from the vault; when only their usage could not be read they are still
+  // listed (and still act), with a line saying why the numbers are missing.
+  const usageError = state.snapshot?.usageError;
+  const note =
+    usageError === undefined
+      ? []
+      : wrap(`Usage could not be read: ${sanitizeForTerminal(usageError)}`, cols).map((l) =>
+          palette.yellow(l),
+        );
+  const visible = Math.max(1, height - 1 - note.length);
   const selectedId = selectedAccount(state)?.id;
   const selectedIndex = Math.max(
     0,
@@ -312,24 +336,33 @@ function accountsBody(state: TuiState, cols: number, height: number, palette: Pa
     ...accounts
       .slice(offset, offset + visible)
       .map((a) => accountRow(a, a.id === selectedId, columns, state.nowMs, palette)),
+    ...note,
   ];
+}
+
+/** A pane read failure, wrapped over the body: the end of such a message (the file, what to do
+ *  about it) is the part that matters, and a single line cut at the edge would hide it. */
+function failedLines(what: string, error: string, cols: number, palette: Palette): string[] {
+  return wrap(`Could not read ${what}: ${sanitizeForTerminal(error)}`, cols).map((l) =>
+    palette.red(l),
+  );
 }
 
 // ---------------------------------------------------------------------------
 // Text panes
 // ---------------------------------------------------------------------------
 
-/** The lines of a text pane, from the renderer behind its command. */
+/** The lines of a text pane, from the renderer behind its command. A read failure is wrapped to
+ *  `cols`. */
 export function paneLines(
   state: TuiState,
   pane: Exclude<PaneId, 'accounts'>,
   palette: Palette,
+  cols = Number.POSITIVE_INFINITY,
 ): string[] {
   const snapshot = state.snapshot;
   if (snapshot === undefined) return [palette.dim('Reading...')];
-  const failed = (what: string, error: string): string[] => [
-    palette.red(`Could not read ${what}: ${error}`),
-  ];
+  const failed = (what: string, error: string): string[] => failedLines(what, error, cols, palette);
   switch (pane) {
     case 'sessions': {
       const s = snapshot.sessions;
@@ -359,27 +392,44 @@ export function maxScroll(lineCount: number, bodyHeight: number): number {
   return Math.max(0, lineCount - bodyHeight);
 }
 
-/** Pull the current text pane's scroll back inside its content, so End then Up moves at once
- *  instead of first unwinding scroll past the last line. The runtime applies it before drawing. */
-export function settleScroll(state: TuiState, rows: number, palette: Palette): TuiState {
+/** Pull the current text pane's scroll (or the help overlay's) back inside its content, so End
+ *  then Up moves at once instead of first unwinding scroll past the last line. The runtime applies
+ *  it before drawing. */
+export function settleScroll(
+  state: TuiState,
+  rows: number,
+  palette: Palette,
+  cols = Number.POSITIVE_INFINITY,
+): TuiState {
+  const body = bodyHeight(rows) - (statusLines(state, cols, rows, palette).length - 1);
+  if (state.mode.kind === 'help') {
+    const limit = maxScroll(helpBody(palette, cols).length, body);
+    return state.mode.scroll <= limit ? state : { ...state, mode: { kind: 'help', scroll: limit } };
+  }
   if (state.pane === 'accounts') return state;
   const pane = state.pane;
-  const limit = maxScroll(paneLines(state, pane, palette).length, bodyHeight(rows));
+  const limit = maxScroll(paneLines(state, pane, palette, cols).length, body);
   return state.scroll[pane] <= limit
     ? state
     : { ...state, scroll: { ...state.scroll, [pane]: limit } };
 }
 
-/** The body height for a terminal `rows` tall. */
+/** The body height for a terminal `rows` tall, with a one-row status line. */
 export function bodyHeight(rows: number): number {
   return Math.max(0, rows - CHROME_ROWS);
+}
+
+/** Whether a terminal this size is below what the view can draw (it shows a notice instead, and
+ *  the runtime then acts on no key but the ones that quit). */
+export function isFrameTooSmall(cols: number, rows: number): boolean {
+  return cols < MIN_COLS || rows < MIN_ROWS;
 }
 
 // ---------------------------------------------------------------------------
 // Chrome
 // ---------------------------------------------------------------------------
 
-/** "cctl  daemon up · auto-switch on · last poll 2m ago". */
+/** "cctl  daemon up | auto-switch on | last poll 2m ago". */
 function headerLine(state: TuiState, palette: Palette): string {
   const parts: string[] = [];
   const daemon = state.snapshot?.daemon;
@@ -402,7 +452,7 @@ function headerLine(state: TuiState, palette: Palette): string {
         : 'no poll yet',
     );
   }
-  return `${palette.bold('cctl')}  ${parts.join(palette.dim(' · '))}`;
+  return `${palette.bold('cctl')}  ${parts.join(palette.dim(SEP))}`;
 }
 
 /** "2m ago" / "just now" for the header. */
@@ -417,9 +467,43 @@ function tabsLine(state: TuiState, palette: Palette): string {
   ).join(' ');
 }
 
-/** The status line: an open prompt, else what is running, else the last message, else a read
- *  that failed. */
-function statusLine(state: TuiState, palette: Palette): string {
+/** The text the status line says and how it is painted: what is running, else the last message,
+ *  else a read that failed. */
+function statusText(
+  state: TuiState,
+  palette: Palette,
+): { text: string; paint: (t: string) => string } {
+  if (state.busy !== undefined) {
+    const quitting = state.quitWhenIdle
+      ? ' - quitting when this finishes (Ctrl-C again to quit now)'
+      : '';
+    return { text: state.busy + quitting, paint: palette.yellow };
+  }
+  if (state.status !== undefined) {
+    const text = sanitizeForTerminal(state.status.text);
+    switch (state.status.tone) {
+      case 'error':
+        return { text, paint: palette.red };
+      case 'warn':
+        return { text, paint: palette.yellow };
+      case 'ok':
+        return { text, paint: palette.green };
+      case 'info':
+        return { text, paint: (t) => t };
+    }
+  }
+  if (state.loadError !== undefined) {
+    return { text: `Could not read: ${sanitizeForTerminal(state.loadError)}`, paint: palette.red };
+  }
+  return { text: '', paint: (t) => t };
+}
+
+/**
+ * The status line's rows: an open prompt (one row), else the message, wrapped onto as many as
+ * {@link MAX_STATUS_ROWS} rows while at least one body row is left, so a refusal's remedy (which
+ * comes last) is read rather than cut off at the edge.
+ */
+function statusLines(state: TuiState, cols: number, rows: number, palette: Palette): string[] {
   const mode = state.mode;
   if (mode.kind === 'prompt') {
     const label = mode.account ? sanitizeForTerminal(mode.account.label) : '';
@@ -429,31 +513,34 @@ function statusLine(state: TuiState, palette: Palette): string {
         : mode.purpose === 'rename'
           ? `New label for ${label}: `
           : `Type ${label} to remove it: `;
-    return `${palette.bold(ask)}${sanitizeForTerminal(mode.input)}_`;
+    return [promptLine(ask, sanitizeForTerminal(mode.input), cols, palette)];
   }
-  if (state.busy !== undefined) {
-    const quitting = state.quitWhenIdle
-      ? ' - quitting when this finishes (Ctrl-C again to quit now)'
-      : '';
-    return palette.yellow(state.busy + quitting);
+  const { text, paint } = statusText(state, palette);
+  const allowed = Math.min(MAX_STATUS_ROWS, 1 + Math.max(0, rows - CHROME_ROWS - 1));
+  const wrapped = wrap(text, cols);
+  if (wrapped.length === 0) return [''];
+  const lines = wrapped.slice(0, allowed);
+  if (wrapped.length > allowed) {
+    lines[allowed - 1] = clip(wrapped.slice(allowed - 1).join(' '), cols);
   }
-  if (state.status !== undefined) {
-    const text = sanitizeForTerminal(state.status.text);
-    switch (state.status.tone) {
-      case 'error':
-        return palette.red(text);
-      case 'warn':
-        return palette.yellow(text);
-      case 'ok':
-        return palette.green(text);
-      case 'info':
-        return text;
-    }
-  }
-  if (state.loadError !== undefined) {
-    return palette.red(`Could not read: ${sanitizeForTerminal(state.loadError)}`);
-  }
-  return '';
+  return lines.map((l) => paint(l));
+}
+
+/**
+ * A prompt and its input in `cols` columns. The end of the input and the cursor are what the
+ * person is typing, so they stay in view: a long input shows its tail (marked as cut), and an ask
+ * too long for the line (a long label to confirm on a narrow terminal) gives way first.
+ */
+function promptLine(ask: string, input: string, cols: number, palette: Palette): string {
+  const inputWidth = displayWidth(input) + 1; // the cursor
+  const askWidth = displayWidth(ask);
+  if (askWidth + inputWidth <= cols) return `${palette.bold(ask)}${input}_`;
+  const reserve = Math.min(inputWidth, Math.max(10, Math.floor(cols / 3)));
+  const askShown = clip(ask, Math.max(0, Math.min(askWidth, cols - reserve)));
+  const room = cols - displayWidth(askShown) - 1;
+  const inputShown =
+    displayWidth(input) <= room ? input : `..${cutTail(input, Math.max(0, room - 2))}`;
+  return `${palette.bold(askShown)}${inputShown}_`;
 }
 
 /** Key hints, each with how much it matters when the line is short: 1 always shows (help and
@@ -479,7 +566,7 @@ const TEXT_PANE_HINTS: ReadonlyArray<readonly [string, number]> = [
   ['? help', 1],
   ['q quit', 1],
 ];
-const HINT_SEP = ' · ';
+const HINT_SEP = SEP;
 
 /** The hints that fit in `cols`, most important first, shown in their usual order. */
 function fittedHints(hints: ReadonlyArray<readonly [string, number]>, cols: number): string {
@@ -498,39 +585,63 @@ function fittedHints(hints: ReadonlyArray<readonly [string, number]>, cols: numb
     .join(HINT_SEP);
 }
 
-/** The key hints for what the screen is doing now. */
-function hintsLine(state: TuiState, cols: number, palette: Palette): string {
+/** The key hints for what the screen is doing now. `overflow`: the help overlay is taller than
+ *  the body, so it says how to scroll it. A prompt whose last Enter did not go through says why. */
+function hintsLine(state: TuiState, cols: number, palette: Palette, overflow: boolean): string {
   const mode = state.mode;
-  if (mode.kind === 'prompt') return palette.dim('Enter confirm · Esc cancel');
+  if (mode.kind === 'prompt') {
+    if (mode.note !== undefined) return palette.yellow(sanitizeForTerminal(mode.note));
+    return palette.dim(`Enter confirm${SEP}Esc cancel`);
+  }
+  if (mode.kind === 'help' && overflow) {
+    return palette.dim(`k/j scroll${SEP}any other key: back`);
+  }
   if (mode.kind === 'help' || mode.kind === 'launch') return palette.dim('any key: back');
   return palette.dim(
     fittedHints(state.pane === 'accounts' ? ACCOUNT_HINTS : TEXT_PANE_HINTS, cols),
   );
 }
 
-/** The help overlay. */
-function helpBody(palette: Palette): string[] {
+/** The help overlay, wrapped to `cols` (a description continues under itself rather than being
+ *  cut at the edge). Taller than the body, it scrolls. */
+function helpBody(palette: Palette, cols: number): string[] {
   const width = Math.max(...KEY_HELP.map(([k]) => k.length));
-  return [
-    palette.bold('Keys'),
-    ...KEY_HELP.map(([keys, what]) => `  ${palette.bold(keys.padEnd(width))}  ${what}`),
-    '',
-    palette.dim('Usage is read from the daemon (it polls); nothing here calls Anthropic directly.'),
-    palette.dim('A reset marked ~ is predicted from history, not reported by the endpoint.'),
-  ];
+  const room = Math.max(10, cols - width - 4);
+  const keys = KEY_HELP.flatMap(([key, what]) =>
+    wrap(what, room).map((line, i) =>
+      i === 0 ? `  ${palette.bold(key.padEnd(width))}  ${line}` : `  ${' '.repeat(width)}  ${line}`,
+    ),
+  );
+  const notes = [
+    'Usage is read from the daemon (it polls); nothing here calls Anthropic directly.',
+    'A reset marked ~ is predicted from history, not reported by the endpoint.',
+  ].flatMap((n) => wrap(n, cols).map((l) => palette.dim(l)));
+  return [palette.bold('Keys'), ...keys, '', ...notes];
 }
 
 /** The launch overlay: the line that runs Claude as `label`, to paste in another terminal. The
  *  label is quoted the way every command cctl prints quotes one, for this platform's shell. */
-function launchBody(label: string, platform: NodeJS.Platform, palette: Palette): string[] {
+function launchBody(
+  label: string,
+  platform: NodeJS.Platform,
+  palette: Palette,
+  cols: number,
+): string[] {
   const quoted = shellQuote(label, platform);
+  // A command is pasted whole or not at all: one too wide for the terminal is marked as cut (and
+  // said so), never left to look complete with its closing quote gone.
+  const room = cols - 2;
+  const commands = [`claude --account ${quoted}`, `cctl claude --account ${quoted}`];
+  const cut = commands.some((c) => displayWidth(c) > room);
+  const [plain, wrapped] = commands.map((c) => (displayWidth(c) > room ? clip(c, room) : c));
   return [
     `To run Claude as ${palette.bold(sanitizeForTerminal(label))}, paste this in another terminal:`,
     '',
-    `  ${palette.bold(`claude --account ${quoted}`)}`,
+    `  ${palette.bold(plain!)}`,
     '',
     palette.dim('That form needs the claude wrapper from `cctl shell-init`. Without it:'),
-    `  cctl claude --account ${quoted}`,
+    `  ${wrapped!}`,
+    ...(cut ? ['', palette.yellow('Cut short - widen the terminal to copy the whole line.')] : []),
   ];
 }
 
@@ -549,24 +660,32 @@ export function renderFrame(
   palette: Palette,
 ): string[] {
   const height = Math.max(0, rows);
-  if (cols < MIN_COLS || rows < MIN_ROWS) {
+  if (isFrameTooSmall(cols, rows)) {
     const notice =
       cols < MIN_COLS
         ? `Terminal too narrow: widen it to ${MIN_COLS} columns (q quits).`
         : `Terminal too short: make it ${MIN_ROWS} rows tall (q quits).`;
-    return [
-      truncateAnsi(notice, Math.max(0, cols)),
-      ...Array<string>(Math.max(0, height - 1)).fill(''),
-    ];
+    // Wrapped, so the way out (q) is never cut off; in a terminal too small even for that, the
+    // short form.
+    let lines = wrap(notice, cols);
+    if (lines.length > height) lines = wrap('Too small: q quits', cols);
+    const shown = lines.slice(0, height);
+    return [...shown, ...Array<string>(Math.max(0, height - shown.length)).fill('')];
   }
-  const bodyRows = bodyHeight(rows);
+  const status = statusLines(state, cols, rows, palette);
+  const bodyRows = bodyHeight(rows) - (status.length - 1);
   let body: string[];
-  if (state.mode.kind === 'help') body = helpBody(palette);
-  else if (state.mode.kind === 'launch')
-    body = launchBody(state.mode.label, state.platform, palette);
-  else if (state.pane === 'accounts') body = accountsBody(state, cols, bodyRows, palette);
+  let overflow = false;
+  if (state.mode.kind === 'help') {
+    const lines = helpBody(palette, cols);
+    overflow = lines.length > bodyRows;
+    const start = Math.min(state.mode.scroll, maxScroll(lines.length, bodyRows));
+    body = lines.slice(start, start + bodyRows);
+  } else if (state.mode.kind === 'launch') {
+    body = launchBody(state.mode.label, state.platform, palette, cols);
+  } else if (state.pane === 'accounts') body = accountsBody(state, cols, bodyRows, palette);
   else {
-    const lines = paneLines(state, state.pane, palette);
+    const lines = paneLines(state, state.pane, palette, cols);
     const start = Math.min(state.scroll[state.pane], maxScroll(lines.length, bodyRows));
     body = lines.slice(start, start + bodyRows);
   }
@@ -576,7 +695,12 @@ export function renderFrame(
     headerLine(state, palette),
     tabsLine(state, palette),
     ...padded,
-    statusLine(state, palette),
-    hintsLine(state, cols, palette),
-  ].map((line) => (visibleWidth(line) > cols ? truncateAnsi(line, cols) : line));
+    ...status,
+    hintsLine(state, cols, palette, overflow),
+  ].map((line) => {
+    // Whatever a pane renderer was handed (a session label, an error from a file), only color
+    // reaches the terminal: no cursor move, screen switch, title write or carriage return.
+    const safe = keepColorOnly(line);
+    return visibleWidth(safe) > cols ? truncateAnsi(safe, cols) : safe;
+  });
 }

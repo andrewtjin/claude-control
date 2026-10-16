@@ -5,11 +5,17 @@
 // Read locally (the vault and daemon.db), never from Anthropic: it works whether or not the daemon
 // is running, showing its last poll. Shared by the one-shot commands (`usage`, `timeline`,
 // `session status`, the outage judgement) and the full-screen view, so the numbers on every
-// surface come from one reader.
+// surface come from one reader. A one-shot command reads once; the view keeps one reader open for
+// as long as it runs (see {@link UsageReader}).
 
 import type { StoredAccount } from '@claude-control/switch-engine';
-import { Store, readFleetHistory } from '@claude-control/daemon';
-import type { AccountUsage } from '@claude-control/shared-protocol';
+import {
+  Store,
+  readFleetHistory,
+  type FleetHistory,
+  type SessionRow,
+} from '@claude-control/daemon';
+import { AccountUsage } from '@claude-control/shared-protocol';
 import { planWeight } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath } from './context.js';
 
@@ -19,8 +25,8 @@ type Engine = ReturnType<typeof buildEngine>;
  *  persisted snapshot per account, and the two history-derived measurements the pure advisor
  *  cannot make for itself (each account's predicted weekly reset and the fleet's burn rate).
  *  Works whether or not the daemon is currently running (it shows the last poll), and opening
- *  a not-yet-created db just yields an empty one. A corrupt snapshot row is skipped, never
- *  fatal. */
+ *  a not-yet-created db just yields an empty one. A corrupt snapshot row (one that does not parse,
+ *  or parses to something other than a usage reading) is skipped, never fatal. */
 export interface UsageState {
   accounts: StoredAccount[];
   activeId: string | null;
@@ -32,6 +38,131 @@ export interface UsageState {
   burnUnitsPerDay: number | undefined;
 }
 
+/** How a {@link UsageReader} is set up; every field has a production default. */
+export interface UsageReaderOptions {
+  /** The daemon's database. */
+  dbPath?: string;
+  /** The history measurement (injectable so a test can count it). */
+  readHistory?: typeof readFleetHistory;
+  /** How long a history measurement is reused. */
+  historyTtlMs?: number;
+}
+
+/** Reuse a history measurement this long by default. History moves by one observation per
+ *  account per poll, and what it predicts (a weekly reset days away) barely moves in a minute,
+ *  while measuring it reads every observation of the last ten days. */
+const HISTORY_TTL_MS = 60_000;
+
+/**
+ * Reads the usage picture, keeping the daemon's database open between reads. Opening the store
+ * runs its migration (a scan of the snapshot table), so a caller that reads every couple of
+ * seconds (the full-screen view) opens it once, not on every read; and it reuses the history
+ * measurement for {@link UsageReaderOptions.historyTtlMs}. A read that fails drops the connection,
+ * so the next one starts fresh (a database replaced or repaired meanwhile is picked up). All of it
+ * is synchronous SQLite on the caller's thread; keeping it to one open and one measurement a
+ * minute is what keeps a live view responsive.
+ */
+export class UsageReader {
+  private store: Store | undefined;
+  private closed = false;
+  private history: { key: string; atMs: number; value: FleetHistory } | undefined;
+  private readonly dbPath: string;
+  private readonly readHistory: typeof readFleetHistory;
+  private readonly historyTtlMs: number;
+
+  constructor(
+    private readonly engine: Pick<Engine, 'listAccounts' | 'getActiveId'>,
+    options: UsageReaderOptions = {},
+  ) {
+    this.dbPath = options.dbPath ?? daemonDbPath();
+    this.readHistory = options.readHistory ?? readFleetHistory;
+    this.historyTtlMs = options.historyTtlMs ?? HISTORY_TTL_MS;
+  }
+
+  /** The usage picture now. `only` names the accounts to read instead of the shared pool;
+   *  `activeId` is the live account when the caller already knows it (asking the engine again
+   *  costs another read of the live login). */
+  async read(nowMs: number, only?: StoredAccount[], activeId?: string | null): Promise<UsageState> {
+    const [accounts, active] = await Promise.all([
+      only !== undefined ? Promise.resolve(only) : this.engine.listAccounts(),
+      activeId !== undefined ? Promise.resolve(activeId) : this.engine.getActiveId(),
+    ]);
+    return this.withStore((store) => {
+      const byId = new Map<string, AccountUsage>();
+      for (const a of accounts) {
+        const row = store.latestUsageSnapshot(a.id);
+        if (!row) continue;
+        const usage = parseUsage(row.json);
+        if (usage !== undefined) byId.set(a.id, usage);
+      }
+      const history = this.historyFor(store, accounts, nowMs);
+      return {
+        accounts,
+        activeId: active,
+        usageFor: (accountId) => byId.get(accountId),
+        predictedResetFor: (accountId) => history.predictedResetByAccount.get(accountId),
+        burnUnitsPerDay: history.burnUnitsPerDay,
+      };
+    });
+  }
+
+  /** The sessions the daemon tracks, through the same open database. */
+  listSessions(): SessionRow[] {
+    return this.withStore((store) => store.listSessions());
+  }
+
+  /** Close the database for good. A read still in flight when this is called (one awaiting the
+   *  vault) fails rather than reopen a file its owner has let go of. */
+  close(): void {
+    this.closed = true;
+    this.drop();
+  }
+
+  private drop(): void {
+    this.store?.close();
+    this.store = undefined;
+  }
+
+  private withStore<T>(body: (store: Store) => T): T {
+    if (this.closed) throw new Error('the usage reader is closed');
+    this.store ??= new Store(this.dbPath);
+    try {
+      return body(this.store);
+    } catch (err) {
+      this.drop();
+      throw err;
+    }
+  }
+
+  /** The history measurement for these accounts, reused while it is fresh. The same measurement
+   *  the daemon makes each poll cycle, over the same store and the one implementation, so a
+   *  number the CLI prints can never disagree with the one the phone got. */
+  private historyFor(store: Store, accounts: StoredAccount[], nowMs: number): FleetHistory {
+    const inputs = accounts.map((a) => ({ accountId: a.id, ...resolvedWeight(a) }));
+    const key = JSON.stringify(inputs);
+    const cached = this.history;
+    if (cached !== undefined && cached.key === key && nowMs - cached.atMs < this.historyTtlMs) {
+      return cached.value;
+    }
+    const value = this.readHistory(store, inputs, nowMs);
+    this.history = { key, atMs: nowMs, value };
+    return value;
+  }
+}
+
+/** A snapshot row's reading, or undefined for one that does not parse or is not a usage reading
+ *  (a row from another build, a hand edit): one bad row must not take down every view of it. */
+function parseUsage(json: string): AccountUsage | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    return undefined;
+  }
+  const parsed = AccountUsage.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
 /** The usage view's state: the shared accounts, the global live account and each account's latest
  *  snapshot. `only` names the accounts to read instead (the outage judgement reads the whole fleet,
  *  reserved accounts included). `engine` is the one to read through; a caller drawing its own
@@ -41,38 +172,11 @@ export async function readUsageState(
   only?: StoredAccount[],
   engine: Engine = buildEngine(),
 ): Promise<UsageState> {
-  const [accounts, activeId] = await Promise.all([
-    only !== undefined ? Promise.resolve(only) : engine.listAccounts(),
-    engine.getActiveId(),
-  ]);
-  const store = new Store(daemonDbPath());
+  const reader = new UsageReader(engine);
   try {
-    const byId = new Map<string, AccountUsage>();
-    for (const a of accounts) {
-      const row = store.latestUsageSnapshot(a.id);
-      if (!row) continue;
-      try {
-        byId.set(a.id, JSON.parse(row.json) as AccountUsage);
-      } catch {
-        // a corrupt row must not crash the whole view
-      }
-    }
-    // The same measurement the daemon makes each poll cycle, over the same store and the one
-    // implementation — so a number the CLI prints can never disagree with the one the phone got.
-    const history = readFleetHistory(
-      store,
-      accounts.map((a) => ({ accountId: a.id, ...resolvedWeight(a) })),
-      nowMs,
-    );
-    return {
-      accounts,
-      activeId,
-      usageFor: (accountId) => byId.get(accountId),
-      predictedResetFor: (accountId) => history.predictedResetByAccount.get(accountId),
-      burnUnitsPerDay: history.burnUnitsPerDay,
-    };
+    return await reader.read(nowMs, only);
   } finally {
-    store.close();
+    reader.close();
   }
 }
 

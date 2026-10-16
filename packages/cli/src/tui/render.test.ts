@@ -151,7 +151,7 @@ describe('renderFrame: the other panes, overlays and the status line', () => {
   });
 
   it('shows the help overlay with every key', () => {
-    const lines = frame({ ...s, mode: { kind: 'help' } }, 120, 20, false);
+    const lines = frame({ ...s, mode: { kind: 'help', scroll: 0 } }, 120, 20, false);
     for (const [keys] of KEY_HELP) expect(lines.join('\n')).toContain(keys);
     expect(lines[19]).toBe('any key: back');
   });
@@ -175,7 +175,7 @@ describe('renderFrame: the other panes, overlays and the status line', () => {
       char: 'w',
     });
     expect(frame(prompt.state, 80, ROWS, false)[ROWS - 2]).toBe('Type work to remove it: w_');
-    expect(frame(prompt.state, 80, ROWS, false)[ROWS - 1]).toBe('Enter confirm · Esc cancel');
+    expect(frame(prompt.state, 80, ROWS, false)[ROWS - 1]).toBe('Enter confirm | Esc cancel');
     const busy = reduce(s, { name: 'enter' }).state;
     expect(frame(busy, 80, ROWS, false)[ROWS - 2]).toBe('Switching to work...');
     const said = { ...s, status: { text: 'Renamed a to b (id).', tone: 'ok' as const } };
@@ -200,11 +200,14 @@ describe('renderFrame: the other panes, overlays and the status line', () => {
   });
 
   it('says the terminal is too narrow or too short instead of drawing a broken layout', () => {
-    expect(frame(s, MIN_COLS - 1, ROWS, false)[0]).toBe('Terminal too narrow: widen it to 40 col');
+    expect(frame(s, MIN_COLS - 1, ROWS, false).slice(0, 2)).toEqual([
+      'Terminal too narrow: widen it to 40',
+      'columns (q quits).',
+    ]);
     expect(frame(s, 80, MIN_ROWS - 1, false)[0]).toBe(
       'Terminal too short: make it 6 rows tall (q quits).',
     );
-    expect(frame(s, 10, 3, false)).toEqual(['Terminal t', '', '']);
+    expect(frame(s, 10, 3, false)).toEqual(['Too small:', 'q quits', '']);
   });
 });
 
@@ -265,11 +268,11 @@ describe('width arithmetic', () => {
 
   it('pads or cuts to an exact width, never splitting a wide character', () => {
     expect(fit('ab', 4)).toBe('ab  ');
-    expect(fit('abcdef', 4)).toBe('abc…');
-    expect(fit('漢字漢字', 5)).toBe('漢字…');
+    expect(fit('abcdef', 4)).toBe('ab..');
+    expect(fit('漢字漢字', 5)).toBe('漢.. ');
     expect(displayWidth(fit('漢字漢字', 4))).toBe(4);
     expect(fit('x', 0)).toBe('');
-    expect(clip('abcdef', 4)).toBe('abc…');
+    expect(clip('abcdef', 4)).toBe('ab..');
     expect(clip('ab', 4)).toBe('ab');
   });
 
@@ -290,5 +293,126 @@ describe('the documented keys', () => {
       .filter((line) => line.startsWith('|'))
       .map((line) => line.split('|')[1]?.trim());
     for (const [keys] of KEY_HELP) expect(cells).toContain(keys);
+  });
+});
+
+describe('regressions: what the frame must never do', () => {
+  const s = stateWith(snapshotOf(everyStateAccounts()));
+  const BEL = String.fromCharCode(7);
+
+  it('passes no escape but color through, whatever a pane renderer was handed', () => {
+    const hostile = `x${ESC}[?1049l${ESC}[?25h${ESC}]52;c;aGk=${BEL}y${ESC}[2J`;
+    const st = stateWith(
+      snapshotOf(everyStateAccounts(), {
+        sessions: {
+          ok: true,
+          value: {
+            rows: [
+              { id: 's1', kind: 'interactive', state: 'active', label: hostile },
+              { id: 's2', kind: 'interactive', state: 'active', label: 'cr\rOVERWRITE' },
+            ],
+            header: {},
+          },
+        },
+      }),
+    );
+    const lines = renderFrame({ ...st, pane: 'sessions' }, 100, ROWS, ANSI_PALETTE);
+    for (const line of lines) {
+      // Only SGR (color and weight) sequences survive; no other escape, BEL or carriage return.
+      const rest = line.replace(new RegExp(`${ESC}\\[[0-9;]*m`, 'g'), '');
+      expect([...rest].some((c) => c.charCodeAt(0) < 0x20 || c.charCodeAt(0) === 0x7f)).toBe(false);
+    }
+  });
+
+  it('keeps the end of a long prompt input and its cursor in view', () => {
+    let st: TuiState = reduce(s, { name: 'char', char: 'r' }).state;
+    for (const c of 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ') {
+      st = reduce(st, { name: 'char', char: c }).state;
+    }
+    const line = frame(st, 40, ROWS, false)[ROWS - 2]!;
+    expect(line.endsWith('ABCDEFGHIJ_')).toBe(true);
+    expect(line.startsWith('New label for work: ')).toBe(true);
+    // A label too long for the ask still leaves the typed text and the cursor showing.
+    const longLabel = stateWith(snapshotOf([account('id-l', 'work-account-main-01')]));
+    let rm: TuiState = reduce(longLabel, { name: 'char', char: 'd' }).state;
+    for (const c of 'work-acc') rm = reduce(rm, { name: 'char', char: c }).state;
+    expect(frame(rm, 40, ROWS, false)[ROWS - 2]!.endsWith('work-acc_')).toBe(true);
+  });
+
+  it('wraps a long status line over extra rows instead of cutting its remedy off', () => {
+    const text =
+      'Refresh needs the running daemon, and the daemon has never run on this machine - start it with: cctl daemon start';
+    const lines = frame({ ...s, status: { text, tone: 'warn' } }, 60, ROWS, false);
+    expect(lines.join(' ')).toContain('cctl daemon start');
+  });
+
+  it('wraps an unreadable pane error over the body so its remedy shows', () => {
+    const error =
+      'C:/Users/someone/AppData/Local/claude-control/vault/accounts.json is not valid JSON (Unexpected end of JSON input); fix the file or move it aside - it was left untouched';
+    const st = stateWith(snapshotOf([], { accounts: { ok: false, error } }));
+    const body = frame(st, 80, ROWS, false).join('\n');
+    expect(body).toContain('fix the file or move it aside');
+    const sessions = stateWith(snapshotOf([], { sessions: { ok: false, error } }));
+    expect(frame({ ...sessions, pane: 'sessions' }, 80, ROWS, false).join('\n')).toContain(
+      'move it aside',
+    );
+  });
+
+  it('marks a launch command cut to fit, never showing a broken one as whole', () => {
+    const lines = frame(
+      { ...s, mode: { kind: 'launch', label: 'work-account-for-the-research-team' } },
+      40,
+      ROWS,
+      false,
+    );
+    const commands = lines.filter((l) => l.includes('--account'));
+    for (const c of commands) expect(c.endsWith("team'") || c.endsWith('..')).toBe(true);
+    expect(lines.join('\n')).toContain('widen the terminal');
+  });
+
+  it('lets a short terminal scroll the help overlay to its last key', () => {
+    const top = frame({ ...s, mode: { kind: 'help', scroll: 0 } }, 40, 12, false);
+    expect(top.join('\n')).not.toContain('q or Esc');
+    expect(top[11]).toBe('k/j scroll | any other key: back');
+    const end = frame({ ...s, mode: { kind: 'help', scroll: 999 } }, 40, 12, false);
+    expect(end.join('\n')).toContain('q or Esc');
+  });
+
+  it('says when usage could not be read, while still listing the accounts', () => {
+    const st = stateWith({
+      ...snapshotOf(everyStateAccounts()),
+      usageError: 'file is not a database',
+    });
+    const text = frame(st, 120, 16, false).join('\n');
+    expect(text).toContain('home');
+    expect(text).toContain('Usage could not be read: file is not a database');
+  });
+
+  it('draws only glyphs every terminal agrees on the width of', () => {
+    const narrow = frame(s, 80, ROWS, true).join('\n');
+    expect(narrow).not.toMatch(/[\u00b7\u2026]/);
+  });
+});
+
+describe('width of emoji and combining marks', () => {
+  it.each([
+    ['🚀ops', 5],
+    ['✅ok', 4],
+    ['⚡x', 3],
+    ['❤️x', 3],
+    ['🫠x', 3],
+    ['👨‍👩‍👧fam', 5],
+    ['🇯🇵', 2],
+    ['ทีมงาน', 5],
+    ['नमस्ते', 4],
+    ['\u1112\u1161\u11ab', 2],
+    ['a\u20d7', 1],
+  ])('%s is %i columns', (text, width) => {
+    expect(displayWidth(text)).toBe(width);
+  });
+
+  it('never splits a cluster when cutting', () => {
+    expect(fit('👨‍👩‍👧family', 4)).toBe('👨‍👩‍👧..');
+    expect(truncateAnsi('❤️x', 2)).toBe('❤️');
   });
 });

@@ -4,8 +4,10 @@
 the guided first-run wizard and the background daemon itself. Bare `cctl` (no
 subcommand) prints `Not set up yet. Run: cctl setup` before setup. Afterward it opens the
 full-screen view (see [Full-screen view](#full-screen-view)) when both its input and its
-output are a terminal, and prints a short status summary otherwise, so a pipe, a script or
-`cctl > file` gets the same plain text it always did. It never dumps raw command-tree usage.
+output are a terminal that can draw it, and prints a short status summary otherwise, so a
+pipe, a script or `cctl > file` gets the same plain text it always did. A terminal that
+cannot move the cursor (`TERM=dumb`, as in an Emacs shell buffer) or the legacy Windows
+console gets the summary too. It never dumps raw command-tree usage.
 `cctl --help` lists every command; this page adds the detail and the unhappy paths.
 
 ## First run
@@ -627,14 +629,24 @@ predicted from history rather than reported.
 | q or Esc            | quit                                                                                                                                                                                                                                  |
 
 Ctrl-C also quits. If an action is running, the view quits as soon as it finishes; a second
-Ctrl-C quits at once.
+Ctrl-C gives the screen back at once, and cctl exits when the action has finished (it is never
+cut off part way). Either way, how the action ended is printed on the normal screen, and a
+refused action makes the exit code non-zero.
+
+The help overlay scrolls with the movement keys in a short terminal. A rename, add or remove
+prompt whose Enter does not go through (an empty label, a label another account already has, a
+mistyped confirmation) stays open and says why. Pasted text only ever goes into a prompt; in the
+list it does nothing. Keys typed while the screen is stepped aside for a login window are
+dropped when it comes back.
 
 As the terminal narrows, columns give way in a fixed order: per-model windows first, then reset
-times, then the plan. Below 40 columns (or 6 rows) the view shows a one-line notice instead.
-Diagnostics that would normally go to stderr appear on the status line, so they never draw over
-the screen. Quitting, a signal, a closed terminal and an error all give the terminal back as it
-was. `cctl tui` refuses to start when its input or output is redirected, and points at
-`cctl usage` for plain output.
+times, then the plan. Below 40 columns (or 6 rows) the view shows a notice instead, and only q,
+Esc and Ctrl-C do anything until it is larger. A long message wraps onto up to three status
+rows. Diagnostics that would normally go to stderr appear on the status line, so they never draw
+over the screen; one logged while an action ran is shown with that action's result. Quitting, a
+signal, a closed terminal and an error all give the terminal back as it was. `cctl tui` refuses
+to start when its input or output is redirected, or on a terminal that cannot draw it, and
+points at `cctl usage` for plain output.
 
 ## Switching and recovery
 

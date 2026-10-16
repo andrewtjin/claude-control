@@ -1,145 +1,146 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
 exports[`renderFrame snapshots > a failed read under the last picture at 40 cols 1`] = `
-"cctl  daemon up · auto-switch on · last 
+"cctl  daemon up | auto-switch on | last 
 [Accounts]  Sessions   Folders   Outages
-   ACCO… 5H         7D         TAGS  AGE
+   ACC.. 5H         7D         TAGS  AGE
 >* work  ##...  45% ####.  72%       2m 
-   home  #####  91% ##### 100% fold… 3h 
-   expi… -          -          quar… 2d 
-   neve… -          -          sess… -  
-   a-la… .....   3% -          fold… now
+   home  #####  91% ##### 100% fol.. 3h 
+   exp.. -          -          qua.. 2d 
+   nev.. -          -          ses.. -  
+   a-l.. .....   3% -          fol.. now
 
 
 
 
 Could not read: daemon.db is locked
-Enter switch · ? help · q quit"
+Enter switch | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > a failed read under the last picture at 40 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mlast <E>[0m
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mlast <E>[0m
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages<E>[0m
-<E>[2m   ACCO… 5H         7D         TAGS  AGE<E>[0m
+<E>[2m   ACC.. 5H         7D         TAGS  AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork <E>[0m <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m       <E>[2m2m <E>[0m
-   home  <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[36mfold…<E>[0m <E>[2m3h <E>[0m
-   expi… <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[31mquar…<E>[0m <E>[2m2d <E>[0m
-   neve… <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[36msess…<E>[0m <E>[2m-  <E>[0m
-   a-la… <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m-         <E>[0m <E>[36mfold…<E>[0m <E>[2mnow<E>[0m
+   home  <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[36mfol..<E>[0m <E>[2m3h <E>[0m
+   exp.. <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[31mqua..<E>[0m <E>[2m2d <E>[0m
+   nev.. <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[36mses..<E>[0m <E>[2m-  <E>[0m
+   a-l.. <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m-         <E>[0m <E>[36mfol..<E>[0m <E>[2mnow<E>[0m
 
 
 
 
 <E>[31mCould not read: daemon.db is locked<E>[0m
-<E>[2mEnter switch · ? help · q quit<E>[0m"
+<E>[2mEnter switch | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > a failed read under the last picture at 80 cols 1`] = `
-"cctl  daemon up · auto-switch on · last poll just now
+"cctl  daemon up | auto-switch on | last poll just now
 [Accounts]  Sessions   Folders   Outages 
    ACCOUNT              PLAN 5H         7D         TAGS                      AGE
 >* work                 20x  ##...  45% ####.  72%                           2m 
-   home                 5x   #####  91% ##### 100% folder: client-a, exclud… 3h 
-   expired-login        1x   -          -          quarantined, error: inva… 2d 
+   home                 5x   #####  91% ##### 100% folder: client-a, exclu.. 3h 
+   expired-login        1x   -          -          quarantined, error: inv.. 2d 
    never-polled         ?    -          -          session x2                -  
-   a-label-far-too-lon… 1x   .....   3% -          folder: client-a, folder… now
+   a-label-far-too-lo.. 1x   .....   3% -          folder: client-a, folde.. now
 
 
 
 
 Could not read: daemon.db is locked
-k/j move · Enter switch · e exclude · u refresh · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | u refresh | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > a failed read under the last picture at 80 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mlast poll just now
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mlast poll just now
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 <E>[2m   ACCOUNT              PLAN 5H         7D         TAGS                      AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork                <E>[0m 20x  <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m                           <E>[2m2m <E>[0m
-   home                 5x   <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[36mfolder: client-a<E>[0m, <E>[2mexclud…<E>[0m <E>[2m3h <E>[0m
-   expired-login        1x   <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[31mquarantined<E>[0m, <E>[31merror: inva…<E>[0m <E>[2m2d <E>[0m
+   home                 5x   <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[36mfolder: client-a<E>[0m, <E>[2mexclu..<E>[0m <E>[2m3h <E>[0m
+   expired-login        1x   <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[31mquarantined<E>[0m, <E>[31merror: inv..<E>[0m <E>[2m2d <E>[0m
    never-polled         ?    <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[36msession x2<E>[0m                <E>[2m-  <E>[0m
-   a-label-far-too-lon… 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m-         <E>[0m <E>[36mfolder: client-a<E>[0m, <E>[36mfolder…<E>[0m <E>[2mnow<E>[0m
+   a-label-far-too-lo.. 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m-         <E>[0m <E>[36mfolder: client-a<E>[0m, <E>[36mfolde..<E>[0m <E>[2mnow<E>[0m
 
 
 
 
 <E>[31mCould not read: daemon.db is locked<E>[0m
-<E>[2mk/j move · Enter switch · e exclude · u refresh · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | u refresh | Tab pane | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > a failed read under the last picture at 120 cols 1`] = `
-"cctl  daemon up · auto-switch on · last poll just now
+"cctl  daemon up | auto-switch on | last poll just now
 [Accounts]  Sessions   Folders   Outages 
    ACCOUNT              PLAN 5H                 7D                 MODELS       TAGS                                 AGE
 >* work                 20x  ##...  45% 2h 13m  ####.  72% 3d 4h   fable 12% 3d                                      2m 
    home                 5x   #####  91% 40m     ##### 100% ~5d 2h  opus 64%     folder: client-a, excluded           3h 
    expired-login        1x   -                  -                               quarantined, error: invalid_grant    2d 
    never-polled         ?    -                  -                               session x2                           -  
-   a-label-far-too-lon… 1x   .....   3%         -                               folder: client-a, folder: side-proj… now
+   a-label-far-too-lo.. 1x   .....   3%         -                               folder: client-a, folder: side-pro.. now
 
 
 
 
 Could not read: daemon.db is locked
-k/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > a failed read under the last picture at 120 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mlast poll just now
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mlast poll just now
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 <E>[2m   ACCOUNT              PLAN 5H                 7D                 MODELS       TAGS                                 AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork                <E>[0m 20x  <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[2m2h 13m <E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m <E>[2m3d 4h  <E>[0m fable 12% 3d                                      <E>[2m2m <E>[0m
    home                 5x   <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[2m40m    <E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[2m~5d 2h <E>[0m opus 64%     <E>[36mfolder: client-a<E>[0m, <E>[2mexcluded<E>[0m           <E>[2m3h <E>[0m
    expired-login        1x   <E>[2m-                 <E>[0m <E>[2m-                 <E>[0m              <E>[31mquarantined<E>[0m, <E>[31merror: invalid_grant<E>[0m    <E>[2m2d <E>[0m
    never-polled         ?    <E>[2m-                 <E>[0m <E>[2m-                 <E>[0m              <E>[36msession x2<E>[0m                           <E>[2m-  <E>[0m
-   a-label-far-too-lon… 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m       <E>[0m <E>[2m-                 <E>[0m              <E>[36mfolder: client-a<E>[0m, <E>[36mfolder: side-proj…<E>[0m <E>[2mnow<E>[0m
+   a-label-far-too-lo.. 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m       <E>[0m <E>[2m-                 <E>[0m              <E>[36mfolder: client-a<E>[0m, <E>[36mfolder: side-pro..<E>[0m <E>[2mnow<E>[0m
 
 
 
 
 <E>[31mCould not read: daemon.db is locked<E>[0m
-<E>[2mk/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > a failed read under the last picture at 200 cols 1`] = `
-"cctl  daemon up · auto-switch on · last poll just now
+"cctl  daemon up | auto-switch on | last poll just now
 [Accounts]  Sessions   Folders   Outages 
    ACCOUNT              PLAN 5H                 7D                 MODELS       TAGS                                   AGE
 >* work                 20x  ##...  45% 2h 13m  ####.  72% 3d 4h   fable 12% 3d                                        2m 
    home                 5x   #####  91% 40m     ##### 100% ~5d 2h  opus 64%     folder: client-a, excluded             3h 
    expired-login        1x   -                  -                               quarantined, error: invalid_grant      2d 
    never-polled         ?    -                  -                               session x2                             -  
-   a-label-far-too-lon… 1x   .....   3%         -                               folder: client-a, folder: side-project now
+   a-label-far-too-lo.. 1x   .....   3%         -                               folder: client-a, folder: side-project now
 
 
 
 
 Could not read: daemon.db is locked
-k/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > a failed read under the last picture at 200 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mlast poll just now
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mlast poll just now
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 <E>[2m   ACCOUNT              PLAN 5H                 7D                 MODELS       TAGS                                   AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork                <E>[0m 20x  <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[2m2h 13m <E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m <E>[2m3d 4h  <E>[0m fable 12% 3d                                        <E>[2m2m <E>[0m
    home                 5x   <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[2m40m    <E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[2m~5d 2h <E>[0m opus 64%     <E>[36mfolder: client-a<E>[0m, <E>[2mexcluded<E>[0m             <E>[2m3h <E>[0m
    expired-login        1x   <E>[2m-                 <E>[0m <E>[2m-                 <E>[0m              <E>[31mquarantined<E>[0m, <E>[31merror: invalid_grant<E>[0m      <E>[2m2d <E>[0m
    never-polled         ?    <E>[2m-                 <E>[0m <E>[2m-                 <E>[0m              <E>[36msession x2<E>[0m                             <E>[2m-  <E>[0m
-   a-label-far-too-lon… 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m       <E>[0m <E>[2m-                 <E>[0m              <E>[36mfolder: client-a<E>[0m, <E>[36mfolder: side-project<E>[0m <E>[2mnow<E>[0m
+   a-label-far-too-lo.. 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m       <E>[0m <E>[2m-                 <E>[0m              <E>[36mfolder: client-a<E>[0m, <E>[36mfolder: side-project<E>[0m <E>[2mnow<E>[0m
 
 
 
 
 <E>[31mCould not read: daemon.db is locked<E>[0m
-<E>[2mk/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > accounts unreadable at 40 cols 1`] = `
-"cctl  daemon up · auto-switch on · no po
+"cctl  daemon up | auto-switch on | no po
 [Accounts]  Sessions   Folders   Outages
 Could not read the accounts: the account
+registry at x is malformed
 
 
 
@@ -149,14 +150,14 @@ Could not read the accounts: the account
 
 
 
-
-Enter switch · ? help · q quit"
+Enter switch | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > accounts unreadable at 40 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mno po<E>[0m
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mno po<E>[0m
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages<E>[0m
 <E>[31mCould not read the accounts: the account<E>[0m
+<E>[31mregistry at x is malformed<E>[0m
 
 
 
@@ -166,12 +167,11 @@ exports[`renderFrame snapshots > accounts unreadable at 40 cols, color 1`] = `
 
 
 
-
-<E>[2mEnter switch · ? help · q quit<E>[0m"
+<E>[2mEnter switch | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > accounts unreadable at 80 cols 1`] = `
-"cctl  daemon up · auto-switch on · no poll yet
+"cctl  daemon up | auto-switch on | no poll yet
 [Accounts]  Sessions   Folders   Outages 
 Could not read the accounts: the account registry at x is malformed
 
@@ -184,11 +184,11 @@ Could not read the accounts: the account registry at x is malformed
 
 
 
-k/j move · Enter switch · e exclude · u refresh · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | u refresh | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > accounts unreadable at 80 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mno poll yet
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mno poll yet
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 <E>[31mCould not read the accounts: the account registry at x is malformed<E>[0m
 
@@ -201,11 +201,11 @@ exports[`renderFrame snapshots > accounts unreadable at 80 cols, color 1`] = `
 
 
 
-<E>[2mk/j move · Enter switch · e exclude · u refresh · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | u refresh | Tab pane | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > accounts unreadable at 120 cols 1`] = `
-"cctl  daemon up · auto-switch on · no poll yet
+"cctl  daemon up | auto-switch on | no poll yet
 [Accounts]  Sessions   Folders   Outages 
 Could not read the accounts: the account registry at x is malformed
 
@@ -218,11 +218,11 @@ Could not read the accounts: the account registry at x is malformed
 
 
 
-k/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > accounts unreadable at 120 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mno poll yet
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mno poll yet
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 <E>[31mCould not read the accounts: the account registry at x is malformed<E>[0m
 
@@ -235,11 +235,11 @@ exports[`renderFrame snapshots > accounts unreadable at 120 cols, color 1`] = `
 
 
 
-<E>[2mk/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > accounts unreadable at 200 cols 1`] = `
-"cctl  daemon up · auto-switch on · no poll yet
+"cctl  daemon up | auto-switch on | no poll yet
 [Accounts]  Sessions   Folders   Outages 
 Could not read the accounts: the account registry at x is malformed
 
@@ -252,11 +252,11 @@ Could not read the accounts: the account registry at x is malformed
 
 
 
-k/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > accounts unreadable at 200 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mno poll yet
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mno poll yet
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 <E>[31mCould not read the accounts: the account registry at x is malformed<E>[0m
 
@@ -269,147 +269,147 @@ exports[`renderFrame snapshots > accounts unreadable at 200 cols, color 1`] = `
 
 
 
-<E>[2mk/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > daemon down at 40 cols 1`] = `
-"cctl  daemon stopped · last poll just no
+"cctl  daemon stopped | last poll just no
 [Accounts]  Sessions   Folders   Outages
-   ACCO… 5H         7D         TAGS  AGE
+   ACC.. 5H         7D         TAGS  AGE
 >* work  ##...  45% ####.  72%       2m 
-   home  #####  91% ##### 100% fold… 3h 
-   expi… -          -          quar… 2d 
-   neve… -          -          sess… -  
-   a-la… .....   3% -          fold… now
+   home  #####  91% ##### 100% fol.. 3h 
+   exp.. -          -          qua.. 2d 
+   nev.. -          -          ses.. -  
+   a-l.. .....   3% -          fol.. now
 
 
 
 
 
-Enter switch · ? help · q quit"
+Enter switch | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > daemon down at 40 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[33mdaemon stopped<E>[0m<E>[2m · <E>[0mlast poll just no<E>[0m
+"<E>[1mcctl<E>[0m  <E>[33mdaemon stopped<E>[0m<E>[2m | <E>[0mlast poll just no<E>[0m
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages<E>[0m
-<E>[2m   ACCO… 5H         7D         TAGS  AGE<E>[0m
+<E>[2m   ACC.. 5H         7D         TAGS  AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork <E>[0m <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m       <E>[2m2m <E>[0m
-   home  <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[36mfold…<E>[0m <E>[2m3h <E>[0m
-   expi… <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[31mquar…<E>[0m <E>[2m2d <E>[0m
-   neve… <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[36msess…<E>[0m <E>[2m-  <E>[0m
-   a-la… <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m-         <E>[0m <E>[36mfold…<E>[0m <E>[2mnow<E>[0m
+   home  <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[36mfol..<E>[0m <E>[2m3h <E>[0m
+   exp.. <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[31mqua..<E>[0m <E>[2m2d <E>[0m
+   nev.. <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[36mses..<E>[0m <E>[2m-  <E>[0m
+   a-l.. <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m-         <E>[0m <E>[36mfol..<E>[0m <E>[2mnow<E>[0m
 
 
 
 
 
-<E>[2mEnter switch · ? help · q quit<E>[0m"
+<E>[2mEnter switch | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > daemon down at 80 cols 1`] = `
-"cctl  daemon stopped · last poll just now
+"cctl  daemon stopped | last poll just now
 [Accounts]  Sessions   Folders   Outages 
    ACCOUNT              PLAN 5H         7D         TAGS                      AGE
 >* work                 20x  ##...  45% ####.  72%                           2m 
-   home                 5x   #####  91% ##### 100% folder: client-a, exclud… 3h 
-   expired-login        1x   -          -          quarantined, error: inva… 2d 
+   home                 5x   #####  91% ##### 100% folder: client-a, exclu.. 3h 
+   expired-login        1x   -          -          quarantined, error: inv.. 2d 
    never-polled         ?    -          -          session x2                -  
-   a-label-far-too-lon… 1x   .....   3% -          folder: client-a, folder… now
+   a-label-far-too-lo.. 1x   .....   3% -          folder: client-a, folde.. now
 
 
 
 
 
-k/j move · Enter switch · e exclude · u refresh · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | u refresh | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > daemon down at 80 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[33mdaemon stopped<E>[0m<E>[2m · <E>[0mlast poll just now
+"<E>[1mcctl<E>[0m  <E>[33mdaemon stopped<E>[0m<E>[2m | <E>[0mlast poll just now
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 <E>[2m   ACCOUNT              PLAN 5H         7D         TAGS                      AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork                <E>[0m 20x  <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m                           <E>[2m2m <E>[0m
-   home                 5x   <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[36mfolder: client-a<E>[0m, <E>[2mexclud…<E>[0m <E>[2m3h <E>[0m
-   expired-login        1x   <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[31mquarantined<E>[0m, <E>[31merror: inva…<E>[0m <E>[2m2d <E>[0m
+   home                 5x   <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[36mfolder: client-a<E>[0m, <E>[2mexclu..<E>[0m <E>[2m3h <E>[0m
+   expired-login        1x   <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[31mquarantined<E>[0m, <E>[31merror: inv..<E>[0m <E>[2m2d <E>[0m
    never-polled         ?    <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[36msession x2<E>[0m                <E>[2m-  <E>[0m
-   a-label-far-too-lon… 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m-         <E>[0m <E>[36mfolder: client-a<E>[0m, <E>[36mfolder…<E>[0m <E>[2mnow<E>[0m
+   a-label-far-too-lo.. 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m-         <E>[0m <E>[36mfolder: client-a<E>[0m, <E>[36mfolde..<E>[0m <E>[2mnow<E>[0m
 
 
 
 
 
-<E>[2mk/j move · Enter switch · e exclude · u refresh · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | u refresh | Tab pane | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > daemon down at 120 cols 1`] = `
-"cctl  daemon stopped · last poll just now
+"cctl  daemon stopped | last poll just now
 [Accounts]  Sessions   Folders   Outages 
    ACCOUNT              PLAN 5H                 7D                 MODELS       TAGS                                 AGE
 >* work                 20x  ##...  45% 2h 13m  ####.  72% 3d 4h   fable 12% 3d                                      2m 
    home                 5x   #####  91% 40m     ##### 100% ~5d 2h  opus 64%     folder: client-a, excluded           3h 
    expired-login        1x   -                  -                               quarantined, error: invalid_grant    2d 
    never-polled         ?    -                  -                               session x2                           -  
-   a-label-far-too-lon… 1x   .....   3%         -                               folder: client-a, folder: side-proj… now
+   a-label-far-too-lo.. 1x   .....   3%         -                               folder: client-a, folder: side-pro.. now
 
 
 
 
 
-k/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > daemon down at 120 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[33mdaemon stopped<E>[0m<E>[2m · <E>[0mlast poll just now
+"<E>[1mcctl<E>[0m  <E>[33mdaemon stopped<E>[0m<E>[2m | <E>[0mlast poll just now
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 <E>[2m   ACCOUNT              PLAN 5H                 7D                 MODELS       TAGS                                 AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork                <E>[0m 20x  <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[2m2h 13m <E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m <E>[2m3d 4h  <E>[0m fable 12% 3d                                      <E>[2m2m <E>[0m
    home                 5x   <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[2m40m    <E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[2m~5d 2h <E>[0m opus 64%     <E>[36mfolder: client-a<E>[0m, <E>[2mexcluded<E>[0m           <E>[2m3h <E>[0m
    expired-login        1x   <E>[2m-                 <E>[0m <E>[2m-                 <E>[0m              <E>[31mquarantined<E>[0m, <E>[31merror: invalid_grant<E>[0m    <E>[2m2d <E>[0m
    never-polled         ?    <E>[2m-                 <E>[0m <E>[2m-                 <E>[0m              <E>[36msession x2<E>[0m                           <E>[2m-  <E>[0m
-   a-label-far-too-lon… 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m       <E>[0m <E>[2m-                 <E>[0m              <E>[36mfolder: client-a<E>[0m, <E>[36mfolder: side-proj…<E>[0m <E>[2mnow<E>[0m
+   a-label-far-too-lo.. 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m       <E>[0m <E>[2m-                 <E>[0m              <E>[36mfolder: client-a<E>[0m, <E>[36mfolder: side-pro..<E>[0m <E>[2mnow<E>[0m
 
 
 
 
 
-<E>[2mk/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > daemon down at 200 cols 1`] = `
-"cctl  daemon stopped · last poll just now
+"cctl  daemon stopped | last poll just now
 [Accounts]  Sessions   Folders   Outages 
    ACCOUNT              PLAN 5H                 7D                 MODELS       TAGS                                   AGE
 >* work                 20x  ##...  45% 2h 13m  ####.  72% 3d 4h   fable 12% 3d                                        2m 
    home                 5x   #####  91% 40m     ##### 100% ~5d 2h  opus 64%     folder: client-a, excluded             3h 
    expired-login        1x   -                  -                               quarantined, error: invalid_grant      2d 
    never-polled         ?    -                  -                               session x2                             -  
-   a-label-far-too-lon… 1x   .....   3%         -                               folder: client-a, folder: side-project now
+   a-label-far-too-lo.. 1x   .....   3%         -                               folder: client-a, folder: side-project now
 
 
 
 
 
-k/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > daemon down at 200 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[33mdaemon stopped<E>[0m<E>[2m · <E>[0mlast poll just now
+"<E>[1mcctl<E>[0m  <E>[33mdaemon stopped<E>[0m<E>[2m | <E>[0mlast poll just now
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 <E>[2m   ACCOUNT              PLAN 5H                 7D                 MODELS       TAGS                                   AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork                <E>[0m 20x  <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[2m2h 13m <E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m <E>[2m3d 4h  <E>[0m fable 12% 3d                                        <E>[2m2m <E>[0m
    home                 5x   <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[2m40m    <E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[2m~5d 2h <E>[0m opus 64%     <E>[36mfolder: client-a<E>[0m, <E>[2mexcluded<E>[0m             <E>[2m3h <E>[0m
    expired-login        1x   <E>[2m-                 <E>[0m <E>[2m-                 <E>[0m              <E>[31mquarantined<E>[0m, <E>[31merror: invalid_grant<E>[0m      <E>[2m2d <E>[0m
    never-polled         ?    <E>[2m-                 <E>[0m <E>[2m-                 <E>[0m              <E>[36msession x2<E>[0m                             <E>[2m-  <E>[0m
-   a-label-far-too-lon… 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m       <E>[0m <E>[2m-                 <E>[0m              <E>[36mfolder: client-a<E>[0m, <E>[36mfolder: side-project<E>[0m <E>[2mnow<E>[0m
+   a-label-far-too-lo.. 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m       <E>[0m <E>[2m-                 <E>[0m              <E>[36mfolder: client-a<E>[0m, <E>[36mfolder: side-project<E>[0m <E>[2mnow<E>[0m
 
 
 
 
 
-<E>[2mk/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > empty vault at 40 cols 1`] = `
-"cctl  daemon up · auto-switch on · no po
+"cctl  daemon up | auto-switch on | no po
 [Accounts]  Sessions   Folders   Outages
 No accounts yet.
 Press a to log one in, or run \`cctl setu
@@ -422,11 +422,11 @@ Press a to log one in, or run \`cctl setu
 
 
 
-Enter switch · ? help · q quit"
+Enter switch | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > empty vault at 40 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mno po<E>[0m
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mno po<E>[0m
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages<E>[0m
 No accounts yet.
 Press a to log one in, or run \`cctl setu
@@ -439,11 +439,11 @@ Press a to log one in, or run \`cctl setu
 
 
 
-<E>[2mEnter switch · ? help · q quit<E>[0m"
+<E>[2mEnter switch | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > empty vault at 80 cols 1`] = `
-"cctl  daemon up · auto-switch on · no poll yet
+"cctl  daemon up | auto-switch on | no poll yet
 [Accounts]  Sessions   Folders   Outages 
 No accounts yet.
 Press a to log one in, or run \`cctl setup\` for the guided first run.
@@ -456,11 +456,11 @@ Press a to log one in, or run \`cctl setup\` for the guided first run.
 
 
 
-k/j move · Enter switch · e exclude · u refresh · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | u refresh | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > empty vault at 80 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mno poll yet
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mno poll yet
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 No accounts yet.
 Press a to log one in, or run \`cctl setup\` for the guided first run.
@@ -473,11 +473,11 @@ Press a to log one in, or run \`cctl setup\` for the guided first run.
 
 
 
-<E>[2mk/j move · Enter switch · e exclude · u refresh · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | u refresh | Tab pane | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > empty vault at 120 cols 1`] = `
-"cctl  daemon up · auto-switch on · no poll yet
+"cctl  daemon up | auto-switch on | no poll yet
 [Accounts]  Sessions   Folders   Outages 
 No accounts yet.
 Press a to log one in, or run \`cctl setup\` for the guided first run.
@@ -490,11 +490,11 @@ Press a to log one in, or run \`cctl setup\` for the guided first run.
 
 
 
-k/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > empty vault at 120 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mno poll yet
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mno poll yet
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 No accounts yet.
 Press a to log one in, or run \`cctl setup\` for the guided first run.
@@ -507,11 +507,11 @@ Press a to log one in, or run \`cctl setup\` for the guided first run.
 
 
 
-<E>[2mk/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > empty vault at 200 cols 1`] = `
-"cctl  daemon up · auto-switch on · no poll yet
+"cctl  daemon up | auto-switch on | no poll yet
 [Accounts]  Sessions   Folders   Outages 
 No accounts yet.
 Press a to log one in, or run \`cctl setup\` for the guided first run.
@@ -524,11 +524,11 @@ Press a to log one in, or run \`cctl setup\` for the guided first run.
 
 
 
-k/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > empty vault at 200 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mno poll yet
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mno poll yet
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 No accounts yet.
 Press a to log one in, or run \`cctl setup\` for the guided first run.
@@ -541,141 +541,141 @@ Press a to log one in, or run \`cctl setup\` for the guided first run.
 
 
 
-<E>[2mk/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > every tag and state at 40 cols 1`] = `
-"cctl  daemon up · auto-switch on · last 
+"cctl  daemon up | auto-switch on | last 
 [Accounts]  Sessions   Folders   Outages
-   ACCO… 5H         7D         TAGS  AGE
+   ACC.. 5H         7D         TAGS  AGE
 >* work  ##...  45% ####.  72%       2m 
-   home  #####  91% ##### 100% fold… 3h 
-   expi… -          -          quar… 2d 
-   neve… -          -          sess… -  
-   a-la… .....   3% -          fold… now
+   home  #####  91% ##### 100% fol.. 3h 
+   exp.. -          -          qua.. 2d 
+   nev.. -          -          ses.. -  
+   a-l.. .....   3% -          fol.. now
 
 
 
 
 
-Enter switch · ? help · q quit"
+Enter switch | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > every tag and state at 40 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mlast <E>[0m
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mlast <E>[0m
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages<E>[0m
-<E>[2m   ACCO… 5H         7D         TAGS  AGE<E>[0m
+<E>[2m   ACC.. 5H         7D         TAGS  AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork <E>[0m <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m       <E>[2m2m <E>[0m
-   home  <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[36mfold…<E>[0m <E>[2m3h <E>[0m
-   expi… <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[31mquar…<E>[0m <E>[2m2d <E>[0m
-   neve… <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[36msess…<E>[0m <E>[2m-  <E>[0m
-   a-la… <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m-         <E>[0m <E>[36mfold…<E>[0m <E>[2mnow<E>[0m
+   home  <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[36mfol..<E>[0m <E>[2m3h <E>[0m
+   exp.. <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[31mqua..<E>[0m <E>[2m2d <E>[0m
+   nev.. <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[36mses..<E>[0m <E>[2m-  <E>[0m
+   a-l.. <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m-         <E>[0m <E>[36mfol..<E>[0m <E>[2mnow<E>[0m
 
 
 
 
 
-<E>[2mEnter switch · ? help · q quit<E>[0m"
+<E>[2mEnter switch | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > every tag and state at 80 cols 1`] = `
-"cctl  daemon up · auto-switch on · last poll just now
+"cctl  daemon up | auto-switch on | last poll just now
 [Accounts]  Sessions   Folders   Outages 
    ACCOUNT              PLAN 5H         7D         TAGS                      AGE
 >* work                 20x  ##...  45% ####.  72%                           2m 
-   home                 5x   #####  91% ##### 100% folder: client-a, exclud… 3h 
-   expired-login        1x   -          -          quarantined, error: inva… 2d 
+   home                 5x   #####  91% ##### 100% folder: client-a, exclu.. 3h 
+   expired-login        1x   -          -          quarantined, error: inv.. 2d 
    never-polled         ?    -          -          session x2                -  
-   a-label-far-too-lon… 1x   .....   3% -          folder: client-a, folder… now
+   a-label-far-too-lo.. 1x   .....   3% -          folder: client-a, folde.. now
 
 
 
 
 
-k/j move · Enter switch · e exclude · u refresh · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | u refresh | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > every tag and state at 80 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mlast poll just now
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mlast poll just now
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 <E>[2m   ACCOUNT              PLAN 5H         7D         TAGS                      AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork                <E>[0m 20x  <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m                           <E>[2m2m <E>[0m
-   home                 5x   <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[36mfolder: client-a<E>[0m, <E>[2mexclud…<E>[0m <E>[2m3h <E>[0m
-   expired-login        1x   <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[31mquarantined<E>[0m, <E>[31merror: inva…<E>[0m <E>[2m2d <E>[0m
+   home                 5x   <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[36mfolder: client-a<E>[0m, <E>[2mexclu..<E>[0m <E>[2m3h <E>[0m
+   expired-login        1x   <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[31mquarantined<E>[0m, <E>[31merror: inv..<E>[0m <E>[2m2d <E>[0m
    never-polled         ?    <E>[2m-         <E>[0m <E>[2m-         <E>[0m <E>[36msession x2<E>[0m                <E>[2m-  <E>[0m
-   a-label-far-too-lon… 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m-         <E>[0m <E>[36mfolder: client-a<E>[0m, <E>[36mfolder…<E>[0m <E>[2mnow<E>[0m
+   a-label-far-too-lo.. 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m-         <E>[0m <E>[36mfolder: client-a<E>[0m, <E>[36mfolde..<E>[0m <E>[2mnow<E>[0m
 
 
 
 
 
-<E>[2mk/j move · Enter switch · e exclude · u refresh · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | u refresh | Tab pane | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > every tag and state at 120 cols 1`] = `
-"cctl  daemon up · auto-switch on · last poll just now
+"cctl  daemon up | auto-switch on | last poll just now
 [Accounts]  Sessions   Folders   Outages 
    ACCOUNT              PLAN 5H                 7D                 MODELS       TAGS                                 AGE
 >* work                 20x  ##...  45% 2h 13m  ####.  72% 3d 4h   fable 12% 3d                                      2m 
    home                 5x   #####  91% 40m     ##### 100% ~5d 2h  opus 64%     folder: client-a, excluded           3h 
    expired-login        1x   -                  -                               quarantined, error: invalid_grant    2d 
    never-polled         ?    -                  -                               session x2                           -  
-   a-label-far-too-lon… 1x   .....   3%         -                               folder: client-a, folder: side-proj… now
+   a-label-far-too-lo.. 1x   .....   3%         -                               folder: client-a, folder: side-pro.. now
 
 
 
 
 
-k/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > every tag and state at 120 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mlast poll just now
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mlast poll just now
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 <E>[2m   ACCOUNT              PLAN 5H                 7D                 MODELS       TAGS                                 AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork                <E>[0m 20x  <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[2m2h 13m <E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m <E>[2m3d 4h  <E>[0m fable 12% 3d                                      <E>[2m2m <E>[0m
    home                 5x   <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[2m40m    <E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[2m~5d 2h <E>[0m opus 64%     <E>[36mfolder: client-a<E>[0m, <E>[2mexcluded<E>[0m           <E>[2m3h <E>[0m
    expired-login        1x   <E>[2m-                 <E>[0m <E>[2m-                 <E>[0m              <E>[31mquarantined<E>[0m, <E>[31merror: invalid_grant<E>[0m    <E>[2m2d <E>[0m
    never-polled         ?    <E>[2m-                 <E>[0m <E>[2m-                 <E>[0m              <E>[36msession x2<E>[0m                           <E>[2m-  <E>[0m
-   a-label-far-too-lon… 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m       <E>[0m <E>[2m-                 <E>[0m              <E>[36mfolder: client-a<E>[0m, <E>[36mfolder: side-proj…<E>[0m <E>[2mnow<E>[0m
+   a-label-far-too-lo.. 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m       <E>[0m <E>[2m-                 <E>[0m              <E>[36mfolder: client-a<E>[0m, <E>[36mfolder: side-pro..<E>[0m <E>[2mnow<E>[0m
 
 
 
 
 
-<E>[2mk/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit<E>[0m"
 `;
 
 exports[`renderFrame snapshots > every tag and state at 200 cols 1`] = `
-"cctl  daemon up · auto-switch on · last poll just now
+"cctl  daemon up | auto-switch on | last poll just now
 [Accounts]  Sessions   Folders   Outages 
    ACCOUNT              PLAN 5H                 7D                 MODELS       TAGS                                   AGE
 >* work                 20x  ##...  45% 2h 13m  ####.  72% 3d 4h   fable 12% 3d                                        2m 
    home                 5x   #####  91% 40m     ##### 100% ~5d 2h  opus 64%     folder: client-a, excluded             3h 
    expired-login        1x   -                  -                               quarantined, error: invalid_grant      2d 
    never-polled         ?    -                  -                               session x2                             -  
-   a-label-far-too-lon… 1x   .....   3%         -                               folder: client-a, folder: side-project now
+   a-label-far-too-lo.. 1x   .....   3%         -                               folder: client-a, folder: side-project now
 
 
 
 
 
-k/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit"
+k/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > every tag and state at 200 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m · <E>[0mauto-switch on<E>[2m · <E>[0mlast poll just now
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mlast poll just now
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages <E>[0m
 <E>[2m   ACCOUNT              PLAN 5H                 7D                 MODELS       TAGS                                   AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork                <E>[0m 20x  <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[2m2h 13m <E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m <E>[2m3d 4h  <E>[0m fable 12% 3d                                        <E>[2m2m <E>[0m
    home                 5x   <E>[38;5;208m#####<E>[0m<E>[2m<E>[0m <E>[38;5;208m 91%<E>[0m <E>[2m40m    <E>[0m <E>[31m#####<E>[0m<E>[2m<E>[0m <E>[31m100%<E>[0m <E>[2m~5d 2h <E>[0m opus 64%     <E>[36mfolder: client-a<E>[0m, <E>[2mexcluded<E>[0m             <E>[2m3h <E>[0m
    expired-login        1x   <E>[2m-                 <E>[0m <E>[2m-                 <E>[0m              <E>[31mquarantined<E>[0m, <E>[31merror: invalid_grant<E>[0m      <E>[2m2d <E>[0m
    never-polled         ?    <E>[2m-                 <E>[0m <E>[2m-                 <E>[0m              <E>[36msession x2<E>[0m                             <E>[2m-  <E>[0m
-   a-label-far-too-lon… 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m       <E>[0m <E>[2m-                 <E>[0m              <E>[36mfolder: client-a<E>[0m, <E>[36mfolder: side-project<E>[0m <E>[2mnow<E>[0m
+   a-label-far-too-lo.. 1x   <E>[32m<E>[0m<E>[2m.....<E>[0m <E>[32m  3%<E>[0m <E>[2m       <E>[0m <E>[2m-                 <E>[0m              <E>[36mfolder: client-a<E>[0m, <E>[36mfolder: side-project<E>[0m <E>[2mnow<E>[0m
 
 
 
 
 
-<E>[2mk/j move · Enter switch · e exclude · r rename · a add · d remove · u refresh · l launch · Tab pane · ? help · q quit<E>[0m"
+<E>[2mk/j move | Enter switch | e exclude | r rename | a add | d remove | u refresh | l launch | Tab pane | ? help | q quit<E>[0m"
 `;

@@ -6,6 +6,7 @@
 
 export {
   Store,
+  STORE_BUSY_TIMEOUT_MS,
   slotBySessionMap,
   type StoreOptions,
   type UsageSnapshotRow,

@@ -27,10 +27,19 @@ import {
   hookSecretPath,
   loadHookSecret,
   readHookEndpoint,
+  STORE_BUSY_TIMEOUT_MS,
   type UsageRepollResult,
   type UsageRepollVerdict,
 } from '@claude-control/daemon';
-import { DEFAULT_REQUEST_TIMEOUT_MS } from './daemonControl.js';
+
+/**
+ * How long a request to the daemon may wait for its answer. Past the daemon's own database lock
+ * wait: a healthy daemon whose write is queued behind another connection's (its checkpointer's
+ * log sync, a CLI write) blocks for up to that long and then applies the request, and a client
+ * that gave up sooner would call it stuck, advise a restart and exit 1 on a request that went
+ * through. Five seconds more covers the request's own work.
+ */
+export const DAEMON_REQUEST_TIMEOUT_MS = STORE_BUSY_TIMEOUT_MS + 5_000;
 
 /** A tracked session as echoed back by the daemon (compact view). */
 export interface SessionView {
@@ -85,7 +94,7 @@ export interface SessionClientDeps {
   /** The at-rest protector for reading the hook secret; defaults to this platform's real one. */
   protector?: Protector;
   /** How long one request may wait for the daemon's answer; defaults to
-   *  {@link DEFAULT_REQUEST_TIMEOUT_MS}, the same bound `cctl daemon stop` gives its request. */
+   *  {@link DAEMON_REQUEST_TIMEOUT_MS}. */
   requestTimeoutMs?: number;
 }
 
@@ -167,7 +176,7 @@ async function postToDaemon(
   // Bounded: a daemon whose event loop is wedged accepts the connection and never answers, and a
   // caller that asks repeatedly (a live view's refresh key) must hear that rather than hang. The
   // bound covers the body as well as the headers, since a reply can stall between the two.
-  const timeoutMs = deps.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const timeoutMs = deps.requestTimeoutMs ?? DAEMON_REQUEST_TIMEOUT_MS;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const hung = (): SessionClientError =>

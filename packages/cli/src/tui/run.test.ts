@@ -26,10 +26,11 @@ import {
 } from '@claude-control/daemon';
 import { PLAIN_PALETTE } from '../ansi.js';
 import { AccountActionError } from '../accountActions.js';
+import { CadenceError } from '@claude-control/switch-engine';
 import { SessionClientError } from '../sessionClient.js';
 import { daemonHeartbeatPath } from '../settings.js';
 import { everyStateAccounts, snapshotOf } from '../testing/tuiFixtures.js';
-import { ENTER_SCREEN, LEAVE_SCREEN, StatusLog, runTui, type TuiDeps } from './run.js';
+import { ENTER_SCREEN, LEAVE_SCREEN, StatusLog, paintFrame, runTui, type TuiDeps } from './run.js';
 import { createTuiSources } from './sources.js';
 import type { TuiSources } from './types.js';
 
@@ -76,8 +77,18 @@ class FakeInput extends EventEmitter {
   }
   resume(): this {
     this.paused = false;
+    // What the terminal held while nobody read it arrives once reading starts again, on a later
+    // turn of the loop, as a real tty's queued input does.
+    if (this.held.length > 0) {
+      const held = this.held.splice(0);
+      setImmediate(() => {
+        for (const text of held) this.emit('data', text);
+      });
+    }
     return this;
   }
+  /** Input the terminal holds while it is not being read. */
+  held: string[] = [];
   pause(): this {
     this.paused = true;
     return this;
@@ -85,6 +96,11 @@ class FakeInput extends EventEmitter {
   /** Type keys, as raw input arrives. */
   type(text: string): void {
     this.emit('data', text);
+  }
+  /** Type keys at a terminal that may not be read right now: held until reading resumes. */
+  typeAhead(text: string): void {
+    if (this.paused || this.listenerCount('data') === 0) this.held.push(text);
+    else this.emit('data', text);
   }
 }
 
@@ -130,6 +146,9 @@ function manualTimers() {
     clearInterval: (h: unknown) => {
       fns.delete(h as number);
     },
+    // One-shot timers (the Escape wait, the input drain) run on the real clock.
+    setTimeout: (fn: () => void, ms: number) => setTimeout(fn, ms),
+    clearTimeout: (h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>),
     tick: () => {
       for (const fn of [...fns.values()]) fn();
     },
@@ -182,7 +201,8 @@ function expectRestored(rig: Rig): void {
   expect(rig.input.paused).toBe(true);
   expect(rig.input.listenerCount('data')).toBe(0);
   expect(rig.output.listenerCount('resize')).toBe(0);
-  expect(rig.output.listenerCount('error')).toBe(0);
+  // The output error guard stays: a restore write that fails late must not become a crash.
+  expect(rig.output.listenerCount('error')).toBe(1);
   for (const event of ['SIGTERM', 'SIGINT', 'SIGHUP', 'exit']) {
     expect(rig.proc.listenerCount(event)).toBe(0);
   }
@@ -372,6 +392,9 @@ describe('a session against a temp vault, a seeded store and a real daemon route
 
       rig.input.type('q');
       expect(await rig.exit).toEqual({ code: 0 });
+      // The view holds the daemon database open while it runs; whoever made the sources closes
+      // them (as `cctl tui` does), or the file stays locked on Windows.
+      sources.close?.();
       expectRestored(rig);
       expectLeftScreen(rig);
     },
@@ -488,13 +511,35 @@ describe('giving the terminal back', () => {
     expectRestored(rig);
   });
 
-  it('at once on a second Ctrl-C mid-action', async () => {
-    const rig = start(scripted({ switchAccount: () => new Promise(() => {}) }));
+  it('at once on a second Ctrl-C mid-action, then waits out the action and reports it', async () => {
+    let finishSwitch: (v: { message: string }) => void = () => {};
+    const rig = start(
+      scripted({
+        switchAccount: () =>
+          new Promise((resolve) => {
+            finishSwitch = resolve;
+          }),
+      }),
+    );
     await until(() => expect(rig.output.text()).toContain('work'));
     rig.input.type('\r');
     rig.input.type(CTRL_C);
     rig.input.type(CTRL_C);
-    expect(await rig.exit).toEqual({ code: 0 });
+    // The screen is given back at once...
+    expect(rig.input.isRaw).toBe(false);
+    expect(rig.output.all).toContain(LEAVE_SCREEN);
+    let ended = false;
+    void rig.exit.then(() => (ended = true));
+    // ...but the process stays for the switch, and a further Ctrl-C does not cut it off.
+    expect(rig.proc.listenerCount('SIGINT')).toBe(1);
+    rig.proc.emit('SIGINT');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(ended).toBe(false);
+    finishSwitch({ message: 'Activated work.' });
+    expect(await rig.exit).toEqual({ code: 130 });
+    expect(rig.output.all.slice(rig.output.all.lastIndexOf(LEAVE_SCREEN))).toContain(
+      'Activated work.',
+    );
     expectRestored(rig);
   });
 });
@@ -637,7 +682,7 @@ describe('while running', () => {
     await until(() => expect(load.mock.calls.length).toBe(loads + 1));
     rig.output.columns = 39;
     rig.output.emit('resize');
-    expect(rig.output.screen()[0]).toBe('Terminal too narrow: widen it to 40 col');
+    expect(rig.output.screen()[0]).toBe('Terminal too narrow: widen it to 40');
     rig.input.type('q');
     await rig.exit;
   });
@@ -659,5 +704,358 @@ describe('while running', () => {
     expect(rig.output.text()).toContain('home');
     rig.input.type('q');
     await rig.exit;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regressions: keys, reads and endings the runtime once got wrong
+// ---------------------------------------------------------------------------
+
+describe('keys that arrive when the person did not mean them for the view', () => {
+  it('drops keys typed while the screen was stepped aside for a login window', async () => {
+    const calls: string[] = [];
+    const sources = scripted({
+      switchAccount: (id) => {
+        calls.push(`switch:${id}`);
+        return Promise.resolve({ message: 'switched' });
+      },
+      addAccount: (label) => {
+        // The person presses Enter at what looks like a hung screen while the add finishes.
+        rig.input.typeAhead('\r');
+        return Promise.resolve({ message: `Added ${label}.` });
+      },
+    });
+    const rig = start(sources);
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.input.type('j');
+    rig.input.type('a');
+    rig.input.type('fresh\r');
+    await until(() => expect(rig.output.text()).toContain('Added fresh.'));
+    await new Promise((r) => setTimeout(r, 400));
+    expect(calls).toEqual([]);
+    rig.input.type('q');
+    await rig.exit;
+  });
+
+  it('brings the screen back as soon as the add has stored the account', async () => {
+    let finishCleanup: () => void = () => {};
+    const rig = start(
+      scripted({
+        addAccount: (label, onStored) =>
+          new Promise((resolve) => {
+            onStored?.(`Added ${label}.`);
+            finishCleanup = () => resolve({ message: `Added ${label}.` });
+          }),
+      }),
+    );
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.input.type('a');
+    rig.input.type('fresh\r');
+    await until(() => expect(rig.input.isRaw).toBe(true));
+    expect(rig.output.all.lastIndexOf(ENTER_SCREEN)).toBeGreaterThan(
+      rig.output.all.indexOf(LEAVE_SCREEN),
+    );
+    expect(rig.output.text()).toContain('Added fresh. Cleaning up after the login window...');
+    finishCleanup();
+    await until(() => expect(rig.output.text()).not.toContain('Cleaning up'));
+    expect(rig.output.text()).toContain('Added fresh.');
+    rig.input.type('q');
+    await rig.exit;
+  });
+
+  it('gives back the screen before cooking the input when stepping aside', async () => {
+    const order: string[] = [];
+    const rig = start(
+      scripted({
+        addAccount: () => Promise.resolve({ message: 'Added x.' }),
+      }),
+    );
+    await until(() => expect(rig.output.text()).toContain('work'));
+    const setRawMode = rig.input.setRawMode.bind(rig.input);
+    rig.input.setRawMode = (mode: boolean) => {
+      order.push(mode ? 'raw on' : 'raw off');
+      return setRawMode(mode);
+    };
+    const write = rig.output.write.bind(rig.output);
+    rig.output.write = (chunk: string) => {
+      if (chunk.includes(LEAVE_SCREEN)) order.push('leave screen');
+      return write(chunk);
+    };
+    rig.input.type('a');
+    rig.input.type('x\r');
+    await until(() => expect(rig.output.text()).toContain('Added x.'));
+    expect(order.slice(0, 2)).toEqual(['leave screen', 'raw off']);
+    rig.input.type('q');
+    await rig.exit;
+  });
+
+  it('reads an arrow split across two reads as the arrow, not Escape then text', async () => {
+    const rig = start(scripted());
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.input.type(ESC);
+    rig.input.type('[B');
+    await new Promise((r) => setTimeout(r, 300));
+    expect(rig.output.screen()[4]).toMatch(/^> {2}home /);
+    rig.input.type('q');
+    expect(await rig.exit).toEqual({ code: 0 });
+  });
+
+  it('asks the terminal to mark pastes, and stops asking on the way out', () => {
+    expect(ENTER_SCREEN).toContain(`${ESC}[?2004h`);
+    expect(LEAVE_SCREEN).toContain(`${ESC}[?2004l`);
+  });
+
+  it('acts on nothing but quitting while the terminal is too small to show the view', async () => {
+    const calls: string[] = [];
+    const rig = start(
+      scripted({
+        switchAccount: (id) => {
+          calls.push(id);
+          return Promise.resolve({ message: 'switched' });
+        },
+      }),
+    );
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.output.columns = 30;
+    rig.output.emit('resize');
+    rig.input.type('j\re');
+    await new Promise((r) => setTimeout(r, 100));
+    expect(calls).toEqual([]);
+    rig.input.type('q');
+    expect(await rig.exit).toEqual({ code: 0 });
+  });
+});
+
+describe('reads around an action', () => {
+  it('re-reads after an action even when a timed read was already running', async () => {
+    let excluded = false;
+    let holdNext = false;
+    let release: () => void = () => {};
+    const load = vi.fn(() => {
+      const snapshot = () =>
+        snapshotOf(everyStateAccounts().map((a) => (a.id === 'id-work' ? { ...a, excluded } : a)));
+      if (!holdNext) return Promise.resolve(snapshot());
+      holdNext = false;
+      // Taken before the action: it reads the picture as it was then.
+      const before = snapshot();
+      return new Promise<ReturnType<typeof snapshot>>((resolve) => {
+        release = () => resolve(before);
+      });
+    });
+    const rig = start(
+      scripted({
+        load,
+        setExcluded: (_id, value) => {
+          excluded = value;
+          return Promise.resolve({ message: 'Excluded work from auto-switch.' });
+        },
+      }),
+    );
+    await until(() => expect(rig.output.text()).toContain('work'));
+    holdNext = true;
+    rig.timers.tick();
+    rig.input.type('e');
+    await until(() => expect(rig.output.text()).toContain('Excluded work'));
+    release();
+    await until(() => expect(rig.output.screen()[3]).toContain('excluded'));
+    rig.input.type('q');
+    await rig.exit;
+  });
+});
+
+describe('how an action ends when the person asked to quit during it', () => {
+  it('prints a refusal after the screen is given back, and exits non-zero', async () => {
+    let refuse: (e: Error) => void = () => {};
+    const rig = start(
+      scripted({
+        switchAccount: () =>
+          new Promise((_, reject) => {
+            refuse = reject;
+          }),
+      }),
+    );
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.input.type('\r');
+    rig.input.type(CTRL_C);
+    refuse(new AccountActionError('switch_failed', 'REFUSAL: the live login is now home.'));
+    expect(await rig.exit).toEqual({ code: 1 });
+    const after = rig.output.all.slice(rig.output.all.lastIndexOf(LEAVE_SCREEN));
+    expect(after).toContain('REFUSAL: the live login is now home.');
+    expectRestored(rig);
+  });
+
+  it('prints the success line too', async () => {
+    let finish: (v: { message: string }) => void = () => {};
+    const rig = start(
+      scripted({
+        removeAccount: () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      }),
+    );
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.input.type('dwork\r');
+    rig.input.type(CTRL_C);
+    finish({ message: 'Removed work.' });
+    expect(await rig.exit).toEqual({ code: 0 });
+    expect(rig.output.all.slice(rig.output.all.lastIndexOf(LEAVE_SCREEN))).toContain(
+      'Removed work.',
+    );
+  });
+
+  it('rejects with a fault that lands after the screen was already given back', async () => {
+    let fail: (e: Error) => void = () => {};
+    const rig = start(
+      scripted({
+        switchAccount: () =>
+          new Promise((_, reject) => {
+            fail = reject;
+          }),
+      }),
+    );
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.input.type('\r');
+    rig.input.type(CTRL_C + CTRL_C);
+    const boom = new Error('vault exploded');
+    fail(boom);
+    await expect(rig.exit).rejects.toBe(boom);
+  });
+});
+
+describe('the terminal going away or misbehaving', () => {
+  it('keeps a guard on output errors after the view ends, so a late one is not a crash', async () => {
+    const rig = start(scripted());
+    rig.input.type('q');
+    await rig.exit;
+    expect(() => rig.output.emit('error', new Error('write EIO'))).not.toThrow();
+  });
+
+  it('gives the screen back when raw mode cannot be turned on at start', async () => {
+    const input = new FakeInput();
+    input.setRawMode = (mode: boolean) => {
+      if (mode) throw Object.assign(new Error('setRawMode EIO'), { code: 'EIO' });
+      input.isRaw = false;
+      return input;
+    };
+    const rig = start(scripted(), { stdin: input });
+    await expect(rig.exit).rejects.toThrow('setRawMode EIO');
+    expect(rig.output.all.lastIndexOf(LEAVE_SCREEN)).toBeGreaterThan(
+      rig.output.all.lastIndexOf(ENTER_SCREEN),
+    );
+  });
+
+  it('gives the screen back when raw mode cannot be turned on after a login window', async () => {
+    const input = new FakeInput();
+    let calls = 0;
+    const real = input.setRawMode.bind(input);
+    input.setRawMode = (mode: boolean) => {
+      if (mode && ++calls === 2) throw new Error('setRawMode EBADF');
+      return real(mode);
+    };
+    const rig = start(scripted({ addAccount: () => Promise.resolve({ message: 'Added x.' }) }), {
+      stdin: input,
+    });
+    await until(() => expect(rig.output.text()).toContain('work'));
+    input.type('a');
+    input.type('x\r');
+    await expect(rig.exit).rejects.toThrow('setRawMode EBADF');
+    expect(rig.output.all.lastIndexOf(LEAVE_SCREEN)).toBeGreaterThan(
+      rig.output.all.lastIndexOf(ENTER_SCREEN),
+    );
+  });
+
+  it('on Ctrl-Break (SIGBREAK) on Windows, with the exit code it asks for', async () => {
+    const rig = start(scripted(), { platform: 'win32' });
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.proc.emit('SIGBREAK');
+    expect(await rig.exit).toEqual({ code: 149 });
+    expectLeftScreen(rig);
+  });
+
+  it('draws at 80x24 when the terminal reports a size of zero', async () => {
+    const output = new FakeOutput();
+    output.columns = 0;
+    output.rows = 0;
+    const rig = start(scripted(), { stdout: output });
+    await until(() => expect(output.text()).toContain('work'));
+    expect(output.screen()).toHaveLength(24);
+    rig.input.type('q');
+    await rig.exit;
+  });
+});
+
+describe('refusals in the words of the view', () => {
+  it('names the account a vanished id belonged to', async () => {
+    const rig = start(
+      scripted({
+        setExcluded: () =>
+          Promise.reject(
+            new AccountActionError(
+              'not_found',
+              'No account matches "05a0c5ac-e293-4504-8f60-33c988411d20".',
+            ),
+          ),
+      }),
+    );
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.input.type('e');
+    await until(() =>
+      expect(rig.output.text()).toContain('work is no longer stored; nothing was changed.'),
+    );
+    expect(rig.output.text()).not.toContain('05a0c5ac');
+    rig.input.type('q');
+    await rig.exit;
+  });
+
+  it('says how to force a switch the cadence guard held back, with a command that exists', async () => {
+    const cause = new CadenceError('switched 1s ago; next switch allowed in 60s', 60_000);
+    const rig = start(
+      scripted({
+        switchAccount: () =>
+          Promise.reject(
+            new AccountActionError('cadence', `${cause.message}. Use --force to override.`, {
+              cause,
+            }),
+          ),
+      }),
+    );
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.input.type('\r');
+    await until(() => expect(rig.output.text()).toContain('next switch allowed in 60s'));
+    expect(rig.output.text()).not.toContain('Use --force to override');
+    expect(rig.output.text()).toContain("cctl switch 'work' --force");
+    rig.input.type('q');
+    await rig.exit;
+  });
+
+  it('keeps a warning logged during an action next to its outcome', async () => {
+    const rig = start(
+      scripted({
+        switchAccount: () => {
+          rig.log.write('refused to adopt the live token\n');
+          return Promise.resolve({ message: 'Activated work.' });
+        },
+      }),
+    );
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.input.type('\r');
+    await until(() =>
+      expect(rig.output.text()).toContain(
+        'Activated work. Warning: refused to adopt the live token',
+      ),
+    );
+    rig.input.type('q');
+    await rig.exit;
+  });
+});
+
+describe('paintFrame', () => {
+  it('erases to the end of a line only when the line stops short of the edge', () => {
+    const H = `${ESC}[H`;
+    const EL = `${ESC}[K`;
+    const ED = `${ESC}[J`;
+    expect(paintFrame(['abc', 'xy'], 3)).toBe(`${H}abc\r\nxy${EL}${ED}`);
+    expect(paintFrame(['ab', 'xyz'], 3)).toBe(`${H}ab${EL}\r\nxyz`);
   });
 });

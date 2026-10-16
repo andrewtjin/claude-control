@@ -16,7 +16,8 @@ import {
   humanizeDaysUntil,
   timelineInputFromWire,
 } from '@claude-control/usage-advisor';
-import { PLAIN_PALETTE, type Palette } from './ansi.js';
+import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
+import { displayWidth, padEndColumns } from './textWidth.js';
 
 /** One row of the session table. `watch` is `undefined` for kinds with no streaming concept
  *  (managed/observed) and a boolean for interactive sessions. `accountLabel` is the resolved
@@ -146,13 +147,14 @@ export function renderSessionStatus(
     account: colWidth(table, headers, 'account'),
   };
 
-  // Pad first, paint after — ANSI codes are zero-width, so alignment survives styling.
+  // Pad first, paint after — ANSI codes are zero-width, so alignment survives styling. Padded in
+  // terminal columns, so a label in a wide script does not push the rest of its row over.
   const cells = (r: typeof headers): string[] => [
-    r.session.padEnd(widths.session),
-    r.kind.padEnd(widths.kind),
-    r.state.padEnd(widths.state),
-    r.watch.padEnd(widths.watch),
-    r.account.padEnd(widths.account),
+    padEndColumns(r.session, widths.session),
+    padEndColumns(r.kind, widths.kind),
+    padEndColumns(r.state, widths.state),
+    padEndColumns(r.watch, widths.watch),
+    padEndColumns(r.account, widths.account),
   ];
   const rowLine = (r: (typeof table)[number]): string => {
     const [session, kind, state, watch, account] = cells(r);
@@ -168,17 +170,20 @@ export function renderSessionStatus(
   return [headerLine, '', palette.dim(cells(headers).join('  ')), ...table.map(rowLine)].join('\n');
 }
 
-/** Width of a column = the longest of its header and any cell. */
+/** Width of a column = the widest of its header and any cell, in terminal columns. */
 function colWidth<K extends string>(
   rows: Record<K, string>[],
   headers: Record<K, string>,
   key: K,
 ): number {
-  return Math.max(headers[key].length, ...rows.map((r) => r[key].length));
+  return Math.max(displayWidth(headers[key]), ...rows.map((r) => displayWidth(r[key])));
 }
 
 /** Turn one Store `sessions` row into a display row, resolving the account id to a label and
- *  tolerating a corrupt/foreign `json` blob (fields simply stay absent). */
+ *  tolerating a corrupt/foreign `json` blob (fields simply stay absent). The label is whatever
+ *  `cctl session label` was handed, by a person or a model in the session, and the daemon stores
+ *  it as given: terminal controls are stripped here, where it becomes something to print, so an
+ *  escape sequence in it is shown inert rather than run by the terminal. */
 export function sessionRowFromStore(
   row: SessionRow,
   labelById: Map<string, string>,
@@ -192,8 +197,10 @@ export function sessionRowFromStore(
   const accountId =
     row.accountId ?? (typeof parsed.accountId === 'string' ? parsed.accountId : undefined);
   const out: SessionStatusRow = { id: row.id, kind: row.kind, state: row.state };
-  if (typeof parsed.label === 'string') out.label = parsed.label;
+  if (typeof parsed.label === 'string') out.label = sanitizeForTerminal(parsed.label);
   if (typeof parsed.watch === 'boolean') out.watch = parsed.watch;
-  if (accountId !== undefined) out.accountLabel = labelById.get(accountId) ?? accountId;
+  if (accountId !== undefined) {
+    out.accountLabel = sanitizeForTerminal(labelById.get(accountId) ?? accountId);
+  }
   return out;
 }

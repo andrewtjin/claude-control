@@ -28,6 +28,7 @@ import {
   type Recovery,
 } from '@claude-control/daemon';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
+import { displayWidth, padEndColumns } from './textWidth.js';
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -225,9 +226,10 @@ export function renderOutages(
     return scope.kind === 'folder' || scope.ruled === true;
   });
   const blocks = [...episodes].reverse().map((e) => {
-    const width = Math.max(0, ...e.start.accounts.map((a) => a.label.length));
+    // Measured in terminal columns, so a label in a wide script lines up with the others.
+    const width = Math.max(0, ...e.start.accounts.map((a) => displayWidth(a.label)));
     const accounts = e.start.accounts.map(
-      (a) => `  ${a.label.padEnd(width)}  ${accountLine(a, now)}`,
+      (a) => `  ${padEndColumns(a.label, width)}  ${accountLine(a, now)}`,
     );
     const walk =
       e.start.switches.length > 0

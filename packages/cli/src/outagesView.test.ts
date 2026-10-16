@@ -20,6 +20,7 @@ import {
   renderOutageBanner,
   renderOutages,
 } from './outagesView.js';
+import { displayWidth } from './textWidth.js';
 
 // Built from LOCAL components, so the expected strings hold in whatever zone the suite runs.
 const local = (month: number, day: number, hour: number, minute: number, year = 2026): number =>
@@ -510,5 +511,23 @@ describe('scopes in the views', () => {
       "No account in C:\\research's pool can take work. First back: inc1 in 2h. " +
         'cctl outages lists every time this happened.',
     );
+  });
+});
+
+describe('renderOutages column widths', () => {
+  it('lines account lines up by terminal width, CJK labels included', () => {
+    const s = start(local(10, 1, 14, 0), {
+      accounts: [
+        { accountId: 'a1', label: '仕事', reason: 'quarantined', spent: [] },
+        { accountId: 'a2', label: 'work', reason: 'quarantined', spent: [] },
+      ],
+    });
+    const lines = renderOutages([{ start: s }], { now: NOW, logPath: 'x' }).split('\n');
+    const at = (label: string): number => {
+      const line = lines.find((l) => l.startsWith(`  ${label}`))!;
+      const rest = line.slice(2 + label.length).search(/\S/);
+      return displayWidth(label) + rest;
+    };
+    expect(at('仕事')).toBe(at('work'));
   });
 });

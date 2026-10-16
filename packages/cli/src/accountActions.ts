@@ -15,6 +15,7 @@ import { dirname } from 'node:path';
 import type { LogSink } from '@claude-control/shared-protocol';
 import {
   CadenceError,
+  LockTimeoutError,
   QuarantineError,
   SharedTokenError,
   SlotError,
@@ -68,6 +69,9 @@ export type AccountActionErrorCode =
   | 'switch_failed'
   /** The token endpoint is shedding load; nothing changed. */
   | 'overloaded'
+  /** Another cctl operation (a daemon switch or refresh, another command) held the credential
+   *  lock for the whole wait; nothing changed, and trying again shortly is the remedy. */
+  | 'busy'
   /** The vault refused the write: a label collision, an empty label, or a login it already
    *  stores. Its own message says which, and the VaultError is the cause. A vault fault (a
    *  registry it cannot read) is not a refusal and escapes as itself. */
@@ -230,6 +234,7 @@ function switchRefusal(err: unknown, label: string): AccountActionError | undefi
     new AccountActionError(code, message, { cause: err });
   if (err instanceof QuarantineError)
     return as('quarantined', `${label} is quarantined; re-login required.`);
+  if (err instanceof LockTimeoutError) return contentionRefusal(err);
   if (err instanceof CadenceError) return as('cadence', `${err.message}. Use --force to override.`);
   if (err instanceof UnknownAccountError) return as('unknown_account', err.message);
   if (err instanceof SlotError) return as('slot_refused', describeSlotRefusal(err, label));
@@ -249,6 +254,29 @@ function switchRefusal(err: unknown, label: string): AccountActionError | undefi
   if (err instanceof SwitchEngineError && isOverloadCode(err.code)) {
     return as('overloaded', `${err.message}. Nothing was changed - try again shortly.`);
   }
+  return undefined;
+}
+
+/**
+ * The refusals any account write can meet because of something else going on at the same moment,
+ * each a routine outcome that clears by itself, not a fault: the credential lock held past the
+ * wait (a daemon auto-switch retrying an overloaded endpoint can hold it longer), an earlier switch
+ * not yet settled, the account removed between being resolved and being written. Undefined for
+ * anything else. Shared by every write so each reads the same, and so a long-lived caller (the
+ * full-screen view) can tell them from a fault that should end it.
+ */
+function contentionRefusal(err: unknown): AccountActionError | undefined {
+  const as = (code: AccountActionErrorCode, message: string): AccountActionError =>
+    new AccountActionError(code, message, { cause: err });
+  if (err instanceof LockTimeoutError) {
+    return as(
+      'busy',
+      `${err.message} - another cctl operation is holding it. Nothing was changed; ` +
+        'try again in a moment.',
+    );
+  }
+  if (err instanceof UnsettledSwitchError) return as('switch_failed', err.message);
+  if (err instanceof UnknownAccountError) return as('unknown_account', err.message);
   return undefined;
 }
 
@@ -288,7 +316,11 @@ export async function setExcluded(
         : `${label} is already available to auto-switch.`,
     };
   }
-  await engine.setAutoSwitchExcluded(account.id, excluded);
+  try {
+    await engine.setAutoSwitchExcluded(account.id, excluded);
+  } catch (err) {
+    throw contentionRefusal(err) ?? err;
+  }
   return {
     account,
     excluded,
@@ -335,9 +367,9 @@ export async function renameAccount(
   try {
     updated = await engine.renameAccount(account.id, newLabel);
   } catch (err) {
-    // A collision or an empty label is a user mistake carrying its own explanation; anything else
-    // is a real fault and propagates.
-    throw vaultRefusal(err) ?? err;
+    // A collision or an empty label is a user mistake carrying its own explanation, and contention
+    // clears by itself; anything else is a real fault and propagates.
+    throw vaultRefusal(err) ?? contentionRefusal(err) ?? err;
   }
   return {
     previousLabel: account.label,
@@ -365,7 +397,11 @@ export async function removeAccount(
 ): Promise<RemoveOutcome> {
   const engine = engineOf(ctx);
   const { account } = await resolveRef(engine, ref);
-  await engine.removeAccount(account.id);
+  try {
+    await engine.removeAccount(account.id);
+  } catch (err) {
+    throw contentionRefusal(err) ?? err;
+  }
   return { account, message: `Removed ${account.label}.` };
 }
 
@@ -523,8 +559,8 @@ async function addFreshAccount(
         throw new AccountActionError('no_capture_login', err.message, { cause: err });
       }
       // The capture stores through the same vault write as the plain add, so a taken label or a
-      // login already stored is refused the same way.
-      throw vaultRefusal(err) ?? err;
+      // login already stored is refused the same way; a lock held past the wait is contention.
+      throw vaultRefusal(err) ?? contentionRefusal(err) ?? err;
     }
     added = {
       account,
