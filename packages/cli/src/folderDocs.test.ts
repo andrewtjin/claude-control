@@ -89,4 +89,13 @@ describe('docs/CLI.md on folder rules', () => {
     expect(DEFAULT_MOVE_INTERVAL_MS).toBe(60 * 60_000);
     expect(docText()).toContain('A session moves at most once an hour');
   });
+
+  it('warns that a recorded folder on an unreachable share stalls its first read', () => {
+    // Every reader resolves a recorded folder with a synchronous realpath and no timeout, so the
+    // wait is the operating system's, and the doc must say who pays it.
+    expect(docText()).toContain("real path (junctions, symlinks) with no timeout of cctl's own");
+    expect(docText()).toContain(
+      'That wait reaches the guard, `cctl claude`, `cctl session show` and the daemon',
+    );
+  });
 });

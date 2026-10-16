@@ -215,6 +215,12 @@ transcript's recorded folder the same way:
   directory's name can stand for that folder, and for no alias rule otherwise. The name is lossy
   (`C:\a_b` and `C:\a-b` share one), so it never picks a ruled folder the session does not run in.
 
+A recorded folder is resolved to its real path (junctions, symlinks) with no timeout of cctl's
+own. On a network share whose host is unreachable, the first read waits out the operating
+system's network timeout: about 43 s on one Windows machine, longer with more network
+providers. That wait reaches the guard, `cctl claude`, `cctl session show` and the daemon (which
+blocks meanwhile); the system then remembers the failure for a while, so later reads are quick.
+
 `cctl claude` reads Claude Code's own arguments to see which session it opens — `--resume
 <alias>`, `--resume <session id>`, `--resume <path to a .jsonl transcript>`, `--continue` (it
 wins when given together with `--resume`, as in Claude Code), `--name <alias>`, `--session-id`,
