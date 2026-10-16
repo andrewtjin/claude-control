@@ -279,6 +279,8 @@ export interface RemoveBindGuardOptions {
   settingsPath: string;
   /** The event the guard was installed on. Defaults to UserPromptSubmit (spec §9). */
   eventName?: string;
+  /** Group profile settings.json files that share main's inode; kept on it across a rewrite. */
+  profileSettingsPaths?: string[];
 }
 
 /**
@@ -318,7 +320,11 @@ export async function removeBindGuard(options: RemoveBindGuardOptions): Promise<
   if (!changed) return false;
   if (kept.length === 0) delete hooksSection[event];
   else hooksSection[event] = kept;
-  await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+  await writeSettings(
+    options.settingsPath,
+    JSON.stringify(settings, null, 2),
+    options.profileSettingsPaths,
+  );
   return true;
 }
 
@@ -365,7 +371,11 @@ export async function ensureBindGuard(
   const eventOpt = options.eventName !== undefined ? { eventName: options.eventName } : {};
   const profileSettingsPaths = options.profileSettingsPaths ?? [];
   if (!options.hasBindings) {
-    const removed = await removeBindGuard({ settingsPath: options.settingsPath, ...eventOpt });
+    const removed = await removeBindGuard({
+      settingsPath: options.settingsPath,
+      ...eventOpt,
+      profileSettingsPaths,
+    });
     // A guard entry can be stranded in a profile settings.json whose hard link to main was severed
     // by an earlier write; clean those too so the last unbind leaves nothing enforcing.
     for (const profilePath of profileSettingsPaths) {
@@ -663,6 +673,8 @@ export interface UninstallHooksOptions {
    *  `buildDaemonHookSpecs`) — pass the same custom names here if the daemon was ever
    *  installed with `eventNames` overridden, otherwise those entries are left behind. */
   eventNames?: HookEventNames;
+  /** Group profile settings.json files that share main's inode; kept on it across a rewrite. */
+  profileSettingsPaths?: string[];
 }
 
 /**
@@ -729,7 +741,11 @@ export async function uninstallHooks(options: UninstallHooksOptions): Promise<'r
   }
 
   if (!changed) return 'none';
-  await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+  await writeSettings(
+    options.settingsPath,
+    JSON.stringify(settings, null, 2),
+    options.profileSettingsPaths,
+  );
   return 'removed';
 }
 
