@@ -80,6 +80,21 @@ export interface RegistryPicture extends RulesPicture {
 }
 
 /** What a new folder rule is made of ({@link Vault.createRule}). */
+/**
+ * The rule writes an import makes (see `SwitchEngine.importRules`), as the {@link Vault} makes them
+ * on disk or as a {@link Vault.draftRules} draft tries them in memory: one interface, so the batch
+ * that is tried first and the batch that is written are carried out by the same code.
+ */
+export interface RuleWriter {
+  createRule(opts: NewRuleOptions): Promise<FolderRule>;
+  includeAccounts(ruleId: string, accountIds: readonly string[]): Promise<unknown>;
+  excludeAccounts(ruleId: string, accountIds: readonly string[]): Promise<unknown>;
+  addScopesToRule(
+    ruleId: string,
+    scopes: { folders: readonly string[]; aliases?: readonly StoredAliasScope[] },
+  ): Promise<FolderRule>;
+}
+
 export interface NewRuleOptions {
   /** Canonical folders the rule applies to (the engine passes exactly one, or none for an alias
    *  rule). */
@@ -1325,6 +1340,22 @@ export class Vault {
    */
   async createRule(opts: NewRuleOptions): Promise<FolderRule> {
     const st = await this.loadState();
+    const { rule, moved } = this.createRuleIn(st, opts);
+    await this.saveRules(st); // groups.json FIRST
+    if (moved.length > 0) {
+      this.removeSharedRows(st, moved);
+      await this.saveShared(st); // accounts.json SECOND
+    }
+    return rule;
+  }
+
+  /** {@link createRule} on the in-memory state `st`: every refusal, then the new rule and its
+   *  reserved rows added to `st`. Returns the rule and the shared rows it moves, which the caller
+   *  drops from the shared side once groups.json is written. */
+  private createRuleIn(
+    st: RegistryState,
+    opts: NewRuleOptions,
+  ): { rule: FolderRule; moved: StoredAccount[] } {
     const plan = this.planNewRule(st, opts);
     const now = this.clock();
     // Stored terminal-safe, exactly as an account label is (see addAccount): the rule label is
@@ -1352,12 +1383,7 @@ export class Vault {
     };
     st.rules.push(rule);
     st.reserved.push(...plan.moved);
-    await this.saveRules(st); // groups.json FIRST
-    if (plan.moved.length > 0) {
-      this.removeSharedRows(st, plan.moved);
-      await this.saveShared(st); // accounts.json SECOND
-    }
-    return rule;
+    return { rule, moved: plan.moved };
   }
 
   /**
@@ -1412,20 +1438,33 @@ export class Vault {
     accountIds: readonly string[],
   ): Promise<{ rule: FolderRule; reserved: string[]; unexcluded: string[] }> {
     const st = await this.loadState();
+    const { rule, moved, unexcluded, changed } = this.includeIn(st, ruleId, accountIds);
+    if (!changed) return { rule, reserved: [], unexcluded: [] };
+    await this.saveRules(st); // groups.json FIRST
+    if (moved.length > 0) {
+      this.removeSharedRows(st, moved);
+      await this.saveShared(st); // accounts.json SECOND
+    }
+    return { rule, reserved: moved.map((m) => m.id), unexcluded };
+  }
+
+  /** {@link includeAccounts} on the in-memory state `st`: every refusal, then the rule and the
+   *  reserved side updated. Returns the shared rows it moves (the caller drops them from the shared
+   *  side once groups.json is written) and whether anything changed. */
+  private includeIn(
+    st: RegistryState,
+    ruleId: string,
+    accountIds: readonly string[],
+  ): { rule: FolderRule; moved: StoredAccount[]; unexcluded: string[]; changed: boolean } {
     const rule = this.mustRule(st, ruleId);
     const plan = this.planInclude(st, rule, accountIds);
-    if (plan.added.length === 0) return { rule, reserved: [], unexcluded: [] };
+    if (plan.added.length === 0) return { rule, moved: [], unexcluded: [], changed: false };
     const unexcluded = rule.exclude.filter((id) => plan.added.includes(id));
     rule.exclude = rule.exclude.filter((id) => !plan.added.includes(id));
     rule.include.push(...plan.added);
     rule.updatedAtMs = this.clock();
     st.reserved.push(...plan.moved);
-    await this.saveRules(st); // groups.json FIRST
-    if (plan.moved.length > 0) {
-      this.removeSharedRows(st, plan.moved);
-      await this.saveShared(st); // accounts.json SECOND
-    }
-    return { rule, reserved: plan.moved.map((m) => m.id), unexcluded };
+    return { rule, moved: plan.moved, unexcluded, changed: true };
   }
 
   /** Run every refusal {@link includeAccounts} would make, writing nothing. */
@@ -1471,12 +1510,22 @@ export class Vault {
     accountIds: readonly string[],
   ): Promise<{ rule: FolderRule; added: string[] }> {
     const st = await this.loadState();
+    const result = this.excludeIn(st, ruleId, accountIds);
+    if (result.added.length > 0) await this.saveRules(st);
+    return result;
+  }
+
+  /** {@link excludeAccounts} on the in-memory state `st`: every refusal, then the rule updated. */
+  private excludeIn(
+    st: RegistryState,
+    ruleId: string,
+    accountIds: readonly string[],
+  ): { rule: FolderRule; added: string[] } {
     const rule = this.mustRule(st, ruleId);
     const added = this.checkExcludable(st, rule, accountIds);
     if (added.length === 0) return { rule, added };
     rule.exclude.push(...added);
     rule.updatedAtMs = this.clock();
-    await this.saveRules(st);
     return { rule, added };
   }
 
@@ -1661,23 +1710,6 @@ export class Vault {
     return rule;
   }
 
-  /**
-   * Record that a rule here is the rule `origin` names on another machine (see
-   * {@link FolderRule.origin}): an import took it to be the file's rule (it holds exactly that
-   * rule's folders), so a later import of the same rule finds it again after either side changed.
-   * A rule that already has an origin, or whose own id is `origin`, keeps what it has. Returns the
-   * rule; one groups.json write, none when nothing changes.
-   */
-  async recordRuleOrigin(ruleId: string, origin: string): Promise<FolderRule> {
-    const st = await this.loadState();
-    const rule = this.mustRule(st, ruleId);
-    if (rule.origin !== undefined || rule.id === origin) return rule;
-    assertRuleOrigin(st, origin);
-    rule.origin = origin;
-    await this.saveRules(st);
-    return rule;
-  }
-
   /** Resolve a rule by id or throw a named error. */
   private mustRule(st: RegistryState, ruleId: string): FolderRule {
     const rule = st.rules.find((r) => r.id === ruleId);
@@ -1697,23 +1729,57 @@ export class Vault {
     scopes: { folders: readonly string[]; aliases?: readonly StoredAliasScope[] },
   ): Promise<FolderRule> {
     const st = await this.loadState();
-    const rule = this.mustRule(st, ruleId);
-    const { folders, aliases } = this.planAddScopes(st, rule, scopes);
-    if (folders.length + aliases.length === 0) return rule;
-    rule.folders = [...rule.folders, ...folders];
-    if (aliases.length > 0) rule.aliases = [...(rule.aliases ?? []), ...aliases];
-    rule.updatedAtMs = this.clock();
-    await this.saveRules(st);
+    const { rule, changed } = this.addScopesIn(st, ruleId, scopes);
+    if (changed) await this.saveRules(st);
     return rule;
   }
 
-  /** Run every refusal {@link addScopesToRule} would make, writing nothing. */
-  async checkAddScopes(
+  /** {@link addScopesToRule} on the in-memory state `st`: every refusal, then the rule updated. */
+  private addScopesIn(
+    st: RegistryState,
     ruleId: string,
     scopes: { folders: readonly string[]; aliases?: readonly StoredAliasScope[] },
-  ): Promise<void> {
+  ): { rule: FolderRule; changed: boolean } {
+    const rule = this.mustRule(st, ruleId);
+    const { folders, aliases } = this.planAddScopes(st, rule, scopes);
+    if (folders.length + aliases.length === 0) return { rule, changed: false };
+    rule.folders = [...rule.folders, ...folders];
+    if (aliases.length > 0) rule.aliases = [...(rule.aliases ?? []), ...aliases];
+    rule.updatedAtMs = this.clock();
+    return { rule, changed: true };
+  }
+
+  /**
+   * A draft of the registry to try rule writes against, writing nothing: the four rule writes an
+   * import makes, each with exactly the refusals and effects {@link createRule},
+   * {@link includeAccounts}, {@link excludeAccounts} and {@link addScopesToRule} have (the same
+   * code), applied to an in-memory copy read now, with `extraShared` added to its shared side (the
+   * accounts an import will have stored by the time it writes its rules). Each write sees the ones
+   * before it, so a batch tried here meets every refusal the same batch meets on disk, in order.
+   */
+  async draftRules(extraShared: readonly StoredAccount[] = []): Promise<RuleWriter> {
     const st = await this.loadState();
-    this.planAddScopes(st, this.mustRule(st, ruleId), scopes);
+    st.shared = [...st.shared, ...extraShared.map((a) => ({ ...a }))];
+    // Each write runs after the ones before it, and its refusal rejects its promise as the
+    // vault's own would.
+    const run = <T>(write: () => T): Promise<T> => Promise.resolve().then(write);
+    return {
+      createRule: (opts) =>
+        run(() => {
+          const { rule, moved } = this.createRuleIn(st, opts);
+          this.removeSharedRows(st, moved);
+          return rule;
+        }),
+      includeAccounts: (ruleId, accountIds) =>
+        run(() => {
+          const { rule, moved } = this.includeIn(st, ruleId, accountIds);
+          this.removeSharedRows(st, moved);
+          return rule;
+        }),
+      excludeAccounts: (ruleId, accountIds) =>
+        run(() => this.excludeIn(st, ruleId, accountIds).rule),
+      addScopesToRule: (ruleId, scopes) => run(() => this.addScopesIn(st, ruleId, scopes).rule),
+    };
   }
 
   /** The scopes {@link addScopesToRule} would add, checked. Pure over `st`. */

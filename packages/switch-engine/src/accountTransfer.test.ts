@@ -12,9 +12,16 @@ import { SwitchEngine } from './switchEngine.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
 import { Vault } from './vault.js';
-import { sandboxPaths, type Paths } from './paths.js';
+import { groupProfileDir, sandboxPaths, type Paths } from './paths.js';
 import { RefreshError, UnknownAccountError, VaultError } from './errors.js';
-import type { ClaudeOauth, CredentialBundle, OauthAccount } from './types.js';
+import type {
+  ClaudeOauth,
+  CredentialBundle,
+  ImportRuleSpec,
+  ImportRuleVerdict,
+  OauthAccount,
+  RuleScopeRef,
+} from './types.js';
 
 const NOW = 100_000_000;
 const HOUR = 3_600_000;
@@ -365,7 +372,7 @@ describe('importRules', () => {
       { scopes: [{ kind: 'folder', folder: p3 }], include: [], exclude: [y.id] },
       { scopes: [{ kind: 'alias', folder: p3, alias: 'Other' }], include: [y.id], exclude: [] },
     ]);
-    expect(res.rules.map((r) => r.ok)).toEqual([true, true, true]);
+    expect(res.outcomes.map((o) => o?.ok)).toEqual([true, true, true]);
     const rules = await h.engine.listRules();
     expect(rules).toHaveLength(3);
     const client = rules.find((r) => r.label === 'Client')!;
@@ -386,7 +393,8 @@ describe('importRules', () => {
         exclude: [],
       },
     ]);
-    expect(res.rules[0]).toMatchObject({ ok: false });
+    expect(res.plan.rules[0]).toMatchObject({ kind: 'refused' });
+    expect(res.outcomes).toEqual([undefined]);
     expect(await h.engine.listRules()).toEqual([]);
     expect(await h.engine.getActiveId('global')).toBe(only.id);
   });
@@ -404,7 +412,7 @@ describe('importRules: accounts kept out of every slot but their own rule', () =
       exclude: [],
     };
     const res = await h.engine.importRules([spec], { keepOut: [client.id] });
-    expect(res.rules[0]).toMatchObject({ ok: false });
+    expect(res.plan.rules[0]).toMatchObject({ kind: 'refused' });
     expect(res.handedOff).toEqual([]);
     expect(await h.engine.listRules()).toEqual([]);
     expect(await h.engine.getActiveId('global')).toBe(only.id);
@@ -433,8 +441,9 @@ describe('importRules: accounts kept out of every slot but their own rule', () =
       ],
       { keepOut: [client.id] },
     );
-    expect(res.rules[0]).toMatchObject({ ok: true });
+    expect(res.outcomes[0]).toMatchObject({ ok: true });
     expect(res.handedOff.map((x) => x.to).sort()).toEqual([s1.id, s2.id].sort());
+    expect(res.plan.handOffs).toEqual(res.handedOff);
     expect([...(await h.engine.liveSlots()).values()]).not.toContain(client.id);
   });
 
@@ -454,7 +463,7 @@ describe('importRules: accounts kept out of every slot but their own rule', () =
       ],
       { keepOut: [client.id] },
     );
-    expect(res.rules[0]).toMatchObject({ ok: true });
+    expect(res.outcomes[0]).toMatchObject({ ok: true });
     expect((await h.engine.listRules())[0]!.activeId).toBeNull();
   });
 });
@@ -674,16 +683,24 @@ describe('adding an account brought from another machine', () => {
 });
 
 describe('importRules: a rule an earlier import made part way', () => {
-  it('grows that rule with the scopes it lacks, as one rule and one slot', async () => {
+  const ORIGIN = '0c0c0c0c-0c0c-4c0c-8c0c-0c0c0c0c0c0c';
+
+  it('grows the rule carrying its identity with the scopes it lacks, as one rule and one slot', async () => {
     const h = await harness();
     const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
     await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
     const p1 = await ruleFolder(h, 'p1');
     const p2 = await ruleFolder(h, 'p2');
     const first = await h.engine.importRules([
-      { scopes: [{ kind: 'folder', folder: p1 }], include: [x.id], exclude: [], label: 'Client' },
+      {
+        scopes: [{ kind: 'folder', folder: p1 }],
+        include: [x.id],
+        exclude: [],
+        label: 'Client',
+        origin: ORIGIN,
+      },
     ]);
-    const ruleId = (first.rules[0] as { rule: { id: string } }).rule.id;
+    const ruleId = (first.outcomes[0] as { rule: { id: string } }).rule.id;
     const res = await h.engine.importRules([
       {
         scopes: [
@@ -691,12 +708,13 @@ describe('importRules: a rule an earlier import made part way', () => {
           { kind: 'folder', folder: p2 },
           { kind: 'alias', folder: p1, alias: 'deploy' },
         ],
-        include: [],
+        include: [x.id],
         exclude: [],
-        intoRuleId: ruleId,
+        origin: ORIGIN,
       },
     ]);
-    expect(res.rules[0]).toMatchObject({ ok: true, created: false });
+    expect(res.plan.rules[0]).toMatchObject({ kind: 'grow', include: [], exclude: [] });
+    expect(res.outcomes[0]).toMatchObject({ ok: true, created: false });
     const rules = await h.engine.listRules();
     expect(rules).toHaveLength(1);
     expect(rules[0]).toMatchObject({ id: ruleId, label: 'Client', include: [x.id] });
@@ -705,14 +723,14 @@ describe('importRules: a rule an earlier import made part way', () => {
     expect(rules[0]!.activeId).toBe(x.id);
   });
 
-  it('grows that rule even when it holds a scope the spec does not, which stays its own', async () => {
+  it('grows it even when it holds a scope the spec does not, which stays its own', async () => {
     const h = await harness();
     const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
     await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
     const p1 = await ruleFolder(h, 'p1');
     const p2 = await ruleFolder(h, 'p2');
     const p3 = await ruleFolder(h, 'p3');
-    const made = await h.engine.importRules([
+    await h.engine.importRules([
       {
         scopes: [
           { kind: 'folder', folder: p1 },
@@ -720,27 +738,197 @@ describe('importRules: a rule an earlier import made part way', () => {
         ],
         include: [x.id],
         exclude: [],
+        origin: ORIGIN,
       },
     ]);
-    const ruleId = (made.rules[0] as { rule: { id: string } }).rule.id;
     const res = await h.engine.importRules([
       {
         scopes: [
           { kind: 'folder', folder: p1 },
           { kind: 'folder', folder: p2 },
         ],
-        include: [],
+        include: [x.id],
         exclude: [],
-        intoRuleId: ruleId,
+        origin: ORIGIN,
       },
     ]);
     // The source dropped p3 from the rule since the first import: the rule here still holds it,
     // and gains p2 rather than a second rule being made beside it.
-    expect(res.rules[0]).toMatchObject({ ok: true, created: false });
+    expect(res.outcomes[0]).toMatchObject({ ok: true, created: false });
     const rules = await h.engine.listRules();
     expect(rules).toHaveLength(1);
     expect(rules[0]!.folders).toHaveLength(3);
     expect(rules[0]!.activeId).toBe(x.id);
+  });
+
+  it('says a rule here that already has all of it is unchanged, writing nothing', async () => {
+    const h = await harness();
+    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+    await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
+    const p1 = await ruleFolder(h, 'p1');
+    const spec = {
+      scopes: [{ kind: 'folder' as const, folder: p1 }],
+      include: [x.id],
+      exclude: [],
+      origin: ORIGIN,
+    };
+    await h.engine.importRules([spec]);
+    const before = await readFile(join(h.paths.vaultDir, 'groups.json'), 'utf8');
+    const res = await h.engine.importRules([spec]);
+    expect(res.plan.rules[0]).toMatchObject({ kind: 'unchanged' });
+    expect(res.outcomes).toEqual([undefined]);
+    expect(await readFile(join(h.paths.vaultDir, 'groups.json'), 'utf8')).toBe(before);
+  });
+});
+
+describe('importRules: a rule lands whole or not at all', () => {
+  const ORIGIN = '0d0d0d0d-0d0d-4d0d-8d0d-0d0d0d0d0d0d';
+  const OTHER = '0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e';
+
+  it("refuses a spec one of whose scopes a rule of this machine's own holds, making nothing", async () => {
+    const h = await harness();
+    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+    const q = await h.engine.addAccount('q', bundle('Q1', 'u-q', NOW + HOUR));
+    await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
+    const p1 = await ruleFolder(h, 'p1');
+    const p2 = await ruleFolder(h, 'p2');
+    const mine = await h.vault.createRule({ folders: [p2], include: [q.id], label: 'mine' });
+    // With an identity no rule here carries, with none, and on exactly the rule's own folder.
+    for (const spec of [
+      { scopes: [p1, p2], origin: ORIGIN },
+      { scopes: [p1, p2] },
+      { scopes: [p2], origin: ORIGIN },
+    ]) {
+      const res = await h.engine.importRules([
+        {
+          scopes: spec.scopes.map((folder) => ({ kind: 'folder' as const, folder })),
+          include: [x.id],
+          exclude: [],
+          ...(spec.origin !== undefined ? { origin: spec.origin } : {}),
+        },
+      ]);
+      expect(res.plan.rules[0]).toMatchObject({
+        kind: 'refused',
+        conflict: { scope: { kind: 'folder', folder: p2 }, rule: { id: mine.id, label: 'mine' } },
+      });
+      expect((res.plan.rules[0] as { message: string }).message).toContain(
+        `folder ${p2} already has a rule here ("mine")`,
+      );
+    }
+    expect(await h.engine.listRules()).toEqual([mine]);
+  });
+
+  it('never grows a rule here that carries another identity', async () => {
+    const h = await harness();
+    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+    await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
+    const p1 = await ruleFolder(h, 'p1');
+    const p2 = await ruleFolder(h, 'p2');
+    await h.engine.importRules([
+      { scopes: [{ kind: 'folder', folder: p1 }], include: [x.id], exclude: [], origin: OTHER },
+    ]);
+    const before = await h.engine.listRules();
+    const res = await h.engine.importRules([
+      {
+        scopes: [
+          { kind: 'folder', folder: p1 },
+          { kind: 'folder', folder: p2 },
+        ],
+        include: [x.id],
+        exclude: [],
+        origin: ORIGIN,
+      },
+    ]);
+    expect(res.plan.rules[0]).toMatchObject({ kind: 'refused' });
+    expect(await h.engine.listRules()).toEqual(before);
+  });
+
+  it('grows the rule itself when the identity is its own id (the file came from here)', async () => {
+    const h = await harness();
+    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+    await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
+    const p1 = await ruleFolder(h, 'p1');
+    const p2 = await ruleFolder(h, 'p2');
+    const mine = await h.vault.createRule({ folders: [p1], include: [x.id] });
+    const res = await h.engine.importRules([
+      {
+        scopes: [
+          { kind: 'folder', folder: p1 },
+          { kind: 'folder', folder: p2 },
+        ],
+        include: [x.id],
+        exclude: [],
+        origin: mine.id,
+      },
+    ]);
+    expect(res.plan.rules[0]).toMatchObject({ kind: 'grow', rule: { id: mine.id } });
+    const rules = await h.engine.listRules();
+    expect(rules).toHaveLength(1);
+    expect(rules[0]!.folders).toEqual([p1, p2]);
+    expect(rules[0]!.origin).toBeUndefined();
+  });
+
+  it('refuses the later of two specs that hold one scope, and a rule split here in two', async () => {
+    const h = await harness();
+    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+    const y = await h.engine.addAccount('y', bundle('Y1', 'u-y', NOW + HOUR));
+    await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
+    const p1 = await ruleFolder(h, 'p1');
+    const p2 = await ruleFolder(h, 'p2');
+    const res = await h.engine.importRules([
+      { scopes: [{ kind: 'folder', folder: p1 }], include: [x.id], exclude: [] },
+      {
+        scopes: [
+          { kind: 'folder', folder: p2 },
+          { kind: 'folder', folder: p1 },
+        ],
+        include: [y.id],
+        exclude: [],
+      },
+    ]);
+    expect(res.plan.rules.map((v) => v.kind)).toEqual(['create', 'refused']);
+    expect(res.plan.rules[1]).toMatchObject({ conflict: { scope: { folder: p1 } } });
+    expect((await h.engine.listRules()).map((r) => r.folders)).toEqual([[p1]]);
+
+    // Two rules here with one identity (only a hand edit makes them): neither is grown.
+    const h2 = await harness();
+    const z = await h2.engine.addAccount('z', bundle('Z1', 'u-z', NOW + HOUR));
+    const q1 = await ruleFolder(h2, 'q1');
+    const q2 = await ruleFolder(h2, 'q2');
+    await h2.vault.createRule({ folders: [q1], exclude: [z.id], origin: ORIGIN });
+    const file = join(h2.paths.vaultDir, 'groups.json');
+    const raw = JSON.parse(await readFile(file, 'utf8')) as {
+      rules: Array<Record<string, unknown>>;
+    };
+    raw.rules.push({ ...raw.rules[0]!, id: OTHER, folders: [q2] });
+    await writeFile(file, JSON.stringify(raw));
+    const split = await h2.engine.importRules([
+      { scopes: [{ kind: 'folder', folder: q1 }], include: [], exclude: [z.id], origin: ORIGIN },
+    ]);
+    expect((split.plan.rules[0] as { message: string }).message).toContain('split between rules');
+  });
+
+  it('refuses a spec the vault would refuse part way, before anything is written', async () => {
+    // Its exclusion is written before its inclusions, which pass the cap on a rule's accounts:
+    // tried against a draft first, so the rule is never left half made.
+    const h = await harness();
+    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+    const y = await h.engine.addAccount('y', bundle('Y1', 'u-y', NOW + HOUR));
+    await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
+    const p1 = await ruleFolder(h, 'p1');
+    const many: string[] = [];
+    for (let i = 0; i < 32; i += 1) {
+      many.push((await h.vault.addPendingAccount(`m${i}`, {}, 'w')).id);
+    }
+    const res = await h.engine.importRules([
+      { scopes: [{ kind: 'folder', folder: p1 }], include: [x.id, ...many], exclude: [y.id] },
+    ]);
+    expect(res.plan.rules[0]).toMatchObject({
+      kind: 'refused',
+      message: 'a folder rule cannot include more than 32 accounts',
+    });
+    expect(res.outcomes).toEqual([undefined]);
+    expect(await h.engine.listRules()).toEqual([]);
   });
 });
 
@@ -755,47 +943,26 @@ describe("a rule's identity across machines (its origin)", () => {
     const res = await h.engine.importRules([
       { scopes: [{ kind: 'folder', folder: p1 }], include: [x.id], exclude: [], origin: ORIGIN },
     ]);
-    expect(res.rules[0]).toMatchObject({ ok: true, created: true });
+    expect(res.outcomes[0]).toMatchObject({ ok: true, created: true });
     expect((await h.vault.listRules())[0]!.origin).toBe(ORIGIN);
   });
 
-  it('refuses, before anything moves, a rule naming an identity a rule here already has', async () => {
+  it('refuses, before anything moves, a rule naming an identity that is not a rule id', async () => {
     const h = await harness();
     const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
     await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
     const p1 = await ruleFolder(h, 'p1');
     const p2 = await ruleFolder(h, 'p2');
-    const mine = await h.vault.createRule({ folders: [p1], exclude: [x.id] });
-    for (const origin of [mine.id, 'not-a-uuid']) {
-      const res = await h.engine.importRules([
-        { scopes: [{ kind: 'folder', folder: p2 }], include: [x.id], exclude: [], origin },
-      ]);
-      expect(res.rules[0]).toMatchObject({ ok: false });
-    }
+    await h.vault.createRule({ folders: [p1], exclude: [x.id] });
+    const res = await h.engine.importRules([
+      { scopes: [{ kind: 'folder', folder: p2 }], include: [x.id], exclude: [], origin: 'x/../y' },
+    ]);
+    expect(res.plan.rules[0]).toMatchObject({ kind: 'refused' });
+    expect(res.handedOff).toEqual([]);
     expect(await h.engine.listRules()).toHaveLength(1);
     expect((await h.engine.listAllAccounts()).find((a) => a.id === x.id)?.ruleIds ?? []).toEqual(
       [],
     );
-  });
-
-  it('is recorded on a rule taken for the file rule, once, and never over another', async () => {
-    const h = await harness();
-    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
-    const p1 = await ruleFolder(h, 'p1');
-    const p2 = await ruleFolder(h, 'p2');
-    const one = await h.vault.createRule({ folders: [p1], exclude: [x.id] });
-    const two = await h.vault.createRule({ folders: [p2], exclude: [x.id] });
-    expect((await h.engine.recordRuleOrigin(one.id, ORIGIN)).origin).toBe(ORIGIN);
-    // Kept as it is: a second identity, or the rule's own id.
-    const other = '0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b';
-    expect((await h.engine.recordRuleOrigin(one.id, other)).origin).toBe(ORIGIN);
-    expect((await h.engine.recordRuleOrigin(two.id, two.id)).origin).toBeUndefined();
-    // One rule per identity, and only a uuid.
-    await expect(h.engine.recordRuleOrigin(two.id, ORIGIN)).rejects.toThrow(VaultError);
-    await expect(h.engine.recordRuleOrigin(two.id, one.id)).rejects.toThrow(VaultError);
-    await expect(h.engine.recordRuleOrigin(two.id, 'x/../y')).rejects.toThrow(VaultError);
-    const rules = await h.vault.listRules();
-    expect(rules.map((r) => r.origin)).toEqual([ORIGIN, undefined]);
   });
 
   it('refuses a registry whose rule carries an origin that is not a uuid', async () => {
@@ -835,8 +1002,8 @@ describe('importRules: the caps, counted over the batch', () => {
         exclude: [b.id],
       },
     ]);
-    expect(res.rules.map((r) => r.ok)).toEqual([true, false]);
-    expect((res.rules[1] as { message: string }).message).toContain('max 64');
+    expect(res.outcomes.map((o) => o?.ok)).toEqual([true, undefined]);
+    expect((res.plan.rules[1] as { message: string }).message).toContain('max 64');
     expect(await h.engine.listRules()).toHaveLength(64);
   });
 
@@ -869,8 +1036,229 @@ describe('importRules: the caps, counted over the batch', () => {
         exclude: [one.id],
       },
     ]);
-    expect(res.rules[0]).toMatchObject({ ok: true });
-    expect(res.rules[1]).toEqual({ ok: false, message: 'cannot reserve more than 256 accounts' });
+    expect(res.outcomes[0]).toMatchObject({ ok: true });
+    expect(res.plan.rules[1]).toEqual({
+      kind: 'refused',
+      message: 'cannot reserve more than 256 accounts',
+    });
     expect(await h.engine.listRules()).toHaveLength(before + 1);
+  });
+});
+
+describe('planImportRules: the decision importRules then carries out', () => {
+  const ORIGIN = '0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f';
+  const OTHER = '1f1f1f1f-1f1f-4f1f-8f1f-1f1f1f1f1f1f';
+  const LATER = '2a2a2a2a-2a2a-4a2a-8a2a-2a2a2a2a2a2a';
+
+  /** The credential store over a rule's profile, to plant what a by-hand login there leaves. */
+  function ruleStore(h: Harness, ruleId: string): CredentialStore {
+    const profileDir = groupProfileDir(h.paths.vaultDir, ruleId);
+    return new CredentialStore({
+      claudeDir: profileDir,
+      credentialsPath: join(profileDir, '.credentials.json'),
+      claudeJsonPath: join(profileDir, '.claude.json'),
+      vaultDir: h.paths.vaultDir,
+    });
+  }
+
+  /** Log `bundle`'s login in by hand inside a rule's profile, as `/login` there would. */
+  async function loginInProfile(h: Harness, ruleId: string, b: CredentialBundle): Promise<void> {
+    await ruleStore(h, ruleId).writeLiveCredentials(b.claudeAiOauth);
+    await ruleStore(h, ruleId).writeOauthAccount(b.oauthAccount!);
+  }
+
+  const folder = (f: string): RuleScopeRef => ({ kind: 'folder', folder: f });
+
+  /** One case: a machine set up, and the specs imported into it. */
+  type Case = (h: Harness) => Promise<ImportRuleSpec[]>;
+
+  const cases: Record<string, Case> = {
+    'a new rule': async (h) => {
+      const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+      await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
+      return [{ scopes: [folder(await ruleFolder(h, 'p'))], include: [x.id], exclude: [] }];
+    },
+    'the rule carrying its identity, grown': async (h) => {
+      const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+      const y = await h.engine.addAccount('y', bundle('Y1', 'u-y', NOW + HOUR));
+      await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
+      const p = await ruleFolder(h, 'p');
+      await h.vault.createRule({ folders: [p], include: [x.id], origin: ORIGIN });
+      const scopes = [folder(p), folder(await ruleFolder(h, 'q'))];
+      return [{ scopes, include: [x.id, y.id], exclude: [], origin: ORIGIN }];
+    },
+    'the rule carrying its identity, unchanged': async (h) => {
+      const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+      const p = await ruleFolder(h, 'p');
+      await h.vault.createRule({ folders: [p], include: [x.id], origin: ORIGIN });
+      return [{ scopes: [folder(p)], include: [x.id], exclude: [], origin: ORIGIN }];
+    },
+    "a folder of this machine's own rule": async (h) => {
+      const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+      const q = await h.engine.addAccount('q', bundle('Q1', 'u-q', NOW + HOUR));
+      const p = await ruleFolder(h, 'p');
+      await h.vault.createRule({ folders: [p], include: [q.id] });
+      return [
+        { scopes: [folder(await ruleFolder(h, 'n')), folder(p)], include: [x.id], exclude: [] },
+      ];
+    },
+    'a rule here with another identity': async (h) => {
+      const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+      const p = await ruleFolder(h, 'p');
+      await h.vault.createRule({ folders: [p], include: [x.id], origin: OTHER });
+      return [{ scopes: [folder(p)], include: [x.id], exclude: [], origin: ORIGIN }];
+    },
+    'a grown rule past the cap on session aliases': async (h) => {
+      const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+      const p = await ruleFolder(h, 'p');
+      const aliases = Array.from({ length: 256 }, (_, i) => ({ folder: p, alias: `s${i}` }));
+      await h.vault.createRule({ folders: [p], aliases, include: [x.id], origin: ORIGIN });
+      const extra: RuleScopeRef = { kind: 'alias', folder: p, alias: 'extra' };
+      return [{ scopes: [folder(p), extra], include: [x.id], exclude: [], origin: ORIGIN }];
+    },
+    'the rule cap, in spec order': async (h) => {
+      const a = await h.engine.addAccount('a', bundle('A1', 'u-a', NOW + HOUR));
+      const b = await h.engine.addAccount('b', bundle('B1', 'u-b', NOW + HOUR));
+      await h.engine.addAccount('c', bundle('C1', 'u-c', NOW + HOUR));
+      for (let i = 0; i < 63; i += 1) {
+        await h.vault.createRule({ folders: [await ruleFolder(h, `r${i}`)], exclude: [b.id] });
+      }
+      return [
+        { scopes: [folder(await ruleFolder(h, 'inc'))], include: [a.id], exclude: [] },
+        { scopes: [folder(await ruleFolder(h, 'exc'))], include: [], exclude: [b.id] },
+      ];
+    },
+    'the main login moved off an account a rule reserves': async (h) => {
+      const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+      await h.engine.addAccount('y', bundle('Y1', 'u-y', NOW + HOUR));
+      await h.engine.activate(x.id);
+      return [{ scopes: [folder(await ruleFolder(h, 'p'))], include: [x.id], exclude: [] }];
+    },
+    'the main login with nothing to move to': async (h) => {
+      const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+      await h.engine.activate(x.id);
+      return [{ scopes: [folder(await ruleFolder(h, 'p'))], include: [x.id], exclude: [] }];
+    },
+    'a slot recorded empty that runs the account': async (h) => {
+      const other = await h.engine.addAccount('other', bundle('O1', 'u-o', NOW + HOUR));
+      await h.engine.activate(other.id);
+      const side = await h.engine.excludeInFolder(await ruleFolder(h, 'side'), [other.id]);
+      const c = bundle('C1', 'u-c', NOW + HOUR);
+      await loginInProfile(h, side.rule.id, c);
+      const client = await h.engine.addAccount('client', c);
+      return [{ scopes: [folder(await ruleFolder(h, 'p'))], include: [client.id], exclude: [] }];
+    },
+    'a slot recorded on one account that runs another': async (h) => {
+      await h.engine.addAccount('work', bundle('W1', 'u-w', NOW + HOUR));
+      const other = await h.engine.addAccount('other', bundle('O1', 'u-o', NOW + HOUR));
+      await h.engine.activate(other.id);
+      const side = await h.engine.excludeInFolder(await ruleFolder(h, 'side'), [other.id]);
+      const c = bundle('C1', 'u-c', NOW + HOUR);
+      const client = await h.engine.addAccount('client', c);
+      await loginInProfile(h, side.rule.id, c);
+      return [{ scopes: [folder(await ruleFolder(h, 'p'))], include: [client.id], exclude: [] }];
+    },
+    'members the rule here has the other way round, or another rule reserves': async (h) => {
+      const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+      const y = await h.engine.addAccount('y', bundle('Y1', 'u-y', NOW + HOUR));
+      const r = await h.engine.addAccount('r', bundle('R1', 'u-r', NOW + HOUR));
+      await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
+      const p = await ruleFolder(h, 'p');
+      await h.vault.createRule({ folders: [p], include: [x.id], exclude: [y.id], origin: ORIGIN });
+      await h.vault.createRule({ folders: [await ruleFolder(h, 'held')], include: [r.id] });
+      return [
+        { scopes: [folder(p)], include: [y.id], exclude: [x.id, r.id], origin: ORIGIN },
+        { scopes: [folder(await ruleFolder(h, 'n'))], include: [], exclude: [r.id] },
+      ];
+    },
+    'two specs on one folder': async (h) => {
+      const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+      const y = await h.engine.addAccount('y', bundle('Y1', 'u-y', NOW + HOUR));
+      await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
+      const p = await ruleFolder(h, 'p');
+      return [
+        { scopes: [folder(p)], include: [x.id], exclude: [] },
+        { scopes: [folder(await ruleFolder(h, 'q')), folder(p)], include: [y.id], exclude: [] },
+      ];
+    },
+    'a rule the vault refuses part way': async (h) => {
+      const y = await h.engine.addAccount('y', bundle('Y1', 'u-y', NOW + HOUR));
+      const many: string[] = [];
+      for (let i = 0; i < 33; i += 1) {
+        many.push((await h.vault.addPendingAccount(`m${i}`, {}, 'w')).id);
+      }
+      return [{ scopes: [folder(await ruleFolder(h, 'p'))], include: many, exclude: [y.id] }];
+    },
+  };
+
+  /** What each case is decided as: the verdict on each spec, and how many slots it moves. */
+  const expected: Record<string, [ImportRuleVerdict['kind'][], number]> = {
+    'a new rule': [['create'], 0],
+    'the rule carrying its identity, grown': [['grow'], 0],
+    'the rule carrying its identity, unchanged': [['unchanged'], 0],
+    "a folder of this machine's own rule": [['refused'], 0],
+    'a rule here with another identity': [['refused'], 0],
+    'a grown rule past the cap on session aliases': [['refused'], 0],
+    'the rule cap, in spec order': [['create', 'refused'], 0],
+    'the main login moved off an account a rule reserves': [['create'], 1],
+    'the main login with nothing to move to': [['refused'], 0],
+    'a slot recorded empty that runs the account': [['refused'], 0],
+    'a slot recorded on one account that runs another': [['create'], 1],
+    'members the rule here has the other way round, or another rule reserves': [
+      ['unchanged', 'unchanged'],
+      0,
+    ],
+    'two specs on one folder': [['create', 'refused'], 0],
+    'a rule the vault refuses part way': [['refused'], 0],
+  };
+
+  for (const [name, setUp] of Object.entries(cases)) {
+    it(`decides ${name} as the real run does`, async () => {
+      const h = await harness();
+      const specs = await setUp(h);
+      const plan = await h.engine.planImportRules(specs);
+      const res = await h.engine.importRules(specs);
+      expect([plan.rules.map((v) => v.kind), plan.handOffs.length]).toEqual(expected[name]);
+      expect(res.plan).toEqual(plan);
+      expect(res.handedOff).toEqual(plan.handOffs);
+      for (const [i, verdict] of plan.rules.entries()) {
+        const writes = verdict.kind === 'create' || verdict.kind === 'grow';
+        expect(res.outcomes[i]?.ok).toBe(writes ? true : undefined);
+      }
+    });
+  }
+
+  it('decides, for accounts not stored yet, what the run decides once they are', async () => {
+    // client's login runs on the main login before any account here is it; the import stores it
+    // with its id kept, and a rule of the file reserves it.
+    const PENDING = '3b3b3b3b-3b3b-4b3b-8b3b-3b3b3b3b3b3b';
+    for (const spare of [false, true]) {
+      const h = await harness();
+      if (spare) {
+        const other = await h.engine.addAccount('other', bundle('O1', 'u-o', NOW + HOUR));
+        await h.engine.activate(other.id);
+      }
+      const c = bundle('C1', 'u-c', NOW + HOUR);
+      await h.live.writeLiveCredentials(c.claudeAiOauth);
+      await h.live.writeOauthAccount(c.oauthAccount!);
+      const specs: ImportRuleSpec[] = [
+        { scopes: [folder(await ruleFolder(h, 'p'))], include: [PENDING], exclude: [] },
+      ];
+      const plan = await h.engine.planImportRules(specs, {
+        pending: [{ id: PENDING, label: 'client', accountUuid: 'u-c', withTokens: true }],
+      });
+      expect(plan.rules[0]!.kind).toBe(spare ? 'create' : 'refused');
+      await h.engine.addAccount('client', c, { id: PENDING });
+      const res = await h.engine.importRules(specs);
+      expect(res.plan).toEqual(plan);
+    }
+    // Planning wrote nothing: no account, no rule.
+    const h = await harness();
+    await h.engine.planImportRules(
+      [{ scopes: [folder(await ruleFolder(h, 'p'))], include: [LATER], exclude: [] }],
+      { pending: [{ id: LATER, label: 'later', withTokens: false }] },
+    );
+    expect(await h.engine.listAllAccounts()).toEqual([]);
+    expect(await h.engine.listRules()).toEqual([]);
   });
 });

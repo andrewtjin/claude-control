@@ -120,27 +120,42 @@ What an import does with each part, printed in full by `--dry-run`:
   client's account does not end up spending its quota on other work; nor does the import move
   a slot onto it, or seat a rule it makes with it. `cctl accounts include <account>` hands it
   back to auto-switch.
-- **Rules** are rebuilt whole: one rule with every folder and session scope the source rule
-  had, on one slot, with the same included and excluded accounts. A rule keeps its identity
-  across machines: a rule the import makes (or adds to) remembers which rule it is, and the
-  export of a rule carries it. So when this machine already has that rule (an earlier import
-  made it, say before one of its folders existed here; or the file came from this machine),
-  the accounts and scopes it lacks are added to it, whatever changed on either machine since,
-  rather than a second rule being made beside it. Otherwise a rule here on exactly those scopes
-  is taken to be it and gains the accounts it lacks. Any other rule here is this machine's own,
-  whatever accounts it shares with the file's, and keeps its scopes. A scope is left out, and listed,
-  when its folder does not exist here, is a network folder (those are never looked up from a
-  file), is a folder of another platform, or is one no rule may cover (a drive root, the home
-  folder, cctl's own folders); a scope another rule here holds is left to that rule. A rule is
-  skipped, and listed, when none of its scopes is left, none of its accounts came along, none of
-  the accounts it includes is in the file or here (with only its exclusions it would open its
-  folders to every account), it names one account both to include and to exclude, it would pass
-  the 64-rule limit or a limit on accounts (32 included or excluded by one rule, 256 reserved in
-  all), or reserving an account would leave this machine's main login, or another rule's slot,
-  with no account to run on. A rule that reserves the account live in a slot here moves that
-  slot to another account first, and says so; that includes this machine's main login when it
-  runs an account of the file that cctl had not stored yet. Folder rules are not created on macOS, nor while a
-  daemon older than this build runs (`cctl daemon restart`).
+- **Rules** land whole or not at all: a rule of the file is one slot, and splitting it would
+  change which account its folders run on, so it is never made on part of its scopes. A rule
+  keeps its identity across machines: a rule the import makes remembers which rule it is, and
+  the export of a rule carries it. Each rule of the file then ends one of three ways:
+  - it **grows** the one rule here that carries its identity (an earlier import made it, say
+    before one of its folders existed here; or the file came from this machine): the scopes
+    and accounts it lacks are added, whatever changed on either machine since. An account the
+    rule here holds the other way round (included where the file excludes it, or the reverse)
+    is left as it is, and listed;
+  - it is **created**, with every scope that can be used here, when no rule here holds any of
+    them;
+  - otherwise it **fails**, counted as a failure (the import exits non-zero), naming the folder
+    or session a rule of this machine holds and that rule. A rule here with another identity,
+    or none (made here by hand), is never grown by an import, even on exactly the same
+    scopes, whatever accounts it shares with the file's. To bring the two together, remove the
+    rule here (`cctl folder reset <folder>`, or `cctl session reset <alias> --cwd <folder>`) and
+    import again, or give it the file's accounts by hand (`cctl folder include <folder>
+<accounts>`); the failure line names the commands.
+
+  A scope that cannot be used here is left out, and listed: its folder does not exist here, is
+  a network folder (those are never looked up from a file), is a folder of another platform, or
+  is one no rule may cover (a drive root, the home folder, cctl's own folders). Once it can be,
+  the next import adds it to the rule the first one made. An exclusion of an account another
+  rule here reserves is left out, and listed (only a shared account can be excluded). A rule is skipped, and listed, when
+  none of its scopes is left, none of its accounts came along, none of the accounts it includes
+  is in the file or here (with only its exclusions it would open its folders to every account),
+  or it names one account both to include and to exclude. A rule fails, saying why, when it
+  would pass the 64-rule limit or a limit on one rule (32 accounts included or excluded, 256
+  folders, 256 session aliases), the 256 accounts reserved in all, or when reserving an account
+  would leave this machine's main login, or another rule's slot, with no account to run on. A
+  rule that reserves the account live in a slot here moves that slot to another account first,
+  and says so; who is live in a slot is read from the slot itself, not from what cctl recorded
+  for it, so a login made by hand inside a folder's profile counts, and so does this machine's
+  main login when it runs an account of the file that cctl had not stored yet. Folder rules are
+  not created on macOS, nor while a daemon older than this build runs (`cctl daemon restart`).
+
 - **Settings** are checked the way `cctl settings set` checks them and saved the same way. A
   setting this machine already has with another value is kept unless `--replace`. A value that
   weakens a guard compared with the one in force here (`bind-enforce` below `block`,
@@ -148,6 +163,13 @@ What an import does with each part, printed in full by `--dry-run`:
   output names the `cctl settings set` command to make it here. When one changed, the output
   ends with `cctl daemon restart`; a value set in the daemon's environment still wins over the
   saved one, and the output names any setting that is, saved or already set.
+
+What `--dry-run` prints for the rules is the decision the import itself makes, made by the same
+code from the same reads, and the real run prints the same lines (in the past tense). Only what
+changes on this machine between the two runs can make them differ: a session that starts or
+stops in a folder a rule would leave with no account, a switch left unfinished in a slot (the
+real run settles it first), or an account, rule or login changed in between. Which account each
+slot ends up running is decided by the real run.
 
 An import is safe to run twice: everything already in place is reported as such and left
 alone, and a run that stopped part-way is completed by the next one. A wrong passphrase, a file

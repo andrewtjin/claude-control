@@ -49,19 +49,20 @@ import { olderDaemonAliasReason, olderDaemonReason } from './folderRulesSupport.
 import {
   OVERRIDDEN_CLAUSE,
   autoSwitchPhrase,
-  describeMembers,
-  describeRuleExtras,
   describeRuleStep,
+  handOffLine,
   includeCommand,
   keptSettingLine,
   planImport,
+  planNames,
   renderImportPlan,
+  ruleLines,
+  ruleSpec,
   sameSettingLine,
-  scopeDetailLines,
-  scopeRef,
   type FolderLookup,
   type ImportPlan,
   type MemberTarget,
+  type ReportNames,
   type RuleStep,
 } from './importPlan.js';
 import {
@@ -89,14 +90,13 @@ export type TransferEngine = Pick<
   | 'listAllAccounts'
   | 'listRules'
   | 'getActiveId'
-  | 'unstoredLiveLogins'
   | 'exportBundle'
   | 'addAccount'
   | 'addPendingAccount'
   | 'importBundle'
   | 'checkRuleScope'
+  | 'planImportRules'
   | 'importRules'
-  | 'recordRuleOrigin'
   | 'setAutoSwitchExcluded'
   | 'removeAccount'
 >;
@@ -521,21 +521,6 @@ async function moveOut(
   return failed;
 }
 
-/** The ids targets have here once the accounts step has run: an account of the file by the id it
- *  got (or already had), an account of this machine by its own. A member whose account could not
- *  be imported has none. */
-function memberIds(
-  targets: readonly MemberTarget[],
-  localIds: ReadonlyMap<number, string>,
-): Map<MemberTarget, string> {
-  const out = new Map<MemberTarget, string>();
-  for (const t of targets) {
-    const id = t.existingId ?? (t.entry !== undefined ? localIds.get(t.entry) : undefined);
-    if (id !== undefined && ![...out.values()].includes(id)) out.set(t, id);
-  }
-  return out;
-}
-
 /**
  * Read up to `max` bytes from `source`, or return undefined as soon as it holds more — reading no
  * further, so an input that never ends (a pipe, a device) costs at most `max` bytes.
@@ -578,9 +563,11 @@ async function readExportText(file: string, deps: TransferDeps): Promise<string>
 /**
  * `cctl import <file|->`. Opens the file (a wrong passphrase, a changed or cut-short file, or a
  * newer format is refused before anything is read from it), plans the import against this
- * machine, and with `--dry-run` prints the plan and stops. Otherwise it carries the plan out:
- * accounts first (one engine call each), then rules (one engine call for all of them; see
- * importRules), then settings. A step that is refused is reported and the rest still run.
+ * machine (the rules' part decided by the engine itself, see SwitchEngine.planImportRules), and
+ * with `--dry-run` prints the plan and stops. Otherwise it carries the plan out: accounts first
+ * (one engine call each), then rules (one engine call for all of them, which decides again and
+ * applies that decision; see importRules), then settings. A step that is refused is reported, and
+ * counted as a failure, and the rest still run.
  */
 export async function runImport(
   file: string,
@@ -600,7 +587,7 @@ export async function runImport(
     throw err;
   }
   const { engine } = deps;
-  const plan = planImport({
+  const plan = await planImport({
     payload,
     accounts: await engine.listAllAccounts(),
     rules: await engine.listRules(),
@@ -612,14 +599,9 @@ export async function runImport(
       const check = engine.checkRuleScope(scope);
       return check.ok ? undefined : check.reason;
     },
-    globalLive: await engine.getActiveId('global'),
+    planRules: (specs, opts) => engine.planImportRules(specs, opts),
     env: deps.env,
     ...(payload.rules.length > 0 ? { rulesBlocked: await deps.rulesBlocked() } : {}),
-    // Read only where rules can be made: it reads each slot's live credentials, which on macOS
-    // means the Keychain, and only the moves a rule makes need it.
-    ...(payload.rules.length > 0 && deps.platform !== 'darwin'
-      ? { unstoredLogins: await engine.unstoredLiveLogins() }
-      : {}),
   });
   const header =
     `From an export of ${payload.accounts.length} account(s) made by cctl ` +
@@ -819,47 +801,16 @@ async function importAccounts(
   return { localIds, pending, addedIds, tokensArrived };
 }
 
-/** A rule step narrowed to the members that have an id here, with those ids. */
-interface RuleWrite {
-  step: RuleStep;
-  include: Map<MemberTarget, string>;
-  exclude: Map<MemberTarget, string>;
-}
-
-/** The line a rule step gets when it was carried out, naming the members actually written. */
-function doneLine(write: RuleWrite, verb: string): string {
-  const members = describeMembers({
-    include: [...write.include.keys()],
-    exclude: [...write.exclude.keys()],
-  });
-  return `${describeRuleStep(write.step)}: ${verb}${members !== '' ? `, ${members}` : ''}${describeRuleExtras(write.step)}`;
-}
-
-/**
- * Record, on each rule here the plan took to be a rule of the file by its scopes alone, which rule
- * of the other machine it is (see RuleStep.takesOrigin) — whether or not the step wrote anything,
- * since what the rule IS does not depend on that. Bookkeeping only: it changes nothing a rule does,
- * so a refusal (the rule was removed meanwhile) is not reported, and the next import of the file
- * makes the same choice again.
- */
-async function recordOrigins(plan: ImportPlan, engine: TransferEngine): Promise<void> {
-  for (const step of plan.rules) {
-    if (step.takesOrigin !== true || step.into === undefined || step.origin === undefined) continue;
-    try {
-      await engine.recordRuleOrigin(step.into.id, step.origin);
-    } catch (err) {
-      if (!(err instanceof SwitchEngineError)) throw err;
-    }
-  }
-}
-
 /**
  * Carry out the rule steps, all in one engine call (see SwitchEngine.importRules for why one call:
- * a rule is rebuilt whole, every exclusion before any inclusion, and no slot is seated until every
- * reservation is in place). A rule whose included accounts all failed to import is not made — with
- * only its exclusions it would open its folders to every shared account. The report says, per rule,
- * what was written (the members that made it), the slots moved first, and the rules the engine
- * refused. Returns whether anything was written.
+ * a rule is applied whole, every exclusion before any inclusion, and no slot is seated until every
+ * reservation is in place). The engine decides again, under its lock, what the plan showed, and its
+ * verdicts are reported through the same lines the plan printed (see ruleLines), so a real run
+ * says what its dry run said unless this machine changed in between. A rule whose included
+ * accounts all failed to import is not sent — with only its exclusions it would open its folders to
+ * every shared account. The report says, per rule, what was written, the rules refused (each a
+ * failure), every slot moved, and a rule a run-time failure left unwritten or half written.
+ * Returns whether anything was written.
  */
 async function importRules(
   plan: ImportPlan,
@@ -871,109 +822,98 @@ async function importRules(
     report('(none in the file)', true);
     return false;
   }
+  const idOf = (t: MemberTarget): string | undefined =>
+    t.existingId ?? (t.entry !== undefined ? localIds.get(t.entry) : undefined);
   const lines = new Map<RuleStep, { text: string[]; ok: boolean }>();
-  const writes: RuleWrite[] = [];
+  const sent: Array<{ step: RuleStep; spec: ImportRuleSpec }> = [];
   for (const step of plan.rules) {
     const where = describeRuleStep(step);
     if (step.skip !== undefined) {
-      lines.set(step, { text: [`${where}: skipped - ${safe(step.skip)}`], ok: true });
+      const shown = ruleLines(step, 'done', planNames(plan));
+      lines.set(step, { text: shown.lines, ok: shown.ok });
       continue;
     }
-    const write = {
-      step,
-      include: memberIds(step.include, localIds),
-      exclude: memberIds(step.exclude, localIds),
-    };
-    if (step.include.length > 0 && write.include.size === 0) {
+    const spec = ruleSpec(step, idOf);
+    if (step.include.length > 0 && spec.include.length === 0) {
       lines.set(step, {
         text: [`${where}: not created - none of the accounts it includes could be imported`],
         ok: false,
       });
-    } else if (
-      write.include.size + write.exclude.size === 0 &&
-      !step.scopes.some((s) => s.joins === true)
-    ) {
+    } else if (spec.include.length + spec.exclude.length === 0) {
       lines.set(step, {
         text: [`${where}: skipped - none of its accounts were imported`],
         ok: true,
       });
     } else {
-      writes.push(write);
+      sent.push({ step, spec });
     }
   }
 
   let changed = false;
   const handOffLines: string[] = [];
-  if (writes.length > 0) {
-    const specs: ImportRuleSpec[] = writes.map(({ step, include, exclude }) => ({
-      scopes: step.scopes.filter((s) => s.skip === undefined).map(scopeRef),
-      include: [...include.values()],
-      exclude: [...exclude.values()],
-      ...(step.label !== undefined ? { label: step.label } : {}),
-      ...(step.into !== undefined
-        ? { intoRuleId: step.into.id }
-        : step.origin !== undefined
-          ? { origin: step.origin }
-          : {}),
-    }));
+  if (sent.length > 0) {
     // An account the file reserves to a rule runs in no slot here but that rule's: not as the
     // replacement for a slot a rule moves, nor as the seat of a rule the import makes.
     const keepOut = plan.accounts.flatMap((s) =>
       s.kind === 'add' && s.forRule === true ? (localIds.get(s.entry) ?? []) : [],
     );
     try {
-      const result = await engine.importRules(specs, { keepOut });
-      changed = result.handedOff.length > 0;
-      const rules = await engine.listRules();
+      const result = await engine.importRules(
+        sent.map((s) => s.spec),
+        { keepOut },
+      );
       const accounts = await engine.listAllAccounts();
-      const labelOf = (id: string): string => safe(accounts.find((a) => a.id === id)?.label ?? id);
-      for (const [i, write] of writes.entries()) {
-        const outcome = result.rules[i]!;
-        const where = describeRuleStep(write.step);
-        if (!outcome.ok) {
+      const rules = await engine.listRules();
+      const names: ReportNames = {
+        labelOf: (id) => accounts.find((a) => a.id === id)?.label ?? id,
+        slotName: (slot) => slotName(slot, rules),
+        platform: plan.platform,
+      };
+      changed = result.handedOff.length > 0;
+      for (const [k, { step }] of sent.entries()) {
+        const verdict = result.plan.rules[k]!;
+        const outcome = result.outcomes[k];
+        const where = describeRuleStep(step);
+        if (outcome !== undefined && !outcome.ok) {
           if (outcome.partial !== undefined) changed = true;
-          lines.set(write.step, {
+          lines.set(step, {
             text: [
               outcome.partial !== undefined
                 ? `${where}: written only in part - ${safe(outcome.message)}; run the import ` +
                   'again to finish it'
-                : `${where}: not ${write.step.into !== undefined ? 'changed' : 'created'} - ${safe(outcome.message)}`,
+                : `${where}: not ${verdict.kind === 'grow' ? 'changed' : 'created'} - ${safe(outcome.message)}`,
             ],
             ok: false,
           });
           continue;
         }
-        changed = true;
-        lines.set(write.step, {
+        const shown = ruleLines({ ...step, verdict }, 'done', names);
+        if (outcome !== undefined) changed = true;
+        lines.set(step, {
           text: [
-            doneLine(write, outcome.created ? 'created' : 'added to the rule here'),
-            ...scopeDetailLines(write.step),
-            ...slotLines(
-              outcome.rule,
-              outcome.live?.liveAccount ?? null,
-              outcome.runningSessions.length,
-            ),
+            ...shown.lines,
+            ...(outcome !== undefined
+              ? slotLines(
+                  outcome.rule,
+                  outcome.live?.liveAccount ?? null,
+                  outcome.runningSessions.length,
+                )
+              : []),
           ],
-          ok: true,
+          ok: shown.ok,
         });
       }
-      for (const h of result.handedOff) {
-        handOffLines.push(
-          `${safe(slotName(h.slot, rules))} switched off ${labelOf(h.from)} (now reserved) and is ` +
-            `on ${labelOf(h.to)}`,
-        );
-      }
+      for (const hand of result.handedOff) handOffLines.push(handOffLine(hand, 'done', names));
     } catch (err) {
       if (!(err instanceof SwitchEngineError)) throw err;
-      for (const write of writes) {
-        lines.set(write.step, {
-          text: [`${describeRuleStep(write.step)}: not created - ${safe(err.message)}`],
+      for (const { step } of sent) {
+        lines.set(step, {
+          text: [`${describeRuleStep(step)}: not imported - ${safe(err.message)}`],
           ok: false,
         });
       }
     }
   }
-  await recordOrigins(plan, engine);
   for (const step of plan.rules) {
     const entry = lines.get(step)!;
     const [first, ...rest] = entry.text;
@@ -1405,9 +1345,14 @@ export function buildTransferCommands(program: Command): void {
   program
     .command('import <file>')
     .description(
-      'add the accounts, rules and settings of a file written by cctl export (- for standard input)',
+      'add the accounts, rules and settings of a file written by cctl export (- for standard ' +
+        'input); each rule lands whole, growing the rule an earlier import of it made, or fails ' +
+        'naming the rule here in its way',
     )
-    .option('--dry-run', 'print what would be done, and change nothing')
+    .option(
+      '--dry-run',
+      'print what the import would do, decided as the real run decides it, and change nothing',
+    )
     .option(
       '--replace',
       "take the file's tokens for a stored account when they are newer or the stored login is " +

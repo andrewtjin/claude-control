@@ -183,8 +183,8 @@ export interface FolderRule {
   /** Display name. Defaults to the folder the rule was created on. */
   label: string;
   /** Which rule this one is on the machine an import brought it from: that rule's own origin, else
-   *  its id. Set on a rule an import made, or took to be the file's rule. Absent on a rule made here
-   *  by hand. A later import finds the rule by it whatever changed since on either machine (members,
+   *  its id. Set on a rule an import made. Absent on a rule made here by hand, which an import never
+   *  grows. A later import finds the rule by it whatever changed since on either machine (members,
    *  folders, name), so a rule brought over part way is grown rather than made again beside itself.
    *  A lower-case uuid; unlike the id it names nothing on disk. */
   origin?: string;
@@ -414,22 +414,102 @@ export interface RemoveAccountOptions {
   expectRefreshToken?: string;
 }
 
-/** One rule an import asks {@link SwitchEngine.importRules} for. */
+/** One rule an import asks {@link SwitchEngine.importRules} for: one rule of the machine the file
+ *  came from, applied whole or not at all. */
 export interface ImportRuleSpec {
-  /** Every scope of the ONE rule this makes (or adds to), as the operator would name them. */
+  /** Every scope of the ONE rule this makes (or grows), as the operator would name them. */
   scopes: RuleScopeRef[];
   include: string[];
   exclude: string[];
   /** The display name of a rule this creates. */
   label?: string;
-  /** Add the members to this rule instead of creating one; the ones of `scopes` it lacks are added
-   *  to it, and the scopes it holds beyond them stay its own. */
-  intoRuleId?: string;
-  /** The {@link FolderRule.origin} of a rule this creates. */
+  /** The rule's identity across machines (see {@link FolderRule.origin}). The rule here carrying it
+   *  (an earlier import of the same rule), or whose own id it is, is grown rather than a second one
+   *  made; a rule this creates stores it. A spec without one can only create. */
   origin?: string;
 }
 
-/** What {@link SwitchEngine.importRules} did with one {@link ImportRuleSpec}. */
+/** An account an import has not stored yet, which {@link SwitchEngine.planImportRules} counts as
+ *  stored (shared, under this id) when it decides what the rules would do. It has no tokens here
+ *  yet, so it is live in a slot only when the login it names runs there unrecognized. */
+export interface PendingImportAccount {
+  /** The id rule specs name it by; any string no stored account has. */
+  id: string;
+  label: string;
+  /** Its login, by which a slot already running that login recognizes it once it is stored. */
+  accountUuid?: string;
+  /** Whether it arrives with tokens; without, it is stored quarantined (no slot can move to it). */
+  withTokens: boolean;
+  autoSwitchExcluded?: boolean;
+}
+
+/** What a {@link SwitchEngine.importRules} batch is told beyond its specs. */
+export interface ImportRulesOptions {
+  /** Accounts no slot may be moved to or seated with unless their own rule includes them. */
+  keepOut?: readonly string[];
+}
+
+/** What {@link SwitchEngine.planImportRules} is told about the import around the rules. */
+export interface PlanImportRulesOptions extends ImportRulesOptions {
+  /** The accounts the import stores before it writes the rules. */
+  pending?: readonly PendingImportAccount[];
+  /** Logins the import gives accounts already stored that record none yet: a slot running such a
+   *  login unrecognized holds that account once the import has run. */
+  logins?: ReadonlyArray<{ id: string; accountUuid: string }>;
+}
+
+/** A member of a rule an import leaves out, and why: the rule here it grows excludes (or
+ *  includes) the account already, or another rule here reserves an account to be excluded (only a
+ *  shared account can be excluded). */
+export interface ImportLeftOut {
+  id: string;
+  why: 'excluded-here' | 'included-here' | 'reserved-here';
+}
+
+/** The scope that keeps a rule of the file from landing whole: held by a rule of this machine (a
+ *  different rule from the file's, or one with no identity), or by an earlier rule of the same
+ *  batch (`rule` absent). */
+export interface ImportConflict {
+  scope: RuleScopeRef;
+  rule?: { id: string; label: string };
+}
+
+/**
+ * What an import does with one {@link ImportRuleSpec}, decided before anything is written:
+ * `create` a new rule on every scope, `grow` the rule here that carries its identity (with the
+ * scopes and members it lacks), leave it `unchanged` (the rule here already has all of it), or
+ * `refused` with the engine's own refusal. Never a rule on part of the spec's scopes.
+ */
+export type ImportRuleVerdict =
+  | {
+      kind: 'create';
+      scopes: RuleScopeRef[];
+      include: string[];
+      exclude: string[];
+      leftOut: ImportLeftOut[];
+    }
+  | {
+      kind: 'grow';
+      /** The rule grown, as it stands before the import. */
+      rule: FolderRule;
+      /** The scopes it gains. */
+      scopes: RuleScopeRef[];
+      /** The members it gains. */
+      include: string[];
+      exclude: string[];
+      leftOut: ImportLeftOut[];
+    }
+  | { kind: 'unchanged'; reason: string; rule?: FolderRule; leftOut: ImportLeftOut[] }
+  | { kind: 'refused'; message: string; conflict?: ImportConflict };
+
+/** Everything an import of rules would do: the verdict on each spec, in spec order, and every slot
+ *  it would move off an account it reserves. */
+export interface ImportRulesPlan {
+  rules: ImportRuleVerdict[];
+  handOffs: SlotHandOff[];
+}
+
+/** What {@link SwitchEngine.importRules} did with one spec it wrote (a `create` or `grow`). */
 export type ImportRuleOutcome =
   | {
       ok: true;
@@ -447,9 +527,12 @@ export type ImportRuleOutcome =
       partial?: FolderRule;
     };
 
-/** What {@link SwitchEngine.importRules} did, rule by rule, and the slots it moved first. */
+/** What {@link SwitchEngine.importRules} decided (`plan`, the same decision
+ *  {@link SwitchEngine.planImportRules} reports), what it then did with each spec it wrote
+ *  (`outcomes`, undefined for one it did not write), and the slots it moved first. */
 export interface ImportRulesResult {
-  rules: ImportRuleOutcome[];
+  plan: ImportRulesPlan;
+  outcomes: Array<ImportRuleOutcome | undefined>;
   handedOff: SlotHandOff[];
 }
 

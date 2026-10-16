@@ -18,6 +18,8 @@ import {
   Vault,
   VaultError,
   acquireLock,
+  groupProfileDir,
+  ruleSlotId,
   sandboxPaths,
   type ClaudeOauth,
   type CredentialBundle,
@@ -1120,23 +1122,25 @@ describe('rules travel whole', () => {
     await b.engine.addAccount('other', bundle('O1', 'u-other'));
     const live = await b.engine.addAccount('client', bundle('C2', 'u-client'));
     await b.engine.activate(live.id);
-    await importInto(b, file, { dryRun: true });
-    expect(b.out.join('')).toContain("this machine's main login moves off client");
-    b.out.length = 0;
-    expect(await importInto(b, file)).toEqual({ failed: 0 });
-    expect(b.out.join('')).toContain(
-      'the global slot switched off client (now reserved) and is on other',
+    const moved = await dryThenReal(b, file);
+    expect(moved.failed).toBe(0);
+    expect(moved.dry).toContain('  the global slot moves off client onto other');
+    expect(moved.real).toContain(
+      '  the global slot switched off client (now reserved) and is on other',
     );
+    expectSameVerdicts(moved);
 
     const c = await machine();
     const only = await c.engine.addAccount('client', bundle('C3', 'u-client'));
     await c.engine.activate(only.id);
-    const why = "including client would leave this machine's main login with no shared account";
-    await importInto(c, file, { dryRun: true });
-    expect(c.out.join('')).toContain(why);
-    c.out.length = 0;
-    expect(await importInto(c, file)).toEqual({ failed: 0 });
-    expect(c.out.join('')).toContain(why);
+    const refused = await dryThenReal(c, file);
+    expect(refused.failed).toBe(1);
+    expect(refused.dry.join('\n')).toContain(
+      'not imported - cannot include "client": it is the only usable shared account, so ' +
+        'reserving it would leave the global slot with none',
+    );
+    expectSameVerdicts(refused);
+    expect(await c.engine.listRules()).toEqual([]);
   });
 
   it('keeps out of auto-switch an account whose rule could not be made here', async () => {
@@ -1532,7 +1536,7 @@ describe('a rule an earlier import made part way', () => {
     expect(rules[0]!.activeId).toBe(xb.id);
   });
 
-  it("grows the rule beside a rule of this machine's own that holds one of its folders", async () => {
+  it("fails, in every import, a rule beside a rule of this machine's own on one of its folders", async () => {
     const a = await machine();
     const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
     const alpha = await a.engine.addAccount('alpha', bundle('A1', 'u-alpha'));
@@ -1553,27 +1557,20 @@ describe('a rule an earlier import made part way', () => {
     const b = await machine();
     const other = await b.engine.addAccount('other', bundle('O1', 'u-other'));
     await b.engine.includeInFolder(f1, [other.id], { label: 'mine' });
+    const before = await b.engine.listRules();
     await rm(f2, { recursive: true, force: true });
-    expect(await importInto(b, file)).toEqual({ failed: 0 });
-    expect((await b.engine.listRules()).map((r) => r.label).sort()).toEqual(['mine', 'work-rule']);
+    const first = await dryThenReal(b, file);
+    expect(first.failed).toBe(1);
+    expect(first.dry.join('\n')).toContain(`folder ${f1} already has a rule here ("mine")`);
+    expectSameVerdicts(first);
+    expect(await b.engine.listRules()).toEqual(before);
 
     await mkdir(f2, { recursive: true });
-    b.out.length = 0;
-    await importInto(b, file, { dryRun: true });
-    const dry = b.out.join('');
-    expect(dry).toContain(`folder ${f2}: joins the rule here`);
-    expect(dry).toContain(`folder ${f1}: left out - this machine has another rule there`);
-    expect(dry).not.toContain(': create');
-    b.out.length = 0;
-    expect(await importInto(b, file)).toEqual({ failed: 0 });
-    const rules = await b.engine.listRules();
-    expect(rules.map((r) => r.label).sort()).toEqual(['mine', 'work-rule']);
-    const work = rules.find((r) => r.label === 'work-rule')!;
-    expect(work.folders).toHaveLength(1);
-    expect(work.aliases).toHaveLength(1);
-    const xb = (await b.engine.listAllAccounts()).find((r) => r.label === 'x')!;
-    expect(work.activeId).toBe(xb.id);
-    expect(rules.find((r) => r.label === 'mine')!.folders).toEqual([f1]);
+    const second = await dryThenReal(b, file);
+    expect(second.failed).toBe(1);
+    expect(second.dry.join('\n')).not.toContain(': create');
+    expectSameVerdicts(second);
+    expect(await b.engine.listRules()).toEqual(before);
   });
 
   /** A source rule on two folders including x, exported while only the first exists on `b`, then
@@ -1659,23 +1656,15 @@ describe('a rule an earlier import made part way', () => {
     await b.engine.excludeInFolder(f3, [epsb.id]);
     const before = (await b.engine.listRules())[0]!;
 
-    await importInto(b, file, { dryRun: true });
-    const dry = b.out.join('');
-    expect(dry).toContain(`folder ${f3}: left out - this machine has another rule there`);
-    expect(dry).not.toContain('joins the rule here');
-    b.out.length = 0;
-    expect(await importInto(b, file)).toEqual({ failed: 0 });
-    const rules = await b.engine.listRules();
-    expect(rules).toHaveLength(2);
-    const mine = rules.find((r) => r.id === before.id)!;
-    expect(mine.folders).toEqual([f3]);
-    expect(mine.include).toEqual(before.include);
-    expect(mine.exclude).toEqual(before.exclude);
-    expect(mine.origin).toBeUndefined();
-    expect(rules.find((r) => r.id !== before.id)!.folders).toEqual([f1]);
+    const run = await dryThenReal(b, file);
+    expect(run.failed).toBe(1);
+    expect(run.dry.join('\n')).toContain(`folder ${f3} already has a rule here ("mine")`);
+    expect(run.dry.join('\n')).not.toContain('joins the rule here');
+    expectSameVerdicts(run);
+    expect(await b.engine.listRules()).toEqual([before]);
   });
 
-  it('grows a rule of its own the first import took by its folders, once the source adds one', async () => {
+  it("never takes a rule of its own on exactly the file rule's folders, before or after the source adds one", async () => {
     const a = await machine();
     const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
     await a.engine.addAccount('s', bundle('S1', 'u-s'));
@@ -1684,26 +1673,26 @@ describe('a rule an earlier import made part way', () => {
     const first = join(a.root, 'first');
     await runExport(first, exportAll, a.deps);
 
-    // b's own rule on exactly e1, with every member the file's has: nothing to add, but it is
-    // taken for the file's rule all the same.
+    // b's own rule on exactly e1, with every member the file's has: still b's own rule.
     const b = await machine();
     const xb = await b.engine.addAccount('x', bundle('X2', 'u-x'));
     await b.engine.addAccount('s2', bundle('S2', 'u-s2'));
     await b.engine.includeInFolder(f1, [xb.id]);
-    expect(await importInto(b, first)).toEqual({ failed: 0 });
-    expect(b.out.join('')).toContain('this machine already has this rule, with these accounts');
-    expect((await b.engine.listRules())[0]!.origin).toBe(rule.id);
+    const before = await b.engine.listRules();
+    const once = await dryThenReal(b, first);
+    expect(once.failed).toBe(1);
+    expectSameVerdicts(once);
+    expect(await b.engine.listRules()).toEqual(before);
 
     const f2 = await folder(a, 'e2');
     await a.vault.addScopesToRule(rule.id, { folders: [f2] });
     const second = join(a.root, 'second');
     await runExport(second, exportAll, a.deps);
-    b.out.length = 0;
-    expect(await importInto(b, second)).toEqual({ failed: 0 });
-    expect(b.out.join('')).toContain(`folder ${f2}: joins the rule here`);
-    const rules = await b.engine.listRules();
-    expect(rules).toHaveLength(1);
-    expect(rules[0]!.folders).toEqual([f1, f2]);
+    const again = await dryThenReal(b, second);
+    expect(again.failed).toBe(1);
+    expect(again.dry.join('\n')).not.toContain('joins the rule here');
+    expectSameVerdicts(again);
+    expect(await b.engine.listRules()).toEqual(before);
   });
 
   it('finds the rule again on the machine it came from, and on a third machine', async () => {
@@ -1799,8 +1788,13 @@ describe('importing the same file again', () => {
   });
 });
 
+/** The engine's refusal of a rule whose reservation would leave the main login with nothing. */
+const MAIN_LOGIN_LEFT_EMPTY =
+  'not imported - cannot include "client": it is the only usable shared account, so reserving ' +
+  'it would leave the global slot with none';
+
 describe('what the dry run promises, the real run does', () => {
-  it("skips a rule that would leave another rule's slot with no account, in both runs", async () => {
+  it("fails a rule that would leave another rule's slot with no account, in both runs", async () => {
     const a = await machine();
     const client = await a.engine.addAccount('client', bundle('C1', 'u-client'));
     await a.engine.includeInFolder(await folder(a, 'proj'), [client.id]);
@@ -1814,23 +1808,24 @@ describe('what the dry run promises, the real run does', () => {
     const side = await folder(b, 'side');
     // The side rule excludes 'other', so its slot runs 'client', the one account left to it.
     await b.engine.excludeInFolder(side, [other.id]);
-    const why = `including client would leave the slot of ${side} with no other account to run on`;
-    await importInto(b, file, { dryRun: true });
-    expect(b.out.join('')).toContain(why);
-    b.out.length = 0;
-    expect(await importInto(b, file)).toEqual({ failed: 0 });
-    expect(b.out.join('')).toContain(why);
+    const why =
+      `not imported - cannot include "client": it is live in the folder slot of ${side}, and ` +
+      'that folder has no other account to switch to';
+    const run = await dryThenReal(b, file);
+    expect(run.failed).toBe(1);
+    expect(run.dry.join('\n')).toContain(why);
+    expectSameVerdicts(run);
     expect(await b.engine.listRules()).toHaveLength(1);
   });
 
-  it('skips adding accounts past what one rule may include, in both runs', async () => {
+  it('fails adding accounts past what one rule may include, in both runs', async () => {
     const b = await machine();
     const proj = await folder(b, 'proj');
     const held: string[] = [];
     for (let i = 0; i < 31; i += 1) {
       held.push((await b.vault.addPendingAccount(`h${i}`, { accountUuid: `u-h${i}` }, 'w')).id);
     }
-    await b.vault.createRule({ folders: [proj], include: held });
+    const here = await b.vault.createRule({ folders: [proj], include: held });
     const file = await sealedFile(
       b,
       filePayload({
@@ -1843,6 +1838,8 @@ describe('what the dry run promises, the real run does', () => {
         rules: [
           {
             label: 'r',
+            // The file came from this machine: its rule is the one here.
+            origin: here.id,
             folders: [proj],
             aliases: [],
             include: ['u-n0', 'u-n1', 'u-n2'],
@@ -1851,12 +1848,11 @@ describe('what the dry run promises, the real run does', () => {
         ],
       }),
     );
-    const why = `folder ${proj}: skipped - the rule would include more than 32 accounts`;
-    await importInto(b, file, { dryRun: true });
-    expect(b.out.join('')).toContain(why);
-    b.out.length = 0;
-    expect(await importInto(b, file)).toEqual({ failed: 0 });
-    expect(b.out.join('')).toContain(why);
+    const why = `folder ${proj}: not imported - a folder rule cannot include more than 32 accounts`;
+    const run = await dryThenReal(b, file);
+    expect(run.failed).toBe(1);
+    expect(run.dry).toContain(`  ${why}`);
+    expectSameVerdicts(run);
     expect((await b.engine.listRules())[0]!.include).toHaveLength(31);
   });
 
@@ -1909,24 +1905,21 @@ describe('what the dry run promises, the real run does', () => {
       return b;
     }
 
-    // Nothing else here can take the main login: both runs skip the rule.
+    // Nothing else here can take the main login: both runs refuse the rule.
     const b = await target(false);
-    const why = "including client would leave this machine's main login with no shared account";
-    await importInto(b, withTokens, { dryRun: true });
-    expect(b.out.join('')).toContain(why);
-    b.out.length = 0;
-    expect(await importInto(b, withTokens)).toEqual({ failed: 0 });
-    expect(b.out.join('')).toContain(why);
+    const refused = await dryThenReal(b, withTokens);
+    expect(refused.failed).toBe(1);
+    expect(refused.dry.join('\n')).toContain(MAIN_LOGIN_LEFT_EMPTY);
+    expectSameVerdicts(refused);
     expect(await b.engine.listRules()).toEqual([]);
 
     // With another account here, both runs say the main login moves, with tokens or without.
     for (const file of [withTokens, without]) {
       const c = await target(true);
-      await importInto(c, file, { dryRun: true });
-      expect(c.out.join('')).toContain("this machine's main login moves off client");
-      c.out.length = 0;
-      expect(await importInto(c, file)).toEqual({ failed: 0 });
-      expect(c.out.join('')).toMatch(/switched off client \(now reserved\) and is on other/);
+      const moved = await dryThenReal(c, file);
+      expect(moved.failed).toBe(0);
+      expect(moved.dry).toContain('  the global slot moves off client onto other');
+      expectSameVerdicts(moved);
       expect(await c.engine.listRules()).toHaveLength(1);
     }
   });
@@ -2006,22 +1999,23 @@ describe('what the dry run promises, the real run does', () => {
 
     const b = await target(false);
     const file = await second(b);
-    const why = "including client would leave this machine's main login with no shared account";
     await importInto(b, file, { dryRun: true, replace: true });
-    expect(b.out.join('')).toContain(why);
+    const dry = ruleSection(b.out.join(''));
+    expect(dry.join('\n')).toContain(MAIN_LOGIN_LEFT_EMPTY);
     b.out.length = 0;
-    expect(await importInto(b, file, { replace: true })).toEqual({ failed: 0 });
-    expect(b.out.join('')).toContain(why);
+    expect(await importInto(b, file, { replace: true })).toEqual({ failed: 1 });
+    expectSameVerdicts({ dry, real: ruleSection(b.out.join('')) });
     expect(await b.engine.listRules()).toEqual([]);
     expect(await b.engine.getActiveId('global')).toBe(CID);
 
     const c = await target(true);
     const fileC = await second(c);
     await importInto(c, fileC, { dryRun: true, replace: true });
-    expect(c.out.join('')).toContain("this machine's main login moves off client");
+    const dryC = ruleSection(c.out.join(''));
+    expect(dryC).toContain('  the global slot moves off client onto other');
     c.out.length = 0;
     expect(await importInto(c, fileC, { replace: true })).toEqual({ failed: 0 });
-    expect(c.out.join('')).toMatch(/switched off client \(now reserved\) and is on other/);
+    expectSameVerdicts({ dry: dryC, real: ruleSection(c.out.join('')) });
     expect(await c.engine.listRules()).toHaveLength(1);
   });
 
@@ -2140,7 +2134,11 @@ describe('accounts a rule of the file reserves', () => {
     b.deps.engine = engineWith(b.engine, {
       importRules: (specs) =>
         Promise.resolve({
-          rules: specs.map(() => ({ ok: false as const, message: 'refused here' })),
+          plan: {
+            rules: specs.map(() => ({ kind: 'refused' as const, message: 'refused here' })),
+            handOffs: [],
+          },
+          outcomes: specs.map(() => undefined),
           handedOff: [],
         }),
     });
@@ -2372,4 +2370,336 @@ describe('a file larger than any setup', () => {
     expect(made).toHaveLength(64);
     expect(made.every((r) => r.aliases?.length === 16)).toBe(true);
   }, 300_000);
+});
+
+// ---------------------------------------------------------------------------
+// The dry run is the engine's own decision, and a file rule lands whole or not at all
+// ---------------------------------------------------------------------------
+
+/** The lines a report prints under "Rules:". */
+function ruleSection(report: string): string[] {
+  const lines = report.split('\n');
+  const start = lines.indexOf('Rules:');
+  const end = lines.indexOf('Settings:', start);
+  return lines.slice(start + 1, end);
+}
+
+/** A dry-run rule line as the real run reports the same verdict: the verb in the past tense, and a
+ *  slot move as made rather than to be made. */
+function asDone(line: string): string {
+  return line
+    .replace(/^(\s+\S.*?): create\b/, '$1: created')
+    .replace(': add to the rule here', ': added to the rule here')
+    .replace(/ moves off (.+) onto (.+)$/, ' switched off $1 (now reserved) and is on $2');
+}
+
+/** Import `file` into `m` as a dry run and then for real, returning both runs' rule lines and the
+ *  real run's failure count. */
+async function dryThenReal(
+  m: Machine,
+  file: string,
+): Promise<{ dry: string[]; real: string[]; failed: number }> {
+  m.out.length = 0;
+  expect(await importInto(m, file, { dryRun: true })).toEqual({ failed: 0 });
+  const dry = ruleSection(m.out.join(''));
+  m.out.length = 0;
+  const { failed } = await importInto(m, file);
+  return { dry, real: ruleSection(m.out.join('')), failed };
+}
+
+/** Every line the dry run printed for the rules is the line the real run printed. */
+function expectSameVerdicts(run: { dry: string[]; real: string[] }): void {
+  expect(run.dry.length).toBeGreaterThan(0);
+  for (const line of run.dry) expect(run.real).toContain(asDone(line));
+}
+
+/** The credential store over a rule's profile, to plant what a by-hand login there leaves. */
+function ruleStore(m: Machine, ruleId: string): CredentialStore {
+  const profileDir = groupProfileDir(m.paths.vaultDir, ruleId);
+  return new CredentialStore({
+    claudeDir: profileDir,
+    credentialsPath: join(profileDir, '.credentials.json'),
+    claudeJsonPath: join(profileDir, '.claude.json'),
+    vaultDir: m.paths.vaultDir,
+  });
+}
+
+describe('a file rule lands whole or not at all', () => {
+  it('fails a rule one of whose folders holds a rule of this machine, making nothing on the rest', async () => {
+    const a = await machine();
+    const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
+    await a.engine.addAccount('s', bundle('S1', 'u-s'));
+    const o1 = await folder(a, 'o1');
+    const o3 = await folder(a, 'o3');
+    await a.vault.createRule({ folders: [o1, o3], include: [x.id], label: 'work' });
+    const file = join(a.root, 'f');
+    await runExport(file, exportAll, a.deps);
+
+    const b = await machine();
+    const xb = await b.engine.addAccount('x', bundle('X2', 'u-x'));
+    await b.engine.addAccount('s2', bundle('S2', 'u-s2'));
+    await b.engine.includeInFolder(o3, [xb.id], { label: 'mine' });
+    const before = await b.engine.listRules();
+
+    const run = await dryThenReal(b, file);
+    expect(run.failed).toBe(1);
+    const line = run.dry.find((l) => l.includes(': not imported - '));
+    expect(line).toContain(`folder ${o3}`);
+    expect(line).toContain('cctl folder reset');
+    expectSameVerdicts(run);
+    expect(await b.engine.listRules()).toEqual(before);
+  });
+
+  it('fails, rather than making a second rule, when the source remade its rule under a new identity', async () => {
+    const a = await machine();
+    const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
+    await a.engine.addAccount('s', bundle('S1', 'u-s'));
+    const p1 = await folder(a, 'p1');
+    const first = await a.vault.createRule({ folders: [p1], include: [x.id], label: 'work' });
+    const f1 = join(a.root, 'f1');
+    await runExport(f1, exportAll, a.deps);
+    const b = await machine();
+    expect(await importInto(b, f1)).toEqual({ failed: 0 });
+    const before = await b.engine.listRules();
+
+    await a.vault.removeRule(first.id);
+    const p2 = await folder(a, 'p2');
+    await a.vault.createRule({ folders: [p1, p2], include: [x.id], label: 'work' });
+    const f2 = join(a.root, 'f2');
+    await runExport(f2, exportAll, a.deps);
+
+    const run = await dryThenReal(b, f2);
+    expect(run.failed).toBe(1);
+    expect(run.dry.find((l) => l.includes(': not imported - '))).toContain(`folder ${p1}`);
+    expectSameVerdicts(run);
+    expect(await b.engine.listRules()).toEqual(before);
+  });
+
+  it('fails a rule the file gives no identity when a folder of it holds a rule here', async () => {
+    const b = await machine();
+    const o1 = await folder(b, 'o1');
+    const o3 = await folder(b, 'o3');
+    const q = await b.engine.addAccount('q', bundle('Q1', 'u-q'));
+    await b.engine.addAccount('s', bundle('S1', 'u-s'));
+    await b.engine.includeInFolder(o3, [q.id]);
+    const before = await b.engine.listRules();
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: [{ label: 'x', accountUuid: 'u-x', autoSwitchExcluded: false }],
+        rules: [{ label: 'r', folders: [o1, o3], aliases: [], include: ['u-x'], exclude: [] }],
+      }),
+    );
+    const run = await dryThenReal(b, file);
+    expect(run.failed).toBe(1);
+    expect(run.dry.find((l) => l.includes(': not imported - '))).toContain(`folder ${o3}`);
+    expectSameVerdicts(run);
+    expect(await b.engine.listRules()).toEqual(before);
+  });
+
+  it('never grows a rule here that carries another identity, though it holds exactly the same folders', async () => {
+    // b's rule on e1 came from machine c; a's rule on e1 is a different rule.
+    const a = await machine();
+    const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
+    await a.engine.addAccount('s', bundle('S1', 'u-s'));
+    const e1 = await folder(a, 'e1');
+    const ruleA = await a.vault.createRule({ folders: [e1], include: [x.id], label: 'work' });
+    const fromA = join(a.root, 'a1');
+    await runExport(fromA, exportAll, a.deps);
+
+    const c = await machine();
+    const y = await c.engine.addAccount('y', bundle('Y1', 'u-y'));
+    await c.engine.addAccount('t', bundle('T1', 'u-t'));
+    await c.vault.createRule({ folders: [e1], include: [y.id], label: 'theirs' });
+    const fromC = join(c.root, 'c1');
+    await runExport(fromC, exportAll, c.deps);
+
+    const b = await machine();
+    expect(await importInto(b, fromC)).toEqual({ failed: 0 });
+    const before = await b.engine.listRules();
+
+    const run = await dryThenReal(b, fromA);
+    expect(run.failed).toBe(1);
+    expectSameVerdicts(run);
+    expect(await b.engine.listRules()).toEqual(before);
+
+    // The source adds a folder: still no second rule beside the one here.
+    const e2 = await folder(a, 'e2');
+    await a.vault.addScopesToRule(ruleA.id, { folders: [e2] });
+    const again = join(a.root, 'a2');
+    await runExport(again, exportAll, a.deps);
+    const second = await dryThenReal(b, again);
+    expect(second.failed).toBe(1);
+    expectSameVerdicts(second);
+    expect(await b.engine.listRules()).toEqual(before);
+  });
+
+  it('keeps one rule per source rule across three machines', async () => {
+    const bm = await machine();
+    const y = await bm.engine.addAccount('y', bundle('Y1', 'u-y'));
+    await bm.engine.addAccount('t', bundle('T1', 'u-t'));
+    const q1 = await folder(bm, 'q1');
+    const q2 = await folder(bm, 'q2');
+    await bm.vault.createRule({ folders: [q1, q2], include: [y.id], label: 'theirs' });
+    const fromB = join(bm.root, 'b');
+    await runExport(fromB, exportAll, bm.deps);
+
+    const c = await machine();
+    expect(await importInto(c, fromB)).toEqual({ failed: 0 });
+    const before = await c.engine.listRules();
+
+    const a = await machine();
+    const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
+    await a.engine.addAccount('s', bundle('S1', 'u-s'));
+    const ruleA = await a.vault.createRule({ folders: [q1, q2], include: [x.id], label: 'work' });
+    const fromA = join(a.root, 'a1');
+    await runExport(fromA, exportAll, a.deps);
+    const run = await dryThenReal(c, fromA);
+    expect(run.failed).toBe(1);
+    expectSameVerdicts(run);
+    expect(await c.engine.listRules()).toEqual(before);
+
+    const q3 = await folder(a, 'q3');
+    await a.vault.addScopesToRule(ruleA.id, { folders: [q3] });
+    const again = join(a.root, 'a2');
+    await runExport(again, exportAll, a.deps);
+    const second = await dryThenReal(c, again);
+    expect(second.failed).toBe(1);
+    expectSameVerdicts(second);
+    expect(await c.engine.listRules()).toEqual(before);
+  });
+});
+
+describe('the dry run is the decision the real run makes', () => {
+  /** A rule imported to `b` from `a`, and the source rule, so a test can grow either side. */
+  async function imported(): Promise<{
+    a: Machine;
+    b: Machine;
+    source: string;
+    here: string;
+    p: string;
+  }> {
+    const a = await machine();
+    const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
+    await a.engine.addAccount('s', bundle('S1', 'u-s'));
+    const p = await folder(a, 'p');
+    const rule = await a.vault.createRule({ folders: [p], include: [x.id], label: 'work' });
+    const file = join(a.root, 'first');
+    await runExport(file, exportAll, a.deps);
+    const b = await machine();
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    const here = (await b.engine.listRules())[0]!.id;
+    return { a, b, source: rule.id, here, p };
+  }
+
+  it('foresees a grown rule passing the cap on session aliases', async () => {
+    const { a, b, source, here, p } = await imported();
+    await b.vault.addScopesToRule(here, {
+      folders: [],
+      aliases: Array.from({ length: 256 }, (_, i) => ({ folder: p, alias: `s${i}` })),
+    });
+    const before = await b.engine.listRules();
+    await a.vault.addScopesToRule(source, {
+      folders: [],
+      aliases: [{ folder: p, alias: 'extra' }],
+    });
+    const file = join(a.root, 'second');
+    await runExport(file, exportAll, a.deps);
+    const run = await dryThenReal(b, file);
+    expect(run.failed).toBe(1);
+    expect(run.dry.find((l) => l.includes(': not imported - '))).toContain(
+      'a folder rule cannot hold more than 256 session aliases',
+    );
+    expectSameVerdicts(run);
+    expect(await b.engine.listRules()).toEqual(before);
+  });
+
+  it('foresees a grown rule passing the cap on folders', async () => {
+    const { a, b, source, here } = await imported();
+    await b.vault.addScopesToRule(here, {
+      folders: Array.from({ length: 255 }, (_, i) => join(b.root, 'nf', `f${i}`)),
+    });
+    const before = await b.engine.listRules();
+    await a.vault.addScopesToRule(source, { folders: [await folder(a, 'p2')] });
+    const file = join(a.root, 'second');
+    await runExport(file, exportAll, a.deps);
+    const run = await dryThenReal(b, file);
+    expect(run.failed).toBe(1);
+    expect(run.dry.find((l) => l.includes(': not imported - '))).toContain(
+      'a folder rule cannot hold more than 256 folders',
+    );
+    expectSameVerdicts(run);
+    expect(await b.engine.listRules()).toEqual(before);
+  });
+
+  /** A file whose one rule, on its own folder, includes client. */
+  async function clientFile(): Promise<string> {
+    const a = await machine();
+    const client = await a.engine.addAccount('client', bundle('C1', 'u-client'));
+    await a.engine.includeInFolder(await folder(a, 'proj'), [client.id]);
+    const file = join(a.root, 'f');
+    await runExport(file, exportAll, a.deps);
+    return file;
+  }
+
+  /** Log `uuid`'s login in by hand inside a rule's profile, as `/login` there would. */
+  async function loginInProfile(
+    m: Machine,
+    ruleId: string,
+    access: string,
+    uuid: string,
+  ): Promise<void> {
+    const store = ruleStore(m, ruleId);
+    await store.writeLiveCredentials(bundle(access, uuid).claudeAiOauth);
+    await store.writeOauthAccount({ accountUuid: uuid, emailAddress: `${uuid}@x.com` });
+  }
+
+  it('reads who is live in a slot recorded empty, and fails the rule in both runs', async () => {
+    const file = await clientFile();
+    const b = await machine();
+    const other = await b.engine.addAccount('other', bundle('O1', 'u-other'));
+    await b.engine.activate(other.id);
+    const side = await folder(b, 'side');
+    await b.engine.excludeInFolder(side, [other.id]);
+    const sideRule = (await b.engine.listRules())[0]!;
+    expect(sideRule.activeId).toBeNull();
+    await loginInProfile(b, sideRule.id, 'C2', 'u-client');
+    const client = await b.engine.addAccount('client', bundle('C2', 'u-client'));
+    expect((await b.engine.listRules())[0]!.activeId).toBeNull();
+    expect(await b.engine.getActiveId(ruleSlotId(sideRule.id))).toBe(client.id);
+
+    const run = await dryThenReal(b, file);
+    expect(run.failed).toBe(1);
+    expect(run.dry.find((l) => l.includes(': not imported - '))).toContain(
+      `it is live in the folder slot of ${side}`,
+    );
+    expectSameVerdicts(run);
+    expect((await b.engine.listRules()).map((r) => r.id)).toEqual([sideRule.id]);
+    expect(await b.engine.getActiveId(ruleSlotId(sideRule.id))).toBe(client.id);
+  });
+
+  it('reads who is live in a slot whose record names another account, and says it moves', async () => {
+    const file = await clientFile();
+    const b = await machine();
+    const work = await b.engine.addAccount('work', bundle('W1', 'u-work'));
+    const other = await b.engine.addAccount('other', bundle('O1', 'u-other'));
+    await b.engine.activate(other.id);
+    const side = await folder(b, 'side');
+    await b.engine.excludeInFolder(side, [other.id]);
+    const sideRule = (await b.engine.listRules())[0]!;
+    expect(sideRule.activeId).toBe(work.id);
+    const client = await b.engine.addAccount('client', bundle('C2', 'u-client'));
+    await loginInProfile(b, sideRule.id, 'C2', 'u-client');
+    expect((await b.engine.listRules())[0]!.activeId).toBe(work.id);
+    expect(await b.engine.getActiveId(ruleSlotId(sideRule.id))).toBe(client.id);
+
+    const run = await dryThenReal(b, file);
+    expect(run.failed).toBe(0);
+    expect(run.dry).toContain(`  the folder slot of ${side} moves off client onto work`);
+    expectSameVerdicts(run);
+    const rules = await b.engine.listRules();
+    expect(rules).toHaveLength(2);
+    expect(rules.find((r) => r.id !== sideRule.id)!.include).toEqual([client.id]);
+    expect(await b.engine.getActiveId(ruleSlotId(sideRule.id))).toBe(work.id);
+  });
 });
