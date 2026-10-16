@@ -53,6 +53,33 @@ async function atomicWriteFile(target: string, data: string): Promise<void> {
   await rename(tmp, target);
 }
 
+/**
+ * Write main settings.json crash-safely, then re-link each profile settings.json that shared the
+ * replaced inode. The temp+rename gives main a fresh inode, leaving such a profile on a copy of the
+ * old main; it holds nothing main did not, yet the profile repair would back it up as a losing copy
+ * and push older backups out of the bounded set. A profile on any other inode is left alone, for the
+ * guard propagation and the profile repair to back up first.
+ */
+async function writeSettings(
+  settingsPath: string,
+  data: string,
+  profileSettingsPaths: readonly string[] = [],
+): Promise<void> {
+  const old = await stat(settingsPath, { bigint: true }).catch(() => undefined);
+  await atomicWriteFile(settingsPath, data);
+  if (old === undefined || old.ino === 0n) return;
+  for (const profilePath of profileSettingsPaths) {
+    try {
+      const profile = await stat(profilePath, { bigint: true });
+      if (profile.ino === old.ino && profile.dev === old.dev) {
+        await linkOrCopy(settingsPath, profilePath);
+      }
+    } catch {
+      // Best-effort: the profile repair still heals a link this could not.
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Shapes
 // ---------------------------------------------------------------------------
@@ -151,6 +178,8 @@ export interface InstallHooksOptions {
    *  would append a fresh entry and leave the old one behind. Optional because the marker is
    *  meaningless for callers whose commands are stable across runs. */
   ownedCommandMarker?: string;
+  /** Group profile settings.json files that share main's inode; kept on it across a rewrite. */
+  profileSettingsPaths?: string[];
 }
 
 export async function installHooks(options: InstallHooksOptions): Promise<void> {
@@ -175,7 +204,9 @@ export async function installHooks(options: InstallHooksOptions): Promise<void> 
   }
 
   const after = JSON.stringify(settings, null, 2);
-  if (after !== before) await atomicWriteFile(options.settingsPath, after);
+  if (after !== before) {
+    await writeSettings(options.settingsPath, after, options.profileSettingsPaths);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +220,8 @@ export interface InstallBindGuardOptions {
   /** The event the guard fires on. Defaults to UserPromptSubmit (spec §9); overridable only so a
    *  caller with renamed events can keep them consistent. */
   eventName?: string;
+  /** Group profile settings.json files that share main's inode; kept on it across a rewrite. */
+  profileSettingsPaths?: string[];
 }
 
 /**
@@ -233,7 +266,9 @@ export async function installBindGuard(options: InstallBindGuardOptions): Promis
 
   hooksSection[event] = groups;
   const after = JSON.stringify(settings, null, 2);
-  if (after !== before) await atomicWriteFile(options.settingsPath, after);
+  if (after !== before) {
+    await writeSettings(options.settingsPath, after, options.profileSettingsPaths);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +386,7 @@ export async function ensureBindGuard(
       ...(options.nodePath !== undefined ? { nodePath: options.nodePath } : {}),
     }),
     ...eventOpt,
+    profileSettingsPaths,
   });
   // Propagate the guard into each group profile's settings.json. The install above wrote main via
   // temp+rename (a fresh inode), so any profile still hard-linked to the OLD main inode now points at
