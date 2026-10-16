@@ -226,6 +226,33 @@ describe('planImport: accounts', () => {
     ]);
   });
 
+  it('numbers a label that spells an id the same import keeps, whichever entry comes first', () => {
+    // One entry is labelled with the id another entry keeps: the vault would refuse whichever of
+    // the two it stored second, so the plan renames the label instead.
+    for (const order of [0, 1]) {
+      const labelled = entry(ID2, { accountUuid: 'u-q', id: ID1 });
+      const holder = entry('p', { accountUuid: 'u-p', id: ID2 });
+      const accounts = order === 0 ? [labelled, holder] : [holder, labelled];
+      const plan = planImport(input({ payload: payload({ accounts }) }));
+      const steps = plan.accounts as Array<{ label: string; id?: string; entry: number }>;
+      const byEntry = (e: ExportedAccount): { label: string; id?: string } =>
+        steps.find((s) => s.entry === accounts.indexOf(e))!;
+      expect(byEntry(labelled)).toMatchObject({ label: `${ID2} (2)`, id: ID1 });
+      expect(byEntry(holder)).toMatchObject({ label: 'p', id: ID2 });
+    }
+  });
+
+  it('does not keep an id an account here carries as its label', () => {
+    const plan = planImport(
+      input({
+        payload: payload({ accounts: [entry('p', { accountUuid: 'u-p', id: ID1 })] }),
+        accounts: [local(ID2, ID1.toUpperCase(), { accountUuid: 'u-other' })],
+      }),
+    );
+    expect(plan.accounts[0]).toMatchObject({ kind: 'add', label: 'p' });
+    expect(plan.accounts[0]).not.toHaveProperty('id');
+  });
+
   it('matches an entry with no login by email only against a row with no login either', () => {
     const noLogin = local('id1', 'mail', { emailAddress: 'M@x.com' });
     const withLogin = local('id2', 'mail2', { emailAddress: 'n@x.com', accountUuid: 'u9' });
@@ -747,15 +774,18 @@ describe('planImport: a rule an earlier import made part way', () => {
     expect(plan.rules[0]!.scopes.map((s) => s.joins)).toEqual([undefined, true]);
   });
 
-  it("leaves a rule of this machine's own alone: one with a member the file's rule lacks", () => {
-    const own = partRule({ include: [ID1, ID2] });
+  it("leaves a rule of this machine's own alone: one that shares no member with the file's rule", () => {
+    const own = partRule({ include: [ID2] });
     const plan = planImport(
       input({
         payload: payload({
           accounts: [entry('x', { accountUuid: 'u-x', id: ID1 })],
           rules: [fileRule({ folders: ['/proj', '/other'], include: ['u-x'] })],
         }),
-        accounts: [x, local(ID2, 'z', { accountUuid: 'u-z', ruleIds: ['rule-part'] })],
+        accounts: [
+          local(ID1, 'x', { accountUuid: 'u-x' }),
+          local(ID2, 'z', { accountUuid: 'u-z', ruleIds: ['rule-part'] }),
+        ],
         rules: [own],
       }),
     );
@@ -766,7 +796,47 @@ describe('planImport: a rule an earlier import made part way', () => {
     ]);
   });
 
-  it('leaves alone a rule that holds a folder the file rule does not', () => {
+  // Whatever changed since the first import, a rule here that includes an account the file's rule
+  // includes is that rule: a second rule including the same account would be a second slot, and
+  // the account can be live in only one, so the other folders would run on some other account.
+  it('grows it when it has a member the file rule no longer has (an exclusion dropped since)', () => {
+    const t = local(ID2, 't', { accountUuid: 'u-t' });
+    const here = partRule({ exclude: [ID2] });
+    const plan = planImport(
+      input({
+        payload: payload({
+          accounts: [entry('x', { accountUuid: 'u-x', id: ID1 })],
+          rules: [fileRule({ folders: ['/proj', '/other'], include: ['u-x'] })],
+        }),
+        accounts: [x, t],
+        rules: [here],
+      }),
+    );
+    expect(plan.rules[0]).toMatchObject({ into: here, include: [], exclude: [] });
+    expect(plan.rules[0]!.skip).toBeUndefined();
+    expect(plan.rules[0]!.scopes.map((s) => s.joins)).toEqual([undefined, true]);
+  });
+
+  it('grows it when it has a member the file rule lacks, adding the ones it lacks', () => {
+    const here = partRule({ include: [ID1, ID2] });
+    const plan = planImport(
+      input({
+        payload: payload({
+          accounts: [
+            entry('x', { accountUuid: 'u-x', id: ID1 }),
+            entry('y', { accountUuid: 'u-y' }),
+          ],
+          rules: [fileRule({ folders: ['/proj', '/other'], include: ['u-x', 'u-y'] })],
+        }),
+        accounts: [x, local(ID2, 'z', { accountUuid: 'u-z', ruleIds: ['rule-part'] })],
+        rules: [here],
+      }),
+    );
+    expect(plan.rules[0]!.into).toBe(here);
+    expect(plan.rules[0]!.include).toEqual([{ entry: 1, label: 'y' }]);
+  });
+
+  it('grows it when it holds a folder the file rule no longer has, which stays its own', () => {
     const wider = partRule({ folders: ['/proj', '/proj/sub'] });
     const plan = planImport(
       input({
@@ -778,7 +848,65 @@ describe('planImport: a rule an earlier import made part way', () => {
         rules: [wider],
       }),
     );
-    expect(plan.rules[0]!.into).toBeUndefined();
+    expect(plan.rules[0]!.into).toBe(wider);
+    expect(plan.rules[0]!.scopes.map((s) => [s.folder, s.joins, s.skip])).toEqual([
+      ['/proj', undefined, undefined],
+      ['/other', true, undefined],
+    ]);
+  });
+
+  it("grows it while a rule of this machine's own holds another of the folders", () => {
+    // This machine's own rule holds /proj; the earlier import left the rest of the file's rule on
+    // the session alias alone. The folder that now exists joins that rule, /proj stays the other's.
+    const mine = partRule({ id: 'rule-mine', label: 'mine', include: [ID2] });
+    const earlier = partRule({
+      folders: [],
+      aliases: [{ folder: '/proj', alias: 'deploy' }],
+      label: 'work-rule',
+    });
+    const plan = planImport(
+      input({
+        payload: payload({
+          accounts: [entry('x', { accountUuid: 'u-x', id: ID1 })],
+          rules: [
+            fileRule({
+              label: 'work-rule',
+              folders: ['/proj', '/other'],
+              aliases: [{ folder: '/proj', alias: 'deploy' }],
+              include: ['u-x'],
+            }),
+          ],
+        }),
+        accounts: [x, local(ID2, 'other', { accountUuid: 'u-o', ruleIds: ['rule-mine'] })],
+        rules: [mine, earlier],
+      }),
+    );
+    expect(plan.rules[0]!.into).toBe(earlier);
+    expect(plan.rules[0]!.scopes.map((s) => [s.sourceFolder, s.alias, s.joins, s.skip])).toEqual([
+      ['/proj', undefined, undefined, 'this machine has another rule there; it is left as it is'],
+      ['/other', undefined, true, undefined],
+      ['/proj', 'deploy', undefined, undefined],
+    ]);
+    expect(renderImportPlan(plan)).toContain(': add to the rule here');
+  });
+
+  it('skips, saying so, a rule this machine already holds split in two, rather than a third', () => {
+    const one = partRule({ id: 'rule-a' });
+    const two = partRule({ id: 'rule-b', folders: ['/other'] });
+    const plan = planImport(
+      input({
+        payload: payload({
+          accounts: [entry('x', { accountUuid: 'u-x', id: ID1 })],
+          rules: [fileRule({ folders: ['/proj', '/other', '/proj/sub'], include: ['u-x'] })],
+        }),
+        accounts: [local(ID1, 'x', { accountUuid: 'u-x', ruleIds: ['rule-a', 'rule-b'] })],
+        rules: [one, two],
+      }),
+    );
+    expect(plan.rules[0]!.skip).toBe(
+      'this machine already has it split between rules on /proj and /other; it is left as it ' +
+        'is (remove all but one with cctl folder reset, then import again)',
+    );
   });
 });
 
@@ -896,6 +1024,72 @@ describe('planImport: the refusals the engine would make, foreseen', () => {
     expect(plan.rules[0]!.notes).toEqual([
       "this machine's main login moves off client, which this rule reserves",
       'the slot of /side moves off work, which this rule reserves',
+    ]);
+  });
+
+  it('never counts an account the file reserves to a rule as a slot replacement', () => {
+    // client's rule is not made here (its folder is missing), so client arrives held back; the
+    // other rule reserves 'only', live on the main login, and nothing else is left for it.
+    const file = payload({
+      accounts: [entry('client', { accountUuid: 'u-c' })],
+      rules: [
+        fileRule({ folders: ['/missing'], include: ['u-c'] }),
+        fileRule({ folders: ['/proj'], include: ['u-o'] }),
+      ],
+    });
+    const plan = planImport(
+      input({
+        payload: file,
+        accounts: [local(ID1, 'only', { accountUuid: 'u-o' })],
+        globalLive: ID1,
+      }),
+    );
+    expect(plan.accounts[0]).toMatchObject({ kind: 'add', heldBack: true, forRule: true });
+    expect(plan.rules[1]!.skip).toBe(
+      "including only would leave this machine's main login with no shared account to run on; " +
+        'add or log in another account here first',
+    );
+  });
+
+  it('counts an account the import adds as live where its login already runs unstored', () => {
+    // This machine's main login is the file's 'client', logged in before cctl stored it: once the
+    // import stores it, it is the main login's account, and reserving it moves the main login.
+    const file = payload({
+      accounts: [entry('client', { accountUuid: 'u-c' })],
+      rules: [fileRule({ folders: ['/proj'], include: ['u-c'] })],
+    });
+    const unstoredLogins = new Map([['global' as const, 'u-c']]);
+    const alone = planImport(input({ payload: file, globalLive: null, unstoredLogins }));
+    expect(alone.rules[0]!.skip).toBe(
+      "including client would leave this machine's main login with no shared account to run " +
+        'on; add or log in another account here first',
+    );
+    const withSpare = planImport(
+      input({
+        payload: file,
+        accounts: [local(ID1, 'spare', { accountUuid: 'u-s' })],
+        globalLive: null,
+        unstoredLogins,
+      }),
+    );
+    expect(withSpare.rules[0]!.skip).toBeUndefined();
+    expect(withSpare.rules[0]!.notes).toEqual([
+      "this machine's main login moves off client, which this rule reserves",
+    ]);
+    // The same goes for an account the file brings without tokens: it is recognized there too.
+    const pending = planImport(
+      input({
+        payload: payload({
+          accounts: [{ label: 'client', accountUuid: 'u-c', autoSwitchExcluded: false }],
+          rules: [fileRule({ folders: ['/proj'], include: ['u-c'] })],
+        }),
+        accounts: [local(ID1, 'spare', { accountUuid: 'u-s' })],
+        globalLive: null,
+        unstoredLogins,
+      }),
+    );
+    expect(pending.rules[0]!.notes).toEqual([
+      "this machine's main login moves off client, which this rule reserves",
     ]);
   });
 

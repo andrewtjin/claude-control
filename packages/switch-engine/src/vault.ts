@@ -1697,7 +1697,9 @@ export class Vault {
 
   /** The id a new account row gets: the one asked for (an import keeping the account's id from the
    *  machine it came from) when it is a uuid no row here has, else a fresh one. The id names the
-   *  account's bundle file, so nothing but a uuid is ever taken from a caller. */
+   *  account's bundle file, so nothing but a uuid is ever taken from a caller. Nor is one another
+   *  row carries as its label: `resolveAccountRef` would then find two accounts by that one name
+   *  (the mirror of what {@link assertLabelFree} refuses for a label). */
   private newAccountId(allRows: readonly StoredAccount[], requested: string | undefined): string {
     if (requested === undefined) return randomUUID();
     if (!ACCOUNT_ID_PATTERN.test(requested)) {
@@ -1706,6 +1708,10 @@ export class Vault {
     const holder = allRows.find((a) => a.id === requested);
     if (holder !== undefined) {
       throw new VaultError(`account "${holder.label}" already has the id ${requested}`);
+    }
+    const named = allRows.find((a) => a.label.toLowerCase() === requested);
+    if (named !== undefined) {
+      throw new VaultError(`account "${named.label}" is labelled with the id ${requested}`);
     }
     return requested;
   }

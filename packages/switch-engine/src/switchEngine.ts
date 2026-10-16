@@ -78,6 +78,7 @@ import {
   allSlots,
   assignDistinct,
   availableInOrder,
+  withoutKeptOut,
   describeRuleScopes,
   exactAliasRule,
   exactFolderRule,
@@ -604,12 +605,27 @@ export function importIdentityRefusal(
   return `the file's tokens do not show the ${unmatched.join('/')} stored here`;
 }
 
-/** The identity anchors a row holds, as an identity block. */
-function rowAnchors(row: Pick<StoredAccount, IdentityAnchor>): OauthAccount {
-  const out: OauthAccount = {};
+/**
+ * The identity block an imported bundle is stored (and written live) with. The brought block is
+ * laid over the stored one, so fields this machine never captured (a display name, a billing type)
+ * arrive with the newer tokens. The anchors are different: what this machine knows of them is kept
+ * whatever the file says. The file vouches only for itself, and the guard has checked the login
+ * and nothing else, so a block naming the right login next to an email of `null`, a number, or
+ * another address must not erase or rewrite the email and organization stored here — in the vault,
+ * on the row, or in the live files. Each anchor is the first TEXT value among the row's, the stored
+ * block's and the brought block's; an anchor none of them holds as text is left out rather than
+ * carried as a non-string.
+ */
+function importedIdentity(
+  row: Pick<StoredAccount, IdentityAnchor>,
+  stored: OauthAccount | undefined,
+  brought: OauthAccount | undefined,
+): OauthAccount {
+  const out: OauthAccount = { ...stored, ...brought };
   for (const key of IDENTITY_ANCHORS) {
-    const value = row[key];
+    const value = row[key] ?? anchorValue(stored?.[key]) ?? anchorValue(brought?.[key]);
     if (value !== undefined) out[key] = value;
+    else delete out[key];
   }
   return out;
 }
@@ -945,14 +961,7 @@ export class SwitchEngine {
         else if (bundle.claudeAiOauth.expiresAt > stored.claudeAiOauth.expiresAt) reason = 'newer';
         else return { replaced: false, reason: 'stored_newer', healedLiveLogin: false };
       }
-      // The brought block is laid over what is known here (the row's anchors, then the stored
-      // block), so a replace never shrinks the identity the vault and the live files carry: a file
-      // whose block names only the login cannot erase the email or organization stored here.
-      const identity: OauthAccount = {
-        ...rowAnchors(existing),
-        ...stored?.oauthAccount,
-        ...bundle.oauthAccount,
-      };
+      const identity = importedIdentity(existing, stored?.oauthAccount, bundle.oauthAccount);
       const { healedLiveLogin } = await this.applyReloginBundle(
         existing,
         bundle.claudeAiOauth,
@@ -1425,6 +1434,27 @@ export class SwitchEngine {
     return this.adoptRotationIfNeeded(liveAccount, liveNow, liveOauth);
   }
 
+  /**
+   * The login (uuid) live in each slot that no stored account is recognized as: the slot has live
+   * credentials, {@link getActiveId} names nobody, and its identity block names a uuid. A login used
+   * here before cctl stored it — the main login of a machine an import is about to fill. Once an
+   * account with that uuid is stored, getActiveId names it, so a plan of what an import will do to
+   * the slots has to count it as live there already.
+   */
+  async unstoredLiveLogins(): Promise<Map<SlotId, string>> {
+    const out = new Map<SlotId, string>();
+    for (const slotId of await this.allSlotIds()) {
+      const rt = this.slotRuntime(slotId);
+      const live = await rt.credStore.readLiveCredentials().catch(() => undefined);
+      if (live === undefined || (await this.getActiveId(slotId)) !== null) continue;
+      const uuid = anchorValue(
+        (await rt.credStore.readOauthAccount().catch(() => undefined))?.accountUuid,
+      );
+      if (uuid !== undefined) out.set(slotId, uuid);
+    }
+    return out;
+  }
+
   /** The reconciled live account of every slot — the doctor/daemon view of "who is where". */
   async liveSlots(): Promise<Map<SlotId, string | null>> {
     const out = new Map<SlotId, string | null>();
@@ -1546,16 +1576,16 @@ export class SwitchEngine {
 
   /**
    * Rebuild rules brought from another machine (`cctl import`), each WHOLE: one rule per spec with
-   * every one of its scopes, or the spec's members (and the scopes it lacks) added to an existing
-   * rule whose scopes are all among the spec's: the rule an earlier, part-way import of the same
-   * rule made, which is grown rather than split from. Done as one batch under one lock, because the
+   * every one of its scopes, or the spec's members (and the scopes it lacks) added to the existing
+   * rule the caller names: the rule an earlier, part-way import of the same rule made, which is
+   * grown rather than split from. Done as one batch under one lock, because the
    * per-scope verbs, run rule after rule,
    * cannot rebuild what the source had: each seats its slot at once, so an earlier rule's slot can
    * take an account a later rule includes (which that include then refuses), and an exclusion the
    * source keeps on record for an account another rule reserves can no longer be made once that
    * reservation exists. Here, in order:
-   *   1. every spec's refusals run first (scopes, caps, the target rule still holding only scopes of
-   *      the spec, an exclusion that would empty a slot sessions run in); a refused spec is reported
+   *   1. every spec's refusals run first (scopes, caps, the target rule still existing, an exclusion
+   *      that would empty a slot sessions run in); a refused spec is reported
    *      and the rest go on. The rule cap and the reserved-account cap are counted over the batch in
    *      spec order, so a spec that passes here is never refused for them half-way through step 3.
    *   2. hand off every slot that holds an account some spec reserves and may not keep it — all of
@@ -1569,9 +1599,18 @@ export class SwitchEngine {
    *   5. write the guard snapshot LAST.
    * Each write is one of the vault's own crash-safe writes; a run that dies part-way leaves rules a
    * second run finds and completes (as additions to rules that already hold the scopes).
+   *
+   * `keepOut` names accounts no slot may be moved to or seated with in steps 2 and 4 unless its own
+   * rule includes them (see withoutKeptOut): accounts the import brought for a rule of the machine
+   * they came from. A slot that has no other account to move to refuses the specs that reserve its
+   * occupant, as it would with no such account here at all.
    */
-  async importRules(specs: readonly ImportRuleSpec[]): Promise<ImportRulesResult> {
+  async importRules(
+    specs: readonly ImportRuleSpec[],
+    opts: { keepOut?: readonly string[] } = {},
+  ): Promise<ImportRulesResult> {
     this.refuseRuleSlotsOnDarwin();
+    const keepOut = new Set(opts.keepOut ?? []);
     const outcomes: Array<ImportRuleOutcome | undefined> = specs.map(() => undefined);
     const refuse = (i: number, err: unknown): void => {
       if (!(err instanceof SwitchEngineError)) throw err;
@@ -1632,7 +1671,7 @@ export class SwitchEngine {
       for (;;) {
         const reservingIds = new Set(specs.flatMap((spec, i) => (open(i) ? spec.include : [])));
         const reserving = picture.shared.filter((a) => reservingIds.has(a.id));
-        const plan = await this.planHandOffLocked(reserving, picture, mayKeep);
+        const plan = await this.planHandOffLocked(reserving, picture, mayKeep, keepOut);
         if (plan.ok) {
           steps = plan.steps;
           break;
@@ -1648,8 +1687,8 @@ export class SwitchEngine {
       const created = new Set<number>();
       for (const [i, spec] of specs.entries()) {
         const rule = picture.rules.find((r) => r.id === spec.intoRuleId);
-        const lacking = rule !== undefined ? this.scopesLacking(rule, scopes[i]!) : undefined;
-        if (!open(i) || lacking === undefined || lacking.length === 0) continue;
+        const lacking = rule !== undefined ? this.scopesLacking(rule, scopes[i]!) : [];
+        if (!open(i) || lacking.length === 0) continue;
         try {
           await this.vault.addScopesToRule(rule!.id, newRuleScopes(lacking));
         } catch (err) {
@@ -1695,7 +1734,7 @@ export class SwitchEngine {
         if (!rule) continue;
         let live: RuleLiveResult | null = null;
         try {
-          live = await this.ensureRuleLiveLocked(rule, { preferIncluded: true });
+          live = await this.ensureRuleLiveLocked(rule, { preferIncluded: true, keepOut });
         } catch (err) {
           if (!(err instanceof SwitchEngineError)) throw err;
           this.log.warn(
@@ -1734,10 +1773,8 @@ export class SwitchEngine {
       return;
     }
     const rule = picture.rules.find((r) => r.id === spec.intoRuleId);
-    const lacking = rule !== undefined ? this.scopesLacking(rule, scopes) : undefined;
-    if (!rule || lacking === undefined) {
-      throw new VaultError('the rule here changed while the import ran; run it again');
-    }
+    if (!rule) throw new VaultError('the rule here changed while the import ran; run it again');
+    const lacking = this.scopesLacking(rule, scopes);
     if (lacking.length > 0) await this.vault.checkAddScopes(rule.id, newRuleScopes(lacking));
     await this.vault.checkInclude(rule.id, spec.include);
     await this.vault.checkExclude(rule.id, spec.exclude);
@@ -1761,13 +1798,10 @@ export class SwitchEngine {
     }
   }
 
-  /** The scopes of `scopes` that `rule` does not hold yet, or undefined when the rule holds one
-   *  that is not among them (it is then not the rule `scopes` describe). By the store's uniqueness
-   *  keys. */
-  private scopesLacking(
-    rule: FolderRule,
-    scopes: readonly RuleScopeRef[],
-  ): RuleScopeRef[] | undefined {
+  /** The scopes of `scopes` that `rule` does not hold yet, by the store's uniqueness keys. The rule
+   *  may hold others: the caller decided it is the rule `scopes` belong to (an earlier import of it,
+   *  since changed on either machine), and growing it is what keeps the file's rule one slot. */
+  private scopesLacking(rule: FolderRule, scopes: readonly RuleScopeRef[]): RuleScopeRef[] {
     const keyOf = (scope: RuleScopeRef): string =>
       scope.kind === 'folder'
         ? `f\u0000${folderUniquenessKey(scope.folder, this.platform)}`
@@ -1776,8 +1810,6 @@ export class SwitchEngine {
       ...rule.folders.map((folder) => keyOf({ kind: 'folder', folder })),
       ...(rule.aliases ?? []).map((a) => keyOf({ kind: 'alias', ...a })),
     ]);
-    const want = new Set(scopes.map(keyOf));
-    if ([...have].some((k) => !want.has(k))) return undefined;
     return scopes.filter((scope) => !have.has(keyOf(scope)));
   }
 
@@ -2233,7 +2265,7 @@ export class SwitchEngine {
    */
   private async ensureRuleLiveLocked(
     rule: FolderRule,
-    opts: { preferIncluded?: boolean } = {},
+    opts: { preferIncluded?: boolean; keepOut?: ReadonlySet<string> } = {},
   ): Promise<RuleLiveResult> {
     const slotId = ruleSlotId(rule.id);
     const rt = this.slotRuntime(slotId);
@@ -2252,7 +2284,7 @@ export class SwitchEngine {
     const current = picture.rules.find((r) => r.id === rule.id) ?? rule;
     const occupancy = await this.slotOccupancy(picture);
     const pool = slotPool(slotId, picture, occupancy);
-    const available = availableInOrder(pool);
+    const available = availableInOrder(withoutKeptOut(pool, opts.keepOut));
     const live = await this.getActiveId(slotId);
     const liveCreds = await rt.credStore.readLiveCredentials().catch(() => undefined);
     const seated = (liveAccount: string, activated: boolean): RuleLiveResult => ({
@@ -2374,6 +2406,7 @@ export class SwitchEngine {
     reserving: readonly StoredAccount[],
     picture: RegistryPicture,
     mayKeep: (slotId: SlotId, accountId: string) => boolean,
+    keepOut?: ReadonlySet<string>,
   ): Promise<
     | { ok: true; steps: Array<{ slotId: SlotId; from: StoredAccount; to: string }> }
     | { ok: false; from: StoredAccount; error: RefreshError }
@@ -2390,7 +2423,11 @@ export class SwitchEngine {
     for (const [slotId, owners] of occupancy) {
       const from = reserving.find((a) => owners.has(a.id) && !mayKeep(slotId, a.id));
       if (from === undefined) continue;
-      moving.push({ slotId, from, options: availableInOrder(slotPool(slotId, after, occupancy)) });
+      moving.push({
+        slotId,
+        from,
+        options: availableInOrder(withoutKeptOut(slotPool(slotId, after, occupancy), keepOut)),
+      });
     }
     const assigned = assignDistinct(moving.map((m) => m.options.map((a) => a.id)));
     if (!assigned.ok) {

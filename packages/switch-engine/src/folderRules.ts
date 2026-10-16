@@ -161,6 +161,21 @@ export function availableInOrder(pool: readonly PoolEntry[]): StoredAccount[] {
 }
 
 /**
+ * `pool` without the accounts of `keepOut` it only inherits from the shared pool: accounts an import
+ * brought for a folder rule of the machine they came from, kept out of auto-switch here until that
+ * rule takes them, which no slot the import moves or seats may run as a last resort either (that
+ * would spend, say, a client's account on unrelated work). An account the slot's own rule includes
+ * stays: that is the rule it is kept for.
+ */
+export function withoutKeptOut(
+  pool: readonly PoolEntry[],
+  keepOut: ReadonlySet<string> | undefined,
+): PoolEntry[] {
+  if (keepOut === undefined || keepOut.size === 0) return [...pool];
+  return pool.filter((e) => e.source === 'include' || !keepOut.has(e.account.id));
+}
+
+/**
  * Give each of several slots a DIFFERENT account from its own candidates (each list best first), or
  * say which slot cannot have one. Taking each slot's first free candidate in turn is not enough: an
  * earlier slot can take the only account a later one could use while it had another to spare, and

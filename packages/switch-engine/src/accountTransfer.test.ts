@@ -392,6 +392,73 @@ describe('importRules', () => {
   });
 });
 
+describe('importRules: accounts kept out of every slot but their own rule', () => {
+  it('never moves a slot onto one, refusing the rule when nothing else is left', async () => {
+    const h = await harness();
+    const only = await h.engine.addAccount('only', bundle('O1', 'u-o', NOW + HOUR));
+    const client = await h.engine.addAccount('client', bundle('C1', 'u-c', NOW + HOUR));
+    await h.engine.activate(only.id);
+    const spec = {
+      scopes: [{ kind: 'folder' as const, folder: await ruleFolder(h, 'p1') }],
+      include: [only.id],
+      exclude: [],
+    };
+    const res = await h.engine.importRules([spec], { keepOut: [client.id] });
+    expect(res.rules[0]).toMatchObject({ ok: false });
+    expect(res.handedOff).toEqual([]);
+    expect(await h.engine.listRules()).toEqual([]);
+    expect(await h.engine.getActiveId('global')).toBe(only.id);
+  });
+
+  it('picks the assignment that leaves them out when one exists', async () => {
+    // The main login and an exclude-only rule's slot both move; taking the first free account for
+    // each in turn would give the rule slot the kept-out one.
+    const h = await harness();
+    const z = await h.engine.addAccount('z', bundle('Z1', 'u-z', NOW + HOUR));
+    const w = await h.engine.addAccount('w', bundle('W1', 'u-w', NOW + HOUR));
+    const s1 = await h.engine.addAccount('s1', bundle('S1', 'u-s1', NOW + HOUR));
+    const s2 = await h.engine.addAccount('s2', bundle('S2', 'u-s2', NOW + HOUR));
+    const client = await h.engine.addAccount('client', bundle('C1', 'u-c', NOW + HOUR), {
+      autoSwitchExcluded: true,
+    });
+    await h.engine.activate(z.id);
+    await h.engine.excludeInFolder(await ruleFolder(h, 'q'), [s2.id]);
+    const res = await h.engine.importRules(
+      [
+        {
+          scopes: [{ kind: 'folder', folder: await ruleFolder(h, 'p') }],
+          include: [z.id, w.id],
+          exclude: [],
+        },
+      ],
+      { keepOut: [client.id] },
+    );
+    expect(res.rules[0]).toMatchObject({ ok: true });
+    expect(res.handedOff.map((x) => x.to).sort()).toEqual([s1.id, s2.id].sort());
+    expect([...(await h.engine.liveSlots()).values()]).not.toContain(client.id);
+  });
+
+  it('never seats a rule it makes with one', async () => {
+    const h = await harness();
+    const live = await h.engine.addAccount('live', bundle('L1', 'u-l', NOW + HOUR));
+    const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
+    const client = await h.engine.addAccount('client', bundle('C1', 'u-c', NOW + HOUR));
+    await h.engine.activate(live.id);
+    const res = await h.engine.importRules(
+      [
+        {
+          scopes: [{ kind: 'folder', folder: await ruleFolder(h, 'p') }],
+          include: [],
+          exclude: [x.id],
+        },
+      ],
+      { keepOut: [client.id] },
+    );
+    expect(res.rules[0]).toMatchObject({ ok: true });
+    expect((await h.engine.listRules())[0]!.activeId).toBeNull();
+  });
+});
+
 describe('importBundle: the file has to prove the login', () => {
   /** A stored account with a full identity, live on the main login. */
   async function stored(h: Harness): Promise<string> {
@@ -461,6 +528,55 @@ describe('importBundle: the file has to prove the login', () => {
     });
   });
 
+  it('never lets a block naming the login erase or rewrite the other anchors stored here', async () => {
+    // The guard checks the login; the email and organization next to it are only the file's word,
+    // whatever form it takes: not text at all, or other text.
+    const blocks: Record<string, unknown>[] = [
+      { emailAddress: null, organizationUuid: null },
+      { emailAddress: false, organizationUuid: 0 },
+      { emailAddress: 42, organizationUuid: { id: 'org-y' } },
+      { emailAddress: 'y@evil.example', organizationUuid: 'org-y' },
+    ];
+    for (const [i, extra] of blocks.entries()) {
+      const h = await harness();
+      const id = await stored(h);
+      const access = `X${i + 2}`;
+      const res = await h.engine.importBundle(id, {
+        claudeAiOauth: {
+          accessToken: access,
+          refreshToken: 'r-' + access,
+          expiresAt: NOW + 9 * HOUR,
+        },
+        oauthAccount: { accountUuid: 'u-x', displayName: 'X renamed', ...extra },
+      });
+      expect(res).toMatchObject({ replaced: true, healedLiveLogin: true });
+      const anchors = {
+        accountUuid: 'u-x',
+        emailAddress: 'u-x@x.com',
+        organizationUuid: 'org-x',
+      };
+      // Fields that are not anchors still arrive with the newer tokens.
+      expect((await h.vault.readBundle(id)).oauthAccount).toEqual({
+        ...anchors,
+        displayName: 'X renamed',
+      });
+      expect(await h.live.readOauthAccount()).toMatchObject(anchors);
+      expect(await h.vault.getAccount(id)).toMatchObject(anchors);
+    }
+  });
+
+  it('fills an anchor nothing here holds only from text, never from another kind of value', async () => {
+    const h = await harness();
+    const row = await h.engine.addPendingAccount('n', { accountUuid: 'u-n' });
+    await h.engine.importBundle(row.id, {
+      claudeAiOauth: { accessToken: 'N1', refreshToken: 'r-N1', expiresAt: NOW + HOUR },
+      oauthAccount: { accountUuid: 'u-n', emailAddress: null, organizationUuid: 'org-n' } as never,
+    });
+    const block = (await h.vault.readBundle(row.id)).oauthAccount!;
+    expect(block).toEqual({ accountUuid: 'u-n', organizationUuid: 'org-n' });
+    expect(await h.vault.getAccount(row.id)).toMatchObject({ organizationUuid: 'org-n' });
+  });
+
   it('for a row with no login, takes only a block echoing every anchor the row has', async () => {
     const h = await harness();
     const row = await h.engine.addPendingAccount('m', {
@@ -520,6 +636,20 @@ describe('adding an account brought from another machine', () => {
     expect((await h.engine.listAllAccounts()).map((r) => r.label)).toEqual(['a']);
   });
 
+  it('refuses to keep an id another account here carries as its label, in any case', async () => {
+    const h = await harness();
+    await h.engine.addAccount(OTHER_ID.toUpperCase(), bundle('L1', 'u-l', NOW + HOUR));
+    await expect(
+      h.engine.addAccount('p', bundle('P1', 'u-p', NOW + HOUR), { id: OTHER_ID }),
+    ).rejects.toThrow(`is labelled with the id ${OTHER_ID}`);
+    await expect(
+      h.engine.addPendingAccount('q', { accountUuid: 'u-q' }, { id: OTHER_ID }),
+    ).rejects.toThrow(`is labelled with the id ${OTHER_ID}`);
+    expect((await h.engine.listAllAccounts()).map((r) => r.label)).toEqual([
+      OTHER_ID.toUpperCase(),
+    ]);
+  });
+
   it('shows the plan of an account waiting for a login until its first login replaces it', async () => {
     const h = await harness();
     const row = await h.engine.addPendingAccount(
@@ -575,7 +705,7 @@ describe('importRules: a rule an earlier import made part way', () => {
     expect(rules[0]!.activeId).toBe(x.id);
   });
 
-  it('refuses, writing nothing, when that rule holds a scope the spec does not', async () => {
+  it('grows that rule even when it holds a scope the spec does not, which stays its own', async () => {
     const h = await harness();
     const x = await h.engine.addAccount('x', bundle('X1', 'u-x', NOW + HOUR));
     await h.engine.addAccount('s', bundle('S1', 'u-s', NOW + HOUR));
@@ -604,8 +734,13 @@ describe('importRules: a rule an earlier import made part way', () => {
         intoRuleId: ruleId,
       },
     ]);
-    expect(res.rules[0]).toMatchObject({ ok: false });
-    expect((await h.engine.listRules())[0]!.folders).toHaveLength(2);
+    // The source dropped p3 from the rule since the first import: the rule here still holds it,
+    // and gains p2 rather than a second rule being made beside it.
+    expect(res.rules[0]).toMatchObject({ ok: true, created: false });
+    const rules = await h.engine.listRules();
+    expect(rules).toHaveLength(1);
+    expect(rules[0]!.folders).toHaveLength(3);
+    expect(rules[0]!.activeId).toBe(x.id);
   });
 });
 

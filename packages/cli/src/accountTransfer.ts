@@ -89,6 +89,7 @@ export type TransferEngine = Pick<
   | 'listAllAccounts'
   | 'listRules'
   | 'getActiveId'
+  | 'unstoredLiveLogins'
   | 'exportBundle'
   | 'addAccount'
   | 'addPendingAccount'
@@ -613,6 +614,11 @@ export async function runImport(
     globalLive: await engine.getActiveId('global'),
     env: deps.env,
     ...(payload.rules.length > 0 ? { rulesBlocked: await deps.rulesBlocked() } : {}),
+    // Read only where rules can be made: it reads each slot's live credentials, which on macOS
+    // means the Keychain, and only the moves a rule makes need it.
+    ...(payload.rules.length > 0 && deps.platform !== 'darwin'
+      ? { unstoredLogins: await engine.unstoredLiveLogins() }
+      : {}),
   });
   const header =
     `From an export of ${payload.accounts.length} account(s) made by cctl ` +
@@ -887,8 +893,13 @@ async function importRules(
       ...(step.label !== undefined ? { label: step.label } : {}),
       ...(step.into !== undefined ? { intoRuleId: step.into.id } : {}),
     }));
+    // An account the file reserves to a rule runs in no slot here but that rule's: not as the
+    // replacement for a slot a rule moves, nor as the seat of a rule the import makes.
+    const keepOut = plan.accounts.flatMap((s) =>
+      s.kind === 'add' && s.forRule === true ? (localIds.get(s.entry) ?? []) : [],
+    );
     try {
-      const result = await engine.importRules(specs);
+      const result = await engine.importRules(specs, { keepOut });
       changed = result.handedOff.length > 0;
       const rules = await engine.listRules();
       const accounts = await engine.listAllAccounts();
@@ -1011,19 +1022,32 @@ const CSI_8BIT = String.fromCharCode(0x9b);
 const SS3_8BIT = String.fromCharCode(0x8f);
 
 /**
+ * How long after one read the next may still carry the rest of an escape sequence the first began.
+ * A terminal writes a key's whole sequence at once, so its parts follow one another within a few
+ * milliseconds when they are read apart at all; a person pressing Esc and then another key is far
+ * slower than this.
+ */
+export const ESCAPE_SEQUENCE_GAP_MS = 50;
+
+/**
  * The keys of a hidden prompt, as typed in raw mode. Enter ends it, Backspace removes the last
  * character, Ctrl-C abandons it. A terminal sends a cursor, editing or function key (an arrow,
  * Home, End, Delete, F1) as an escape sequence; with nothing echoed the prompt cannot honor it, so
- * the whole sequence is dropped — never typed into the passphrase as invisible `[D`, `[3~` or `A`.
- * Every form a terminal uses is read whole: CSI (ESC `[`, parameters, one final byte), the Linux
- * console's function keys (ESC `[` `[` and one letter), SS3 (ESC `O`, one byte), their 8-bit
- * forms, and an ESC sent twice (Alt with an arrow, or Esc pressed before one). A sequence may
- * arrive split across reads, so where one stands is kept between them.
+ * the whole sequence is dropped — never typed into the passphrase as invisible `[D`, `[3~` or `A`,
+ * and never ending early so that the key typed after it is taken for its last byte.
  *
- * Nothing typed is lost to a sequence: a byte no sequence can hold (Enter, Ctrl-C, Backspace in
- * the middle of one) ends it and counts as the key it is. The Esc key pressed on its own (its ESC
- * is the last thing read) is ignored and the next key is typed as usual; ESC followed by a
- * printable key in the same read is an Alt chord, dropped whole.
+ * Every form a terminal sends for a key is read whole: CSI (ESC `[`, parameter bytes, then one
+ * final byte — and since no key's sequence carries intermediate bytes, any byte that is not a
+ * parameter ends it, so rxvt's Shift+Home `ESC [ 7 $` ends at its `$`), the Linux console's function
+ * keys (ESC `[` `[` and one letter), SS3 (ESC `O`, parameters, one byte), their 8-bit forms, an ESC
+ * sent twice (Alt with an arrow), and an Alt chord (ESC and a key, sent together).
+ *
+ * What the bytes alone cannot say is time: Esc pressed on its own and then `[` typed reads exactly
+ * like the start of an arrow key's sequence split across two reads. So a sequence left open at the
+ * end of a read continues into the next only when that read follows within
+ * {@link ESCAPE_SEQUENCE_GAP_MS}; later than that it was a key of its own, the open sequence is
+ * dropped, and the new read is typed as it stands. Nothing typed is lost to a sequence: a byte no
+ * sequence can hold (Enter, Ctrl-C, Backspace, a new ESC) ends it and counts as the key it is.
  */
 export class HiddenInput {
   value = '';
@@ -1032,15 +1056,20 @@ export class HiddenInput {
    *  introducer, among a CSI sequence's parameters, in a Linux console function key (one letter
    *  to come), or in an SS3 sequence. */
   private escape: 'none' | 'start' | 'csi-first' | 'csi' | 'fkey' | 'ss3' = 'none';
-  /** Whether the ESC that began the pending sequence came in the read being fed. */
-  private escapeInRead = false;
+  /** When the read that left a sequence open arrived. */
+  private openedAt = 0;
+
+  /** `now` reads a clock that never steps back (the default is the process's monotonic one). */
+  constructor(private readonly now: () => number = () => performance.now()) {}
 
   feed(chunk: string): void {
-    this.escapeInRead = false;
+    const at = this.now();
+    if (this.escape !== 'none' && at - this.openedAt > ESCAPE_SEQUENCE_GAP_MS) this.escape = 'none';
     for (const ch of chunk) {
       if (this.state !== 'typing') return;
       if (!this.inSequence(ch)) this.key(ch);
     }
+    this.openedAt = at;
   }
 
   /** Feed `ch` to the escape sequence in progress: true when it belonged to it, false when it is a
@@ -1048,16 +1077,17 @@ export class HiddenInput {
   private inSequence(ch: string): boolean {
     const code = ch.codePointAt(0)!;
     const printable = code >= 0x20 && code <= 0x7e;
+    const parameter = code >= 0x30 && code <= 0x3f;
     switch (this.escape) {
       case 'none':
         return false;
       case 'start':
         if (ch === '[') this.escape = 'csi-first';
         else if (ch === 'O') this.escape = 'ss3';
-        else if (ch === ESC) this.escapeInRead = true;
-        else {
+        else if (ch !== ESC) {
+          // An Alt chord when it is a key; anything else (Enter, Ctrl-C) is a key of its own.
           this.escape = 'none';
-          return this.escapeInRead && printable;
+          return printable;
         }
         return true;
       case 'csi-first':
@@ -1068,11 +1098,8 @@ export class HiddenInput {
         this.escape = 'csi';
         return this.inSequence(ch);
       case 'csi':
-        if (code >= 0x20 && code <= 0x3f) return true;
-        this.escape = 'none';
-        return code >= 0x40 && code <= 0x7e;
       case 'ss3':
-        if (code >= 0x30 && code <= 0x3f) return true;
+        if (parameter) return true;
         this.escape = 'none';
         return printable;
       case 'fkey':
@@ -1084,10 +1111,8 @@ export class HiddenInput {
   /** A key typed outside any escape sequence. */
   private key(ch: string): void {
     const code = ch.codePointAt(0)!;
-    if (ch === ESC) {
-      this.escape = 'start';
-      this.escapeInRead = true;
-    } else if (ch === CSI_8BIT) this.escape = 'csi-first';
+    if (ch === ESC) this.escape = 'start';
+    else if (ch === CSI_8BIT) this.escape = 'csi-first';
     else if (ch === SS3_8BIT) this.escape = 'ss3';
     else if (ch === '\r' || ch === '\n') this.state = 'done';
     else if (ch === ETX) this.state = 'cancelled';

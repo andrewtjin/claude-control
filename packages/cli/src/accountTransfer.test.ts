@@ -3,16 +3,35 @@
 
 import { describe, it, expect } from 'vitest';
 import { CliFailure } from './context.js';
-import { HiddenInput, passphraseFromFile, passphraseProblem } from './accountTransfer.js';
+import {
+  ESCAPE_SEQUENCE_GAP_MS,
+  HiddenInput,
+  passphraseFromFile,
+  passphraseProblem,
+} from './accountTransfer.js';
 
 const ESC = String.fromCharCode(27);
 const ETX = String.fromCharCode(3);
 
-/** Feed `chunks` to a fresh prompt and return it. */
-function typed(...chunks: string[]): HiddenInput {
-  const input = new HiddenInput();
-  for (const chunk of chunks) input.feed(chunk);
+/** A read of the prompt: its text and how many milliseconds after the read before it arrived. */
+type Read = string | { text: string; afterMs: number };
+
+/** Feed `reads` to a fresh prompt and return it. A bare string arrives as a person types, well
+ *  after the read before it; `burst(...)` gives reads a terminal sent at once. */
+function typed(...reads: Read[]): HiddenInput {
+  let now = 1_000;
+  const input = new HiddenInput(() => now);
+  for (const read of reads) {
+    const { text, afterMs } = typeof read === 'string' ? { text: read, afterMs: 200 } : read;
+    now += afterMs;
+    input.feed(text);
+  }
   return input;
+}
+
+/** Reads that follow one another at once: one key's sequence, split. */
+function burst(...texts: string[]): Read[] {
+  return texts.map((text) => ({ text, afterMs: 1 }));
 }
 
 describe('HiddenInput', () => {
@@ -31,10 +50,12 @@ describe('HiddenInput', () => {
     expect(input.value).toBe('correct horse battery');
   });
 
-  it('follows a key code split across two reads', () => {
-    const input = typed('abc', ESC, '[', '3', '~', 'd\n');
+  it('follows a key code split across reads that come at once', () => {
+    const input = typed('abc', ...burst(ESC, '[', '3', '~'), 'd\n');
     expect(input.value).toBe('abcd');
     expect(input.state).toBe('done');
+    expect(typed('ab', ...burst(ESC, '['), ...burst('D'), 'c\r').value).toBe('abc');
+    expect(typed('ab', ...burst(ESC, 'O'), ...burst('H'), 'c\r').value).toBe('abc');
   });
 
   it('removes a character on Backspace and gives up on Ctrl-C', () => {
@@ -57,8 +78,27 @@ describe('HiddenInput', () => {
     expect(typed('pass', ESC, 'xword\r').value).toBe('passxword');
   });
 
-  it('drops an Alt chord whole (ESC and a key in one read)', () => {
+  // The keys that also start a sequence: after Esc on its own, a person typing `[` or a capital `O`
+  // means that character, and the key after it is typed too.
+  it('types [ and O when they follow Esc pressed on its own, and the keys after them', () => {
+    expect(typed(ESC, 'O', 'r', 'a', 'n', 'g', 'e', '\r').value).toBe('Orange');
+    expect(typed(ESC, '[', 'a', 'b', 'c', '\r').value).toBe('[abc');
+    expect(typed('p', ESC, 'O', '1', 'x', '\r').value).toBe('pO1x');
+    expect(typed('p', ESC, 'O1x\r').value).toBe('pO1x');
+    expect(typed('p', ESC, '[[Ax\r').value).toBe('p[[Ax');
+    expect(typed('p', ESC, 'E', ESC, 'Oq\r').value).toBe('pEOq');
+  });
+
+  it('drops a sequence a pause cut short, and types what comes after it', () => {
+    // ESC [ in one read is a terminal's (or Alt+[); a key typed later is not its final byte.
+    expect(typed('a', `${ESC}[`, 'b', '\r').value).toBe('ab');
+    expect(typed('a', `${ESC}[1;`, '5', 'C', '\r').value).toBe('a5C');
+    expect(typed('a', `${ESC}O`, 'b\r').value).toBe('ab');
+  });
+
+  it('drops an Alt chord whole (ESC and a key sent together)', () => {
     expect(typed('ab', `${ESC}x`, 'c\r').value).toBe('abc');
+    expect(typed('ab', ...burst(ESC, 'x'), 'c\r').value).toBe('abc');
   });
 
   it('drops the Linux console function keys F1 to F5 whole', () => {
@@ -73,16 +113,33 @@ describe('HiddenInput', () => {
     expect(typed('a', `${csi8}3~`, `${ss38}P`, `${ESC}[11^`, `${ESC}[Z`, 'b\r').value).toBe('ab');
   });
 
+  it('ends a sequence at any byte that is not a parameter, as rxvt ends its shifted keys', () => {
+    // rxvt: Shift+Insert, Shift+Delete, Shift+Home, Shift+End end in `$`; Ctrl+Shift ones in `@`.
+    for (const key of ['[2$', '[3$', '[7$', '[8$', '[23$', '[2@', '[7^', '[a', 'Oa', '[2;5~']) {
+      expect(typed('pass', `${ESC}${key}`, 'w', 'o', 'r', 'd', '\r').value).toBe('password');
+      expect(typed('pass', ...burst(...`${ESC}${key}`), 'word\r').value).toBe('password');
+    }
+  });
+
   it('never swallows Enter, Ctrl-C or Backspace inside a broken sequence', () => {
-    const enter = typed('ab', `${ESC}[1;`, '\r');
+    const enter = typed('ab', ...burst(`${ESC}[1;`, '\r'));
     expect(enter.state).toBe('done');
     expect(enter.value).toBe('ab');
-    expect(typed('ab', `${ESC}[`, ETX).state).toBe('cancelled');
-    expect(typed('abc', `${ESC}O`, String.fromCharCode(127), '\r').value).toBe('ab');
+    expect(typed('ab', ...burst(`${ESC}[`, ETX)).state).toBe('cancelled');
+    expect(typed('abc', ...burst(`${ESC}O`, String.fromCharCode(127)), '\r').value).toBe('ab');
   });
 
   it('types pasted text between the bracketed-paste markers', () => {
     expect(typed(`${ESC}[200~`, 'pasted secret', `${ESC}[201~`, '\r').value).toBe('pasted secret');
+  });
+
+  it('reads the gap on the clock it is given, by default one that never steps back', () => {
+    expect(ESCAPE_SEQUENCE_GAP_MS).toBeLessThan(200);
+    const input = new HiddenInput();
+    input.feed('ab');
+    input.feed(`${ESC}[D`);
+    input.feed('c\r');
+    expect(input.value).toBe('abc');
   });
 });
 

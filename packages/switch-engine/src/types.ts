@@ -416,8 +416,8 @@ export interface ImportRuleSpec {
   exclude: string[];
   /** The display name of a rule this creates. */
   label?: string;
-  /** Add the members to this rule instead of creating one. Every scope it holds is among
-   *  `scopes`; the ones of `scopes` it lacks are added to it. */
+  /** Add the members to this rule instead of creating one; the ones of `scopes` it lacks are added
+   *  to it, and the scopes it holds beyond them stay its own. */
   intoRuleId?: string;
 }
 

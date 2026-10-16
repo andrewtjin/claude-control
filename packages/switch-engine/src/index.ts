@@ -91,6 +91,7 @@ export {
   allSlots,
   assignDistinct,
   availableInOrder,
+  withoutKeptOut,
   exactFolderRule,
   exactAliasRule,
   describeRuleScopes,

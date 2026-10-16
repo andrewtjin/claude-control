@@ -29,6 +29,7 @@ import {
   sanitizeTerminalText,
   shellQuoteArg,
   slotPool,
+  withoutKeptOut,
   type AccountView,
   type FolderRule,
   type RuleScopeRef,
@@ -53,7 +54,8 @@ export type AccountStep =
    *  made here, so the account would otherwise land in the shared pool auto-switch draws on.
    *  `awaitsRule` says the file reserves it to a rule this plan makes: it is stored kept out of
    *  auto-switch, and handed back once that rule includes it, so a rule refused at run time cannot
-   *  leave it in the shared pool either. */
+   *  leave it in the shared pool either. `forRule` says the file reserves it to a rule at all: no
+   *  slot the import moves or seats may run it unless that rule's own (see withoutKeptOut). */
   | {
       kind: 'add';
       entry: number;
@@ -64,6 +66,7 @@ export type AccountStep =
       autoSwitchExcluded: boolean;
       heldBack?: true;
       awaitsRule?: true;
+      forRule?: true;
     }
   /** The same account is already stored here as `existing`; it is left as it is. */
   | { kind: 'skip'; entry: number; existing: AccountView; reason: string }
@@ -97,10 +100,10 @@ export interface ScopePlan {
  * What the import does with one rule of the file. A rule is rebuilt WHOLE — one rule here with
  * every scope that can be used here — or added to a rule this machine already has: one on exactly
  * those scopes (an earlier import of the same rule, or of another file from the same machine), or
- * one holding only some of them and only members of the file's rule (an earlier import that
- * stopped part way, before a folder of it existed here), which gains the scopes it lacks. It is
- * never split: a rule is one slot, so a split would change which account each of its folders runs
- * on.
+ * one holding some of them that shares a member with it (an earlier import that stopped part way,
+ * before a folder of it existed here, whatever changed since), which gains the scopes it lacks. It
+ * is never split: a rule is one slot, so a split would change which account each of its folders
+ * runs on. See intoRule.
  */
 export interface RuleStep {
   /** The rule's display name, for a rule this creates, when it is not just the default. */
@@ -164,6 +167,9 @@ export interface PlanInput {
   rulesBlocked?: { folder?: string; alias?: string };
   /** The account live on this machine's main login (the global slot), if any. */
   globalLive?: string | null;
+  /** The login (uuid) live in a slot that no account stored here is yet: an account of the file
+   *  with that login is live there as soon as the import stores it (see unstoredLiveLogins). */
+  unstoredLogins?: ReadonlyMap<SlotId, string>;
   /** The environment the daemon is started from here, to say when it overrides a saved setting. */
   env?: Readonly<Record<string, string | undefined>>;
 }
@@ -219,12 +225,33 @@ function existingFor(
  * label in any case or by id.
  */
 function planAccounts(input: PlanInput): AccountStep[] {
+  const matches = input.payload.accounts.map((entry) => existingFor(entry, input.accounts));
   const taken = new Set(input.accounts.map((a) => a.label.toLowerCase()));
-  const ids = new Set(input.accounts.map((a) => a.id.toLowerCase()));
-  const isTaken = (label: string): boolean =>
-    taken.has(label.toLowerCase()) || ids.has(label.toLowerCase());
+  const idsHere = new Set(input.accounts.map((a) => a.id.toLowerCase()));
+  // The ids this import keeps for the accounts it adds: an id no account here has, and that no
+  // account here answers to as its label (the vault refuses both, since a name would then resolve
+  // to two accounts). Every label the import gives must avoid these as much as the ids already
+  // here — whichever of the two the vault stores first, it refuses the other.
+  const keptIds = new Set(
+    input.payload.accounts.flatMap((entry, i) =>
+      matches[i] === undefined &&
+      entry.id !== undefined &&
+      !idsHere.has(entry.id.toLowerCase()) &&
+      !taken.has(entry.id.toLowerCase())
+        ? [entry.id.toLowerCase()]
+        : [],
+    ),
+  );
+  const isTaken = (label: string, ownId: string | undefined): boolean => {
+    const lower = label.toLowerCase();
+    return (
+      taken.has(lower) ||
+      idsHere.has(lower) ||
+      (keptIds.has(lower) && lower !== ownId?.toLowerCase())
+    );
+  };
   return input.payload.accounts.map((entry, i): AccountStep => {
-    const existing = existingFor(entry, input.accounts);
+    const existing = matches[i];
     if (existing !== undefined) {
       if (input.replace && entry.bundle !== undefined) {
         const refusal = importIdentityRefusal(existing, entry.bundle.oauthAccount);
@@ -247,11 +274,11 @@ function planAccounts(input: PlanInput): AccountStep[] {
     }
     const wanted = storedLabel(entry.label);
     let label = wanted;
-    for (let n = 2; isTaken(label); n += 1) label = `${wanted} (${n})`;
+    for (let n = 2; isTaken(label, entry.id); n += 1) label = `${wanted} (${n})`;
     taken.add(label.toLowerCase());
-    // An id another account here already has stays behind (that account is not this one: they
-    // name different logins); the vault then makes a new one.
-    const keepId = entry.id !== undefined && !input.accounts.some((a) => a.id === entry.id);
+    // An id another account here already has, or spells as its label, stays behind (that account
+    // is not this one: they name different logins); the vault then makes a new one.
+    const keepId = entry.id !== undefined && keptIds.has(entry.id.toLowerCase());
     return {
       kind: 'add',
       entry: i,
@@ -425,32 +452,44 @@ function earlySkip(
 }
 
 /**
- * The rule here the file's rule is added to, if any. Every usable scope held here must be held by
- * this one rule, and the rule must hold nothing else. When it holds all of them it is the same
- * rule (as before, whatever its members). When it holds only some, it is taken for the same rule
- * only while its members are all members of the file's rule: then it is what an earlier import of
- * this rule made before the rest of its folders existed here, and it gains them. A rule of this
- * machine's own that happens to hold one of the folders is left as it is.
+ * Which rule here, if any, the file's rule IS — the one it is added to rather than made beside.
+ *
+ * A rule here holding exactly the file rule's usable scopes, and nothing else, is that rule,
+ * whatever its members. Otherwise a rule here holding some of the scopes is that rule when it
+ * shares a member with it on the same side: an account both include, or both exclude. That is what
+ * an earlier import of this rule left (made before the rest of its folders existed here, then
+ * changed on either machine since: a member added or dropped, a folder added or removed), and
+ * making a second rule beside it would split the file's rule in two — two slots, so the account
+ * both include could run in only one of them, and the other folders would quietly run on some
+ * other account. A rule here that shares no member is this machine's own; the scopes it holds stay
+ * its own. When two or more rules here share members with it (a split an older build made), there
+ * is no one rule to grow, and making a third would split it further: `ambiguous` names them.
  */
 function intoRule(
   usable: readonly ScopePlan[],
   holders: readonly (FolderRule | undefined)[],
   step: RuleStep,
   steps: readonly AccountStep[],
-): FolderRule | undefined {
+): { rule?: FolderRule; ambiguous?: FolderRule[] } {
   const held = [...new Set(holders.filter((h): h is FolderRule => h !== undefined))];
-  if (held.length !== 1) return undefined;
-  const rule = held[0]!;
-  const holds = holders.filter((h) => h === rule).length;
-  if (holds !== rule.folders.length + (rule.aliases?.length ?? 0)) return undefined;
-  if (holds === usable.length) return rule;
-  const ids = (targets: readonly MemberTarget[]): Set<string | undefined> =>
-    new Set(targets.map((t) => localIdOf(t, steps)));
+  if (held.length === 0) return {};
+  const only = held[0]!;
+  if (
+    held.length === 1 &&
+    holders.every((h) => h === only) &&
+    usable.length === only.folders.length + (only.aliases?.length ?? 0)
+  ) {
+    return { rule: only };
+  }
+  const ids = (targets: readonly MemberTarget[]): Set<string> =>
+    new Set(targets.flatMap((t) => localIdOf(t, steps) ?? []));
   const include = ids(step.include);
   const exclude = ids(step.exclude);
-  return rule.include.every((id) => include.has(id)) && rule.exclude.every((id) => exclude.has(id))
-    ? rule
-    : undefined;
+  const same = held.filter(
+    (r) => r.include.some((id) => include.has(id)) || r.exclude.some((id) => exclude.has(id)),
+  );
+  if (same.length > 1) return { ambiguous: same };
+  return same.length === 1 ? { rule: same[0]! } : {};
 }
 
 /**
@@ -550,22 +589,30 @@ function planRules(input: PlanInput, steps: readonly AccountStep[]): RuleStep[] 
     if (noScope !== undefined) return { ...step, skip: noScope };
 
     // The members are added to the rule here that is this rule (see intoRule), which gains any
-    // scope it lacks; otherwise a scope some other rule here holds stays that rule's, and the rule
-    // is made on the rest.
+    // scope no rule here holds; otherwise the rule is made on those. Either way a scope some other
+    // rule here holds stays that rule's.
     const usable = step.scopes.filter((s) => s.skip === undefined);
     const holders = usable.map((s) => ruleHolding(s, input));
-    const into = intoRule(usable, holders, step, steps);
-    if (into !== undefined) {
-      step.into = into;
-      for (const [i, scope] of usable.entries()) if (holders[i] === undefined) scope.joins = true;
-    } else {
-      for (const [i, scope] of usable.entries()) {
-        if (holders[i] !== undefined)
-          scope.skip = 'this machine has another rule there; it is left as it is';
-      }
-      const left = noScopeLeft(step.scopes);
-      if (left !== undefined) return { ...step, skip: left };
+    const { rule: into, ambiguous } = intoRule(usable, holders, step, steps);
+    if (ambiguous !== undefined) {
+      return {
+        ...step,
+        skip:
+          'this machine already has it split between rules on ' +
+          ambiguous.map((r) => describeRuleScopes(r)).join(' and ') +
+          '; it is left as it is (remove all but one with cctl folder reset, then import again)',
+      };
     }
+    if (into !== undefined) step.into = into;
+    for (const [i, scope] of usable.entries()) {
+      if (holders[i] === undefined) {
+        if (into !== undefined) scope.joins = true;
+      } else if (holders[i] !== into) {
+        scope.skip = 'this machine has another rule there; it is left as it is';
+      }
+    }
+    const left = noScopeLeft(step.scopes);
+    if (left !== undefined) return { ...step, skip: left };
 
     narrowMembers(step, steps, input);
     const joins = step.scopes.some((s) => s.joins === true);
@@ -601,11 +648,18 @@ function planRules(input: PlanInput, steps: readonly AccountStep[]): RuleStep[] 
  * spare account are seen as such. When some slot is left with none, every rule reserving the
  * account it is stuck on is skipped, saying why, and the choice is made again without them; the
  * engine refuses those same rules. Each move is noted on the rules that cause it. Who is live in
- * each slot is read from what is recorded for it; which account each slot then runs is decided at
- * run time.
+ * each slot is read from what is recorded for it, and an account the import adds counts as live
+ * where its login already runs unstored (this machine's main login, typically: it was logged in
+ * before cctl kept it). Which account each slot then runs is decided at run time.
  */
 function foreseeHandOffs(input: PlanInput, steps: readonly AccountStep[], rules: RuleStep[]): void {
   const key = (t: MemberTarget): string => memberKey(t, steps);
+  // The accounts the file reserves to a rule are never a slot's replacement (the engine is told the
+  // same: see importRules' keepOut).
+  const forRule = fileReserved(input, steps);
+  const keptOut = new Set(
+    steps.flatMap((s) => (s.kind === 'add' && forRule.has(s.entry) ? [key(s)] : [])),
+  );
   // The accounts the import adds join the shared pool before the rules are written, as rows only
   // the plan knows (with tokens they can take a slot; without, they are quarantined).
   const added: StoredAccount[] = steps.flatMap((s) =>
@@ -630,7 +684,18 @@ function foreseeHandOffs(input: PlanInput, steps: readonly AccountStep[], rules:
       slot === 'global'
         ? (input.globalLive ?? null)
         : (input.rules.find((r) => ruleSlotId(r.id) === slot)?.activeId ?? null);
-    occupancy.set(slot, new Set(live !== null ? [live] : []));
+    const owners = new Set(live !== null ? [live] : []);
+    // A login this machine runs but has not stored, which the import stores: live there once added.
+    const login = input.unstoredLogins?.get(slot);
+    for (const s of steps) {
+      if (
+        login !== undefined &&
+        s.kind === 'add' &&
+        loginOf(input.payload.accounts[s.entry]!) === login
+      )
+        owners.add(key({ entry: s.entry, label: s.label }));
+    }
+    occupancy.set(slot, owners);
   }
   const made = (): RuleStep[] => rules.filter((r) => r.skip === undefined);
   const describeSlot = (slot: SlotId): string => {
@@ -656,7 +721,8 @@ function foreseeHandOffs(input: PlanInput, steps: readonly AccountStep[], rules:
     for (const [slot, owners] of occupancy) {
       const from = reserving.find((a) => owners.has(a.id) && !mayKeep(slot, a.id));
       if (from === undefined) continue;
-      const options = availableInOrder(slotPool(slot, after, occupancy)).map((a) => a.id);
+      const pool = withoutKeptOut(slotPool(slot, after, occupancy), keptOut);
+      const options = availableInOrder(pool).map((a) => a.id);
       moving.push({ slot, from, options });
     }
     const assigned = assignDistinct(moving.map((m) => m.options));
@@ -682,6 +748,17 @@ function foreseeHandOffs(input: PlanInput, steps: readonly AccountStep[], rules:
   }
 }
 
+/** The entries of the file some rule of it includes: accounts reserved to a rule on the machine the
+ *  file came from. */
+function fileReserved(input: PlanInput, steps: readonly AccountStep[]): Set<number> {
+  const labels = labelsByEntry(steps);
+  return new Set(
+    input.payload.rules.flatMap((r) =>
+      r.include.flatMap((ref) => resolveMember(ref, input, labels)?.entry ?? []),
+    ),
+  );
+}
+
 /**
  * Keep out of auto-switch every account the file reserves to a rule (unless the file already
  * excludes it). On the other machine it ran only in that rule's folders; here, without the rule, it
@@ -693,21 +770,16 @@ function foreseeHandOffs(input: PlanInput, steps: readonly AccountStep[], rules:
  * leaves it held back too.
  */
 function holdBackOrphans(input: PlanInput, steps: AccountStep[], rules: readonly RuleStep[]): void {
-  const labels = labelsByEntry(steps);
-  const reservedOnSource = new Set(
-    input.payload.rules.flatMap((r) =>
-      r.include.flatMap((ref) => resolveMember(ref, input, labels)?.entry ?? []),
-    ),
-  );
+  const reservedOnSource = fileReserved(input, steps);
   const reservedByPlan = new Set(
     rules
       .filter((r) => r.skip === undefined)
       .flatMap((r) => r.include.flatMap((t) => (t.entry !== undefined ? [t.entry] : []))),
   );
   for (const step of steps) {
-    if (step.kind !== 'add' || step.autoSwitchExcluded || !reservedOnSource.has(step.entry)) {
-      continue;
-    }
+    if (step.kind !== 'add' || !reservedOnSource.has(step.entry)) continue;
+    step.forRule = true;
+    if (step.autoSwitchExcluded) continue;
     if (reservedByPlan.has(step.entry)) {
       step.awaitsRule = true;
     } else {

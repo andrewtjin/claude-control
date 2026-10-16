@@ -117,14 +117,18 @@ What an import does with each part, printed in full by `--dry-run`:
   account.
 - **An account reserved to a rule that is not made here** (its folder is missing here, say, or
   the rule is refused while the import runs) is added but kept out of auto-switch, so a
-  client's account does not end up spending its quota on other work; `cctl accounts include
-<account>` hands it back to auto-switch.
+  client's account does not end up spending its quota on other work; nor does the import move
+  a slot onto it, or seat a rule it makes with it. `cctl accounts include <account>` hands it
+  back to auto-switch.
 - **Rules** are rebuilt whole: one rule with every folder and session scope the source rule
   had, on one slot, with the same included and excluded accounts. When this machine already has
   a rule on exactly those scopes (an earlier import of the same file, or of another file from
   the same machine), the accounts it lacks are added to it; when it has the rule an earlier
-  import made before one of its folders existed here, that rule gains the folder rather than a
-  second rule being made. A scope is left out, and listed,
+  import made before one of its folders existed here (one holding some of the scopes and
+  sharing an included or excluded account with it, whatever changed on either machine since),
+  that rule gains the folder rather than a second rule being made. When this machine already
+  has the rule split between two such rules, the rule is skipped and listed rather than split
+  further. A scope is left out, and listed,
   when its folder does not exist here, is a network folder (those are never looked up from a
   file), is a folder of another platform, or is one no rule may cover (a drive root, the home
   folder, cctl's own folders); a scope another rule here holds is left to that rule. A rule is
@@ -134,7 +138,8 @@ What an import does with each part, printed in full by `--dry-run`:
   the 64-rule limit or a limit on accounts (32 included or excluded by one rule, 256 reserved in
   all), or reserving an account would leave this machine's main login, or another rule's slot,
   with no account to run on. A rule that reserves the account live in a slot here moves that
-  slot to another account first, and says so. Folder rules are not created on macOS, nor while a
+  slot to another account first, and says so; that includes this machine's main login when it
+  runs an account of the file that cctl had not stored yet. Folder rules are not created on macOS, nor while a
   daemon older than this build runs (`cctl daemon restart`).
 - **Settings** are checked the way `cctl settings set` checks them and saved the same way. A
   setting this machine already has with another value is kept unless `--replace`. A value that

@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import {
+  CredentialStore,
   FileCredentialChannel,
   InsecurePassthroughProtector,
   LockTimeoutError,
@@ -1492,6 +1493,88 @@ describe('a rule an earlier import made part way', () => {
     expect(rules[0]!.activeId).toBe(xb.id);
     expect(await picture(b)).toEqual(await picture(a));
   });
+
+  it('grows the rule though the source dropped an exclusion of it since the first import', async () => {
+    const a = await machine();
+    const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
+    const t = await a.engine.addAccount('t', bundle('T1', 'u-t'));
+    await a.engine.addAccount('s', bundle('S1', 'u-s'));
+    const p1 = await folder(a, 'p1');
+    const p2 = await folder(a, 'p2');
+    const rule = await a.vault.createRule({
+      folders: [p1, p2],
+      include: [x.id],
+      exclude: [t.id],
+    });
+    const first = join(a.root, 'first');
+    await runExport(first, exportAll, a.deps);
+
+    const b = await machine();
+    await rm(p2, { recursive: true, force: true });
+    expect(await importInto(b, first)).toEqual({ failed: 0 });
+    expect(await b.engine.listRules()).toHaveLength(1);
+
+    await a.vault.removeFromRule(rule.id, [t.id]);
+    const second = join(a.root, 'second');
+    await runExport(second, exportAll, a.deps);
+    await mkdir(p2, { recursive: true });
+    b.out.length = 0;
+    await importInto(b, second, { dryRun: true });
+    const dry = b.out.join('');
+    expect(dry).toContain(`folder ${p2}: joins the rule here`);
+    expect(dry).not.toContain(': create');
+    expect(dry).not.toContain('another rule there');
+    expect(await importInto(b, second)).toEqual({ failed: 0 });
+    const rules = await b.engine.listRules();
+    expect(rules).toHaveLength(1);
+    expect(rules[0]!.folders).toHaveLength(2);
+    const xb = (await b.engine.listAllAccounts()).find((r) => r.label === 'x')!;
+    expect(rules[0]!.activeId).toBe(xb.id);
+  });
+
+  it("grows the rule beside a rule of this machine's own that holds one of its folders", async () => {
+    const a = await machine();
+    const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
+    const alpha = await a.engine.addAccount('alpha', bundle('A1', 'u-alpha'));
+    const eps = await a.engine.addAccount('eps', bundle('E1', 'u-eps'));
+    const f1 = await folder(a, 'f1');
+    const f2 = await folder(a, 'f2');
+    await a.vault.createRule({
+      folders: [f1, f2],
+      aliases: [{ folder: f1, alias: 'deploy' }],
+      include: [x.id, alpha.id],
+      exclude: [eps.id],
+      label: 'work-rule',
+    });
+    const file = join(a.root, 'f');
+    await runExport(file, exportAll, a.deps);
+
+    // Machine b has its own account and its own rule on f1.
+    const b = await machine();
+    const other = await b.engine.addAccount('other', bundle('O1', 'u-other'));
+    await b.engine.includeInFolder(f1, [other.id], { label: 'mine' });
+    await rm(f2, { recursive: true, force: true });
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    expect((await b.engine.listRules()).map((r) => r.label).sort()).toEqual(['mine', 'work-rule']);
+
+    await mkdir(f2, { recursive: true });
+    b.out.length = 0;
+    await importInto(b, file, { dryRun: true });
+    const dry = b.out.join('');
+    expect(dry).toContain(`folder ${f2}: joins the rule here`);
+    expect(dry).toContain(`folder ${f1}: left out - this machine has another rule there`);
+    expect(dry).not.toContain(': create');
+    b.out.length = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    const rules = await b.engine.listRules();
+    expect(rules.map((r) => r.label).sort()).toEqual(['mine', 'work-rule']);
+    const work = rules.find((r) => r.label === 'work-rule')!;
+    expect(work.folders).toHaveLength(1);
+    expect(work.aliases).toHaveLength(1);
+    const xb = (await b.engine.listAllAccounts()).find((r) => r.label === 'x')!;
+    expect(work.activeId).toBe(xb.id);
+    expect(rules.find((r) => r.label === 'mine')!.folders).toEqual([f1]);
+  });
 });
 
 describe('importing the same file again', () => {
@@ -1641,6 +1724,92 @@ describe('what the dry run promises, the real run does', () => {
     expect(b.out.join('')).toContain(why);
     expect(await b.engine.listRules()).toEqual([]);
   });
+
+  it('sees the main login moving when the account a rule includes runs there unstored', async () => {
+    const a = await machine();
+    const client = await a.engine.addAccount('client', bundle('C1', 'u-client'));
+    await a.engine.includeInFolder(await folder(a, 'proj'), [client.id]);
+    const withTokens = join(a.root, 'tokens');
+    await runExport(withTokens, exportAll, a.deps);
+    const without = join(a.root, 'none');
+    await runExport(without, { ...exportAll, tokens: false }, a.deps);
+
+    /** A machine whose main login is client's, logged in before cctl stored it. */
+    async function target(spare: boolean): Promise<Machine> {
+      const b = await machine();
+      if (spare) {
+        const other = await b.engine.addAccount('other', bundle('O1', 'u-other'));
+        await b.engine.activate(other.id);
+      }
+      const live = new CredentialStore(b.paths);
+      await live.writeLiveCredentials(bundle('C-LIVE', 'u-client').claudeAiOauth);
+      await live.writeOauthAccount({ accountUuid: 'u-client', emailAddress: 'u-client@x.com' });
+      expect(await b.engine.getActiveId('global')).toBeNull();
+      return b;
+    }
+
+    // Nothing else here can take the main login: both runs skip the rule.
+    const b = await target(false);
+    const why = "including client would leave this machine's main login with no shared account";
+    await importInto(b, withTokens, { dryRun: true });
+    expect(b.out.join('')).toContain(why);
+    b.out.length = 0;
+    expect(await importInto(b, withTokens)).toEqual({ failed: 0 });
+    expect(b.out.join('')).toContain(why);
+    expect(await b.engine.listRules()).toEqual([]);
+
+    // With another account here, both runs say the main login moves, with tokens or without.
+    for (const file of [withTokens, without]) {
+      const c = await target(true);
+      await importInto(c, file, { dryRun: true });
+      expect(c.out.join('')).toContain("this machine's main login moves off client");
+      c.out.length = 0;
+      expect(await importInto(c, file)).toEqual({ failed: 0 });
+      expect(c.out.join('')).toMatch(/switched off client \(now reserved\) and is on other/);
+      expect(await c.engine.listRules()).toHaveLength(1);
+    }
+  });
+
+  it('makes the rule it promised when one account is labelled with the id another keeps', async () => {
+    // Written by a build whose vault let an import keep an id that a label here already spelled:
+    // the label and the id travel together, and either order would make the vault refuse one.
+    const ID_Q = '6a1f0c3e-2b4d-4e6f-8a9b-0c1d2e3f4a5b';
+    const ID_P = '7b2e1d4f-3c5e-4f70-9bac-1d2e3f4a5b6c';
+    for (const order of [0, 1]) {
+      const b = await machine();
+      const proj = await folder(b, 'proj');
+      const q = {
+        label: ID_P,
+        id: ID_Q,
+        accountUuid: 'u-q',
+        autoSwitchExcluded: false,
+        bundle: bundle('Q1', 'u-q'),
+      };
+      const p = {
+        label: 'p',
+        id: ID_P,
+        accountUuid: 'u-p',
+        autoSwitchExcluded: false,
+        bundle: bundle('P1', 'u-p'),
+      };
+      const file = await sealedFile(
+        b,
+        filePayload({
+          accounts: order === 0 ? [q, p] : [p, q],
+          rules: [{ label: 'r', folders: [proj], aliases: [], include: ['u-q'], exclude: [] }],
+        }),
+      );
+      await importInto(b, file, { dryRun: true });
+      expect(b.out.join('')).toContain(`folder ${proj}: create, include ${ID_P} (2)`);
+      b.out.length = 0;
+      expect(await importInto(b, file)).toEqual({ failed: 0 });
+      expect(b.out.join('')).toContain(`folder ${proj}: created, include ${ID_P} (2)`);
+      const rows = await b.engine.listAllAccounts();
+      expect(rows.map((r) => r.label).sort()).toEqual([`${ID_P} (2)`, 'p']);
+      expect(rows.find((r) => r.label === 'p')!.id).toBe(ID_P);
+      expect(await b.engine.listRules()).toHaveLength(1);
+    }
+  });
 });
 
 describe('settings that guard something', () => {
@@ -1739,6 +1908,45 @@ describe('accounts a rule of the file reserves', () => {
     const row = (await b.engine.listAllAccounts()).find((r) => r.label === 'client')!;
     expect(row.autoSwitchExcluded).toBe(true);
     expect(b.out.join('')).toContain('client: kept out of auto-switch');
+  });
+
+  it('never moves a slot onto it, nor seats a new rule with it, during the import', async () => {
+    // Its rule's folder is gone here, so client arrives kept out of auto-switch. Another rule of
+    // the file reserves z and w, live on the main login and in an exclude-only rule's slot here.
+    const a = await machine();
+    const client = await a.engine.addAccount('client', bundle('C1', 'u-client'));
+    const az = await a.engine.addAccount('z', bundle('Z1', 'u-z'));
+    const aw = await a.engine.addAccount('w', bundle('W1', 'u-w'));
+    const projA = await folder(a, 'projA');
+    await a.engine.includeInFolder(projA, [client.id]);
+    await a.engine.includeInFolder(await folder(a, 'projB'), [az.id, aw.id]);
+    const file = join(a.root, 'f');
+    await runExport(file, exportAll, a.deps);
+    await rm(projA, { recursive: true, force: true });
+
+    const b = await machine();
+    const z = await b.engine.addAccount('z', bundle('Z2', 'u-z'));
+    const w = await b.engine.addAccount('w', bundle('W2', 'u-w'));
+    await b.engine.addAccount('s1', bundle('S1', 'u-s1'));
+    const s2 = await b.engine.addAccount('s2', bundle('S2', 'u-s2'));
+    await b.engine.activate(z.id);
+    const q = await folder(b, 'q');
+    await b.engine.excludeInFolder(q, [s2.id]);
+    const qRule = (await b.engine.listRules())[0]!;
+    expect(qRule.activeId).toBe(w.id);
+
+    await importInto(b, file, { dryRun: true });
+    expect(b.out.join('')).toContain('client: add, with its tokens, kept out of auto-switch');
+    b.out.length = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    const out = b.out.join('');
+    expect(out).not.toMatch(/is on client/);
+    const row = (await b.engine.listAllAccounts()).find((r) => r.label === 'client')!;
+    expect(row.autoSwitchExcluded).toBe(true);
+    const live = await b.engine.liveSlots();
+    expect([...live.values()]).not.toContain(row.id);
+    expect(live.get('global')).not.toBe(z.id);
+    expect((await b.engine.listRules()).find((r) => r.id === qRule.id)!.activeId).not.toBe(w.id);
   });
 
   it('quotes the command that hands it back', async () => {
@@ -1846,4 +2054,67 @@ describe('a file larger than any setup', () => {
     expect(lookups).toBe(0);
     expect(await b.engine.listAllAccounts()).toEqual([]);
   });
+
+  // Every bound at once: the most rules a machine holds, the most scopes in all, the most members
+  // per rule, each with the longest label. What the import prints and asks of the disk and the
+  // engine grows with the sum of these (each scope and member once), never with their product.
+  it('handles the largest file the bounds allow with output and work that add up, not multiply', async () => {
+    const MAX_PLAN_TEXT = 6_000_000;
+    let lookups = 0;
+    let checks = 0;
+    let batches = 0;
+    const b = await machine({
+      resolveFolder: (f) => {
+        lookups += 1;
+        return resolveFolderHere(f, process.platform);
+      },
+    });
+    b.deps.engine = engineWith(b.engine, {
+      checkRuleScope: (scope: Parameters<SwitchEngine['checkRuleScope']>[0]) => {
+        checks += 1;
+        return b.engine.checkRuleScope(scope);
+      },
+      importRules: (...args: Parameters<SwitchEngine['importRules']>) => {
+        batches += 1;
+        return b.engine.importRules(...args);
+      },
+    });
+    const there = await folder(b, 'many');
+    const accounts = Array.from({ length: 64 }, (_, i) => ({
+      label: String(i).padStart(4, '0') + 'L'.repeat(1020),
+      accountUuid: `u-${i}`,
+      autoSwitchExcluded: false,
+    }));
+    const rules = Array.from({ length: 64 }, (_, r) => ({
+      label: `r${r}`,
+      folders: [],
+      aliases: Array.from({ length: 16 }, (_x, j) => ({
+        folder: there,
+        alias: `${r}-${j}-` + 'a'.repeat(190),
+      })),
+      include: Array.from({ length: 32 }, (_x, i) => `u-${i}`),
+      exclude: Array.from({ length: 32 }, (_x, i) => `u-${32 + i}`),
+    }));
+    const file = await sealedFile(b, filePayload({ accounts, rules }));
+
+    await importInto(b, file, { dryRun: true });
+    const dry = b.out.join('');
+    // Each member is printed once per rule and each scope once in all: 64 rules x 64 labels of
+    // 1 KB is 4 MB, and the 1024 scopes add their own length once more. A fixed ceiling whatever
+    // the file holds, where a product of rules, scopes and members ran past any heap.
+    expect(dry.length).toBeLessThan(MAX_PLAN_TEXT);
+    expect(lookups).toBe(64 * 16);
+    expect(checks).toBe(64 * 16);
+    expect(batches).toBe(0);
+
+    b.out.length = 0;
+    lookups = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    expect(b.out.join('').length).toBeLessThan(MAX_PLAN_TEXT);
+    expect(lookups).toBe(64 * 16);
+    expect(batches).toBe(1);
+    const made = await b.engine.listRules();
+    expect(made).toHaveLength(64);
+    expect(made.every((r) => r.aliases?.length === 16)).toBe(true);
+  }, 300_000);
 });
