@@ -263,7 +263,8 @@ export function aggregateTokenStats(options: AggregateTokenStatsOptions): TokenS
 
 /** Each message id once across sessions. A scan de-duplicated per session keeps a fork's copies of
  *  its parent's turns so {@link dropInheritedTurns} can give each to its maker whichever file was
- *  read first; a copy whose maker is unknown still must not count twice in the totals. */
+ *  read first; a copy whose maker is unknown still must not count twice in the totals. Which copy
+ *  is kept then follows read order: with no maker recorded, neither session's slot is known right. */
 function countOnce(turns: readonly TranscriptTurn[]): TranscriptTurn[] {
   const seen = new Set<string>();
   return turns.filter((turn) => {
