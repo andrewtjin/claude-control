@@ -108,8 +108,9 @@ function lastRecordedSlots(
  * The turns of the sessions beside the shown ones that may have made a shown fork's copied turns. A
  * fork's file sits beside its parent's, and a copy is only known as one once its maker is read too.
  * Only a turn before its own session's first recorded span can be a copy, and only a session with a
- * span can be known as its maker, so an ordinary session reads nothing more, and a fork reads only
- * its recorded siblings, from its earliest such turn on.
+ * span can be known as its maker (from that span on), so an ordinary session, or one older than
+ * every span, reads nothing more, and a fork reads only its recorded siblings, from its earliest
+ * such turn on.
  */
 async function makerTurns(
   deps: SessionAliasDeps,
@@ -118,15 +119,22 @@ async function makerTurns(
   spans: readonly SessionSlotSpanRow[],
 ): Promise<TranscriptTurn[]> {
   const firstSpan = new Map<string, number>();
+  // A maker is only known from its first span on, so a turn older than every span has none to find.
+  let earliestSpan = Infinity;
   for (const span of spans) {
     firstSpan.set(
       span.sessionId,
       Math.min(span.startedAtMs, firstSpan.get(span.sessionId) ?? Infinity),
     );
+    earliestSpan = Math.min(earliestSpan, span.startedAtMs);
   }
   let sinceMs = Infinity;
   for (const turn of turns) {
-    if (turn.sessionId != null && turn.tsMs < (firstSpan.get(turn.sessionId) ?? Infinity)) {
+    if (
+      turn.sessionId != null &&
+      turn.tsMs >= earliestSpan &&
+      turn.tsMs < (firstSpan.get(turn.sessionId) ?? Infinity)
+    ) {
       sinceMs = Math.min(sinceMs, turn.tsMs);
     }
   }

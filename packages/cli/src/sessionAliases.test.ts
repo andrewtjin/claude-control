@@ -47,6 +47,7 @@ const S_FORK = 'aaaaaaaa-0000-4000-8000-000000000003';
 const S_AWAY = 'bbbbbbbb-0000-4000-8000-000000000001';
 const S_DUP1 = 'cccccccc-0000-4000-8000-000000000001';
 const S_DUP2 = 'cccccccc-0000-4000-8000-000000000002';
+const S_OLD = 'dddddddd-0000-4000-8000-000000000001';
 
 const bundle = (token: string): CredentialBundle => ({
   claudeAiOauth: { accessToken: token, refreshToken: 'r-' + token, expiresAt: 999 },
@@ -330,6 +331,25 @@ describe('runSessionShow', () => {
     expect(uses(h.json().sessions[0])).toEqual([['client', 1, 4000]]);
     const read = vi.mocked(readTranscriptTurns).mock.calls.map((c) => [...(c[0].sessionIds ?? [])]);
     expect(read).toEqual([[S_HAND]]);
+  });
+
+  it('reads no other transcript for a session older than every recorded span', async () => {
+    await writeSession(
+      here,
+      S_OLD,
+      [
+        userLine(here, T0 - 10 * HOUR),
+        turnLine('msg_o1', T0 - 10 * HOUR, 5),
+        customTitle('old one'),
+      ],
+      T0 - 9 * HOUR,
+    );
+    vi.mocked(readTranscriptTurns).mockClear();
+    const h = harness();
+    await runSessionShow('old one', { json: true }, h.deps);
+    expect(uses(h.json().sessions[0])).toEqual([['unattributed', 1, 5]]);
+    const read = vi.mocked(readTranscriptTurns).mock.calls.map((c) => [...(c[0].sessionIds ?? [])]);
+    expect(read).toEqual([[S_OLD]]);
   });
 
   it('defaults to the current session from CLAUDE_CODE_SESSION_ID, billed from its span alone', async () => {
