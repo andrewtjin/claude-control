@@ -82,6 +82,7 @@ import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
 import { runSessionAliases, runSessionShow, type SessionAliasDeps } from './sessionAliases.js';
 import { runSessionExclude, runSessionInclude, runSessionReset } from './sessionRules.js';
 import { withCaptureDir } from './captureDir.js';
+import { loginForRelogin, reloginRecoveryHint, spawnClaude } from './claudeAuthLogin.js';
 import { dpapiIdentityStore, runDaemon } from './daemonRun.js';
 import {
   appendCrashLine,
@@ -1605,9 +1606,12 @@ async function addFreshAccount(label: string): Promise<void> {
  * capture as `add --fresh`, but the captured credentials are written into the account's existing
  * vault entry (SAME id) and its quarantine is cleared — which is exactly what `add --fresh` must
  * NOT do (that mints a new id, orphaning the account's usage-attribution history). The engine's
- * identity guard refuses if the user logs into a different account in the window.
+ * identity guard refuses if the user logs into a different account.
+ *
+ * The login itself runs through `claude auth login` when the installed CLI has it, else (or with
+ * `--window`) through the interactive window this command always used — see claudeAuthLogin.ts.
  */
-async function reloginAccount(ref: string): Promise<void> {
+async function reloginAccount(ref: string, opts: { window?: boolean }): Promise<void> {
   const engine = buildEngine();
   // Resolve against the WHOLE fleet, reserved (folder-bound) members included: a re-login must reach
   // exactly the accounts binding reserves, whose ids/labels live in the group registry, not the
@@ -1620,20 +1624,16 @@ async function reloginAccount(ref: string): Promise<void> {
   // Same return-don't-fail contract as addFreshAccount: cleanup has to outlive every failure
   // path, and `fail()` (process.exit) would skip it. See captureDir.ts.
   const failure = await withCaptureDir(dirname(paths.vaultDir), 'relogin', async (captureDir) => {
-    // Same darwin Keychain-diff-and-restore as addFreshAccount — see that flow's comment.
+    // Same darwin Keychain-diff-and-restore as addFreshAccount — see that flow's comment. Read
+    // before ANY spawn, the support probe included, so the delta measures only this login.
     const prior = process.platform === 'darwin' ? await engine.readLiveOauth() : undefined;
-    process.stdout.write(
-      `Re-logging in "${account.label}" (${account.id}). A throwaway Claude window will open.\n` +
-        '  1. /login - pick the SAME account this entry belongs to (attribution is preserved).\n' +
-        '  2. Send one short message so the login completes.\n' +
-        '  3. /exit\n\n',
+    const login = await loginForRelogin(
+      account,
+      { ...process.env, CLAUDE_CONFIG_DIR: captureDir },
+      opts.window === true,
+      { spawner: spawnClaude, write: (text) => process.stdout.write(text) },
     );
-    const run = spawnSync('claude', [], {
-      stdio: 'inherit',
-      env: { ...process.env, CLAUDE_CONFIG_DIR: captureDir },
-      shell: process.platform === 'win32', // `claude` is a .cmd shim on Windows; a real PATH exe on mac/linux
-    });
-    if (run.error) return `could not launch \`claude\`: ${run.error.message}`;
+    if (login.failure !== undefined) return login.failure;
     try {
       // The Keychain path puts the pre-window login BACK on the way out (see that method), so
       // on darwin the live login is never healed by a re-login — the switch is always the honest
@@ -1656,8 +1656,14 @@ async function reloginAccount(ref: string): Promise<void> {
       );
     } catch (err) {
       // no_capture_login (login never completed) and relogin_identity_mismatch (wrong account) are
-      // expected, actionable failures — print the engine's message, don't stack-trace.
-      if (err instanceof SwitchEngineError) return err.message;
+      // expected, actionable failures — print the engine's message, don't stack-trace. After a
+      // browser login, add how to get past it: that login cannot be steered to an account the way
+      // the window's /login can, so a browser signed in as someone else is the usual cause.
+      if (err instanceof SwitchEngineError) {
+        return login.flow === 'browser'
+          ? `${err.message}\n${reloginRecoveryHint(account, err.code)}`
+          : err.message;
+      }
       throw err;
     }
     return undefined;
@@ -1840,9 +1846,15 @@ function buildAccountCommands(program: Command): void {
 
   accounts
     .command('relogin <ref>')
-    .description('re-login an existing (usually quarantined) account in place, keeping its id')
-    .action(async (ref: string) => {
-      await reloginAccount(ref);
+    .description(
+      're-login an existing (usually quarantined) account in place through the browser, keeping its id',
+    )
+    .option(
+      '--window',
+      'log in through an interactive Claude window instead of `claude auth login`',
+    )
+    .action(async (ref: string, opts: { window?: boolean }) => {
+      await reloginAccount(ref, opts);
     });
 
   accounts
