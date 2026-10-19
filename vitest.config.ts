@@ -6,7 +6,10 @@ import { defineConfig } from 'vitest/config';
 // separate projects tree), so a flat include is simpler and correct here.
 export default defineConfig({
   test: {
-    include: ['packages/*/src/**/*.test.ts'],
+    include: ['packages/*/src/**/*.test.ts', 'test/**/*.test.ts'],
+    // Every test file gets a throwaway home and a guard against writing the real Claude login or
+    // cctl state; see test/sandbox.mjs.
+    setupFiles: ['./test/sandbox.mjs'],
     environment: 'node',
     // Credential shell-outs (DPAPI) and native node:sqlite handles are process-global;
     // keep files isolated in forks so one test's env/fs state can't leak into another.
