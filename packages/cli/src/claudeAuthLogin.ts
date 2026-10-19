@@ -276,14 +276,14 @@ async function browserLogin(
   deps: ReloginLoginDeps,
 ): Promise<ReloginLogin> {
   const email = emailFlag ? safeLoginEmail(target.emailAddress) : undefined;
-  // `--email` only pre-fills the login page. A browser already signed in to claude.ai as someone
-  // else completes the login as THAT account without asking, so the instructions lead with it;
-  // the engine's identity guard refuses such a login afterwards, but only after the round trip.
+  // `--email` only pre-fills the login page. A browser already signed in to claude.ai offers that
+  // account's Authorize button, whatever the email says, so the instructions say to check it; the
+  // engine's identity guard refuses a wrong account afterwards, but only after the round trip.
   const who = target.emailAddress ?? 'the account this entry belongs to';
   deps.write(
     `Re-logging in "${target.label}" (${target.id}) through the browser.\n` +
       `  1. Sign in as ${who} - the SAME account (attribution is preserved).\n` +
-      '     If the browser is signed in to a different claude.ai account, switch accounts there first.\n' +
+      '     Check the account before you click Authorize; if it is another one, switch accounts on claude.ai first.\n' +
       '  2. If the browser does not open, visit the link printed below; paste the code here if asked.\n\n',
   );
   const timeoutMs = deps.timeoutMs ?? AUTH_LOGIN_TIMEOUT_MS;

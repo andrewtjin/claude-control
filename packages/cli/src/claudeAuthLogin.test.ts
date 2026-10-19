@@ -196,12 +196,12 @@ describe('loginForRelogin', () => {
     expect(run?.timeoutMs).toBe(AUTH_LOGIN_TIMEOUT_MS);
   });
 
-  it('tells the user which account to sign in as and to switch the browser account first', async () => {
+  it('tells the user which account to sign in as and to check it before authorizing', async () => {
     const { printed } = await login(stubSpawner());
     expect(printed).toContain('Re-logging in "work" (id-1) through the browser.');
     expect(printed).toContain('Sign in as me@example.com');
     expect(printed).toContain(
-      'If the browser is signed in to a different claude.ai account, switch accounts there first.',
+      'Check the account before you click Authorize; if it is another one, switch accounts on claude.ai first.',
     );
     expect(printed).toContain('paste the code here if asked');
     // The window's instructions belong to the other flow only.

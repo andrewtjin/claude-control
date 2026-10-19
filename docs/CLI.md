@@ -48,8 +48,9 @@ and both refuse if you log into a different account.
 dir: it opens the browser, waits for the sign-in (or a pasted code, if the browser cannot hand it
 back) and needs no interactive terminal, so it also works from Claude Code's `!` prefix. The email
 only pre-fills the login page — a browser already signed in to claude.ai as a **different**
-account completes the login as that account, and `relogin` then refuses it. So switch the
-browser's claude.ai account first, or use `--window` or `reauth` instead. A
+account still offers that account's Authorize button, and `relogin` refuses the login if you
+click it. So check the account before you click Authorize and switch it on claude.ai if needed,
+or use `--window` or `reauth` instead. A
 Claude Code too old to have `claude auth login` gets the interactive window automatically
 (`/login`, send one message, `/exit`), which `--window` asks for explicitly. A login that does not
 finish within 15 minutes is stopped.
