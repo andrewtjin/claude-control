@@ -39,6 +39,7 @@ const engine = vi.hoisted(() => ({
   readLiveOauth: vi.fn((): Promise<undefined> => Promise.resolve(undefined)),
   reloginFromConfigDir: vi.fn(),
   reloginFromKeychainDelta: vi.fn(),
+  restoreLiveOauth: vi.fn((): Promise<boolean> => Promise.resolve(false)),
 }));
 vi.mock('./context.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./context.js')>()),
@@ -146,6 +147,8 @@ beforeEach(async () => {
     healedLiveLogin: false,
   });
   engine.reloginFromKeychainDelta.mockResolvedValue({ ...work, quarantined: false });
+  engine.restoreLiveOauth.mockReset();
+  engine.restoreLiveOauth.mockResolvedValue(false);
   spawner.spawnClaude.mockReset();
 });
 
@@ -284,11 +287,84 @@ describe('accounts relogin', () => {
     expect(await leftoverLoginDirs()).toEqual([]);
   });
 
+  it('gives no login advice for an engine refusal that is not about the login', async () => {
+    stubClaude();
+    captureCall().mockRejectedValue(
+      new RefreshError('a switch to or from "work" is not settled yet', 'switch_unsettled'),
+    );
+    const r = await relogin();
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain('a switch to or from "work" is not settled yet');
+    expect(r.err).not.toContain('--window');
+    expect(r.err).not.toContain('reauth');
+    expect(await leftoverLoginDirs()).toEqual([]);
+  });
+
   it('still deletes the dir when the capture throws something unexpected', async () => {
     stubClaude();
     captureCall().mockRejectedValue(new Error('disk on fire'));
     await expect(relogin()).rejects.toThrow('disk on fire');
     expect(await leftoverLoginDirs()).toEqual([]);
+  });
+
+  // On macOS the CLI writes every login to the one Keychain item, so a login that stored its
+  // tokens and then failed has already replaced the live login. The process platform is forced
+  // here; every outside effect is still a stub.
+  describe('on darwin', () => {
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const prior = { accessToken: 'A', refreshToken: 'r-A', expiresAt: 1 };
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+      engine.readLiveOauth.mockResolvedValue(prior as never);
+    });
+    afterEach(() => {
+      Object.defineProperty(process, 'platform', platform);
+    });
+
+    it('puts the prior live login back when the browser login fails', async () => {
+      stubClaude({ login: { ...ok, status: 1 } });
+      engine.restoreLiveOauth.mockResolvedValue(true);
+      const r = await relogin();
+      expect(r.exited).toBe(true);
+      expect(r.err).toContain('`claude auth login` exited with code 1');
+      expect(engine.restoreLiveOauth).toHaveBeenCalledWith(prior);
+      expect(engine.reloginFromKeychainDelta).not.toHaveBeenCalled();
+      expect(await leftoverLoginDirs()).toEqual([]);
+    });
+
+    it('puts the prior live login back when the browser login times out', async () => {
+      stubClaude({ login: { status: null, signal: 'SIGTERM', output: '', timedOut: true } });
+      const r = await relogin();
+      expect(r.exited).toBe(true);
+      expect(engine.restoreLiveOauth).toHaveBeenCalledWith(prior);
+      expect(await leftoverLoginDirs()).toEqual([]);
+    });
+
+    it('says so when the prior login could not be checked, and still deletes the dir', async () => {
+      stubClaude({ login: { ...ok, status: 1 } });
+      engine.restoreLiveOauth.mockRejectedValue(new Error('lock held'));
+      const r = await relogin();
+      expect(r.exited).toBe(true);
+      expect(r.err).toContain('`claude auth login` exited with code 1');
+      expect(r.err).toContain('Could not check that your previous live login is still in place');
+      expect(r.err).toContain('lock held');
+      expect(await leftoverLoginDirs()).toEqual([]);
+    });
+
+    it('leaves the restore to the capture when the login succeeds', async () => {
+      stubClaude();
+      const r = await relogin();
+      expect(r.exited).toBe(false);
+      expect(engine.reloginFromKeychainDelta).toHaveBeenCalledTimes(1);
+      expect(engine.restoreLiveOauth).not.toHaveBeenCalled();
+    });
+  });
+
+  it('never restores a live login off darwin, where the login lands in the throwaway dir', async () => {
+    if (process.platform === 'darwin') return;
+    stubClaude({ login: { ...ok, status: 1 } });
+    await relogin();
+    expect(engine.restoreLiveOauth).not.toHaveBeenCalled();
   });
 
   it('refuses an unknown account before running anything', async () => {

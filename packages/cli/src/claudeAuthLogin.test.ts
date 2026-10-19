@@ -153,6 +153,24 @@ describe('detectAuthLogin', () => {
     });
   });
 
+  // Through the Windows shim a missing `claude` is cmd.exe's own error, not a spawn error. Read
+  // as an older CLI it would open a window that cannot start either.
+  it('reports an error, not an older CLI, when the shell cannot find `claude`', async () => {
+    const notFound =
+      "'claude' is not recognized as an internal or external command,\r\n" +
+      'operable program or batch file.\r\n';
+    for (const probe of [
+      { ...ok(notFound), status: 1 },
+      { ...ok(''), status: 9009 },
+    ]) {
+      const stub = stubSpawner({ probe });
+      expect(await detectAuthLogin(stub.spawner, env)).toEqual({
+        kind: 'error',
+        message: 'could not launch `claude` (is it on PATH?)',
+      });
+    }
+  });
+
   it('reports an error when the probe does not answer in time', async () => {
     const stub = stubSpawner({
       probe: { status: null, signal: 'SIGTERM', output: '', timedOut: true },
@@ -333,7 +351,7 @@ describe('reloginRecoveryHint', () => {
     expect(hint).toContain('Switch it to the right account on claude.ai');
   });
 
-  it('offers just the other ways in for any other failure', () => {
+  it('offers just the other ways in for a login that left nothing to capture', () => {
     const hint = reloginRecoveryHint(target, 'no_capture_login');
     expect(hint).not.toContain('different claude.ai account');
     expect(hint).toContain('Re-run, or log in through an interactive window');
@@ -376,6 +394,34 @@ describe('createClaudeSpawner', () => {
     expect(run.status).not.toBe(0);
     expect(Date.now() - started).toBeLessThan(20_000);
   }, 30_000);
+
+  // Ctrl+C at the paste prompt reaches this process too; it must outlive the child so the caller
+  // can still delete the throwaway dir. The handlers live exactly as long as the run.
+  it('swallows Ctrl+C in this process only while an inherited run is going', async () => {
+    const watched: NodeJS.Signals[] =
+      process.platform === 'win32' ? ['SIGINT', 'SIGBREAK'] : ['SIGINT'];
+    const before = watched.map((sig) => process.listenerCount(sig));
+    const pending = node(['-e', 'setTimeout(Object,200)'], { env: process.env, capture: false });
+    expect(watched.map((sig) => process.listenerCount(sig))).toEqual(before.map((n) => n + 1));
+    expect((await pending).status).toBe(0);
+    expect(watched.map((sig) => process.listenerCount(sig))).toEqual(before);
+  });
+
+  it('leaves Ctrl+C alone for a captured run, which has no terminal to share', async () => {
+    const before = process.listenerCount('SIGINT');
+    const pending = node(['--version'], { env: process.env, capture: true });
+    expect(process.listenerCount('SIGINT')).toBe(before);
+    await pending;
+  });
+
+  it('removes its handlers when the command cannot be started', async () => {
+    const before = process.listenerCount('SIGINT');
+    await createClaudeSpawner('cctl-no-such-binary-for-tests')([], {
+      env: process.env,
+      capture: false,
+    });
+    expect(process.listenerCount('SIGINT')).toBe(before);
+  });
 
   it('does not mark a run that ends before its timeout as timed out', async () => {
     const run = await node(['--version'], { env: process.env, capture: true, timeoutMs: 60_000 });

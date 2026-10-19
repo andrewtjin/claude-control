@@ -79,6 +79,26 @@ export function createClaudeSpawner(
       const child = windows
         ? spawn([command, ...args].join(' '), { stdio, env: options.env, shell: true })
         : spawn(command, [...args], { stdio, env: options.env });
+      // While an inherited-stdio child runs, Ctrl+C reaches the whole console group. Left to its
+      // default, Node would exit this process at once, before the child exits and before the
+      // caller's cleanup of the throwaway dir runs. Swallowing it here lets the child own the
+      // Ctrl+C; its exit then resolves this run as a failure, and cleanup happens as usual. The
+      // same reasoning as the launcher's spawnClaude. A captured (piped) run needs none of this.
+      const watched: NodeJS.Signals[] = options.capture
+        ? []
+        : windows
+          ? ['SIGINT', 'SIGBREAK']
+          : ['SIGINT'];
+      const ignore = (): void => {
+        // Intentionally empty: the child handles the signal and its exit settles the run.
+      };
+      for (const sig of watched) process.on(sig, ignore);
+      const settle = (run: ClaudeRun): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        for (const sig of watched) process.off(sig, ignore);
+        resolve(run);
+      };
+
       let output = '';
       child.stdout?.on('data', (chunk: Buffer) => (output += chunk.toString('utf8')));
       child.stderr?.on('data', (chunk: Buffer) => (output += chunk.toString('utf8')));
@@ -93,14 +113,8 @@ export function createClaudeSpawner(
             }, options.timeoutMs);
       // `error` (could not start) and `close` (exited, streams drained) can both fire for one
       // run; the first one settles the promise and the second is a no-op.
-      child.on('error', (error) => {
-        if (timer !== undefined) clearTimeout(timer);
-        resolve({ status: null, signal: null, output, timedOut, error });
-      });
-      child.on('close', (status, signal) => {
-        if (timer !== undefined) clearTimeout(timer);
-        resolve({ status, signal, output, timedOut });
-      });
+      child.on('error', (error) => settle({ status: null, signal: null, output, timedOut, error }));
+      child.on('close', (status, signal) => settle({ status, signal, output, timedOut }));
     });
 }
 
@@ -184,8 +198,25 @@ export async function detectAuthLogin(
       message: `\`claude auth login --help\` did not answer within ${PROBE_TIMEOUT_MS / 1000} seconds`,
     };
   }
+  if (run.status !== 0 && notLaunched(run)) {
+    return { kind: 'error', message: 'could not launch `claude` (is it on PATH?)' };
+  }
   if (run.status !== 0 || !run.output.includes('--claudeai')) return { kind: 'unsupported' };
   return { kind: 'supported', email: run.output.includes('--email') };
+}
+
+/**
+ * True when a run that did start reports that the SHELL could not find `claude`. Through the
+ * Windows shim the spawned process is cmd.exe, so a missing CLI is not a spawn error: cmd itself
+ * exits 1 (9009 from some callers) and prints "is not recognized as an internal or external
+ * command". Read as "this CLI has no `auth login`", that would open a window that cannot start
+ * either. Any other non-zero probe still counts as an older CLI, which is the back-compat case
+ * the window fallback exists for.
+ */
+function notLaunched(run: ClaudeRun): boolean {
+  return (
+    run.status === 9009 || /is not recognized as an internal or external command/i.test(run.output)
+  );
 }
 
 /** The account a re-login is for — just what the login step prints and passes on. */

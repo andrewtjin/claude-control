@@ -1633,7 +1633,25 @@ async function reloginAccount(ref: string, opts: { window?: boolean }): Promise<
       opts.window === true,
       { spawner: spawnClaude, write: (text) => process.stdout.write(text) },
     );
-    if (login.failure !== undefined) return login.failure;
+    if (login.failure !== undefined) {
+      // On darwin a login that stored its tokens and only then failed (a non-zero exit after the
+      // token exchange, or the timeout landing just after it) has already replaced the live
+      // Keychain login, and the capture below, whose own restore would undo that, never runs.
+      // Put the prior login back here instead, or the live tokens and the live identity block
+      // would name different accounts.
+      if (process.platform === 'darwin') {
+        try {
+          await engine.restoreLiveOauth(prior);
+        } catch (err) {
+          const why = err instanceof Error ? err.message : String(err);
+          return (
+            `${login.failure}\nCould not check that your previous live login is still in place ` +
+            `(${why}); \`cctl status\` shows which account is live.`
+          );
+        }
+      }
+      return login.failure;
+    }
     try {
       // The Keychain path puts the pre-window login BACK on the way out (see that method), so
       // on darwin the live login is never healed by a re-login — the switch is always the honest
@@ -1657,10 +1675,14 @@ async function reloginAccount(ref: string, opts: { window?: boolean }): Promise<
     } catch (err) {
       // no_capture_login (login never completed) and relogin_identity_mismatch (wrong account) are
       // expected, actionable failures — print the engine's message, don't stack-trace. After a
-      // browser login, add how to get past it: that login cannot be steered to an account the way
-      // the window's /login can, so a browser signed in as someone else is the usual cause.
+      // browser login, add how to get past those two: that login cannot be steered to an account
+      // the way the window's /login can, so a browser signed in as someone else is the usual
+      // cause. Any other engine refusal (a lock held, a switch not yet settled) is not about the
+      // login, and logging in again another way would not get past it, so it gets no hint.
       if (err instanceof SwitchEngineError) {
-        return login.flow === 'browser'
+        const loginRefused =
+          err.code === 'no_capture_login' || err.code === 'relogin_identity_mismatch';
+        return login.flow === 'browser' && loginRefused
           ? `${err.message}\n${reloginRecoveryHint(account, err.code)}`
           : err.message;
       }

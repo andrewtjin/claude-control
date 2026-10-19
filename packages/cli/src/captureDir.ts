@@ -1,5 +1,6 @@
-// Lifecycle of the throwaway `CLAUDE_CONFIG_DIR` that `accounts add --fresh` and
-// `accounts relogin` run an interactive `claude` inside.
+// Lifecycle of the throwaway `CLAUDE_CONFIG_DIR` a login runs inside: an interactive `claude`
+// for `accounts add --fresh`, and `claude auth login` (or, with `--window` or on a Claude Code
+// without it, the interactive window) for `accounts relogin`.
 //
 // This is its own module, rather than three lines inlined in each command, because deleting
 // that directory is a security obligation (it holds a real `.credentials.json`) and two
@@ -11,8 +12,8 @@
 //     `withCaptureDir` fixes that by shape: the body RETURNS its failure message and the
 //     caller fails *after* cleanup has already happened.
 //  2. **Windows refuses to unlink a file another process still has open.** `claude` (and any
-//     grandchild it spawned) can hold handles inside the config dir for seconds after
-//     `spawnSync` returns, so the delete races the window we just closed and fails with
+//     grandchild it spawned) can hold handles inside the config dir for seconds after the
+//     `claude` run returns, so the delete races the process that just exited and fails with
 //     `EPERM, Permission denied`. Measured on Node 24: the *sync* `rmSync` ignores
 //     `maxRetries` entirely (it gives up in under a millisecond), which is why the delete is
 //     async — and the promises `rm` retries at every level of the tree, so its delays multiply

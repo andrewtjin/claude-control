@@ -3390,8 +3390,10 @@ export class SwitchEngine {
     return this.withCredentialLock(async () => {
       const creds = await this.credStore.readLiveCredentials();
       if (!creds || creds.refreshToken === prior?.refreshToken) {
+        // Worded for either login step: relogin runs `claude auth login` by default, which opens
+        // no window, and the interactive window only on request or as a fallback.
         throw new RefreshError(
-          'the throwaway window did not produce a new login in the Keychain; did the login complete?',
+          'the login did not produce a new login in the Keychain; did it complete?',
           'no_capture_login',
         );
       }
@@ -3404,15 +3406,15 @@ export class SwitchEngine {
 
         const oauthAccount = await this.configDirStore(configDir).readOauthAccount();
 
-        // Attribution guard — see reloginFromConfigDir for why a mismatch is fatal, not a warning.
-        if (
-          existing.accountUuid !== undefined &&
-          oauthAccount?.accountUuid !== undefined &&
-          existing.accountUuid !== oauthAccount.accountUuid
-        ) {
+        // Attribution guard — the SAME rule the file relogin applies (see reloginIdentityRefusal
+        // and applyReloginBundle for why a refusal is fatal, not a warning), so both platforms
+        // refuse the same logins. The transient dir's `.claude.json` is written by the login that
+        // just happened and nothing else, so it is exactly the identity that login reported.
+        const refusal = reloginIdentityRefusal(existing, oauthAccount);
+        if (refusal !== undefined) {
           throw new RefreshError(
-            `the captured login is a different account (${oauthAccount.emailAddress ?? oauthAccount.accountUuid}) ` +
-              `than "${existing.label}" - re-login must use the SAME account to keep its usage history intact`,
+            `the captured login ${refusal} - re-login must use the SAME account to keep its ` +
+              'usage history intact',
             'relogin_identity_mismatch',
           );
         }
@@ -3429,6 +3431,29 @@ export class SwitchEngine {
       } finally {
         if (prior) await this.credStore.writeLiveCredentials(prior);
       }
+    });
+  }
+
+  /**
+   * Put `prior` back as the live login after a darwin login step that ran but was not captured
+   * (it failed, or was stopped). The CLI writes every login to the one Keychain item whatever
+   * `CLAUDE_CONFIG_DIR` says, so a login that stored its tokens and only then failed has already
+   * replaced the live login, while `~/.claude.json` still names the previous account — the
+   * stale-identity contamination {@link reloginFromKeychainDelta} restores against on its own
+   * paths. This is that restore for the path that never reaches it.
+   *
+   * Only a CHANGED live login is rewritten (by refresh token, the same delta test the capture
+   * uses), so a run that stored nothing writes nothing. With no `prior` there is nothing to put
+   * back, matching the capture methods, which treat such a login as the live one. Returns
+   * whether it restored.
+   */
+  async restoreLiveOauth(prior: ClaudeOauth | undefined): Promise<boolean> {
+    if (!prior) return false;
+    return this.withCredentialLock(async () => {
+      const live = await this.credStore.readLiveCredentials();
+      if (live?.refreshToken === prior.refreshToken) return false;
+      await this.credStore.writeLiveCredentials(prior);
+      return true;
     });
   }
 

@@ -359,6 +359,69 @@ describe('keychain-delta capture (darwin flows)', () => {
       code: 'no_capture_login',
     });
   });
+
+  it('reloginFromKeychainDelta refuses a login that contradicts the email of a row with no uuid', async () => {
+    // The same rule the file relogin applies: with no uuid on the row, the remaining anchors
+    // carry the check, so another account's login cannot be adopted just because the row's
+    // identity was captured without a uuid.
+    const h = await harness();
+    await seedAActiveWithB(h);
+    const work = await h.engine.addAccount('work', {
+      claudeAiOauth: oauth('W', NOW + 10 * HOUR),
+      oauthAccount: { emailAddress: 'work@x.com' },
+    });
+    const prior = await h.engine.readLiveOauth();
+    const dir = await windowLogin(h, 'personal', 'uuid-personal');
+
+    await expect(h.engine.reloginFromKeychainDelta(work.id, dir, prior)).rejects.toMatchObject({
+      code: 'relogin_identity_mismatch',
+    });
+    expect((await h.vault.readBundle(work.id)).claudeAiOauth.accessToken).toBe('W');
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+  });
+
+  it('reloginFromKeychainDelta accepts a matching email on a row with no uuid', async () => {
+    const h = await harness();
+    await seedAActiveWithB(h);
+    const work = await h.engine.addAccount('work', {
+      claudeAiOauth: oauth('W', NOW + 10 * HOUR),
+      oauthAccount: { emailAddress: 'work@x.com' },
+    });
+    const prior = await h.engine.readLiveOauth();
+    const dir = await windowLogin(h, 'work', 'uuid-work');
+
+    const updated = await h.engine.reloginFromKeychainDelta(work.id, dir, prior);
+    expect(updated.id).toBe(work.id);
+    expect((await h.vault.readBundle(work.id)).claudeAiOauth.accessToken).toBe('work');
+  });
+
+  it('restoreLiveOauth puts the prior login back after a login that replaced it', async () => {
+    // A login step that stored its tokens and then failed: the capture never runs, so this is
+    // the only thing standing between the user and another account's tokens left live.
+    const h = await harness();
+    const { accountA } = await seedAActiveWithB(h);
+    const prior = await h.engine.readLiveOauth();
+    await windowLogin(h, 'STRAY');
+
+    expect(await h.engine.restoreLiveOauth(prior)).toBe(true);
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+    expect(await h.engine.getActiveId()).toBe(accountA.id);
+  });
+
+  it('restoreLiveOauth writes nothing when the live login never changed', async () => {
+    const h = await harness();
+    await seedAActiveWithB(h);
+    const prior = await h.engine.readLiveOauth();
+    expect(await h.engine.restoreLiveOauth(prior)).toBe(false);
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('A');
+  });
+
+  it('restoreLiveOauth has nothing to restore when there was no prior login', async () => {
+    const h = await harness();
+    await windowLogin(h, 'FIRST');
+    expect(await h.engine.restoreLiveOauth(undefined)).toBe(false);
+    expect((await h.credStore.readLiveCredentials())?.accessToken).toBe('FIRST');
+  });
 });
 
 describe('reloginFromConfigDir', () => {
