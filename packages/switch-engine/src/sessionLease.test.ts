@@ -528,12 +528,12 @@ describe('nothing else touches a parallel session', () => {
     });
   });
 
-  it('activate names every session when several terminals hold it', async () => {
+  it('activate names every process when several terminals hold it', async () => {
     const h = await harness();
     const { B } = await leased(h);
     await h.engine.addLeaseHolders(leaseRuleId(B.id), [child(h, 4188, 4120), child(h, 5188, 5120)]);
     await expect(h.engine.activate(B.id)).rejects.toThrow(
-      'account "B" is in use by 2 parallel sessions (pids 4188, 5188)',
+      'account "B" is in use by a parallel session on 2 terminals (pids 4188, 5188',
     );
   });
 
@@ -847,14 +847,17 @@ describe('sweepLeases', () => {
     expect((await h.vault.listRules())[0]?.lease?.holders).toEqual([worker]);
   });
 
-  it('quick: a dead launcher with no recorded child defers; with its child recorded and dead, it ends', async () => {
+  it("quick: a dead launcher's unrecorded child holds the session; once nothing runs, it ends", async () => {
     const h = await harness();
     const { B } = await seed(h);
     await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
     h.alive.delete(4120);
+    // Its Claude Code runs, never recorded: the quick sweep reads the process table and finds it.
+    h.alive.add(4188);
+    h.table.push({ pid: 4188, ppid: 4120, startMs: NOW + 4188 });
     const quick = await h.engine.sweepLeases({ mode: 'quick', probe: noWorkers });
-    expect(quick.deferred.map((d) => d.reason)).toEqual(['unrecorded_child']);
-    await h.engine.addLeaseHolders(leaseRuleId(B.id), [child(h, 4188, 4120, NOW + 4188, false)]);
+    expect(quick.adopted.map((a) => a.pid)).toEqual([4188]);
+    h.alive.delete(4188);
     const again = await h.engine.sweepLeases({ mode: 'quick', probe: noWorkers });
     expect(again.ended.map((e) => e.accountId)).toEqual([B.id]);
   });
@@ -939,14 +942,14 @@ describe('sweepLeases', () => {
     expect(quick?.holders[0]?.state).toBe('alive');
   });
 
-  it('a holder on another host is foreign: never swept from here', async () => {
+  it('a holder of another platform (a WSL distro on this machine) is foreign: never swept from here', async () => {
     const h = await harness();
     const { B } = await seed(h);
     const remote: LeaseHolder = {
       pid: 812,
       start: 5,
-      host: 'OTHER',
-      platform: 'win32',
+      host: HOST,
+      platform: 'linux',
       role: 'launcher',
     };
     await h.engine.claimSessionSlot(B.id, remote, { launchRuleId: null });
@@ -991,5 +994,486 @@ describe('accounts relogin of an account a parallel session holds', () => {
     expect(res.healedLiveLogin).toBe(true);
     expect((await leaseStore(h.paths, B.id).readLiveCredentials())?.accessToken).toBe('B-fresh');
     expect((await h.global.readLiveCredentials())?.accessToken).toBe('A');
+  });
+});
+
+/** A Linux /proc stand-in: stat starts by pid, environments by pid, one boot and namespace, and
+ *  each process's arguments where `argv` gives them (unreadable otherwise). */
+function linuxProc(
+  starts: Map<number, number>,
+  env: Map<number, string>,
+  argv: Map<number, string[]> = new Map(),
+): ProcFs {
+  return {
+    stat: (pid) => {
+      const start = starts.get(pid);
+      return start === undefined ? undefined : { ppid: 1, startTicks: start, state: 'S' };
+    },
+    bootId: () => 'boot-1',
+    pidNs: () => 'pid:[1]',
+    configDirOf: (pid) => env.get(pid),
+    pids: () => [...new Set([...starts.keys(), ...env.keys()])],
+    cmdlineOf: (pid) => argv.get(pid),
+  };
+}
+
+/** A Linux holder recorded on the harness host. */
+function linuxHolder(
+  pid: number,
+  start: number,
+  role: LeaseHolder['role'],
+  parent?: number,
+): LeaseHolder {
+  return {
+    pid,
+    start,
+    host: HOST,
+    platform: 'linux',
+    bootId: 'boot-1',
+    pidNs: 'pid:[1]',
+    role,
+    ...(parent !== undefined ? { parent } : {}),
+  };
+}
+
+describe('a process that outlives its Claude Code on the session profile', () => {
+  it('linux: the release records it as the holder, and a quick sweep from another terminal keeps it', async () => {
+    const starts = new Map([
+      [812, 5000],
+      [813, 5001],
+      [900, 5002],
+    ]);
+    const env = new Map<number, string>();
+    const h = await harness('linux', linuxProc(starts, env));
+    const { B } = await seed(h);
+    const me = linuxHolder(812, 5000, 'launcher');
+    const kid = linuxHolder(813, 5001, 'claude', 812);
+    h.alive.add(812);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [kid]);
+    // Claude Code started a background `claude -p` that inherited the profile, then exited.
+    const profile = groupProfileDir(h.paths.vaultDir, leaseRuleId(B.id));
+    env.set(900, profile);
+    h.alive.add(900);
+    const released = await h.engine.releaseLease(leaseRuleId(B.id), [me, kid], noWorkers);
+    expect(released).toMatchObject({ ended: false, heldBy: [900] });
+    h.alive.delete(812);
+    const quick = await h.engine.sweepLeases({ mode: 'quick', probe: noWorkers });
+    expect(quick.ended).toEqual([]);
+    expect((await h.vault.listRules())[0]?.lease?.holders.map((x) => x.pid)).toEqual([900]);
+    expect((await leaseStore(h.paths, B.id).readLiveCredentials())?.accessToken).toBe('B');
+  });
+
+  it('linux: a quick sweep never ends a session whose dead holders left a process on its profile', async () => {
+    const starts = new Map([
+      [812, 5000],
+      [813, 5001],
+      [900, 5002],
+    ]);
+    const env = new Map<number, string>();
+    const h = await harness('linux', linuxProc(starts, env));
+    const { B } = await seed(h);
+    h.alive.add(812);
+    await h.engine.claimSessionSlot(B.id, linuxHolder(812, 5000, 'launcher'), {
+      launchRuleId: null,
+    });
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [linuxHolder(813, 5001, 'claude', 812)]);
+    h.alive.delete(812);
+    env.set(900, groupProfileDir(h.paths.vaultDir, leaseRuleId(B.id)));
+    h.alive.add(900);
+    const quick = await h.engine.sweepLeases({ mode: 'quick', probe: noWorkers });
+    expect(quick.ended).toEqual([]);
+    expect(quick.adopted.map((a) => a.pid)).toEqual([900]);
+  });
+
+  it('win32: a quick sweep reads the process table before ending a session, and keeps a live descendant', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [child(h, 4188, 4120)]);
+    h.alive.delete(4120);
+    h.alive.delete(4188);
+    // A detached helper Claude Code started, still running after both exited.
+    h.alive.add(5000);
+    h.table.push({ pid: 5000, ppid: 4188, startMs: NOW + 5000 });
+    const quick = await h.engine.sweepLeases({ mode: 'quick', probe: noWorkers });
+    expect(quick.ended).toEqual([]);
+    expect(quick.adopted.map((a) => a.pid)).toEqual([5000]);
+  });
+
+  it("win32: the last terminal's release keeps a live descendant of its Claude Code as the holder", async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    const kid = child(h, 4188, 4120);
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [kid]);
+    h.alive.delete(4188);
+    h.alive.add(5000);
+    h.table.push({ pid: 5000, ppid: 4188, startMs: NOW + 5000 });
+    const released = await h.engine.releaseLease(leaseRuleId(B.id), [me, kid], noWorkers);
+    expect(released).toMatchObject({ ended: false, heldBy: [5000] });
+    expect((await leaseStore(h.paths, B.id).readLiveCredentials())?.accessToken).toBe('B');
+    // Once it exits too, the next sweep ends the session.
+    h.alive.delete(4120);
+    h.alive.delete(5000);
+    const after = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
+    expect(after.ended.map((e) => e.accountId)).toEqual([B.id]);
+  });
+
+  it('a process table that cannot be read is no evidence: the end is deferred, nothing is cleared', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    h.alive.delete(4120);
+    for (const mode of ['full', 'quick'] as const) {
+      const report = await h.engine.sweepLeases({
+        mode,
+        probe: noWorkers,
+        processTable: () => Promise.reject(new Error('timed out')),
+      });
+      expect(report.ended).toEqual([]);
+      expect(report.deferred.map((d) => d.reason)).toEqual(['processes_unreadable']);
+    }
+    expect((await leaseStore(h.paths, B.id).readLiveCredentials())?.accessToken).toBe('B');
+  });
+
+  it("a dead holder's pid taken over by a later process: that process's children are not the session's", async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120, NOW + 4120), { launchRuleId: null });
+    // pid 4120 now runs a process started an hour later, with children of its own.
+    h.table.splice(0, h.table.length, { pid: 4120, ppid: 700, startMs: NOW + HOUR });
+    h.table.push({ pid: 9001, ppid: 4120, startMs: NOW + HOUR + 10 });
+    h.table.push({ pid: 9002, ppid: 9001, startMs: NOW + HOUR + 20 });
+    h.alive.add(9001);
+    h.alive.add(9002);
+    const report = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
+    expect(report.adopted).toEqual([]);
+    expect(report.ended.map((e) => e.accountId)).toEqual([B.id]);
+  });
+
+  it('one session whose end fails does not stop the sweep from ending the others', async () => {
+    const h = await harness();
+    const { B, C } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    await h.engine.claimSessionSlot(C.id, launcher(h, 5120), { launchRuleId: null });
+    h.alive.delete(4120);
+    h.alive.delete(5120);
+    // B's profile .claude.json is a directory now: any read of it fails, as a locked file would.
+    const bProfile = groupProfileDir(h.paths.vaultDir, leaseRuleId(B.id));
+    await rm(join(bProfile, '.claude.json'), { force: true });
+    await mkdir(join(bProfile, '.claude.json'));
+    const report = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
+    expect(report.ended.map((e) => e.accountId)).toEqual([C.id]);
+    expect(report.deferred).toEqual([{ accountId: B.id, label: 'B', reason: 'teardown_failed' }]);
+  });
+});
+
+describe('ending a parallel session never loses its login', () => {
+  it('a torn .claude.json is set aside, and a session whose login is stored still ends', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    const profile = groupProfileDir(h.paths.vaultDir, leaseRuleId(B.id));
+    await writeFile(join(profile, '.claude.json'), '{"oauthAccount":{"accountUu');
+    h.alive.delete(4120);
+    const report = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
+    expect(report.ended.map((e) => e.accountId)).toEqual([B.id]);
+    expect(await readFile(join(profile, '.claude.json.corrupt'), 'utf8')).toContain('accountUu');
+  });
+
+  it('a rotated login that cannot be adopted is kept, not cleared: login_unadopted', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    const profile = groupProfileDir(h.paths.vaultDir, leaseRuleId(B.id));
+    const rotated = {
+      accessToken: 'B9',
+      refreshToken: 'r-B9',
+      expiresAt: NOW + 11 * HOUR,
+    };
+    await writeFile(join(profile, '.credentials.json'), JSON.stringify({ claudeAiOauth: rotated }));
+    // The identity block is gone: nothing says whose login this is, so it is not adopted.
+    await writeFile(join(profile, '.claude.json'), '{}');
+    h.alive.delete(4120);
+    const report = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
+    expect(report.ended).toEqual([]);
+    expect(report.deferred.map((d) => d.reason)).toEqual(['login_unadopted']);
+    expect((await leaseStore(h.paths, B.id).readLiveCredentials())?.refreshToken).toBe('r-B9');
+    expect((await h.vault.readBundle(B.id)).claudeAiOauth.refreshToken).toBe('r-B');
+  });
+
+  it('a torn .credentials.json is kept too: it may hold the only copy of a rotated token', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    const profile = groupProfileDir(h.paths.vaultDir, leaseRuleId(B.id));
+    await writeFile(join(profile, '.credentials.json'), '{"claudeAiOauth":{"accessTo');
+    const res = await h.engine.releaseLease(leaseRuleId(B.id), [me], noWorkers);
+    expect(res).toMatchObject({ ended: false, deferred: 'login_unadopted' });
+    expect(await readFile(join(profile, '.credentials.json'), 'utf8')).toContain('accessTo');
+  });
+
+  it('a rotation the end will adopt is no lost login: doctor is not told to re-login for it', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    const profile = groupProfileDir(h.paths.vaultDir, leaseRuleId(B.id));
+    const rotated = { accessToken: 'B9', refreshToken: 'r-B9', expiresAt: NOW + 11 * HOUR };
+    await writeFile(join(profile, '.credentials.json'), JSON.stringify({ claudeAiOauth: rotated }));
+    expect(await h.engine.leaseHoldsUnstoredLogin(leaseRuleId(B.id))).toBe(false);
+    // With its identity block gone, nothing says whose it is: that one would be lost.
+    await writeFile(join(profile, '.claude.json'), '{}');
+    expect(await h.engine.leaseHoldsUnstoredLogin(leaseRuleId(B.id))).toBe(true);
+  });
+
+  it('a live token older than the stored login holds nothing worth keeping: the session ends', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    const profile = groupProfileDir(h.paths.vaultDir, leaseRuleId(B.id));
+    // The grant a re-login replaced: the vault's copy is newer.
+    const older = { accessToken: 'B0', refreshToken: 'r-B0', expiresAt: NOW + HOUR };
+    await writeFile(join(profile, '.credentials.json'), JSON.stringify({ claudeAiOauth: older }));
+    h.alive.delete(4120);
+    const report = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
+    expect(report.ended.map((e) => e.accountId)).toEqual([B.id]);
+    expect((await h.vault.readBundle(B.id)).claudeAiOauth.refreshToken).toBe('r-B');
+  });
+});
+
+describe('what a join and a refusal say about who else is on the session', () => {
+  it('counts a live Claude Code whose terminal was killed, and a background session; never a dead holder', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [child(h, 4188, 4120)]);
+    h.alive.delete(4120);
+    await h.engine.sweepLeases({ mode: 'quick', probe: noWorkers });
+    const worker: LeaseHolder = {
+      pid: 6000,
+      start: 0,
+      host: HOST,
+      platform: 'win32',
+      role: 'background',
+    };
+    h.alive.add(6000);
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [worker]);
+    const claim = await h.engine.claimSessionSlot(B.id, launcher(h, 5120), { launchRuleId: null });
+    expect(claim).toMatchObject({ kind: 'lease', otherTerminals: 1, otherBackground: 1 });
+  });
+
+  it('a deferred end leaves dead holders on disk; a join does not count them as other terminals', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const one = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, one, { launchRuleId: null });
+    await h.engine.releaseLease(leaseRuleId(B.id), [one], () => Promise.resolve('unreadable'));
+    h.alive.delete(4120);
+    const claim = await h.engine.claimSessionSlot(B.id, launcher(h, 5120), { launchRuleId: null });
+    expect(claim).toMatchObject({ kind: 'lease', otherTerminals: 0 });
+  });
+
+  it('a refusal for several terminals waits for the last of them, not "that session"', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    await h.engine.claimSessionSlot(B.id, launcher(h, 5120), { launchRuleId: null });
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [child(h, 4188, 4120), child(h, 5188, 5120)]);
+    await expect(h.engine.activate(B.id)).rejects.toThrow(
+      /account "B" is in use by a parallel session on 2 terminals \(pids 4188, 5188, since \d\d:\d\d\); it rejoins the pool when the last of them exits/,
+    );
+  });
+
+  it('a join leaves room for the Claude Code its launcher records next', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 1000), { launchRuleId: null });
+    await h.engine.addLeaseHolders(
+      leaseRuleId(B.id),
+      Array.from({ length: 30 }, (_, i) => launcher(h, 2000 + i)),
+    );
+    // 31 recorded: a join would make 32, and its Claude Code a 33rd that could never be recorded.
+    await expect(
+      h.engine.claimSessionSlot(B.id, launcher(h, 9999), { launchRuleId: null }),
+    ).rejects.toThrow(LeaseHolderCapError);
+  });
+
+  it('a seat that fails on a join says why, not that the account changed slots', async () => {
+    const h = await harness();
+    const { B, C } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    await rm(join(groupProfileDir(h.paths.vaultDir, leaseRuleId(B.id)), '.credentials.json'));
+    // C stores B's login: a shared token every seat refuses, however often it is retried.
+    await h.vault.writeBundle(C.id, bundleFor('B'));
+    const err = await h.engine
+      .claimSessionSlot(B.id, launcher(h, 5120), { launchRuleId: null })
+      .catch((e: unknown) => e);
+    expect(String(err)).not.toContain('changed slots');
+    expect(String(err)).toContain('could not log B in to its parallel-session slot');
+  });
+});
+
+describe('the rest of the engine around a parallel session', () => {
+  it('a quarantined reserved account live in its folder slot is refused, as seating it always was', async () => {
+    const h = await harness();
+    const { C } = await seed(h);
+    const rule = await h.vault.createRule({ folders: ['C:\\repo'], include: [C.id] });
+    await h.engine.activate(C.id, { force: true, slot: ruleSlotId(rule.id) });
+    await h.vault.quarantine(C.id, 'invalid_grant');
+    expect(await h.engine.planSessionSlot(C.id, { launchRuleId: null })).toMatchObject({
+      kind: 'refused',
+      code: 'quarantined',
+    });
+  });
+
+  it("a shared account live in a named session's slot is told how to free it: session exclude", async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    const rule = await h.vault.createRule({
+      folders: [],
+      aliases: [{ folder: 'C:\\research', alias: 'auth work' }],
+      exclude: [A.id],
+    });
+    await h.engine.activate(B.id, { force: true, slot: ruleSlotId(rule.id) });
+    const plan = await h.engine.planSessionSlot(B.id, { launchRuleId: null });
+    expect(plan).toMatchObject({ kind: 'refused', code: 'live_in_other_rule' });
+    const message = plan.kind === 'refused' ? plan.message : '';
+    expect(message).toContain('live in the slot of session');
+    expect(message).toContain("cctl session exclude 'auth work' 'B' --cwd 'C:\\research'");
+    expect(message).not.toContain('switch that slot');
+  });
+
+  it('renaming a leased account renames its parallel session', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    await h.engine.renameAccount(B.id, 'Bx');
+    expect((await h.vault.listRules())[0]?.label).toBe('Bx');
+  });
+
+  it("emptying a folder's slot is not refused for a parallel session that merely works in that folder", async () => {
+    const h = await harness();
+    const { B, C } = await seed(h);
+    const folder = await mkdtemp(join(tmpdir(), 'ce-lease-f-'));
+    dirs.push(folder);
+    await h.engine.includeInFolder(folder, [C.id]);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    // B's Claude Code runs in that folder: the shared roster lists it with that cwd.
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [child(h, process.pid, 4120)]);
+    await mkdir(join(h.paths.claudeDir, 'sessions'), { recursive: true });
+    await writeFile(
+      join(h.paths.claudeDir, 'sessions', `${process.pid}.json`),
+      JSON.stringify({ pid: process.pid, cwd: folder, sessionId: 's1' }),
+    );
+    const reset = await h.engine.resetFolder(folder);
+    expect(reset).toMatchObject({ dissolved: true, runningSessions: [] });
+  });
+});
+
+describe('only a Claude Code keeps a session after its terminals exit', () => {
+  it('linux: a dev server that inherited the profile does not hold it; a backgrounded claude -p does', async () => {
+    const starts = new Map([
+      [812, 5000],
+      [813, 5001],
+      [900, 5002],
+      [901, 5003],
+    ]);
+    const env = new Map<number, string>();
+    const argv = new Map<number, string[]>([
+      [900, ['node', '/home/u/app/node_modules/.bin/vite']],
+      [901, ['/home/u/.local/bin/claude', '-p', 'summarize']],
+    ]);
+    const h = await harness('linux', linuxProc(starts, env, argv));
+    const { B } = await seed(h);
+    const me = linuxHolder(812, 5000, 'launcher');
+    const kid = linuxHolder(813, 5001, 'claude', 812);
+    h.alive.add(812);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [kid]);
+    const profile = groupProfileDir(h.paths.vaultDir, leaseRuleId(B.id));
+    env.set(900, profile);
+    env.set(901, profile);
+    h.alive.add(900);
+    h.alive.add(901);
+    // The claude -p holds it; the dev server is never recorded.
+    const held = await h.engine.releaseLease(leaseRuleId(B.id), [me, kid], noWorkers);
+    expect(held).toMatchObject({ ended: false, heldBy: [901] });
+    // Once the claude -p exits, the next sweep ends it under the dev server, which keeps running.
+    h.alive.delete(812);
+    h.alive.delete(901);
+    env.delete(901);
+    const swept = await h.engine.sweepLeases({ mode: 'quick', probe: noWorkers });
+    expect(swept.adopted).toEqual([]);
+    expect(swept.ended.map((e) => e.accountId)).toEqual([B.id]);
+  });
+
+  it('linux: the last terminal out ends the session though a dev server still runs on its profile', async () => {
+    const starts = new Map([
+      [812, 5000],
+      [813, 5001],
+      [900, 5002],
+    ]);
+    const env = new Map<number, string>();
+    const argv = new Map<number, string[]>([[900, ['sleep', '900']]]);
+    const h = await harness('linux', linuxProc(starts, env, argv));
+    const { B } = await seed(h);
+    const me = linuxHolder(812, 5000, 'launcher');
+    const kid = linuxHolder(813, 5001, 'claude', 812);
+    h.alive.add(812);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [kid]);
+    env.set(900, groupProfileDir(h.paths.vaultDir, leaseRuleId(B.id)));
+    h.alive.add(900);
+    const released = await h.engine.releaseLease(leaseRuleId(B.id), [me, kid], noWorkers);
+    expect(released).toMatchObject({ ended: true });
+    expect(released.heldBy).toBeUndefined();
+  });
+
+  it('win32: a descendant that is no Claude Code is walked through but never holds the session', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    const kid = child(h, 4188, 4120);
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [kid]);
+    h.alive.delete(4188);
+    // Claude Code started a shell, which started a dev server and a claude -p.
+    for (const pid of [5000, 5001, 5002]) h.alive.add(pid);
+    h.table.push({
+      pid: 5000,
+      ppid: 4188,
+      startMs: NOW + 5000,
+      name: 'bash.exe',
+      commandLine: 'C:/Program Files/Git/bin/bash.exe -c "npm run dev & claude -p hi"',
+    });
+    h.table.push({
+      pid: 5001,
+      ppid: 5000,
+      startMs: NOW + 5001,
+      name: 'node.exe',
+      commandLine: 'node.exe C:/repo/node_modules/vite/bin/vite.js',
+    });
+    h.table.push({
+      pid: 5002,
+      ppid: 5000,
+      startMs: NOW + 5002,
+      name: 'claude.exe',
+      commandLine: 'C:/Users/u/.local/bin/claude.exe -p hi',
+    });
+    const held = await h.engine.releaseLease(leaseRuleId(B.id), [me, kid], noWorkers);
+    expect(held).toMatchObject({ ended: false, heldBy: [5002] });
+    // With only the dev server left, a sweep ends the session.
+    h.alive.delete(4120);
+    h.alive.delete(5002);
+    h.table.splice(
+      h.table.findIndex((r) => r.pid === 5002),
+      1,
+    );
+    const swept = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
+    expect(swept.adopted).toEqual([]);
+    expect(swept.ended.map((e) => e.accountId)).toEqual([B.id]);
   });
 });

@@ -245,6 +245,9 @@ export interface FakeClaudeRig {
   log: string;
   /** The directory the fake's bin lives in (its `claude` shim and `fake.cjs`). */
   bin: string;
+  /** The fake as the shims run it: under `node_modules/@anthropic-ai/claude-code`, where npm
+   *  installs Claude Code. A fake started from this path is taken for a Claude Code. */
+  script: string;
 }
 
 /** A sandbox with a main config dir, one folder profile, a work folder and the fake on PATH. The
@@ -260,12 +263,21 @@ export async function makeFakeClaudeRig(prefix = 'cctl-bgattach-'): Promise<Fake
   for (const d of [bin, join(main, 'sessions'), profile, work]) await mkdir(d, { recursive: true });
   await writeFile(join(root, 'package.json'), JSON.stringify({ type: 'module' }));
   await writeFile(join(bin, 'fake.cjs'), FAKE_CLAUDE_SCRIPT, 'utf8');
+  // The shims run a copy laid out where npm installs Claude Code, so a process check that tells a
+  // Claude Code by its command line takes the fake for one.
+  const pkg = join(bin, 'node_modules', '@anthropic-ai', 'claude-code');
+  await mkdir(pkg, { recursive: true });
+  const script = join(pkg, 'cli.cjs');
+  await writeFile(script, FAKE_CLAUDE_SCRIPT, 'utf8');
   if (process.platform === 'win32') {
-    await writeFile(join(bin, 'claude.cmd'), '@ECHO off\r\n"%_prog%" "%dp0%\\fake.cjs" %*\r\n');
+    await writeFile(
+      join(bin, 'claude.cmd'),
+      '@ECHO off\r\n"%_prog%" "%dp0%\\node_modules\\@anthropic-ai\\claude-code\\cli.cjs" %*\r\n',
+    );
   } else {
     await writeFile(
       join(bin, 'claude'),
-      `#!/bin/sh\nexec "${process.execPath}" "${join(bin, 'fake.cjs')}" "$@"\n`,
+      `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`,
       'utf8',
     );
     await chmod(join(bin, 'claude'), 0o755);
@@ -282,5 +294,5 @@ export async function makeFakeClaudeRig(prefix = 'cctl-bgattach-'): Promise<Fake
     FAKE_LIVE_START: LIVE_START,
     FAKE_LOG: log,
   };
-  return { root, main, profile, work, env, log, bin };
+  return { root, main, profile, work, env, log, bin, script };
 }

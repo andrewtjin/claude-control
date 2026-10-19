@@ -598,9 +598,13 @@ Where it runs:
 - on the global slot when `work` is live there. That session then follows global switches,
   from any terminal or the phone;
 - in this folder's slot when `work` is live there (it then follows the folder's switches);
+- in the slot of a folder `work` is reserved to, when it is live there, from any folder. The
+  session then follows that folder's switches, which can move it off `work`;
 - otherwise in a parallel-session slot of its own.
 
-A shared account live in another folder's slot is refused: run it there.
+A shared account live in another folder's slot is refused: run it there, or switch that slot to
+another account first (for a named session's slot, keep `work` out of it with
+`cctl session exclude`).
 
 While a parallel session runs:
 
@@ -616,16 +620,21 @@ When the last terminal on `work` exits, its refreshed login returns to cctl and 
 the pool. A closed window or a killed process is cleaned up by the daemon within one poll, or,
 with no daemon, by the next `cctl claude --account work` or `cctl switch work`.
 
+A Claude Code the session started that outlives it on its profile (a backgrounded `claude -p`)
+keeps `work` reserved until it exits: it may still use the login. The terminal names its pid
+when it exits, and `cctl doctor` names it too. Anything else the session started (a dev server,
+an editor) does not hold `work`: it never reads the login.
+
 History is shared, as in folder profiles: `--resume` and `--continue` see every conversation.
 
 Not available with it (for now): `--bg`, `attach`/`stop`/`rm`/`kill`/`respawn`, and Claude
 Code subcommands. For a named session that should keep an account, use
 `cctl session include <alias> <account>`.
 
-It needs this build everywhere it can run. A running daemon on an older build is refused (fix:
-`cctl daemon restart`), and so is an older `cctl` on PATH or in the autostart registration
-(fix: update that install). An older cctl cannot read the rules file while a parallel session
-exists.
+It needs a build that reads parallel sessions (1.1.0 or later) everywhere it can run. A running
+daemon on an older build is refused (fix: `cctl daemon restart`), and so is an older `cctl` on
+PATH, in the PowerShell `claude` wrapper or in the autostart registration (fix: update that
+install). An older cctl cannot read the rules file while a parallel session exists.
 
 macOS: not available yet, except for an account that is already live in the global slot.
 

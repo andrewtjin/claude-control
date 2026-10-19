@@ -25,8 +25,10 @@ import {
   SwitchEngine,
   folderBindingsPath,
   groupProfileDir,
+  isLeaseRule,
   ruleSlotId,
   sandboxPaths,
+  selfHolder,
   type ClaudeOauth,
   type CredentialBundle,
   type Paths,
@@ -343,6 +345,17 @@ describe('cctl session reset', () => {
     await runSessionReset('Side', 'client', { cwd: away }, h.deps);
     expect((await onlyRule()).include).toEqual([work.id]);
     expect(h.text()).toContain(`Removed client from what session "Side" in ${away} includes.`);
+  });
+
+  it('first ends the parallel session of an account whose processes are gone, then excludes it', async () => {
+    // A parallel session on work whose terminal is long gone: its launcher's pid runs nothing.
+    const gone = selfHolder('launcher', { pid: 2_147_480_000 });
+    await engine.claimSessionSlot(work.id, gone, { launchRuleId: null });
+    expect((await engine.listRules()).some(isLeaseRule)).toBe(true);
+    await runSessionExclude('Side', 'work', { cwd: away }, harness().deps);
+    const rules = await engine.listRules();
+    expect(rules.some(isLeaseRule)).toBe(false);
+    expect(rules.map((r) => r.exclude)).toEqual([[work.id]]);
   });
 
   it('drops an exclusion, saying the session may use the account again', async () => {

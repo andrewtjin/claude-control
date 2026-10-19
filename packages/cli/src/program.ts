@@ -33,10 +33,12 @@ import {
   parsePastedCode,
   resolveAccountRef,
   isLeaseRule,
+  operatorRules,
   type FolderRule,
+  type LeaseView,
   type StoredAccount,
 } from '@claude-control/switch-engine';
-import { cliLeaseProbe, sweepBeforeLeaseRefusal, terminalsOf } from './leaseCli.js';
+import { cliLeaseProbe, leaseInUse, sweepBeforeLeaseRefusal } from './leaseCli.js';
 import { olderInstallReason } from './folderRulesSupport.js';
 import {
   ControlPlaneClient,
@@ -416,20 +418,7 @@ export function buildProgram(): Command {
       await healAccounts(buildEngine());
       const nowMs = Date.now();
       const state = await readUsageState(nowMs);
-      const rows: UsageRow[] = state.accounts.map((a) => {
-        // The prediction is measured here, from the same history the pacing line below reads,
-        // and handed to the row: an account whose endpoint reset has already passed has no
-        // reset in its snapshot, so without this the runway would simply vanish from this one
-        // view while every other surface still counted down to it.
-        const predictedResetAt = state.predictedResetFor(a.id);
-        return {
-          label: a.label,
-          active: a.id === state.activeId,
-          usage: state.usageFor(a.id),
-          ...(predictedResetAt !== undefined ? { predictedResetAt } : {}),
-        };
-      });
-      let text = renderUsage(rows, nowMs, detectPalette());
+      let text = renderUsage(usageRowsOf(state), nowMs, detectPalette());
       // Pacing needs the same weekly-limit view the burn plan uses (accountId + quarantine
       // state), which UsageRow doesn't carry — build it separately rather than widen UsageRow
       // for one trailing line.
@@ -440,6 +429,15 @@ export function buildProgram(): Command {
           renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
       }
       text += await renderFolderRulesAppendix(buildEngine(), detectPalette());
+      // An account a parallel session holds is out of the pool (and of the pacing above), but it
+      // is the one that terminal is using: its usage is shown on its own.
+      const leased = await parallelSessionAccounts(buildEngine());
+      if (leased.length > 0) {
+        const held = await readUsageState(nowMs, leased);
+        text +=
+          `\n\n${PARALLEL_SESSION_HEADING}\n` +
+          renderUsage(usageRowsOf(held), nowMs, detectPalette());
+      }
       const banner = await exhaustionBanner(await cliAutoSwitchPolicy(), nowMs);
       process.stdout.write((banner !== undefined ? `${banner}\n\n` : '') + text + '\n');
     });
@@ -486,6 +484,14 @@ export function buildProgram(): Command {
       }
       // What each folder rule runs on, so a folder burning its own accounts shows beside the plan.
       text += await renderFolderRulesAppendix(buildEngine(), detectPalette());
+      // The accounts parallel sessions hold are in no plan above: name them, so the one a terminal
+      // is using does not just vanish.
+      const leased = await parallelSessionAccounts(buildEngine());
+      if (leased.length > 0) {
+        text +=
+          `\n\n${PARALLEL_SESSION_HEADING} ` +
+          leased.map((a) => sanitizeForTerminal(a.label)).join(', ');
+      }
       process.stdout.write(text + '\n');
     });
 
@@ -747,9 +753,7 @@ export function buildProgram(): Command {
           report,
           heartbeat,
           hasLeases,
-          hasLeases
-            ? olderInstallReason({ cliBuild: VERSION, daemonAlive: heartbeat.state === 'alive' })
-            : undefined,
+          hasLeases ? olderInstallReason() : undefined,
         ),
         checkVersionSkew(VERSION, daemonBuild, heartbeat.state === 'alive'),
       );
@@ -1325,9 +1329,15 @@ async function readStatusSummary(): Promise<SetupSummary> {
     dpapiIdentityStore(join(dataDir, 'daemon-identity.enc'), defaultProtector()).load(),
   ]);
   const heartbeat = await readHeartbeat(daemonHeartbeatPath(paths));
-  const parallelSessions = (await engine.listRules().catch(() => [] as FolderRule[]))
-    .filter(isLeaseRule)
-    .map((r) => ({ label: r.label, terminals: terminalsOf(r.lease.holders) }));
+  // Each holder judged (kill-0, no process query): a session whose processes all exited is not
+  // shown as in use by them.
+  const leases = await (async () => engine.listLeases({ mode: 'quick' }))().catch(
+    () => [] as LeaseView[],
+  );
+  const parallelSessions = leases.map((lease) => {
+    const use = leaseInUse(lease);
+    return { label: lease.label, inUse: use.phrase, running: use.running };
+  });
   return {
     accounts: accounts.map((a) => ({ label: a.label, active: a.id === activeId })),
     ...(parallelSessions.length > 0 ? { parallelSessions } : {}),
@@ -1395,6 +1405,38 @@ async function readUsageState(nowMs: number, only?: StoredAccount[]): Promise<Us
   } finally {
     store.close();
   }
+}
+
+/** The rows `cctl usage` shows for these accounts. The prediction is measured here, from the same
+ *  history the pacing line reads, and handed to the row: an account whose endpoint reset has
+ *  already passed has no reset in its snapshot, so without this the runway would simply vanish
+ *  from this one view while every other surface still counted down to it. */
+function usageRowsOf(state: UsageState): UsageRow[] {
+  return state.accounts.map((a) => {
+    const predictedResetAt = state.predictedResetFor(a.id);
+    return {
+      label: a.label,
+      active: a.id === state.activeId,
+      usage: state.usageFor(a.id),
+      ...(predictedResetAt !== undefined ? { predictedResetAt } : {}),
+    };
+  });
+}
+
+/** How `cctl usage` and `cctl timeline` head the accounts parallel sessions hold. */
+const PARALLEL_SESSION_HEADING =
+  'In use by a parallel session (out of the pool until its terminals exit):';
+
+/** The accounts only a parallel session holds: out of the shared pool, so out of the usage rows and
+ *  the pacing, and in no folder rule's section either. */
+async function parallelSessionAccounts(
+  engine: ReturnType<typeof buildEngine>,
+): Promise<StoredAccount[]> {
+  const rules = await engine.listRules().catch(() => [] as FolderRule[]);
+  const held = new Set(rules.filter(isLeaseRule).map((r) => r.include[0]!));
+  if (held.size === 0) return [];
+  const reserved = new Set(operatorRules(rules).flatMap((r) => r.include));
+  return (await engine.listAllAccounts()).filter((a) => held.has(a.id) && !reserved.has(a.id));
 }
 
 /** Build the advisor's `AccountUsageInput` view shared by `timeline`'s outlook/plan and both

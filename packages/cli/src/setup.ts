@@ -210,9 +210,9 @@ export async function connectWithTimeout(
 
 export interface SetupSummary {
   accounts: { label: string; active: boolean }[];
-  /** The parallel sessions running now (`cctl claude --account`), each with how many terminals
-   *  hold it. Absent when none runs. */
-  parallelSessions?: { label: string; terminals: number }[];
+  /** Each parallel session (`cctl claude --account`): what it is in use by now, and whether any of
+   *  its processes runs. Absent when there is none. */
+  parallelSessions?: { label: string; inUse: string; running: boolean }[];
   hooksInstalled: boolean;
   hooksProfilePath: string;
   relayUrl: string;
@@ -270,19 +270,23 @@ export function renderSetupSummary(
     : warn('discord: local-only (not paired) — pair later: cctl setup --reconfigure');
 
   // An account a parallel session holds is out of the pool until its terminals exit; say so beside
-  // the accounts, since no switch reaches it meanwhile.
+  // the accounts, since no switch reaches it meanwhile. One whose processes all exited is a warning:
+  // it still holds the account until a check ends it.
+  const sessions = s.parallelSessions ?? [];
+  const sessionText = sessions
+    .map((p) =>
+      p.running
+        ? `${sanitizeForTerminal(p.label)} (in use by ${sanitizeForTerminal(p.inUse)})`
+        : `${sanitizeForTerminal(p.label)} (${sanitizeForTerminal(p.inUse)})`,
+    )
+    .join(', ');
   const sessionsLine =
-    s.parallelSessions === undefined || s.parallelSessions.length === 0
+    sessions.length === 0
       ? []
       : [
-          ok(
-            `parallel sessions: ${s.parallelSessions
-              .map(
-                (p) =>
-                  `${sanitizeForTerminal(p.label)} (in use by ${p.terminals} terminal${p.terminals === 1 ? '' : 's'})`,
-              )
-              .join(', ')}`,
-          ),
+          sessions.every((p) => p.running)
+            ? ok(`parallel sessions: ${sessionText}`)
+            : warn(`parallel sessions: ${sessionText}`),
         ];
 
   const lines = [

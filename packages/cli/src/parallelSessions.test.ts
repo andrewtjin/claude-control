@@ -18,10 +18,18 @@ import {
 } from './folderRulesSupport.js';
 import { resolveDaemonConfig, type SettingsReport } from './settings.js';
 import { leaseArgRefusal, startsBackgroundSession } from './backgroundAttach.js';
-import { holdLeaseSignals, terminalsOf, trackChildHolder } from './leaseCli.js';
+import { holdLeaseSignals, leaseInUse, trackChildHolder } from './leaseCli.js';
 import { createLeaseOccupancyProbe } from './leaseProbe.js';
 import { cctlVersionOf, findCctlOnPath } from './installLookup.js';
-import { checkDaemonScopeSupport, checkRuleScopes, checkSessionLeases } from './doctor.js';
+import {
+  checkDaemonScopeSupport,
+  checkRuleScopes,
+  checkSessionLeases,
+  gatherSessionLeases,
+} from './doctor.js';
+import { renderSetupSummary } from './setup.js';
+import { queryWslDaemonTask, wslTaskAction } from './wslInstall.js';
+import { queryDaemonUnit, renderDaemonUnit } from './systemdInstall.js';
 
 const report = (rows: { name: string; value: string }[]): SettingsReport => ({
   startedAtMs: 1,
@@ -60,12 +68,13 @@ describe('the daemon fence', () => {
 describe('the install fence', () => {
   /** An install lookup with fixed answers; records whether the autostart was asked. */
   function lookup(
-    over: Partial<{ onPath: string; auto: { noun: string; execute: string } }>,
+    over: Partial<{ onPath: string; wrapper: string; auto: { noun: string; execute: string } }>,
     versions: Record<string, string>,
   ) {
     let askedAutostart = false;
     const l: InstallLookup = {
       onPath: () => over.onPath,
+      wrapperEntry: () => over.wrapper,
       autostart: () => {
         askedAutostart = true;
         return over.auto;
@@ -77,48 +86,53 @@ describe('the install fence', () => {
 
   it('an older cctl on PATH refuses, naming it', () => {
     const { l } = lookup({ onPath: 'C:/npm/cctl.cmd' }, { 'C:/npm/cctl.cmd': '1.0.0' });
-    expect(olderInstallReason({ cliBuild: '1.1.0', daemonAlive: true }, l)).toBe(
+    expect(olderInstallReason(l)).toBe(
       'the cctl at C:/npm/cctl.cmd (v1.0.0) predates parallel sessions: while one runs it cannot ' +
-        'read the rules file, so every command it runs (including claude through the shell wrapper) ' +
-        'would fail. Update that install first (npm i -g @andrewtjin/cctl)',
+        'read the rules file, so every command it runs would fail. Update that install first ' +
+        '(npm i -g @andrewtjin/cctl)',
     );
   });
 
-  it('with no daemon alive, an older install the autostart starts refuses', () => {
+  it('an older install the autostart starts refuses', () => {
     const { l } = lookup(
       { auto: { noun: 'logon task', execute: 'C:/old/cctl.cmd' } },
       { 'C:/old/cctl.cmd': '0.5.2' },
     );
-    expect(olderInstallReason({ cliBuild: '1.1.0', daemonAlive: false }, l)).toContain(
+    expect(olderInstallReason(l)).toContain(
       'the logon task starts the cctl at C:/old/cctl.cmd (v0.5.2), which predates parallel sessions',
     );
   });
 
-  it('a daemon alive skips the autostart query', () => {
+  it('the autostart is asked even while a daemon runs: the next logon starts what it names', () => {
     const { l, asked } = lookup(
       { auto: { noun: 'logon task', execute: 'C:/old/cctl.cmd' } },
       { 'C:/old/cctl.cmd': '0.5.2' },
     );
-    expect(olderInstallReason({ cliBuild: '1.1.0', daemonAlive: true }, l)).toBeUndefined();
-    expect(asked()).toBe(false);
+    expect(olderInstallReason(l)).toContain('C:/old/cctl.cmd (v0.5.2)');
+    expect(asked()).toBe(true);
   });
 
-  it('a version that cannot be read refuses nothing; the same or a newer version neither', () => {
-    expect(
-      olderInstallReason({ cliBuild: '1.1.0', daemonAlive: true }, lookup({ onPath: 'x' }, {}).l),
-    ).toBeUndefined();
-    expect(
-      olderInstallReason(
-        { cliBuild: '1.1.0', daemonAlive: true },
-        lookup({ onPath: 'x' }, { x: '1.1.0' }).l,
-      ),
-    ).toBeUndefined();
-    expect(
-      olderInstallReason(
-        { cliBuild: '1.1.0', daemonAlive: true },
-        lookup({ onPath: 'x' }, { x: '1.2.0' }).l,
-      ),
-    ).toBeUndefined();
+  it('an older cctl the PowerShell wrapper runs refuses, though PATH has a newer one', () => {
+    const { l } = lookup(
+      { onPath: 'C:/new/cctl.cmd', wrapper: 'C:/old/node_modules/@andrewtjin/cctl/dist/bin.js' },
+      { 'C:/new/cctl.cmd': '1.1.0', 'C:/old/node_modules/@andrewtjin/cctl/dist/bin.js': '1.0.0' },
+    );
+    expect(olderInstallReason(l)).toContain(
+      'the PowerShell claude wrapper runs the cctl at C:/old/node_modules/@andrewtjin/cctl/dist/bin.js (v1.0.0)',
+    );
+  });
+
+  it('an install that already reads parallel sessions is no risk, whatever this build is', () => {
+    // 1.1.0 is the first to read them: a newer build beside it (a candidate run from its own
+    // dist, a second prefix) must not refuse it.
+    for (const v of ['1.1.0', '1.1.1', '1.2.0']) {
+      expect(olderInstallReason(lookup({ onPath: 'x' }, { x: v }).l)).toBeUndefined();
+    }
+    expect(olderInstallReason(lookup({ onPath: 'x' }, { x: '1.0.9' }).l)).toContain('(v1.0.9)');
+  });
+
+  it('a version that cannot be read refuses nothing', () => {
+    expect(olderInstallReason(lookup({ onPath: 'x' }, {}).l)).toBeUndefined();
   });
 });
 
@@ -171,9 +185,14 @@ describe('arguments a parallel session cannot run', () => {
   it('refuses a new background session, the background verbs and every other subcommand', () => {
     expect(refused(['--bg'])).toContain('"--bg" starts a background session that outlives it');
     expect(refused(['--background', 'x'])).toContain('cctl session include <name> work');
-    for (const verb of ['attach', 'stop', 'rm', 'kill', 'respawn']) {
+    expect(refused(['attach', 'abc12345'])).toBe(
+      '"attach" opens a background session, which runs on the account its service holds; ' +
+        '--account cannot choose one for it. Run it without --account.',
+    );
+    // The control verbs open nothing: they stop, remove or restart a session.
+    for (const verb of ['stop', 'rm', 'kill', 'respawn']) {
       expect(refused([verb, 'abc12345'])).toBe(
-        `"${verb}" opens a background session, which runs on the account its service holds; ` +
+        `"${verb}" acts on a background session, which runs on the account its service holds; ` +
           '--account cannot choose one for it. Run it without --account.',
       );
     }
@@ -289,9 +308,38 @@ describe('holding signals around a parallel session', () => {
     expect(on).toEqual(['SIGINT']);
   });
 
-  it('counts terminals by their launchers', () => {
-    expect(terminalsOf([{ role: 'launcher' }, { role: 'claude' }, { role: 'launcher' }])).toBe(2);
-    expect(terminalsOf([{ role: 'background' }])).toBe(1);
+  it('says what a session is in use by: running terminals and background sessions, never exited ones', () => {
+    type Judged = LeaseView['holders'][number];
+    const h = (pid: number, role: LeaseHolder['role'], state: Judged['state'], parent?: number) =>
+      ({
+        pid,
+        start: 1,
+        host: 'BOX',
+        platform: 'win32',
+        role,
+        state,
+        ...(parent !== undefined ? { parent } : {}),
+      }) as Judged;
+    // Two launchers, one with its Claude Code: two terminals.
+    expect(
+      leaseInUse({
+        holders: [h(1, 'launcher', 'alive'), h(2, 'claude', 'alive', 1), h(3, 'launcher', 'alive')],
+      }),
+    ).toEqual({ phrase: '2 terminals', running: true });
+    // Only a background worker: no terminal holds it.
+    expect(leaseInUse({ holders: [h(6, 'background', 'unverifiable')] })).toEqual({
+      phrase: '1 background session',
+      running: true,
+    });
+    // A Claude Code whose terminal was killed still runs where that terminal was.
+    expect(leaseInUse({ holders: [h(1, 'launcher', 'dead'), h(2, 'claude', 'alive', 1)] })).toEqual(
+      { phrase: '1 terminal', running: true },
+    );
+    // Every process exited: not in use by them.
+    expect(leaseInUse({ holders: [h(1, 'launcher', 'dead'), h(2, 'claude', 'dead', 1)] })).toEqual({
+      phrase: 'no process of it runs; it ends at the next check',
+      running: false,
+    });
   });
 });
 
@@ -423,5 +471,124 @@ describe('doctor and parallel sessions', () => {
   it('names a process found running on the profile', () => {
     const c = checkSessionLeases([view([h(1, 'dead')], { unrecorded: [9001] })]);
     expect(c.detail).toContain('process(es) 9001 run on its profile');
+  });
+
+  it('names the processes holding a session that no terminal runs', () => {
+    const found = h(900, 'alive', { role: 'claude', parent: 812 });
+    const c = checkSessionLeases([view([found])]);
+    expect(c.ok).toBe(true);
+    expect(c.detail).toContain('W is held only by process(es) 900 that no terminal runs');
+  });
+
+  it('background sessions its profile still hosts keep it: never promised to be freed', async () => {
+    const engine = {
+      listLeases: () => Promise.resolve([view([h(4120, 'dead')])]),
+      checkSlots: () => Promise.resolve([]),
+    };
+    const worker = {
+      pid: 6000,
+      start: 0,
+      host: 'h',
+      platform: 'win32' as const,
+      role: 'background' as const,
+    };
+    const { leases, facts } = await gatherSessionLeases(engine, () => Promise.resolve([worker]));
+    expect(facts.get('session-w')?.workers).toEqual([6000]);
+    const c = checkSessionLeases(leases, facts);
+    expect(c.detail).toContain(
+      "its profile's background service still hosts session(s) (pids 6000)",
+    );
+    expect(c.detail).not.toContain('frees it');
+  });
+
+  it('names a process list that could not be read, and a login that could not be saved', () => {
+    const unreadable = checkSessionLeases([view([h(1, 'dead')], { processesUnreadable: true })]);
+    expect(unreadable.detail).toContain(
+      'the process list that shows what still runs on its profile',
+    );
+    const login = checkSessionLeases(
+      [view([h(1, 'dead')])],
+      new Map([['session-w', { unstoredLogin: true }]]),
+    );
+    expect(login.detail).toContain('Log in again with cctl accounts relogin W');
+    expect(login.detail).not.toContain('frees it within one poll');
+  });
+});
+
+describe('the background-worker probe on Linux', () => {
+  it("verifies the roster even for a file-only read: a stale entry's reused pid is never a holder", async () => {
+    const asked: boolean[] = [];
+    const probe = createLeaseOccupancyProbe(
+      {
+        // A roster left by a service that died: its worker pid now runs another process, which
+        // only the verified read leaves out.
+        hostedWorkerProcesses: (_dir, opts) => {
+          asked.push(opts.verify);
+          return Promise.resolve(opts.verify ? [] : [{ pid: 2345, procStart: '4242' }]);
+        },
+      },
+      { platform: 'linux', hostname: () => 'box' },
+    );
+    expect(await probe('/p', { verify: false })).toEqual([]);
+    expect(asked).toEqual([true]);
+  });
+});
+
+describe('cctl status and parallel sessions', () => {
+  const base = {
+    accounts: [{ label: 'A', active: true }],
+    hooksInstalled: true,
+    hooksProfilePath: 'settings.json',
+    relayUrl: 'wss://x',
+    autostart: 'registered' as const,
+    daemonAlive: true,
+    paired: true,
+  };
+
+  it('a session in use says by what; one whose processes all exited is a warning, not ok', () => {
+    const running = renderSetupSummary({
+      ...base,
+      parallelSessions: [{ label: 'V', inUse: '1 background session', running: true }],
+    });
+    expect(running).toContain('parallel sessions: V (in use by 1 background session)');
+    const stale = renderSetupSummary({
+      ...base,
+      parallelSessions: [
+        { label: 'V', inUse: 'no process of it runs; it ends at the next check', running: false },
+      ],
+    });
+    expect(stale).not.toContain('[ok] parallel sessions');
+    expect(stale).toContain(
+      '[--] parallel sessions: V (no process of it runs; it ends at the next check)',
+    );
+  });
+});
+
+describe('what the autostart registration starts, on WSL and on Linux', () => {
+  it('the WSL task names the shim inside its bash script, not wsl.exe', () => {
+    for (const shim of ['/home/u/.nvm/versions/node/v20/bin/cctl', "/home/o'brien/bin/cctl"]) {
+      const action = wslTaskAction('Ubuntu', shim);
+      const q = queryWslDaemonTask({
+        host: { distro: 'Ubuntu' },
+        run: () =>
+          JSON.stringify({
+            registered: true,
+            execute: action.execute,
+            arguments: action.arguments,
+            state: 'Ready',
+          }),
+      });
+      expect(q.execute).toBe(shim);
+    }
+  });
+
+  it('the systemd unit names the shim its ExecStart runs', () => {
+    const shim = '/home/u/.local/bin/cctl';
+    const q = queryDaemonUnit({
+      unitPath: '/u/claude-control-daemon.service',
+      fs: { read: () => renderDaemonUnit(shim) } as never,
+      run: () => 'enabled',
+    });
+    expect(q.execute).toBe(shim);
   });
 });

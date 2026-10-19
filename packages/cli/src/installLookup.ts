@@ -1,14 +1,15 @@
 // Where the cctl installs on this machine are, and what version each is: the one a shell runs (the
-// first `cctl` on PATH) and the one the autostart registration starts. Read before a parallel session
-// is taken, since an older install cannot read the rules file while one exists (see
-// folderRulesSupport.ts). File reads only, plus the autostart query, which the caller asks for only
-// when no daemon is alive.
+// first `cctl` on PATH), the one the PowerShell `claude` wrapper runs, and the one the autostart
+// registration starts. Read before a parallel session is taken, since an older install cannot read
+// the rules file while one exists (see folderRulesSupport.ts). File reads only, plus the autostart
+// query.
 
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { delimiter, dirname, join } from 'node:path';
 import { queryAutostart } from './autostart.js';
 import type { InstallLookup } from './folderRulesSupport.js';
 import { unwrapNpmCmdShim } from './launcher.js';
+import { parsePowerShellWrapper, readPowerShellWrapperProfile } from './shellInit.js';
 
 /** The package a cctl install is published as. */
 const PACKAGE_NAME = '@andrewtjin/cctl';
@@ -84,6 +85,12 @@ export function cctlVersionOf(path: string): string | undefined {
 export function defaultInstallLookup(): InstallLookup {
   return {
     onPath: () => findCctlOnPath(),
+    wrapperEntry: () => {
+      if (process.platform !== 'win32') return undefined;
+      const text = readPowerShellWrapperProfile();
+      const parsed = text === undefined ? undefined : parsePowerShellWrapper(text);
+      return parsed?.kind === 'node-direct' ? parsed.cctlEntry : undefined;
+    },
     autostart: () => {
       const q = queryAutostart();
       return q.supported && q.registered && q.execute !== undefined

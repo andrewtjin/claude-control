@@ -36,6 +36,8 @@ import type { ClaudeBackgroundHost } from './backgroundHost.js';
 const MAIN = null;
 const X = 'C:/data/profiles/rule-x';
 const Q = 'C:/data/profiles/rule-q';
+/** The profile of W's parallel session (`cctl claude --account W`). */
+const P = 'C:/data/profiles/session-w';
 const SID = 'c5f2097e-d500-42a0-9ddf-8a33f4f9a886';
 const SHORT = 'c5f2097e';
 const SID2 = '0dff6248-faa1-48a3-ba02-a3ac6c888819';
@@ -208,8 +210,10 @@ class FakeClaude implements ClaudeBackgroundHost {
     };
   }
 
+  /** Config dirs beyond the usual three, for a case that needs one (a parallel session's). */
+  extraDirs: Config[] = [];
   configDirs(): Promise<Config[]> {
-    return Promise.resolve([MAIN, X, Q]);
+    return Promise.resolve([MAIN, X, Q, ...this.extraDirs]);
   }
   liveSessions(): Promise<LiveSession[]> {
     this.beforeRegistry?.(++this.registryReads);
@@ -450,10 +454,14 @@ function world(
   const lines: string[] = [];
   const shields = { n: 0, held: 0, hints: [] as string[] };
   const homeX: SessionHome = { configDir: X, movable: true, ...home };
-  const views: Record<string, { account?: string; slot: string; removed?: boolean }> = {
+  const views: Record<
+    string,
+    { account?: string; slot: string; removed?: boolean; parallel?: boolean }
+  > = {
     main: { account: 'Shared', slot: 'the global slot' },
     [X]: { account: 'Inc', slot: 'the folder slot of C:/work' },
     [Q]: { slot: 'the profile of a folder rule since removed', removed: true },
+    [P]: { account: 'W', slot: 'the parallel-session slot of W', parallel: true },
   };
   const ruled = (cwd: string): boolean => cwd.toLowerCase().startsWith('c:/work');
   const ctx: RouteContext = {
@@ -1378,6 +1386,28 @@ describe('routeBackgroundLaunch — the session runs on another account', () => 
       expect(w.host.hosted.get(X)).toEqual([{ short: '7a7a7a7a', sessionId: NEW, cwd: WORK }]);
       expect(w.host.rowsOf(NEW)).toEqual([X]);
     }
+  });
+});
+
+describe("routeBackgroundLaunch — a session on a parallel session's slot", () => {
+  it('idle there and working in a ruled folder: opened where it runs, never moved onto the folder', async () => {
+    const w = world();
+    w.host.extraDirs.push(P);
+    w.host.runs(P, SID, { name: 'bg eval', saved: { kind: 'replayable', options: [] } });
+    const d = await decideIn(w, attach(SHORT));
+    expect(d).toMatchObject(openUnder(P));
+    expect(w.host.hostOf()).toEqual([P]);
+    expect(w.host.calls.some((c) => c.startsWith('stop') || c.startsWith('rm'))).toBe(false);
+    expect(w.lines.join(' ')).not.toContain('moving');
+  });
+
+  it('runs nowhere, its only row there: opened there, never started on the folder', async () => {
+    const w = world();
+    w.host.extraDirs.push(P);
+    w.host.row(P, 'stopped');
+    const d = await decideIn(w, attach(SHORT));
+    expect(d).toMatchObject(openUnder(P));
+    expect(w.host.rowsOf()).toEqual([P]);
   });
 });
 

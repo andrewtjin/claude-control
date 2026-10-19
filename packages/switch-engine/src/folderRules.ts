@@ -93,6 +93,36 @@ export function withoutHolders(
   return holders.filter((h) => !removed.some((r) => sameHolder(h, r)));
 }
 
+/** Who a parallel session is in use by, counted the way a person would: terminals and background
+ *  sessions. A terminal is each launcher, and each Claude Code (or process found running on the
+ *  profile) whose launcher is not among the holders: one whose terminal was killed under it still
+ *  runs where that terminal was. A background session is a worker the profile's service hosts.
+ *  The caller passes the holders it counts (the live ones, for a display of what runs now). */
+export function leaseOccupants(holders: readonly Pick<LeaseHolder, 'pid' | 'role' | 'parent'>[]): {
+  terminals: number;
+  background: number;
+} {
+  const launchers = new Set(holders.filter((h) => h.role === 'launcher').map((h) => h.pid));
+  const orphans = holders.filter(
+    (h) => h.role === 'claude' && (h.parent === undefined || !launchers.has(h.parent)),
+  ).length;
+  return {
+    terminals: launchers.size + orphans,
+    background: holders.filter((h) => h.role === 'background').length,
+  };
+}
+
+/** {@link leaseOccupants} as a phrase: "2 terminals", "1 background session", "1 terminal and 1
+ *  background session"; "no running process" when there is none. */
+export function occupantsPhrase(o: { terminals: number; background: number }): string {
+  const parts: string[] = [];
+  if (o.terminals > 0) parts.push(`${o.terminals} terminal${o.terminals === 1 ? '' : 's'}`);
+  if (o.background > 0) {
+    parts.push(`${o.background} background session${o.background === 1 ? '' : 's'}`);
+  }
+  return parts.length === 0 ? 'no running process' : parts.join(' and ');
+}
+
 /** One consistent picture of the registry: the shared rows (`accounts.json`), the reserved rows and
  *  the rules (`groups.json`). Read once per decision so every function below sees the same state. */
 export interface RulesPicture {

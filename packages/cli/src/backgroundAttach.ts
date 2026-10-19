@@ -589,6 +589,9 @@ export interface ConfigView {
   slot: string;
   /** The profile of a folder rule since removed: no login, so every prompt there fails. */
   removed?: boolean;
+  /** A parallel session's slot (`cctl claude --account`): its account was chosen for that session,
+   *  so nothing moves a background session onto or off it. */
+  parallel?: boolean;
 }
 
 export interface RouteContext {
@@ -1283,7 +1286,10 @@ async function decide(
     let final = false;
     /** Where a move that failed put it back, when that is where it is opened. */
     let putBack: Extract<SessionWhere, { kind: 'bg' }> | undefined;
-    if (tree !== undefined) {
+    if (runsOn.parallel === true) {
+      why = "it runs on a parallel session's slot, whose account was chosen for that session";
+      final = true;
+    } else if (tree !== undefined) {
       why = 'it works in a git worktree Claude Code made for it, which a move would delete';
       final = true;
     } else if (home.unusable !== undefined) {
@@ -1471,6 +1477,16 @@ async function decide(
   // The slot it belongs to holds no row: start it there from its latest row, on the terms a move
   // carries options over on (its rows elsewhere go, so it is left one only there).
   const latest = rows[0]!;
+  // Its latest row is on a parallel session's slot: the account was chosen for that session, and
+  // a start elsewhere would take the session off it. It is opened where its row is.
+  const latestOn = await ctx.view(latest.configDir);
+  if (latestOn.parallel === true) {
+    return openRow(
+      latest,
+      `cctl: background session ${label(target)} stays on ${onWhat(latestOn)}: its account was ` +
+        'chosen for that parallel session. Opening it there.',
+    );
+  }
   let hint: string | undefined;
   const started = await ctx.shield(
     (hold) =>
@@ -1590,8 +1606,11 @@ export function leaseArgRefusal(args: readonly string[], label: string): string 
   const request = parseBackgroundRequest(args);
   if (request?.verb === 'attach' || request?.verb === 'control') {
     const verb = request.args[request.refAt - 1] ?? request.verb;
+    // attach opens a session; stop, kill, rm and respawn act on one. Either way it is a session
+    // its service runs, on the account that service holds.
+    const what = request.verb === 'attach' ? 'opens' : 'acts on';
     return (
-      `"${verb}" opens a background session, which runs on the account its service holds; ` +
+      `"${verb}" ${what} a background session, which runs on the account its service holds; ` +
       '--account cannot choose one for it. Run it without --account.'
     );
   }

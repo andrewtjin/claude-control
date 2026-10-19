@@ -174,7 +174,7 @@ async function fakeRecord(w: World, pid: number): Promise<{ cfg: string; seen: s
 /** Start a fake Claude Code session on a config dir, rotating its login every `rotateMs`. Waits
  *  until it has rotated at least once. */
 async function startFake(w: World, configDir: string, rotateMs = 60): Promise<ChildProcess> {
-  const child = spawn(process.execPath, [join(w.rig.bin, 'fake.cjs')], {
+  const child = spawn(process.execPath, [w.rig.script], {
     env: {
       ...process.env,
       ...w.rig.env,
@@ -228,7 +228,7 @@ async function startLauncher(
     );
   }
   const pidFile = join(w.runDir, `launcher-${Date.now()}-${Math.random()}.pid`);
-  const args = withFake ? [script, 'with-fake', join(w.rig.bin, 'fake.cjs'), pidFile] : [script];
+  const args = withFake ? [script, 'with-fake', w.rig.script, pidFile] : [script];
   const proc = spawn(process.execPath, args, {
     env: {
       ...process.env,
@@ -478,7 +478,7 @@ describe('a parallel session, end to end', () => {
   );
 
   it(
-    '6. the launcher killed before its Claude Code was recorded: a quick check defers, a full one finds it',
+    '6. the launcher killed before its Claude Code was recorded: a quick check finds it before it ends anything',
     { timeout: 180_000 },
     async () => {
       const w = await setup();
@@ -492,11 +492,11 @@ describe('a parallel session, end to end', () => {
       await w.engine.releaseLease(leaseRuleId(w.W.id), [placeholder.holder], w.probe);
       l.proc.kill('SIGKILL');
       await until(() => !running(l.proc.pid!));
+      // Every recorded holder is gone, so even a quick check looks for what still runs on the
+      // profile (the process table on Windows, /proc on Linux) before it would end the session.
       const quick = await w.engine.sweepLeases({ mode: 'quick', probe: w.probe });
-      expect(quick.deferred.map((d) => d.reason)).toEqual(['unrecorded_child']);
-      const full = await w.engine.sweepLeases({ mode: 'full', probe: w.probe });
-      expect(full.adopted.map((a) => a.pid)).toEqual([l.childPid]);
-      expect(full.ended).toEqual([]);
+      expect(quick.adopted.map((a) => a.pid)).toEqual([l.childPid]);
+      expect(quick.ended).toEqual([]);
       await writeFile(join(w.runDir, `${l.childPid!}.exit`), '');
       await until(() => !running(l.childPid!));
       const freed = await w.engine.sweepLeases({ mode: 'full', probe: w.probe });

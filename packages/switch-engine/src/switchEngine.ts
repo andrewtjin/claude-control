@@ -64,6 +64,7 @@ import {
   folderUniquenessKey,
   isWellFormedText,
   isWithin,
+  shellQuoteArg,
 } from './folderPath.js';
 import { projectDirMatches, recordedFolderFor } from './recordedFolder.js';
 import { sanitizeTerminalText } from './terminalSafe.js';
@@ -80,7 +81,9 @@ import {
   availableInOrder,
   describeRuleScopes,
   isLeaseRule,
+  leaseOccupants,
   leaseRuleId,
+  occupantsPhrase,
   sameHolderProcess,
   withHolders,
   withoutHolders,
@@ -97,7 +100,7 @@ import {
   withRule,
   type RulesPicture,
 } from './folderRules.js';
-import { readdir, readFile, rm } from 'node:fs/promises';
+import { readdir, readFile, rename, rm } from 'node:fs/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -155,10 +158,13 @@ import {
 import {
   LEASE_START_TOLERANCE_MS,
   holderState,
+  isClaudeCodeProcess,
+  linuxTags,
   pidAlive,
   procFs as realProcFs,
   readProcessTable,
   selfHolder,
+  visibleNamespaces,
   type HolderEvidence,
 } from './processStarts.js';
 import { hostname } from 'node:os';
@@ -293,10 +299,11 @@ export interface LeaseProcessSeams {
 
 /** What a sweep of parallel sessions does (see {@link SwitchEngine.sweepLeases}). */
 export interface LeaseSweepOptions {
-  /** full (the daemon, the CLI where a lease blocks the user, a join): the Windows start check via
-   *  one process-table query, and processes running on a lease profile that no holder records are
-   *  found and recorded. quick (the CLI on its way to something else): no process query on Windows;
-   *  on Linux the start check is a file read either way, so quick only skips the environ scan. */
+  /** full (the daemon, the CLI where a lease blocks the user, a join): the Windows start check of
+   *  every holder via one process-table query. quick (the CLI on its way to something else): no
+   *  start check on Windows (kill-0 only), and the process table is read only when a session's
+   *  holders are all gone. Either way a session ends only once nothing runs on its profile: on Linux
+   *  the start check and the search for processes on the profile are file reads in both modes. */
   mode: 'quick' | 'full';
   /** The profile's background workers; a sweep never ends a lease whose service still hosts some. */
   probe: LeaseOccupancyProbe;
@@ -487,8 +494,10 @@ function describeRule(rule: FolderRule): string {
 /** A rule's slot in words: the parallel-session slot of its account, or the folder slot of its
  *  scopes. */
 function slotWordsOf(rule: FolderRule): string {
-  return isLeaseRule(rule)
-    ? `the parallel-session slot of ${rule.label}`
+  if (isLeaseRule(rule)) return `the parallel-session slot of ${rule.label}`;
+  // A rule of named sessions only has no folder to call its slot by.
+  return rule.folders.length === 0
+    ? `the slot of ${describeRule(rule)}`
     : `the folder slot of ${describeRule(rule)}`;
 }
 
@@ -506,14 +515,22 @@ function clockTime(ms: number): string {
 }
 
 /** Why an account a parallel session holds is not available, as `cctl switch`, the phone and
- *  activate say it. */
+ *  activate say it. Several terminals (or background sessions) on one account share one parallel
+ *  session, which ends when the last of them exits. */
 function leasedRefusal(label: string, lease: SessionLease): string {
   const pids = leaseSessionPids(lease);
-  const by =
-    pids.length <= 1
-      ? `a parallel session (pid ${pids[0] ?? '?'}, since ${clockTime(lease.startedAtMs)})`
-      : `${pids.length} parallel sessions (pids ${pids.join(', ')})`;
-  return `account "${label}" is in use by ${by}; it rejoins the pool when that session exits`;
+  const since = clockTime(lease.startedAtMs);
+  if (pids.length <= 1) {
+    return (
+      `account "${label}" is in use by a parallel session (pid ${pids[0] ?? '?'}, since ${since}); ` +
+      'it rejoins the pool when that session exits'
+    );
+  }
+  const on = occupantsPhrase(leaseOccupants(lease.holders));
+  return (
+    `account "${label}" is in use by a parallel session on ${on} (pids ${pids.join(', ')}, since ` +
+    `${since}); it rejoins the pool when the last of them exits`
+  );
 }
 
 /** The parallel-session rule of an account, if it has one. */
@@ -1273,7 +1290,44 @@ export class SwitchEngine {
   private async clearSlotLive(rt: SlotRuntime): Promise<void> {
     if (rt.profileDir === undefined) return;
     await removeIfExists(join(rt.profileDir, '.credentials.json'));
-    await rt.credStore.clearOauthAccount();
+    try {
+      await rt.credStore.clearOauthAccount();
+    } catch (err) {
+      if (!(err instanceof SyntaxError)) throw err;
+      // A `.claude.json` nothing can parse (a writer killed mid-write) names nobody, so there is no
+      // block to drop, but left in place it would fail every later seat of this slot, which must
+      // write one. Set aside, it is kept for inspection and the next seat starts a clean file.
+      const path = join(rt.profileDir, '.claude.json');
+      await rename(path, `${path}.corrupt`);
+    }
+  }
+
+  /** Whether a parallel session's slot holds a login that ending it could not keep (see
+   *  {@link slotHoldsUnstoredLogin}): what doctor names when such a session is not ended. Read-only. */
+  async leaseHoldsUnstoredLogin(ruleId: string): Promise<boolean> {
+    return this.slotHoldsUnstoredLogin(this.slotRuntime(ruleSlotId(ruleId)));
+  }
+
+  /**
+   * Whether clearing a slot would lose a login: credentials that cannot be read at all (a torn file,
+   * which may hold the only copy of a rotated token), or a token no stored account's bundle holds
+   * that adoption refuses to store (see {@link adoptionPlan}). A token adoption would store is not
+   * lost (ending the session adopts it first), and neither is one older than the stored login of the
+   * account live there (the vault already holds a newer one). Nothing there loses nothing. Read-only:
+   * doctor asks it of a session not ended yet, the teardown after its adoption.
+   */
+  private async slotHoldsUnstoredLogin(rt: SlotRuntime): Promise<boolean> {
+    let live: ClaudeOauth | undefined;
+    try {
+      live = await rt.credStore.readLiveCredentials();
+    } catch {
+      return true;
+    }
+    if (live === undefined) return false;
+    if ((await this.vault.readStoredTokens()).holdersOf(live).length > 0) return false;
+    const owner = await this.getActiveId(rt.id);
+    const oauth = await rt.credStore.readOauthAccount().catch(() => undefined);
+    return (await this.adoptionPlan(owner, live, oauth)).kind === 'refused';
   }
 
   /** Adopt into the vault whatever rotation the account live in `rt` holds — the reconcile-by-reading
@@ -1811,7 +1865,8 @@ export class SwitchEngine {
    * One difference by kind. A folder or alias rule's slot whose switch cannot be settled is cleared
    * anyway without adopting (its dissolve retires that switch). A parallel session's slot is not:
    * there the live login is the only copy of a token a session may have rotated for hours, so nothing
-   * is written and the result says `slot_untrusted`; the sweep retries it.
+   * is written and the result says `slot_untrusted`; the sweep retries it. For the same reason a
+   * parallel session's slot whose login could not be adopted is kept (`login_unadopted`).
    */
   private async teardownRuleSlotLocked(
     rule: FolderRule,
@@ -1834,6 +1889,22 @@ export class SwitchEngine {
       };
     }
     const adoptedRotation = untrusted ? false : await this.adoptSlotRotation(rt);
+    // A parallel session's slot whose login could not be adopted (unreadable, naming no account,
+    // or refused) is not cleared: that login may be the only copy of a token the session rotated.
+    // A re-login of the account rewrites the slot with a stored token, which the next sweep ends.
+    if (opts.lease && (await this.slotHoldsUnstoredLogin(rt))) {
+      this.log.warn(
+        { ruleId: rule.id },
+        `the parallel session of ${rule.label} holds a login that could not be adopted; it is ` +
+          `kept until it can be (cctl accounts relogin ${rule.label} rewrites it)`,
+      );
+      return {
+        released: false,
+        adoptedRotation: false,
+        releasedIds: [],
+        deferred: 'login_unadopted',
+      };
+    }
     this.fault(opts.lease ? 'lease:after-adopt' : 'reset:after-adopt');
 
     await this.clearSlotLive(rt);
@@ -2918,8 +2989,8 @@ export class SwitchEngine {
       const next = withHolders(rule.lease.holders, holders);
       if (next.length > MAX_LEASE_HOLDERS) {
         throw new LeaseHolderCapError(
-          `cannot join the parallel session of ${rule.label}: it already holds ` +
-            `${rule.lease.holders.length} processes. Exit a terminal on ${rule.label} first.`,
+          `the parallel session of ${rule.label} already records ${rule.lease.holders.length} ` +
+            'processes, as many as it may',
           MAX_LEASE_HOLDERS,
         );
       }
@@ -2930,12 +3001,15 @@ export class SwitchEngine {
 
   /**
    * Remove this terminal's holders from its parallel session; when none would remain, end the session
-   * (its rotation adopted, its login cleared, the account back in the pool) — unless the profile's
-   * background service still hosts workers, which then hold it. The roster is read before the lock,
-   * as a file read only, so the exit path never waits on a process query. Anything that leaves the
-   * question open (an unreadable roster, a Linux process still running on the profile, a slot whose
-   * switch cannot be settled) writes nothing: the departing holders stay on disk, dead after this exit,
-   * and the next sweep decides with fresh evidence. Never writes an empty holder list.
+   * (its rotation adopted, its login cleared, the account back in the pool) — unless something still
+   * runs on its profile, which then holds it: the background service's workers, or a process its
+   * Claude Code started that outlived it (a backgrounded `claude -p`, a detached helper), found the
+   * way a full sweep finds one (Linux: its environment names the profile; Windows: a live descendant
+   * of the departing holders in the process table). The roster is read before the lock, and so is
+   * the process table when this release looks like the last one out. Anything that leaves the
+   * question open (an unreadable roster or process table, a slot whose switch cannot be settled, a
+   * login that could not be adopted) writes nothing: the departing holders stay on disk, dead after
+   * this exit, and the next sweep decides with fresh evidence. Never writes an empty holder list.
    */
   async releaseLease(
     ruleId: string,
@@ -2945,6 +3019,16 @@ export class SwitchEngine {
     const profileDir = this.configDirForSlot(ruleSlotId(ruleId))!;
     // Undefined: the roster read failed outright, which decides nothing either.
     const workers = await probe(profileDir, { verify: false }).catch(() => undefined);
+    // The process evidence a last holder out needs, read without the lock when this release is the
+    // last one by the rules on disk now; a concurrent release that leaves this one last reads it
+    // under the lock instead.
+    const before = await this.vault.getRule(ruleId).catch(() => undefined);
+    let evidence =
+      before !== undefined &&
+      isLeaseRule(before) &&
+      withoutHolders(before.lease.holders, holders).length === 0
+        ? await this.holderEvidence('full', {})
+        : undefined;
     return this.withCredentialLock(async () => {
       const nothing: LeaseRelease = {
         ended: false,
@@ -2969,13 +3053,22 @@ export class SwitchEngine {
         await this.writeSnapshotLocked();
         return { ...nothing, remaining: workers.length, deferredToBackground: true };
       }
-      // This process is the departing launcher: a shell that inherited the profile's config dir
-      // (a cctl started from inside the session) must not keep its own session alive.
-      if (
-        this.platform === 'linux' &&
-        this.processesOnProfile(profileDir).some((pid) => pid !== process.pid)
-      ) {
-        return { ...nothing, deferred: 'unrecorded_child' };
+      evidence ??= await this.holderEvidence('full', {});
+      // This process is the departing launcher, never one of the processes it looks for: a shell
+      // that inherited the profile's config dir (a cctl started from inside the session) must not
+      // keep its own session alive, and the process-table query it just ran is its own child.
+      const left = this.unrecordedProcesses(rule, evidence, { exceptSelf: true });
+      if (left === 'unreadable') return { ...nothing, deferred: 'processes_unreadable' };
+      if (left.length > 0) {
+        const kept = left.slice(0, MAX_LEASE_HOLDERS);
+        await this.vault.setLeaseHolders(ruleId, kept);
+        await this.writeSnapshotLocked();
+        this.log.info(
+          { ruleId, pids: kept.map((h) => h.pid) },
+          `parallel session of ${rule.label}: its terminals exited, but process(es) ` +
+            `${kept.map((h) => h.pid).join(', ')} still run on its profile; now holding it`,
+        );
+        return { ...nothing, remaining: kept.length, heldBy: kept.map((h) => h.pid) };
       }
       const torn = await this.teardownRuleSlotLocked(rule, { lease: true });
       if (!torn.released)
@@ -2990,13 +3083,15 @@ export class SwitchEngine {
 
   /**
    * Drop the holders of parallel sessions whose processes are gone, record processes found running on
-   * a session's profile that no holder records (full mode), and end the sessions left with none.
-   * Two passes: everything that needs a process query or a roster read runs first without the lock;
-   * then, under it, each session is re-read and written at most once. A process judged dead stays
-   * dead, so a holder added between the passes (not in the dead set) survives. A session reaching no
-   * holder is ended only on positive evidence: in quick mode not while a dead launcher's Claude Code
-   * was never recorded (only a full check can see it), not while its roster is unreadable or was not
-   * read, and not while its slot's switch cannot be settled.
+   * a session's profile that no holder records, and end the sessions left with none. Two passes:
+   * everything that needs a process query or a roster read runs first without the lock; then, under
+   * it, each session is re-read and written at most once. A process judged dead stays dead, so a
+   * holder added between the passes (not in the dead set) survives. A session reaching no holder is
+   * ended only on positive evidence that nothing runs on its profile, in either mode: the processes
+   * found there (Linux: by environment, a file read; Windows: the live descendants of its holders in
+   * the process table, which a quick sweep reads only once a session's holders are all gone), its
+   * roster, and its slot's switch. A process table or roster that cannot be read, or a slot that
+   * cannot be settled, defers the end. One session failing never stops the sweep of the others.
    */
   async sweepLeases(opts: LeaseSweepOptions): Promise<LeaseSweepReport> {
     const report: LeaseSweepReport = {
@@ -3019,15 +3114,21 @@ export class SwitchEngine {
       string,
       {
         dead: LeaseHolder[];
-        adopted: LeaseHolder[];
+        adopted: LeaseHolder[] | 'unreadable';
         probe: LeaseHolder[] | 'unreadable' | undefined;
       }
     >();
+    // A quick sweep reads the Windows process table only when it is about to decide that a session
+    // has no process left, and then once for all of them.
+    let tableRead = opts.mode === 'full';
     for (const rule of leases) {
       const dead = rule.lease.holders.filter((h) => holderState(h, evidence) === 'dead');
       const allGone = dead.length === rule.lease.holders.length;
-      const adopted =
-        opts.mode === 'full' && allGone ? this.unrecordedProcesses(rule, evidence) : [];
+      if (allGone && !tableRead && this.platform === 'win32') {
+        tableRead = true;
+        evidence.table = await this.readTable(opts);
+      }
+      const adopted = allGone ? this.unrecordedProcesses(rule, evidence) : [];
       const profileDir = this.configDirForSlot(ruleSlotId(rule.id))!;
       const probe = await opts
         .probe(profileDir, { verify: opts.mode === 'full' })
@@ -3035,78 +3136,97 @@ export class SwitchEngine {
       judged.set(rule.id, { dead, adopted, probe });
     }
 
-    // Second pass, under the lock: re-read each session, decide in memory, write at most once.
+    // Second pass, under the lock: re-read each session, decide in memory, write at most once. Each
+    // session is decided on its own: one whose teardown throws (a profile file another process left
+    // torn, a rules write refused) is deferred and logged, and the sweep goes on to the next.
     await this.withCredentialLock(async () => {
       let changed = false;
       for (const seen of leases) {
-        const rule = await this.vault.getRule(seen.id);
-        if (rule === undefined || !isLeaseRule(rule)) continue;
-        const accountId = rule.include[0]!;
-        const facts = judged.get(rule.id);
-        const recorded = rule.lease.holders;
-        const kept = withoutHolders(recorded, facts?.dead ?? []);
-        const room = Math.max(0, MAX_LEASE_HOLDERS - kept.length);
-        const adopted = (facts?.adopted ?? []).slice(0, room);
-        if ((facts?.adopted.length ?? 0) > adopted.length) {
+        try {
+          if (await this.sweepOneLeaseLocked(seen.id, judged.get(seen.id), report)) changed = true;
+        } catch (err) {
+          if (this.isSimulatedDeath(err)) throw err;
           this.log.warn(
-            { ruleId: rule.id, dropped: facts!.adopted.length - adopted.length },
-            'a parallel session holds as many processes as it may record; the rest are not recorded',
+            { ruleId: seen.id, err: errorReason(err) },
+            `could not end the parallel session of ${seen.label}: ${errorReason(err)}`,
           );
+          report.deferred.push({
+            accountId: seen.include[0]!,
+            label: seen.label,
+            reason: 'teardown_failed',
+          });
         }
-        const next = withHolders(kept, adopted);
-        const defer = (reason: LeaseDeferReason): void => {
-          report.deferred.push({ accountId, label: rule.label, reason });
-        };
-        if (next.length > 0) {
-          if (!isDeepStrictEqual(next, recorded)) {
-            await this.vault.setLeaseHolders(rule.id, next);
-            changed = true;
-            report.droppedHolders += recorded.length - kept.length;
-            report.adoptedHolders += adopted.length;
-            for (const h of adopted) {
-              report.adopted.push({ accountId, label: rule.label, pid: h.pid });
-              this.log.info(
-                { ruleId: rule.id, pid: h.pid },
-                `parallel session of ${rule.label}: found running process ${h.pid} on its profile; now holding it`,
-              );
-            }
-          }
-          continue;
-        }
-        if (facts === undefined || facts.probe === undefined) {
-          defer('no_probe');
-          continue;
-        }
-        if (opts.mode === 'quick' && this.launcherWithoutChild(recorded)) {
-          defer('unrecorded_child');
-          continue;
-        }
-        if (facts.probe === 'unreadable') {
-          defer('roster_unreadable');
-          continue;
-        }
-        if (facts.probe.length > 0) {
-          await this.vault.setLeaseHolders(rule.id, withHolders([], facts.probe));
-          changed = true;
-          report.droppedHolders += recorded.length;
-          continue;
-        }
-        const torn = await this.teardownRuleSlotLocked(rule, { lease: true });
-        if (!torn.released) {
-          defer(torn.deferred ?? 'slot_untrusted');
-          continue;
-        }
-        report.droppedHolders += recorded.length;
-        report.ended.push({ accountId, label: rule.label, adoptedRotation: torn.adoptedRotation });
-        this.log.info(
-          { ruleId: rule.id },
-          `ended parallel session of ${rule.label} (holders exited); rotation adopted: ` +
-            (torn.adoptedRotation ? 'yes' : 'no'),
-        );
       }
       if (changed) await this.writeSnapshotLocked();
     });
     return report;
+  }
+
+  /** One session of {@link sweepLeases}'s second pass, under the lock: drop its dead holders, record
+   *  the processes found on its profile, or end it. Returns whether it wrote holders (the snapshot
+   *  is then rewritten once for the whole pass). */
+  private async sweepOneLeaseLocked(
+    ruleId: string,
+    facts:
+      | {
+          dead: LeaseHolder[];
+          adopted: LeaseHolder[] | 'unreadable';
+          probe: LeaseHolder[] | 'unreadable' | undefined;
+        }
+      | undefined,
+    report: LeaseSweepReport,
+  ): Promise<boolean> {
+    const rule = await this.vault.getRule(ruleId);
+    if (rule === undefined || !isLeaseRule(rule)) return false;
+    const accountId = rule.include[0]!;
+    const recorded = rule.lease.holders;
+    const kept = withoutHolders(recorded, facts?.dead ?? []);
+    const found = facts?.adopted === 'unreadable' ? [] : (facts?.adopted ?? []);
+    const room = Math.max(0, MAX_LEASE_HOLDERS - kept.length);
+    const adopted = found.slice(0, room);
+    if (found.length > adopted.length) {
+      this.log.warn(
+        { ruleId: rule.id, dropped: found.length - adopted.length },
+        'a parallel session holds as many processes as it may record; the rest are not recorded',
+      );
+    }
+    const next = withHolders(kept, adopted);
+    const defer = (reason: LeaseDeferReason): false => {
+      report.deferred.push({ accountId, label: rule.label, reason });
+      return false;
+    };
+    if (next.length > 0) {
+      if (isDeepStrictEqual(next, recorded)) return false;
+      await this.vault.setLeaseHolders(rule.id, next);
+      report.droppedHolders += recorded.length - kept.length;
+      report.adoptedHolders += adopted.length;
+      for (const h of adopted) {
+        report.adopted.push({ accountId, label: rule.label, pid: h.pid });
+        this.log.info(
+          { ruleId: rule.id, pid: h.pid },
+          `parallel session of ${rule.label}: found running process ${h.pid} on its profile; now holding it`,
+        );
+      }
+      return true;
+    }
+    if (facts === undefined || facts.probe === undefined) return defer('no_probe');
+    if (facts.adopted === 'unreadable') return defer('processes_unreadable');
+    if (facts.probe === 'unreadable') return defer('roster_unreadable');
+    if (facts.probe.length > 0) {
+      await this.vault.setLeaseHolders(rule.id, withHolders([], facts.probe));
+      report.droppedHolders += recorded.length;
+      return true;
+    }
+    const torn = await this.teardownRuleSlotLocked(rule, { lease: true });
+    if (!torn.released) return defer(torn.deferred ?? 'slot_untrusted');
+    report.droppedHolders += recorded.length;
+    report.ended.push({ accountId, label: rule.label, adoptedRotation: torn.adoptedRotation });
+    this.log.info(
+      { ruleId: rule.id },
+      `ended parallel session of ${rule.label} (holders exited); rotation adopted: ` +
+        (torn.adoptedRotation ? 'yes' : 'no'),
+    );
+    return false;
   }
 
   /** Every parallel session with each holder judged (read-only; `mode` as in {@link sweepLeases}):
@@ -3119,7 +3239,9 @@ export class SwitchEngine {
     return leases.map((rule) => {
       const view = this.leaseView(rule, evidence);
       if (opts.mode !== 'full' || view.holders.some((h) => h.state !== 'dead')) return view;
-      const unrecorded = this.unrecordedProcesses(rule, evidence).map((h) => h.pid);
+      const found = this.unrecordedProcesses(rule, evidence);
+      if (found === 'unreadable') return { ...view, processesUnreadable: true };
+      const unrecorded = found.map((h) => h.pid);
       return unrecorded.length > 0 ? { ...view, unrecorded } : view;
     });
   }
@@ -3132,43 +3254,77 @@ export class SwitchEngine {
     return this.leaseView(rule, await this.holderEvidence('quick', {}));
   }
 
-  /** Processes a parallel session's profile is in use by but that no holder records: on Windows the
-   *  live descendants of its recorded holders (Windows keeps a dead parent's id on its children, and
-   *  a child started before the holder is not its child but a reused pid's), on Linux every process
-   *  whose environment names the profile. Only for a session whose recorded holders are all gone:
-   *  while one runs, the session is held anyway. */
+  /**
+   * Processes a parallel session's profile is in use by but that no holder records, or
+   * `'unreadable'` when the evidence to find them is missing (a process table that could not be
+   * read). Only asked once its recorded holders are all gone: while one runs, the session is held
+   * anyway.
+   *
+   * Only a Claude Code counts (see {@link isClaudeCodeProcess}): it is what reads the profile's
+   * login, while a dev server or an editor the session started merely inherited its environment,
+   * and keeping the account out of the pool for as long as one of those runs would gain nothing.
+   *
+   * Linux: every such process whose environment names the profile. Windows: the live such
+   * descendants of its recorded holders (Windows keeps a dead parent's id on its children; the walk
+   * goes through every descendant, since a Claude Code may run under a shell). Two kinds of process carry
+   * a holder's pid as their parent without being ours, and neither is walked: one started before
+   * the holder (a reused pid's earlier child), and one started by a later process that took over
+   * the holder's pid after it died (the table shows that pid running with a start that is not the
+   * holder's: everything it started is its own). A descendant whose own parent has exited between
+   * it and the holder cannot be traced on Windows and is not found. `exceptSelf` leaves out this
+   * process and does not walk from it: the release runs in a departing launcher, whose own children
+   * are the query it just ran.
+   */
   private unrecordedProcesses(
     rule: FolderRule & { lease: SessionLease },
     evidence: HolderEvidence,
-  ): LeaseHolder[] {
+    opts: { exceptSelf?: boolean } = {},
+  ): LeaseHolder[] | 'unreadable' {
     const host = evidence.host;
     const recorded = new Set(rule.lease.holders.map((h) => h.pid));
     if (this.platform === 'win32') {
       const table = evidence.table;
-      if (table === undefined || table.size === 0) return [];
+      if (table === undefined || table.size === 0) return 'unreadable';
       const children = new Map<number, ProcessRow[]>();
       for (const row of table.values()) {
         children.set(row.ppid, [...(children.get(row.ppid) ?? []), row]);
       }
       const found = new Map<number, LeaseHolder>();
+      const walked = new Set<number>();
       for (const h of rule.lease.holders) {
-        if (h.platform !== 'win32' || h.host !== host) continue;
-        const queue = [h.pid];
+        if (h.platform !== 'win32') continue;
+        if (opts.exceptSelf === true && h.pid === process.pid) continue;
+        const now = table.get(h.pid);
+        const reusedAt =
+          now !== undefined && Math.abs(now.startMs - h.start) > LEASE_START_TOLERANCE_MS
+            ? now.startMs
+            : undefined;
+        const queue: Array<{ pid: number; root: boolean }> = [{ pid: h.pid, root: true }];
         while (queue.length > 0) {
-          const parent = queue.shift()!;
+          const { pid: parent, root } = queue.shift()!;
           for (const row of children.get(parent) ?? []) {
             if (row.startMs < h.start - LEASE_START_TOLERANCE_MS) continue;
-            if (recorded.has(row.pid) || found.has(row.pid) || row.pid === parent) continue;
-            if (!evidence.isAlive(row.pid)) continue;
-            found.set(row.pid, {
-              pid: row.pid,
-              start: row.startMs,
-              host,
-              platform: 'win32',
-              role: 'claude',
-              parent: row.ppid,
-            });
-            queue.push(row.pid);
+            if (root && reusedAt !== undefined && row.startMs >= reusedAt) continue;
+            if (recorded.has(row.pid) || walked.has(row.pid) || row.pid === parent) continue;
+            if (row.pid === process.pid || !evidence.isAlive(row.pid)) continue;
+            walked.add(row.pid);
+            // Every descendant is walked (a Claude Code may run under a shell it started), but only
+            // a Claude Code holds the session: a dev server or an editor never reads its login.
+            const identity = {
+              ...(row.name !== undefined ? { image: row.name } : {}),
+              ...(row.commandLine !== undefined ? { commandLine: row.commandLine } : {}),
+            };
+            if (isClaudeCodeProcess(identity)) {
+              found.set(row.pid, {
+                pid: row.pid,
+                start: row.startMs,
+                host,
+                platform: 'win32',
+                role: 'claude',
+                parent: row.ppid,
+              });
+            }
+            queue.push({ pid: row.pid, root: false });
           }
         }
       }
@@ -3176,9 +3332,9 @@ export class SwitchEngine {
     }
     if (this.platform !== 'linux') return [];
     const fs = evidence.procFs;
-    if (fs === undefined) return [];
+    if (fs === undefined) return 'unreadable';
     const profile = this.configDirForSlot(ruleSlotId(rule.id))!;
-    const tags = { bootId: fs.bootId(), pidNs: fs.pidNs() };
+    const tags = linuxTags(fs);
     return this.processesOnProfile(profile, fs)
       .filter((pid) => !recorded.has(pid) && pid !== process.pid)
       .map((pid) => {
@@ -3190,29 +3346,25 @@ export class SwitchEngine {
           platform: 'linux' as const,
           role: 'claude' as const,
           ...(stat !== undefined && stat.ppid > 0 ? { parent: stat.ppid } : {}),
-          ...(tags.bootId !== undefined ? { bootId: tags.bootId } : {}),
-          ...(tags.pidNs !== undefined ? { pidNs: tags.pidNs } : {}),
+          ...tags,
         };
       });
   }
 
-  /** Linux: the pids whose environment names `profileDir` as their CLAUDE_CONFIG_DIR (compared as
-   *  folders). Processes of other users cannot be read and are not listed. */
+  /** Linux: the Claude Code processes whose environment names `profileDir` as their
+   *  CLAUDE_CONFIG_DIR (compared as folders). Anything else that inherited it from the session (a dev
+   *  server, an editor, a shell) never reads its login, so it is not listed (see
+   *  {@link isClaudeCodeProcess}). Processes of other users cannot be read and are not listed. */
   private processesOnProfile(profileDir: string, fs: ProcFs = this.leaseProcFs()): number[] {
     const key = folderKey(this.canonReserved(profileDir), this.platform);
     return fs.pids().filter((pid) => {
       const dir = fs.configDirOf(pid);
-      return dir !== undefined && folderKey(this.canonReserved(dir), this.platform) === key;
+      if (dir === undefined || folderKey(this.canonReserved(dir), this.platform) !== key) {
+        return false;
+      }
+      const argv = fs.cmdlineOf?.(pid);
+      return isClaudeCodeProcess(argv === undefined ? {} : { argv });
     });
-  }
-
-  /** Whether a launcher among `holders` has no Claude Code child recorded: its child may be running
-   *  unrecorded, which only a full check can see. */
-  private launcherWithoutChild(holders: readonly LeaseHolder[]): boolean {
-    return holders.some(
-      (h) =>
-        h.role === 'launcher' && !holders.some((c) => c.role === 'claude' && c.parent === h.pid),
-    );
   }
 
   /** A parallel session as {@link listLeases} shows it. */
@@ -3259,12 +3411,23 @@ export class SwitchEngine {
           return { pid: me.pid, start: me.start };
         })(),
     };
-    if (mode === 'full' && this.platform === 'win32') {
-      const read = seams.processTable ?? own?.processTable ?? readProcessTable;
-      const rows = await read().catch(() => [] as ProcessRow[]);
-      evidence.table = new Map(rows.map((r) => [r.pid, r]));
+    if (this.platform === 'linux') {
+      // The namespaces visible from here, read once per check and only if a holder needs them.
+      let seen: Set<string> | undefined;
+      evidence.visibleNamespaces = () => (seen ??= visibleNamespaces(procFsNow));
     }
+    if (mode === 'full' && this.platform === 'win32') evidence.table = await this.readTable(seams);
     return evidence;
+  }
+
+  /** The Windows process table by pid, or undefined when it could not be read (a query that failed,
+   *  timed out or came back empty): every use then reads it as no evidence, never as no process. */
+  private async readTable(
+    seams: Pick<LeaseSweepOptions, 'processTable'>,
+  ): Promise<ReadonlyMap<number, ProcessRow> | undefined> {
+    const read = seams.processTable ?? this.leaseSeams?.processTable ?? readProcessTable;
+    const rows = await read().catch(() => [] as ProcessRow[]);
+    return rows.length === 0 ? undefined : new Map(rows.map((r) => [r.pid, r]));
   }
 
   /** The `/proc` the engine reads (see {@link SwitchEngineOptions.leaseProcesses}). */
@@ -3330,15 +3493,38 @@ export class SwitchEngine {
       if (rule !== undefined && !isLeaseRule(rule)) {
         const reserved = picture.reserved.some((a) => a.id === accountId);
         if (rule.id === launchRuleId || (reserved && rule.include.includes(accountId))) {
+          // Seating a reserved account always refused a quarantined one; running on it where it is
+          // already live must too, or the launch starts on a login known to be dead.
+          if (reserved && account.quarantined) {
+            return {
+              kind: 'refused',
+              code: 'quarantined',
+              message:
+                `${label} is quarantined (${account.quarantineReason ?? 're-login required'}); log ` +
+                `in again with: cctl accounts relogin ${label}`,
+            };
+          }
           return { kind: 'rule', ruleId: rule.id };
         }
+        // A folder rule's slot switches with --folder; a rule of named sessions only has no
+        // command that switches its slot, so the way off it is keeping the account out of it.
+        const firstAlias = rule.aliases?.[0];
+        const free =
+          rule.folders.length > 0
+            ? `switch that slot to another account first (cctl switch <account> --folder ` +
+              `${shellQuoteArg(rule.folders[0]!, this.platform)})`
+            : firstAlias !== undefined
+              ? 'keep it out of that rule first (cctl session exclude ' +
+                `${shellQuoteArg(firstAlias.alias, this.platform)} ` +
+                `${shellQuoteArg(label, this.platform)} --cwd ` +
+                `${shellQuoteArg(firstAlias.folder, this.platform)})`
+              : 'switch that slot to another account first';
         return {
           kind: 'refused',
           code: 'live_in_other_rule',
           message:
             `${label} is a shared account live in ${words(where)} (it serves that slot's sessions ` +
-            'there); run claude there, or switch that slot to another account first, then run ' +
-            `claude --account ${label} here.`,
+            `there); run claude there, or ${free}, then run claude --account ${label} here.`,
         };
       }
     }
@@ -3410,6 +3596,15 @@ export class SwitchEngine {
     const rt = this.slotRuntime(slotId);
     this.refuseSessionSlotsOnDarwin(rule.label);
     const kept = rule.lease.holders.filter((h) => !sameHolderProcess(h, holder));
+    // Every launcher records its Claude Code right after the claim: a join leaves room for it, or
+    // the session would start Claude Code that could never be recorded.
+    if (withHolders(kept, [holder]).length + 1 > MAX_LEASE_HOLDERS) {
+      throw new LeaseHolderCapError(
+        `cannot join the parallel session of ${rule.label}: it already holds ${kept.length} ` +
+          `processes. Exit a terminal on ${rule.label} first.`,
+        MAX_LEASE_HOLDERS,
+      );
+    }
     ensureGroupProfile(rt.profileDir!, this.paths.claudeDir, {
       logger: this.log,
       mainClaudeJsonPath: this.paths.claudeJsonPath,
@@ -3425,7 +3620,7 @@ export class SwitchEngine {
       } catch (err) {
         if (this.isSimulatedDeath(err)) throw err;
         throw new SessionSlotError(
-          `${rule.label} changed slots while this launch started; run it again. (${errorReason(err)})`,
+          `could not log ${rule.label} in to its parallel-session slot: ${errorReason(err)}`,
           'lease_seat_failed',
           { cause: err },
         );
@@ -3433,22 +3628,20 @@ export class SwitchEngine {
       this.fault('lease:join-after-seat');
     }
     const next = withHolders(kept, [holder]);
-    if (next.length > MAX_LEASE_HOLDERS) {
-      throw new LeaseHolderCapError(
-        `cannot join the parallel session of ${rule.label}: it already holds ${kept.length} ` +
-          `processes. Exit a terminal on ${rule.label} first.`,
-        MAX_LEASE_HOLDERS,
-      );
-    }
     await this.vault.setLeaseHolders(rule.id, next);
     await this.writeSnapshotLocked();
+    // Who else is on it now: the holders still running (a deferred end leaves dead ones on disk),
+    // counted as terminals and background sessions.
+    const evidence = await this.holderEvidence('quick', {});
+    const others = leaseOccupants(kept.filter((h) => holderState(h, evidence) !== 'dead'));
     return {
       kind: 'lease',
       ruleId: rule.id,
       profileDir: rt.profileDir!,
       joined: true,
       holders: next.length,
-      otherTerminals: kept.filter((h) => h.role === 'launcher').length,
+      otherTerminals: others.terminals,
+      otherBackground: others.background,
     };
   }
 
@@ -3822,7 +4015,15 @@ export class SwitchEngine {
         if (!found.some((f) => f.sessionFile === s.sessionFile)) found.push(s);
       }
     }
-    return found;
+    // The session roster is shared by every profile and records no config dir, so a parallel
+    // session working in this rule's folder shows up here too. It runs on its own slot, which
+    // emptying this one cannot touch: its recorded processes are left out.
+    const onLeases = new Set(
+      (await this.vault.listRules())
+        .filter(isLeaseRule)
+        .flatMap((r) => r.lease.holders.map((h) => h.pid)),
+    );
+    return found.filter((f) => !onLeases.has(f.pid));
   }
 
   /**
@@ -5643,23 +5844,41 @@ export class SwitchEngine {
 
   // ---- internals ----
 
-  /** If the live (previous-account) token rotated under us, adopt it into the vault. */
-  private async adoptRotationIfNeeded(
+  /**
+   * What adoption would do with a live token of `prevActiveId`'s, read-only:
+   *   - `none`: nothing to adopt (no live token, or the stored one);
+   *   - `stale`: a token older than the stored one (see the direction guard), left alone;
+   *   - `refused`: a token adoption must not store under this account, with why (silent: an
+   *     identity that provably belongs to another account; logged: an ownership guard);
+   *   - `adopt`: a later rotation of this account's, with the identity block to store beside it.
+   */
+  private async adoptionPlan(
     prevActiveId: string | null,
     liveNow: ClaudeOauth | undefined,
     liveOauthAccount: OauthAccount | undefined,
-  ): Promise<boolean> {
-    if (!prevActiveId || !liveNow) return false;
+  ): Promise<
+    | { kind: 'none' | 'stale' }
+    | { kind: 'refused'; reason: string; silent: boolean }
+    | { kind: 'adopt'; oauthAccount: OauthAccount | undefined }
+  > {
+    if (!liveNow) return { kind: 'none' };
+    if (!prevActiveId) {
+      return { kind: 'refused', reason: 'no account is live there', silent: true };
+    }
     const prevBundle = await this.vault.readBundle(prevActiveId).catch(() => undefined);
-    if (!prevBundle) return false;
+    if (!prevBundle) {
+      return { kind: 'refused', reason: 'the live account has no stored login', silent: true };
+    }
     // Identity guard: adoption WRITES the live credentials into this account's bundle, so a
     // provable owner mismatch must skip — persisting another account's tokens under this id
     // would corrupt both the bundle and every usage-attribution row keyed to it. Unprovable
     // (either side missing a uuid) falls through to the token comparison, as before.
     const prevUuid = prevBundle.oauthAccount?.accountUuid;
     const liveUuid = liveOauthAccount?.accountUuid;
-    if (prevUuid !== undefined && liveUuid !== undefined && prevUuid !== liveUuid) return false;
-    if (liveNow.refreshToken === prevBundle.claudeAiOauth.refreshToken) return false;
+    if (prevUuid !== undefined && liveUuid !== undefined && prevUuid !== liveUuid) {
+      return { kind: 'refused', reason: 'the live login is another account', silent: true };
+    }
+    if (liveNow.refreshToken === prevBundle.claudeAiOauth.refreshToken) return { kind: 'none' };
 
     // Direction guard: "differs" is not "newer". Adoption exists to save a token the CLI
     // minted AFTER our stored copy, but an in-place re-login makes the VAULT the newer side —
@@ -5669,21 +5888,11 @@ export class SwitchEngine {
     // switch meant to complete it. `expiresAt` dates each grant's mint (access-token lifetimes
     // are fixed per provider), so a live token that expires no later than the stored one
     // cannot be a later rotation, and is left alone rather than adopted.
-    if (liveNow.expiresAt <= prevBundle.claudeAiOauth.expiresAt) return false;
+    if (liveNow.expiresAt <= prevBundle.claudeAiOauth.expiresAt) return { kind: 'stale' };
 
     // Ownership guards, run only now that a write is otherwise decided (they are the expensive part).
     const refusal = await this.adoptionRefusal(prevActiveId, prevUuid, liveNow, liveOauthAccount);
-    if (refusal !== undefined) {
-      this.log.warn({ prevActiveId, reason: refusal }, 'refused to adopt the live token');
-      this.audit.append({
-        ts: this.clock(),
-        event: 'adoption_refused',
-        fromAccountId: prevActiveId,
-        toAccountId: prevActiveId,
-        detail: refusal,
-      });
-      return false;
-    }
+    if (refusal !== undefined) return { kind: 'refused', reason: refusal, silent: false };
 
     // Identity precedence: the live block goes into this account's bundle only when it PROVABLY
     // belongs to it — both sides report a uuid and they agree. Otherwise the bundle keeps its own
@@ -5694,7 +5903,31 @@ export class SwitchEngine {
     // write carries none rather than inventing one.
     const provenLive =
       liveUuid !== undefined && liveUuid === prevUuid ? liveOauthAccount : undefined;
-    const oauthAccount = provenLive ?? prevBundle.oauthAccount;
+    return { kind: 'adopt', oauthAccount: provenLive ?? prevBundle.oauthAccount };
+  }
+
+  /** If the live (previous-account) token rotated under us, adopt it into the vault. */
+  private async adoptRotationIfNeeded(
+    prevActiveId: string | null,
+    liveNow: ClaudeOauth | undefined,
+    liveOauthAccount: OauthAccount | undefined,
+  ): Promise<boolean> {
+    const plan = await this.adoptionPlan(prevActiveId, liveNow, liveOauthAccount);
+    // Every plan but `none` names an account with a live token; the guard only narrows the types.
+    if (prevActiveId === null || liveNow === undefined) return false;
+    if (plan.kind === 'refused' && !plan.silent) {
+      this.log.warn({ prevActiveId, reason: plan.reason }, 'refused to adopt the live token');
+      this.audit.append({
+        ts: this.clock(),
+        event: 'adoption_refused',
+        fromAccountId: prevActiveId,
+        toAccountId: prevActiveId,
+        detail: plan.reason,
+      });
+      return false;
+    }
+    if (plan.kind !== 'adopt') return false;
+    const oauthAccount = plan.oauthAccount;
     await this.vault.writeBundle(prevActiveId, {
       claudeAiOauth: liveNow,
       ...(oauthAccount ? { oauthAccount } : {}),

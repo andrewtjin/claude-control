@@ -47,6 +47,9 @@
 //     re-parsing $MyInvocation.Line, which cannot map expressions and variables back to their
 //     values — so the wrapper states the quirk and its fix: quote such arguments, or run claude.exe.
 
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 export type SupportedShell = 'powershell' | 'bash' | 'zsh' | 'fish';
 
 export const SUPPORTED_SHELLS: readonly SupportedShell[] = ['powershell', 'bash', 'zsh', 'fish'];
@@ -235,5 +238,43 @@ export function parsePowerShellWrapper(profileText: string): ParsedPowerShellWra
   }
   // The fallback body just calls the `cctl` shim — no embedded absolute paths to go stale.
   if (/(?:^|\s)cctl\s+claude\s+@args/m.test(profileText)) return { kind: 'shim' };
+  return undefined;
+}
+
+/** Candidate PowerShell profile locations on Windows — Windows PowerShell 5.1 and PowerShell 7, plus
+ *  a OneDrive-redirected Documents (the common case where `$PROFILE` does not live under
+ *  `%USERPROFILE%\Documents`). Best-effort; used only by the wrapper check. Pure over `env`. */
+export function powerShellProfilePaths(env: NodeJS.ProcessEnv = process.env): string[] {
+  const home = env.USERPROFILE;
+  if (!home || home.length === 0) return [];
+  const docRoots = [join(home, 'Documents')];
+  if (env.OneDrive && env.OneDrive.length > 0) docRoots.push(join(env.OneDrive, 'Documents'));
+  if (env.OneDriveCommercial && env.OneDriveCommercial.length > 0) {
+    docRoots.push(join(env.OneDriveCommercial, 'Documents'));
+  }
+  const paths: string[] = [];
+  for (const root of docRoots) {
+    // Windows PowerShell 5.1 uses the WindowsPowerShell folder; PowerShell 7+ uses PowerShell.
+    for (const dir of ['WindowsPowerShell', 'PowerShell']) {
+      paths.push(join(root, dir, 'Microsoft.PowerShell_profile.ps1'));
+      paths.push(join(root, dir, 'profile.ps1'));
+    }
+  }
+  return paths;
+}
+
+/** Read the first PowerShell profile that carries a cctl wrapper (by its marker), for the wrapper
+ *  check. Returns undefined when none of the candidate profiles exist or carry the wrapper. */
+export function readPowerShellWrapperProfile(
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  for (const p of powerShellProfilePaths(env)) {
+    try {
+      const text = readFileSync(p, 'utf8');
+      if (text.includes(POWERSHELL_WRAPPER_MARKER)) return text;
+    } catch {
+      // Absent or unreadable profile: skip and try the next candidate.
+    }
+  }
   return undefined;
 }

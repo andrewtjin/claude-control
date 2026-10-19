@@ -81,9 +81,10 @@ export function olderDaemonReason(
 // A rules file holding a parallel session is stamped with a schema no older build reads: an older
 // daemon would stop maintaining every slot, and an older CLI would fail every command that reads the
 // rules — including the `claude` the shell wrapper runs, in every terminal. So a parallel session is
-// refused while a live daemon's report lacks the row below, and while an older install is the one
-// that would next touch this vault: the `cctl` on PATH, or (with no daemon alive) the install the
-// autostart registration starts.
+// refused while a live daemon's report lacks the row below, and while an install older than parallel
+// sessions is one that would next touch this vault: the `cctl` on PATH, the cctl the PowerShell
+// wrapper runs, or the install the autostart registration starts (whether or not a daemon runs now:
+// the next logon starts that one).
 
 /** The settings-report row a daemon that reads parallel sessions writes. */
 export const SESSION_LEASES_REPORT_ROW = 'parallel sessions';
@@ -134,10 +135,17 @@ export function olderDaemonScopeReason(
   );
 }
 
+/** The first cctl version that reads a rules file holding a parallel session. An install at or past
+ *  it is no risk, whatever this build's own version is. */
+export const PARALLEL_SESSIONS_SINCE = '1.1.0';
+
 /** Where the cctl installs that could next touch this vault are, and what version each is. */
 export interface InstallLookup {
   /** The `cctl` a shell runs (the first on PATH), or undefined when none is there. */
   onPath(): string | undefined;
+  /** The cctl entry script the PowerShell `claude` wrapper runs (it names one by path, not by
+   *  PATH), or undefined when there is no such wrapper. */
+  wrapperEntry?(): string | undefined;
   /** What the autostart registration starts, and what to call it, or undefined for none. */
   autostart(): { noun: string; execute: string } | undefined;
   /** The version of the cctl install a shim or entry script belongs to; undefined when it cannot
@@ -163,33 +171,44 @@ function olderThan(version: string | undefined, build: string): boolean {
 }
 
 /**
- * Why an older cctl install would break while a parallel session exists, as one sentence ending in
- * the fix, or undefined: the `cctl` on PATH (what the shell wrapper's `claude` runs), and — only when
- * no daemon is alive, since a live one was checked by its report — the install the autostart
- * registration starts. A version that cannot be read refuses nothing (doctor names it).
+ * Why an install older than parallel sessions would break while one exists, as one sentence ending
+ * in the fix, or undefined: the `cctl` on PATH (what a typed `cctl` runs), the cctl the PowerShell
+ * `claude` wrapper runs (it names its own install by path), and the install the autostart
+ * registration starts. That last one is asked even while a daemon runs: the running daemon's report
+ * says what runs now, not what the next logon starts. A version that cannot be read refuses
+ * nothing.
  */
 export function olderInstallReason(
-  ctx: { cliBuild: string; daemonAlive: boolean },
   lookup: InstallLookup = defaultInstallLookup(),
 ): string | undefined {
   const tail =
-    'while one runs it cannot read the rules file, so every command it runs (including claude ' +
-    'through the shell wrapper) would fail. Update that install first (npm i -g @andrewtjin/cctl)';
+    'while one runs it cannot read the rules file, so every command it runs would fail. Update ' +
+    'that install first (npm i -g @andrewtjin/cctl)';
+  const version = (path: string): string | undefined => {
+    const v = lookup.versionOf(path);
+    return olderThan(v, PARALLEL_SESSIONS_SINCE) ? v!.replace(/^v/, '') : undefined;
+  };
   const onPath = lookup.onPath();
-  if (onPath !== undefined) {
-    const version = lookup.versionOf(onPath);
-    if (olderThan(version, ctx.cliBuild)) {
-      return `the cctl at ${onPath} (v${version!.replace(/^v/, '')}) predates parallel sessions: ${tail}`;
-    }
+  const pathOld = onPath === undefined ? undefined : version(onPath);
+  if (pathOld !== undefined) {
+    return `the cctl at ${onPath} (v${pathOld}) predates parallel sessions: ${tail}`;
   }
-  if (ctx.daemonAlive) return undefined;
+  const entry = lookup.wrapperEntry?.();
+  const entryOld = entry === undefined ? undefined : version(entry);
+  if (entryOld !== undefined) {
+    return (
+      `the PowerShell claude wrapper runs the cctl at ${entry} (v${entryOld}), which predates ` +
+      `parallel sessions: ${tail}, then point the wrapper at it (replace the old one in your ` +
+      'profile with the output of: cctl shell-init powershell)'
+    );
+  }
   const auto = lookup.autostart();
   if (auto === undefined) return undefined;
-  const version = lookup.versionOf(auto.execute);
-  if (!olderThan(version, ctx.cliBuild)) return undefined;
+  const autoOld = version(auto.execute);
+  if (autoOld === undefined) return undefined;
   return (
-    `the ${auto.noun} starts the cctl at ${auto.execute} (v${version!.replace(/^v/, '')}), which ` +
-    'predates parallel sessions: while one runs, the daemon it starts cannot read the rules file ' +
-    'and would maintain no slot at all. Update that install first (npm i -g @andrewtjin/cctl)'
+    `the ${auto.noun} starts the cctl at ${auto.execute} (v${autoOld}), which predates parallel ` +
+    'sessions: while one runs, the daemon it starts cannot read the rules file and would maintain ' +
+    'no slot at all. Update that install first (npm i -g @andrewtjin/cctl), then cctl daemon install'
   );
 }

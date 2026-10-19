@@ -97,6 +97,7 @@ const engine = vi.hoisted(() => ({
   releaseLease:
     vi.fn<(ruleId: string, holders: LeaseHolder[], probe: unknown) => Promise<LeaseRelease>>(),
   sweepLeases: vi.fn<(opts: unknown) => Promise<LeaseSweepReport>>(),
+  removeAccount: vi.fn<(id: string) => Promise<void>>(() => Promise.resolve()),
   listLeases: vi.fn(() => Promise.resolve([])),
 }));
 
@@ -2138,6 +2139,67 @@ describe('cctl claude --account: where it runs', () => {
       'cctl: W stays reserved while the background session(s) this session started run',
     );
   });
+
+  it('a release kept by a process the session left on its profile names it, and promises no early end', async () => {
+    engine.planSessionSlot.mockResolvedValueOnce(lease());
+    engine.releaseLease.mockResolvedValueOnce({
+      ended: false,
+      adoptedRotation: false,
+      remaining: 1,
+      deferredToBackground: false,
+      heldBy: [900],
+    });
+    const r = await launch(['--account', 'W']);
+    expect(r.err).toContain(
+      'cctl: W stays reserved: Claude Code process 900, started from this session, still runs on its profile',
+    );
+    expect(r.err).toContain('to free it now, end it (pid 900)');
+    expect(r.err).not.toContain('the daemon does it on its next poll');
+  });
+
+  it('a release that cannot save the login says how to fix it, not that the daemon will', async () => {
+    engine.planSessionSlot.mockResolvedValueOnce(lease());
+    engine.releaseLease.mockResolvedValueOnce({
+      ended: false,
+      adoptedRotation: false,
+      remaining: 0,
+      deferredToBackground: false,
+      deferred: 'login_unadopted',
+    });
+    const r = await launch(['--account', 'W']);
+    expect(r.err).toContain('cctl accounts relogin W');
+    expect(r.err).not.toContain('the daemon does it on its next poll');
+  });
+
+  it('a join onto a session a background worker holds says so, not "this terminal only"', async () => {
+    engine.planSessionSlot.mockResolvedValueOnce(lease({ join: true }));
+    engine.claimSessionSlot.mockResolvedValueOnce({
+      kind: 'lease',
+      ruleId: 'session-w',
+      profileDir: join(profilesRoot(sandboxPaths(sandbox.root).vaultDir), 'session-w'),
+      joined: true,
+      holders: 2,
+      otherTerminals: 0,
+      otherBackground: 1,
+    });
+    const r = await launch(['--account', 'W']);
+    expect(r.err).toContain(
+      'cctl: Claude Code on W (parallel session, this terminal only; shared with 1 background session)',
+    );
+  });
+
+  it('--override on a parallel session prints no override line: it relaxes nothing there', async () => {
+    engine.planSessionSlot.mockResolvedValueOnce(lease());
+    const r = await launch(['--account', 'W', '--override']);
+    expect(r.exited).toBe(false);
+    expect(r.err).toContain('cctl: Claude Code on W (parallel session, this terminal only)');
+    expect(r.err).not.toContain('--override in effect');
+  });
+
+  it("the help says where --account runs, a parallel session's slot included", async () => {
+    const r = await runCli(['help', 'claude']);
+    expect(r.out + r.err).toContain('else in a parallel session of its own');
+  });
 });
 
 describe('cctl switch and cctl accounts remove against a parallel session', () => {
@@ -2201,20 +2263,19 @@ describe('cctl switch and cctl accounts remove against a parallel session', () =
   it('accounts remove checks the session first, and refuses while it runs', async () => {
     engine.listAllAccounts.mockResolvedValue([A, B, W]);
     engine.listRules.mockResolvedValue([leaseRule]);
-    const removeAccount = vi.fn(() =>
-      Promise.reject(
-        new SlotError(
-          'account "W" is in use by a parallel session (pid 4120); exit it first',
-          'leased',
-        ),
+    engine.removeAccount.mockRejectedValueOnce(
+      new SlotError(
+        'account "W" is in use by a parallel session (pid 4120); exit it first',
+        'leased',
       ),
     );
-    (engine as unknown as { removeAccount: typeof removeAccount }).removeAccount = removeAccount;
     const r = await runCli(['accounts', 'remove', 'W']);
     expect(r.exited).toBe(true);
     expect(r.err).toContain(
       'account "W" is in use by a parallel session (pid 4120); exit it first',
     );
+    // The account the label resolved to, never the label typed.
+    expect(engine.removeAccount).toHaveBeenCalledWith('w');
     expect(engine.sweepLeases).toHaveBeenCalledWith(
       expect.objectContaining({ mode: 'full', only: 'w' }),
     );
@@ -2249,12 +2310,52 @@ describe('views and parallel sessions', () => {
     }
   });
 
-  it('accounts list shows the leased account as in use by its terminals', async () => {
+  /** The session as a check judges it: each holder alive, or each one exited. */
+  const judged = (state: 'alive' | 'dead') => [
+    {
+      ruleId: 'session-w',
+      accountId: 'w',
+      label: 'W',
+      profileDir: 'p',
+      startedAtMs: 0,
+      holders: leaseRule.lease!.holders.map((h) => ({ ...h, state })),
+    },
+  ];
+
+  it('accounts list shows the leased account as in use by its terminals, under a heading of its own', async () => {
     engine.listAllAccounts.mockResolvedValue([A, B, W]);
     engine.listRules.mockResolvedValue([leaseRule]);
+    engine.listLeases.mockResolvedValueOnce(judged('alive') as never);
     const r = await runCli(['accounts', 'list']);
     const line = r.out.split('\n').find((l) => l.includes('w@example.com'));
     expect(line).toContain('in use: parallel session (2 terminals)');
+    // A parallel session is no folder rule: W is not listed as reserved to one.
+    expect(r.out).not.toContain('Reserved to folder rules');
+    expect(r.out).toContain(
+      'In use by a parallel session (out of the pool until its terminals exit',
+    );
+  });
+
+  it('accounts list does not show a session whose processes all exited as in use by them', async () => {
+    engine.listAllAccounts.mockResolvedValue([A, B, W]);
+    engine.listRules.mockResolvedValue([leaseRule]);
+    engine.listLeases.mockResolvedValueOnce(judged('dead') as never);
+    const r = await runCli(['accounts', 'list']);
+    const line = r.out.split('\n').find((l) => l.includes('w@example.com'));
+    expect(line).not.toContain('in use');
+    expect(line).toContain('no process of it runs; it ends at the next check');
+  });
+
+  it('folder exclude and session exclude first end a session whose processes are gone', async () => {
+    engine.listAllAccounts.mockResolvedValue([A, B, W]);
+    engine.listRules.mockResolvedValue([leaseRule]);
+    engine.excludeInFolder.mockRejectedValueOnce(new SlotError('stop here', 'leased'));
+    await runCli(['folder', 'exclude', research, 'W']);
+    expect(engine.sweepLeases).toHaveBeenCalledWith(
+      expect.objectContaining({ mode: 'full', only: 'w' }),
+    );
+    const sweptAt = engine.sweepLeases.mock.invocationCallOrder.at(-1)!;
+    expect(sweptAt).toBeLessThan(engine.excludeInFolder.mock.invocationCallOrder.at(-1)!);
   });
 
   it('slotName calls a parallel-session slot by its account', () => {

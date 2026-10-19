@@ -225,6 +225,8 @@ function fakeEngine(opts: {
   applyActivations?: boolean;
   /** The parallel session holding an account (default: the lease rule including it, if any). */
   leaseOf?: (accountId: string) => LeaseView | undefined;
+  /** What a sweep of the parallel sessions reports (default: nothing done). */
+  sweepReport?: LeaseSweepReport;
 }): FakeEngineControls {
   const controls: FakeEngineControls = {
     activateCalls: [],
@@ -335,13 +337,15 @@ function fakeEngine(opts: {
     sweepLeases: (sweep: LeaseSweepOptions): Promise<LeaseSweepReport> => {
       controls.sweepCalls.push(sweep);
       controls.order.push('sweep');
-      return Promise.resolve({
-        droppedHolders: 0,
-        adoptedHolders: 0,
-        ended: [],
-        deferred: [],
-        adopted: [],
-      });
+      return Promise.resolve(
+        opts.sweepReport ?? {
+          droppedHolders: 0,
+          adoptedHolders: 0,
+          ended: [],
+          deferred: [],
+          adopted: [],
+        },
+      );
     },
     leaseOf: (accountId: string): Promise<LeaseView | undefined> =>
       Promise.resolve(leaseViewOf(accountId)),
@@ -407,6 +411,8 @@ async function createRig(opts: {
   sessionIdentityOf?: (sessionId: string) => Promise<SessionIdentity | null>;
   /** The background workers of a parallel session's profile (the daemon sweeps only with one). */
   leaseOccupancyProbe?: LeaseOccupancyProbe;
+  /** Where the daemon logs (default: nowhere). */
+  logger?: Logger;
 }): Promise<Rig> {
   const relay = new SteadyRelay();
   const relayPort = await relay.listen();
@@ -467,7 +473,7 @@ async function createRig(opts: {
     }),
     controlPlaneClient,
     ...(autoSwitcher !== undefined ? { autoSwitcher } : {}),
-    logger: silentLogger(),
+    logger: opts.logger ?? silentLogger(),
     clock: () => NOW,
     pollIntervalMs: opts.pollIntervalMs ?? 100_000,
     ...(opts.slotAlertWindowMs !== undefined ? { slotAlertWindowMs: opts.slotAlertWindowMs } : {}),
@@ -2188,6 +2194,37 @@ describe('daemon and parallel sessions', () => {
     );
     expect(controls.ensureRuleLiveCalls).not.toContain('session-w');
     expect(slotAlerts(rig.relay).some((a) => a.body.includes('Work'))).toBe(false);
+  });
+
+  it('logs each session it ended and each process it found still holding one', async () => {
+    const { accounts, groups, live } = withLease();
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      sweepReport: {
+        droppedHolders: 1,
+        adoptedHolders: 1,
+        ended: [{ accountId: 'w', label: 'Work', adoptedRotation: true }],
+        deferred: [],
+        adopted: [{ accountId: 'v', label: 'Vee', pid: 900 }],
+      },
+    });
+    const lines: string[] = [];
+    const noop = (): void => {};
+    const rig = await createRig({
+      controls,
+      bodyFor: () => ({ limits: [] }),
+      leaseOccupancyProbe: noWorkers,
+      logger: { debug: noop, info: (_o, m) => void lines.push(String(m)), warn: noop, error: noop },
+    });
+    await rig.start();
+    await waitFor(() => lines.some((l) => l.includes('Vee')));
+    expect(lines).toContain('ended the parallel session of Work: no process of it runs any more');
+    expect(lines).toContain(
+      'parallel session of Vee: process 900 still runs on its profile, so it now holds the ' +
+        'session; Vee stays reserved until it exits',
+    );
   });
 
   it('never evaluates the auto-switch for a parallel session, and raises no stuck alert for it', async () => {

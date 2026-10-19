@@ -372,6 +372,8 @@ export interface ReservedAccountView {
   quarantined: boolean;
   /** Live in one of its folders' slots right now. */
   live: boolean;
+  /** Included by a folder or session rule, not only held by a parallel session. */
+  reservedToRules?: boolean;
   /** The folders of each rule that includes it, one string per rule. */
   includedBy: string[];
 }
@@ -379,10 +381,12 @@ export interface ReservedAccountView {
 /** The reserved accounts as an aligned table: they are not in the shared table above it, and each
  *  is usable only in the folders that include it, which the last-but-one column names. Its first
  *  columns match the shared table's, so a reserved account shows its plan and billing as any other
- *  account does. '' when no account is reserved. */
+ *  account does. '' when no account is reserved. `heading` names what the rows are out of the pool
+ *  for: folder rules by default, a parallel session for the accounts only one holds. */
 export function renderReservedAccounts(
   rows: readonly ReservedAccountView[],
   palette: Palette = PLAIN_PALETTE,
+  heading = 'Reserved to folder rules (used only in the folders that include them; * = live there):',
 ): string {
   if (rows.length === 0) return '';
   const cells = rows.map((r) => ({
@@ -426,11 +430,9 @@ export function renderReservedAccounts(
       .join('  ')
       .trimEnd();
   };
-  return [
-    'Reserved to folder rules (used only in the folders that include them; * = live there):',
-    palette.dim(padded(headers).join('  ').trimEnd()),
-    ...cells.map(line),
-  ].join('\n');
+  return [heading, palette.dim(padded(headers).join('  ').trimEnd()), ...cells.map(line)].join(
+    '\n',
+  );
 }
 
 /** What `cctl where` explains for a folder: the rule that applies (longest match, no merging) or,

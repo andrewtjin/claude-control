@@ -35,7 +35,9 @@ import {
 } from './folderRulesSupport.js';
 import { verifyManagedSettingsEffective } from './managedSettings.js';
 import type { SettingsReport } from './settings.js';
-import { parsePowerShellWrapper, POWERSHELL_WRAPPER_MARKER } from './shellInit.js';
+import { parsePowerShellWrapper } from './shellInit.js';
+// The PowerShell profile readers live with the wrapper they look for; doctor's callers keep them here.
+export { powerShellProfilePaths, readPowerShellWrapperProfile } from './shellInit.js';
 
 export interface DoctorCheck {
   name: string;
@@ -491,8 +493,10 @@ export function checkDaemonScopeSupport(
   installReason?: string,
 ): DoctorCheck {
   const words = SCOPE_CHECKS[kind];
+  // An older install first: when the running daemon is that install's, its restart would only
+  // bring the same build back.
   const reason = present
-    ? (olderDaemonScopeReason(kind, report, heartbeat) ?? installReason)
+    ? (installReason ?? olderDaemonScopeReason(kind, report, heartbeat))
     : undefined;
   if (reason !== undefined) return { name: words.name, ok: false, detail: reason };
   return {
@@ -507,10 +511,16 @@ export function checkDaemonScopeSupport(
 }
 
 /** What doctor learned about a parallel session with no running holder, beyond its holders: a
- *  process found on its profile, a roster that could not be read, a slot that cannot be settled. */
+ *  roster that could not be read, background sessions its profile's service still hosts, a slot
+ *  that cannot be settled, a login there that ending it could not keep. */
 export interface LeaseFacts {
   rosterUnreadable?: string;
+  /** Pids of the background sessions its profile's service hosts: the next check records them as
+   *  its holders, so it stays until they end. */
+  workers?: number[];
   untrusted?: string;
+  /** Its slot holds a login no stored account holds (or one that cannot be read). */
+  unstoredLogin?: boolean;
 }
 
 /**
@@ -526,10 +536,26 @@ export function checkSessionLeases(
   if (leases.length === 0)
     return { name: 'parallel-sessions', ok: true, detail: 'no parallel sessions' };
   const problems: string[] = [];
+  // Sessions held only by processes no terminal runs: nothing is wrong, but nothing a user would
+  // look for keeps the account reserved, so the pids are named.
+  const notes: string[] = [];
   for (const lease of leases) {
     const label = sanitizeForTerminal(lease.label);
     const running = lease.holders.filter((h) => h.state === 'alive' || h.state === 'unverifiable');
-    if (running.length > 0) continue;
+    if (running.length > 0) {
+      const launchers = new Set(running.filter((h) => h.role === 'launcher').map((h) => h.pid));
+      const unattended = running.filter(
+        (h) => h.role === 'claude' && (h.parent === undefined || !launchers.has(h.parent)),
+      );
+      if (launchers.size === 0 && unattended.length === running.length) {
+        notes.push(
+          `${label} is held only by process(es) ${unattended.map((h) => h.pid).join(', ')} that ` +
+            'no terminal runs (a session whose terminal closed, or something it started); it ' +
+            'rejoins the pool when they exit',
+        );
+      }
+      continue;
+    }
     const foreign = lease.holders.filter((h) => h.state === 'foreign');
     if (foreign.length > 0) {
       problems.push(
@@ -548,7 +574,22 @@ export function checkSessionLeases(
       );
       continue;
     }
+    if (lease.processesUnreadable === true) {
+      problems.push(
+        `the parallel session of ${label} could not be ended: the process list that shows what ` +
+          'still runs on its profile could not be read. It is retried every poll.',
+      );
+      continue;
+    }
     const fact = facts.get(lease.ruleId) ?? {};
+    if ((fact.workers ?? []).length > 0) {
+      problems.push(
+        `the parallel session of ${label} has no terminal left, but its profile's background ` +
+          `service still hosts session(s) (pids ${fact.workers!.join(', ')}); the next check ` +
+          'records them, and the account stays reserved until they end.',
+      );
+      continue;
+    }
     if (fact.untrusted !== undefined) {
       problems.push(
         `the parallel session of ${label} could not be ended: its slot has an unfinished change ` +
@@ -562,6 +603,14 @@ export function checkSessionLeases(
         `the parallel session of ${label} could not be ended: the background-session roster of ` +
           `its profile could not be read (${sanitizeForTerminal(fact.rosterUnreadable)}). It is ` +
           'retried every poll.',
+      );
+      continue;
+    }
+    if (fact.unstoredLogin === true) {
+      problems.push(
+        `the parallel session of ${label} could not be ended: its slot holds a login that could ` +
+          'not be saved to the vault, and clearing it could lose the latest token. Log in again ' +
+          `with cctl accounts relogin ${label}; the next check then frees it.`,
       );
       continue;
     }
@@ -581,7 +630,9 @@ export function checkSessionLeases(
   return {
     name: 'parallel-sessions',
     ok: true,
-    detail: `${leases.length} parallel session(s), each held by a running process`,
+    detail:
+      `${leases.length} parallel session(s), each held by a running process` +
+      (notes.length > 0 ? `; ${notes.join('; ')}` : ''),
   };
 }
 
@@ -591,7 +642,8 @@ export function checkSessionLeases(
  * running holder, whether its roster reads and whether its slot can be settled.
  */
 export async function gatherSessionLeases(
-  engine: Pick<SwitchEngine, 'listLeases' | 'checkSlots'>,
+  engine: Pick<SwitchEngine, 'listLeases' | 'checkSlots'> &
+    Partial<Pick<SwitchEngine, 'leaseHoldsUnstoredLogin'>>,
   probe: LeaseOccupancyProbe | undefined,
 ): Promise<{ leases: LeaseView[]; facts: Map<string, LeaseFacts> }> {
   const leases = await engine.listLeases({ mode: 'full' });
@@ -613,7 +665,15 @@ export async function gatherSessionLeases(
       );
       if (workers === 'unreadable') {
         fact.rosterUnreadable = join(lease.profileDir, 'daemon', 'roster.json');
+      } else if (workers.length > 0) {
+        fact.workers = workers.map((w) => w.pid);
       }
+    }
+    if (
+      engine.leaseHoldsUnstoredLogin !== undefined &&
+      (await engine.leaseHoldsUnstoredLogin(lease.ruleId).catch(() => false))
+    ) {
+      fact.unstoredLogin = true;
     }
     facts.set(lease.ruleId, fact);
   }
@@ -781,28 +841,6 @@ export function checkVersionSkew(
 // PowerShell `claude` wrapper (Windows) — stale embedded paths
 // ---------------------------------------------------------------------------
 
-/** Candidate PowerShell profile locations on Windows — Windows PowerShell 5.1 and PowerShell 7, plus
- *  a OneDrive-redirected Documents (the common case where `$PROFILE` does not live under
- *  `%USERPROFILE%\Documents`). Best-effort; used only by the wrapper check. Pure over `env`. */
-export function powerShellProfilePaths(env: NodeJS.ProcessEnv = process.env): string[] {
-  const home = env.USERPROFILE;
-  if (!home || home.length === 0) return [];
-  const docRoots = [join(home, 'Documents')];
-  if (env.OneDrive && env.OneDrive.length > 0) docRoots.push(join(env.OneDrive, 'Documents'));
-  if (env.OneDriveCommercial && env.OneDriveCommercial.length > 0) {
-    docRoots.push(join(env.OneDriveCommercial, 'Documents'));
-  }
-  const paths: string[] = [];
-  for (const root of docRoots) {
-    // Windows PowerShell 5.1 uses the WindowsPowerShell folder; PowerShell 7+ uses PowerShell.
-    for (const dir of ['WindowsPowerShell', 'PowerShell']) {
-      paths.push(join(root, dir, 'Microsoft.PowerShell_profile.ps1'));
-      paths.push(join(root, dir, 'profile.ps1'));
-    }
-  }
-  return paths;
-}
-
 /** Whether an installed PowerShell `claude` wrapper still points at a node binary and cctl entry that
  *  exist. A node upgrade/move or a cctl reinstall can change the absolute paths the wrapper embedded,
  *  after which typing `claude` fails with a raw CommandNotFoundException or a "Cannot find module"
@@ -852,22 +890,6 @@ export function checkPowerShellWrapper(
       `the PowerShell claude wrapper points at ${missing.join(' and ')} that no longer exist(s) — ` +
       'regenerate it: cctl shell-init powershell | Out-File -Append $PROFILE',
   };
-}
-
-/** Read the first PowerShell profile that carries a cctl wrapper (by its marker), for the wrapper
- *  check. Returns undefined when none of the candidate profiles exist or carry the wrapper. */
-export function readPowerShellWrapperProfile(
-  env: NodeJS.ProcessEnv = process.env,
-): string | undefined {
-  for (const p of powerShellProfilePaths(env)) {
-    try {
-      const text = readFileSync(p, 'utf8');
-      if (text.includes(POWERSHELL_WRAPPER_MARKER)) return text;
-    } catch {
-      // Absent or unreadable profile: skip and try the next candidate.
-    }
-  }
-  return undefined;
 }
 
 /** Run every check for the given paths. */

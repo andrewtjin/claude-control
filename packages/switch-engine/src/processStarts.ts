@@ -5,8 +5,9 @@
 // ended under a live process nor kept forever by a dead one's reused pid. So a holder records the
 // process's start too, taken where it cannot move with the wall clock:
 //   - Linux: field 22 of /proc/<pid>/stat, clock ticks since boot, compared exactly, plus the boot id
-//     (another boot = every recorded process is gone) and the pid namespace (another WSL distro or a
-//     container is foreign: its pids mean nothing here). All synchronous file reads, no spawn.
+//     (another boot = every recorded process is gone, whatever namespace it ran in), the pid
+//     namespace (another WSL distro or a container is foreign: its pids mean nothing here) and the
+//     machine id (which survives a rename of the machine). All synchronous file reads, no spawn.
 //   - Windows: the creation time in epoch ms. The recorded side is the moment this process learned
 //     it (node's time origin, or the spawn), the checked side an absolute FILETIME read in one
 //     process-table query, so the two are compared within a tolerance.
@@ -51,17 +52,28 @@ export function windowsStartMs(raw: string): number | undefined {
   return Number((value - epoch) / 10_000n);
 }
 
-/** Run one query and collect its stdout lines, or none when it cannot run or times out.
- *  `detached` is the start-time reader's historical spawn, kept as it was; the process table is read
- *  attached, because a detached PowerShell on Windows was measured to print nothing to the pipe. */
-function queryLines(
+/** What one query printed, and whether it ran to a clean exit. A query killed at its timeout, or
+ *  one that exited non-zero, may have printed only part of its answer. */
+export interface QueryResult {
+  lines: string[];
+  complete: boolean;
+}
+
+/** Run one query and collect its stdout lines. `complete` is false when it could not run, timed
+ *  out or failed: a caller that reads the output as a whole answer (the process table) must not
+ *  take a cut-off one for it. `detached` is the start-time reader's historical spawn, kept as it
+ *  was; the process table is read attached, because a detached PowerShell on Windows was measured
+ *  to print nothing to the pipe. */
+export function runQuery(
   command: string,
   args: string[],
   env: NodeJS.ProcessEnv,
   detached: boolean,
-): Promise<string[]> {
+  timeoutMs = START_QUERY_TIMEOUT_MS,
+): Promise<QueryResult> {
   return new Promise((resolve) => {
     let text = '';
+    let timedOut = false;
     let child;
     try {
       child = nodeSpawn(command, args, {
@@ -72,21 +84,32 @@ function queryLines(
         detached,
       });
     } catch {
-      resolve([]);
+      resolve({ lines: [], complete: false });
       return;
     }
-    const timer = setTimeout(() => child.kill(), START_QUERY_TIMEOUT_MS);
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeoutMs);
     child.stdout.setEncoding('utf8').on('data', (c: string) => (text += c));
     child.on('error', () => {
       clearTimeout(timer);
-      resolve([]);
+      resolve({ lines: [], complete: false });
     });
-    child.on('close', () => {
+    child.on('close', (code) => {
       clearTimeout(timer);
-      resolve(text.split(/\r?\n/));
+      resolve({ lines: text.split(/\r?\n/), complete: !timedOut && code === 0 });
     });
   });
 }
+
+/** How {@link readProcessTable} runs its query (a seam for tests). */
+export type QueryRunner = (
+  command: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  detached: boolean,
+) => Promise<QueryResult>;
 
 /**
  * Read live processes' start times in one call, as Claude Code records them: `Get-Process` on Windows
@@ -101,9 +124,11 @@ export function readProcessStarts(
     const out = new Map<number, string>();
     const list = pids.filter((pid) => Number.isInteger(pid) && pid > 0).join(',');
     if (list === '') return out;
-    const lines =
+    // A process missing from a cut-off answer reads as "nothing read now", which the background
+    // host's own rule counts as the same process, so a partial answer is still usable here.
+    const { lines } =
       platform === 'win32'
-        ? await queryLines(
+        ? await runQuery(
             'powershell.exe',
             [
               '-NoProfile',
@@ -115,7 +140,7 @@ export function readProcessStarts(
             process.env,
             true,
           )
-        : await queryLines(
+        : await runQuery(
             'ps',
             ['-o', 'pid=,lstart=', '-p', list],
             { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
@@ -130,38 +155,99 @@ export function readProcessStarts(
 }
 
 /**
- * Windows only: every process with its parent and creation time, in one `Get-CimInstance
- * Win32_Process` query. The parent link is kept after the parent exits, which is how a full check
- * finds a dead launcher's Claude Code still running. An empty table means the query failed: every
- * holder then reads as unverifiable, never dead.
+ * Windows only: every process with its parent, creation time, image name and command line, in one
+ * `Get-CimInstance Win32_Process` query. The parent link is kept after the parent exits, which is
+ * how a full check finds a dead launcher's Claude Code still running; the name and command line say
+ * whether a process found that way is a Claude Code at all. A query that timed out or failed rejects
+ * rather than answer with the rows it printed before it stopped: a cut-off table would read as
+ * positive evidence that a process missing from it is gone. An empty table is a failure too.
  */
-export async function readProcessTable(): Promise<ProcessRow[]> {
-  const lines = await queryLines(
+export async function readProcessTable(run: QueryRunner = runQuery): Promise<ProcessRow[]> {
+  const { lines, complete } = await run(
     'powershell.exe',
     [
       '-NoProfile',
       '-NonInteractive',
       '-Command',
+      // One line per process: `<pid> <ppid> <filetime> <name>|<command line>`. An image name
+      // cannot hold `|`, so the first one ends it; line breaks in a command line become spaces.
       'Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { ' +
-        '"$($_.ProcessId) $($_.ParentProcessId) $(if ($_.CreationDate) { $_.CreationDate.ToFileTimeUtc() } else { 0 })" }',
+        '"$($_.ProcessId) $($_.ParentProcessId) $(if ($_.CreationDate) { $_.CreationDate.ToFileTimeUtc() } else { 0 }) ' +
+        "$($_.Name)|$($_.CommandLine -replace '[\\r\\n]+', ' ')\" }",
     ],
     process.env,
     false,
   );
-  return parseProcessTable(lines);
+  const rows = parseProcessTable(lines);
+  if (!complete || rows.length === 0) throw new Error('the process table could not be read');
+  return rows;
 }
 
-/** The rows of a process-table query's output (`<pid> <ppid> <filetime>` per line). Pure. */
+/** The rows of a process-table query's output (`<pid> <ppid> <filetime>`, then optionally
+ *  ` <name>|<command line>`, per line). An empty command line is left out: it could not be read. */
 export function parseProcessTable(lines: readonly string[]): ProcessRow[] {
   const rows: ProcessRow[] = [];
   for (const line of lines) {
-    const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s*$/.exec(line);
+    const m = /^\s*(\d+)\s+(\d+)\s+(\d+)(?:\s(.*))?$/.exec(line);
     if (m === null) continue;
     const startMs = windowsStartMs(m[3]!);
     if (startMs === undefined) continue;
-    rows.push({ pid: Number(m[1]), ppid: Number(m[2]), startMs });
+    const rest = m[4] ?? '';
+    const bar = rest.indexOf('|');
+    const name = (bar < 0 ? rest : rest.slice(0, bar)).trim();
+    const commandLine = bar < 0 ? '' : rest.slice(bar + 1).trim();
+    rows.push({
+      pid: Number(m[1]),
+      ppid: Number(m[2]),
+      startMs,
+      ...(name !== '' ? { name } : {}),
+      ...(commandLine !== '' ? { commandLine } : {}),
+    });
   }
   return rows;
+}
+
+/** The last segment of a path written with either separator, lower-cased, without `.exe`. */
+function programName(path: string): string {
+  const base = path.split(/[\\/]/).pop() ?? '';
+  return base.toLowerCase().replace(/\.exe$/, '');
+}
+
+/** Paths only a Claude Code runs from: the npm package, and the native installer's version store
+ *  (whose binaries are named by version, not `claude`). Compared with `/` separators, lower-cased. */
+const CLAUDE_CODE_PATH_MARKS = ['/@anthropic-ai/claude-code/', '/claude/versions/'];
+
+/** The runtimes a script-installed Claude Code runs under. */
+const SCRIPT_HOSTS: ReadonlySet<string> = new Set(['node', 'nodejs', 'bun']);
+
+/**
+ * Whether a process is a Claude Code (the CLI, its background service, the copy an Agent SDK
+ * bundles), by how it was started: a program named `claude` (the native binary, a symlink to it, or
+ * the title Claude Code gives its own process), or a command line that runs it from where Claude
+ * Code is installed (`node .../@anthropic-ai/claude-code/cli.js`, the native version store). Only a
+ * Claude Code reads a profile's login, so only one holds a parallel session; a dev server or an
+ * editor that merely inherited the profile's CLAUDE_CONFIG_DIR does not. A process whose command
+ * line cannot be read counts as one: a doubt keeps the session, as everywhere else here.
+ */
+export function isClaudeCodeProcess(p: {
+  /** The image name or executable path (Windows: Win32_Process.Name). */
+  image?: string;
+  /** The arguments, the program first (Linux: /proc/<pid>/cmdline). */
+  argv?: readonly string[];
+  /** The whole command line as one string (Windows). */
+  commandLine?: string;
+}): boolean {
+  const argv = p.argv ?? [];
+  // The program, or the script a JavaScript runtime runs: an npm install's `claude` is a script
+  // that `node` runs under the name it was started by (`node /usr/local/bin/claude`).
+  const script =
+    argv[0] !== undefined && SCRIPT_HOSTS.has(programName(argv[0])) ? argv[1] : undefined;
+  const named = [p.image, argv[0], script].filter((w): w is string => w !== undefined);
+  if (named.some((w) => programName(w) === 'claude')) return true;
+  const line = p.commandLine ?? (argv.length > 0 ? argv.join(' ') : undefined);
+  if (line === undefined || line.trim() === '') return true;
+  const flat = line.toLowerCase().replace(/\\/g, '/');
+  return CLAUDE_CODE_PATH_MARKS.some((mark) => flat.includes(mark));
 }
 
 /** The file reads {@link createProcFs} makes, injectable so a fixture tree stands in for `/proc`. */
@@ -171,9 +257,12 @@ export interface ProcFsIo {
   readdir(path: string): string[];
 }
 
-/** Node's own file reads under `/proc`. */
+/** Node's own file reads under `/proc`. UTF-8, the encoding node writes a child's environment in: a
+ *  profile path holding a non-ASCII character must read back as the same string the engine compares
+ *  it with. Any other byte decodes to a replacement character and never swallows an ASCII one, so
+ *  the stat fields after the name still split as before. */
 const nodeProcIo: ProcFsIo = {
-  readFile: (p) => readFileSync(p, 'latin1'),
+  readFile: (p) => readFileSync(p, 'utf8'),
   readlink: (p) => readlinkSync(p),
   readdir: (p) => readdirSync(p),
 };
@@ -189,10 +278,15 @@ function attempt<T>(read: () => T): T | undefined {
 }
 
 /**
- * The Linux `/proc` reads (see {@link ProcFs}) under `root`. `stat` parses after the LAST `)`, since
- * a process's name (field 2) may itself hold spaces and parentheses.
+ * The Linux `/proc` reads (see {@link ProcFs}) under `root`, and the machine id at `machineIdPath`.
+ * `stat` parses after the LAST `)`, since a process's name (field 2) may itself hold spaces and
+ * parentheses.
  */
-export function createProcFs(root = '/proc', io: ProcFsIo = nodeProcIo): ProcFs {
+export function createProcFs(
+  root = '/proc',
+  io: ProcFsIo = nodeProcIo,
+  machineIdPath = '/etc/machine-id',
+): ProcFs {
   return {
     stat(pid) {
       const text = attempt(() => io.readFile(join(root, String(pid), 'stat')));
@@ -207,7 +301,16 @@ export function createProcFs(root = '/proc', io: ProcFsIo = nodeProcIo): ProcFs 
       const ppid = Number(fields[1]);
       const startTicks = Number(fields[19]);
       if (!Number.isInteger(ppid) || !Number.isInteger(startTicks)) return undefined;
-      return { ppid, startTicks };
+      return { ppid, startTicks, state: fields[0] ?? '' };
+    },
+    machineId() {
+      const text = attempt(() => io.readFile(machineIdPath));
+      const id = text?.trim();
+      return id === undefined || id === '' ? undefined : id;
+    },
+    pidNsOf(pid) {
+      const link = attempt(() => io.readlink(join(root, String(pid), 'ns', 'pid')));
+      return link === undefined || link === '' ? undefined : link;
     },
     bootId() {
       const text = attempt(() => io.readFile(join(root, 'sys', 'kernel', 'random', 'boot_id')));
@@ -224,6 +327,14 @@ export function createProcFs(root = '/proc', io: ProcFsIo = nodeProcIo): ProcFs 
       const prefix = 'CLAUDE_CONFIG_DIR=';
       const entry = environ.split('\u0000').find((e) => e.startsWith(prefix));
       return entry === undefined ? undefined : entry.slice(prefix.length);
+    },
+    cmdlineOf(pid) {
+      const text = attempt(() => io.readFile(join(root, String(pid), 'cmdline')));
+      if (text === undefined) return undefined;
+      // NUL-separated, with a NUL after the last argument (none when a process rewrote its title).
+      const words = text.split('\u0000');
+      if (words.at(-1) === '') words.pop();
+      return words;
     },
     pids() {
       const names = attempt(() => io.readdir(root)) ?? [];
@@ -303,13 +414,15 @@ export function childHolder(pid: number, parent: number, source: HolderSource = 
   };
 }
 
-/** The boot id and pid namespace a Linux holder carries, each only when readable. */
-function linuxTags(fs: ProcFs): { bootId?: string; pidNs?: string } {
+/** The boot id, pid namespace and machine id a Linux holder carries, each only when readable. */
+export function linuxTags(fs: ProcFs): { bootId?: string; pidNs?: string; machineId?: string } {
   const bootId = fs.bootId();
   const pidNs = fs.pidNs();
+  const machineId = fs.machineId?.();
   return {
     ...(bootId !== undefined ? { bootId } : {}),
     ...(pidNs !== undefined ? { pidNs } : {}),
+    ...(machineId !== undefined ? { machineId } : {}),
   };
 }
 
@@ -324,32 +437,76 @@ export interface HolderEvidence {
   /** Linux. */
   procFs?: ProcFs;
   /** Windows, full mode: the process table by pid. Undefined or empty: the query failed. */
-  table?: ReadonlyMap<number, ProcessRow>;
+  table?: ReadonlyMap<number, ProcessRow> | undefined;
   /** This process: a holder on its pid with another start is a reused record, provably dead. */
   self?: { pid: number; start: number };
+  /** Linux: the pid namespaces of the processes visible from here (default: read from `procFs` on
+   *  each call). The engine passes one read once per check. */
+  visibleNamespaces?: () => ReadonlySet<string>;
+}
+
+/** Linux: the pid namespaces the processes visible from here run in. A namespace nested in this
+ *  one shows up; one that is gone (or a sibling's) does not. */
+export function visibleNamespaces(fs: ProcFs): Set<string> {
+  const seen = new Set<string>();
+  if (fs.pidNsOf === undefined) return seen;
+  for (const pid of fs.pids()) {
+    const ns = fs.pidNsOf(pid);
+    if (ns !== undefined) seen.add(ns);
+  }
+  return seen;
+}
+
+/** The states a Linux process has exited in but still shows under `/proc`: a zombie (not yet
+ *  reaped by its parent) and a dead one being torn down. kill-0 succeeds on both. */
+const EXITED_STATES: ReadonlySet<string> = new Set(['Z', 'X', 'x']);
+
+/**
+ * Whether a Linux holder was recorded on this machine: the same host name, or the same machine id
+ * (a renamed machine keeps its machine id, and its old name would otherwise make every holder it
+ * recorded foreign forever).
+ */
+function sameLinuxMachine(h: LeaseHolder, now: HolderEvidence): boolean {
+  if (h.host === now.host) return true;
+  const machine = now.procFs?.machineId?.();
+  return h.machineId !== undefined && machine !== undefined && h.machineId === machine;
 }
 
 /**
  * Whether one holder's process still runs, judged from this process:
- *   1. another host, platform or (linux) pid namespace: `foreign`, never judged from here;
- *   2. (linux) another boot: `dead`, without a process query;
- *   3. this process's own pid with another start: `dead` (this process owns that pid now);
- *   4. kill-0 says no such process: `dead`;
- *   5. start 0 (never known): `unverifiable`;
- *   6. the start check: linux compares boot ticks exactly (unreadable: `unverifiable`); win32, full
- *      only, compares the table's creation time within {@link LEASE_START_TOLERANCE_MS} (no row:
- *      `unverifiable`); win32 quick makes none;
- *   7. otherwise `alive`.
+ *   1. another platform: `foreign`, never judged from here. On linux another machine (host name and
+ *      machine id both differ) is foreign too. On win32 the host name is not checked: the vault is
+ *      tied to this machine and user, so a holder of another name was recorded here before a rename;
+ *   2. (linux) another boot: `dead`, without a process query, whatever namespace it ran in (no
+ *      namespace of an earlier boot still exists);
+ *   3. (linux) another pid namespace in this boot: `foreign` while a process visible from here runs
+ *      in it (a nested one, whose pids this check cannot read) or while nothing ties it to this
+ *      machine (no matching machine id: another container's or distro's); `dead` when it is this
+ *      machine's and no visible process runs in it (a WSL distro that restarted in the same VM);
+ *   4. this process's own pid with another start: `dead` (this process owns that pid now);
+ *   5. kill-0 says no such process: `dead`;
+ *   6. start 0 (never known): `unverifiable`;
+ *   7. the start check: linux compares boot ticks exactly (unreadable: `unverifiable`; a zombie, which
+ *      kill-0 still finds, is `dead`); win32, full only, compares the table's creation time within
+ *      {@link LEASE_START_TOLERANCE_MS} (no row: `unverifiable`); win32 quick makes none;
+ *   8. otherwise `alive`.
  * Nothing here reads the wall clock, so a clock step cannot change the answer.
  */
 export function holderState(h: LeaseHolder, now: HolderEvidence): LeaseHolderState {
-  if (h.host !== now.host || h.platform !== now.platform) return 'foreign';
+  if (h.platform !== now.platform) return 'foreign';
   const linux = h.platform === 'linux';
   if (linux) {
-    const ns = now.procFs?.pidNs();
-    if ((h.pidNs ?? null) !== (ns ?? null)) return 'foreign';
+    if (!sameLinuxMachine(h, now)) return 'foreign';
     const boot = now.procFs?.bootId();
     if (h.bootId !== undefined && boot !== undefined && h.bootId !== boot) return 'dead';
+    const ns = now.procFs?.pidNs();
+    if ((h.pidNs ?? null) !== (ns ?? null)) {
+      const machine = now.procFs?.machineId?.();
+      const ours = h.machineId !== undefined && h.machineId === machine;
+      if (!ours || h.pidNs === undefined || now.procFs === undefined) return 'foreign';
+      const visible = (now.visibleNamespaces ?? (() => visibleNamespaces(now.procFs!)))();
+      return visible.has(h.pidNs) ? 'foreign' : 'dead';
+    }
   }
   if (now.self !== undefined && h.pid === now.self.pid && h.start !== now.self.start) {
     return 'dead';
@@ -359,6 +516,7 @@ export function holderState(h: LeaseHolder, now: HolderEvidence): LeaseHolderSta
   if (linux) {
     const stat = now.procFs?.stat(h.pid);
     if (stat === undefined) return 'unverifiable';
+    if (stat.state !== undefined && EXITED_STATES.has(stat.state)) return 'dead';
     return stat.startTicks === h.start ? 'alive' : 'dead';
   }
   if (now.mode === 'quick') return 'alive';

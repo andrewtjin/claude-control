@@ -5,6 +5,7 @@
 
 import { hostname } from 'node:os';
 import {
+  linuxTags,
   procFs as realProcFs,
   windowsStartMs,
   type LeaseHolder,
@@ -26,6 +27,12 @@ export interface LeaseProbeDeps {
  * (Windows: the FILETIME Claude Code recorded, as epoch ms; Linux: `/proc` boot ticks). A start that
  * cannot be read is 0, which keeps the session (unverifiable counts as alive). A roster that cannot
  * be read answers `'unreadable'`, which never ends a session.
+ *
+ * On Linux the roster is always verified, even when the caller asks only for the file: the start a
+ * holder records there is read from `/proc` now, so a roster entry whose pid another process took
+ * over (a service that died and left its roster) would become a holder matching that unrelated
+ * process exactly, and keep the session for as long as it runs. Verifying there is a `ps` call, not
+ * the PowerShell query the file-only read spares Windows.
  */
 export function createLeaseOccupancyProbe(
   host: Pick<ClaudeBackgroundHost, 'hostedWorkerProcesses'>,
@@ -37,7 +44,10 @@ export function createLeaseOccupancyProbe(
   return async (profileDir, opts) => {
     let workers: Array<{ pid: number; procStart?: string }>;
     try {
-      workers = await host.hostedWorkerProcesses(profileDir, opts);
+      workers = await host.hostedWorkerProcesses(
+        profileDir,
+        platform === 'linux' ? { ...opts, verify: true } : opts,
+      );
     } catch {
       return 'unreadable';
     }
@@ -47,16 +57,13 @@ export function createLeaseOccupancyProbe(
         const start = w.procStart === undefined ? undefined : windowsStartMs(w.procStart);
         return { pid: w.pid, start: start ?? 0, host: host_(), platform, role: 'background' };
       }
-      const bootId = fs.bootId();
-      const pidNs = fs.pidNs();
       return {
         pid: w.pid,
         start: fs.stat(w.pid)?.startTicks ?? 0,
         host: host_(),
         platform,
         role: 'background',
-        ...(bootId !== undefined ? { bootId } : {}),
-        ...(pidNs !== undefined ? { pidNs } : {}),
+        ...linuxTags(fs),
       };
     });
   };

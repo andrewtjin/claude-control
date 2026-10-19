@@ -3,15 +3,19 @@
 //
 // A parallel session whose processes are gone is ended by the daemon within one poll. With no daemon
 // running, nothing else would end it, so every command a parallel session can refuse (`cctl switch`,
-// `cctl accounts remove`, a join by `cctl claude --account`) first runs the full check on that one
-// session: the user is already blocked there, so the process query it costs is acceptable.
+// `cctl accounts remove`, `cctl folder exclude`, `cctl session exclude`, a join by `cctl claude
+// --account`) first runs the full check on that one session: the user is already blocked there, so
+// the process query it costs is acceptable.
 
 import {
   childHolder,
   isLeaseRule,
+  leaseOccupants,
+  occupantsPhrase,
   type FolderRule,
   type LeaseHolder,
   type LeaseOccupancyProbe,
+  type LeaseView,
   type Paths,
 } from '@claude-control/switch-engine';
 import { backgroundHostOptions, createClaudeBackgroundHost } from './backgroundHost.js';
@@ -33,9 +37,10 @@ const NO_WORKERS: LeaseOccupancyProbe = () => Promise.resolve([]);
 
 /**
  * Before a command an account's parallel session would block: end the parallel sessions whose
- * processes are gone. A quick check of every session (no process query on Windows), then, when
- * `accountId` has one, the full check of that one. Costs one rules read when no parallel session
- * exists. A check that fails is not the command's failure: the session's own refusal follows.
+ * processes are gone. A quick check of every session (on Windows a process query only when one has
+ * no holder left), then, when `accountId` has one, the full check of that one. Costs one rules read
+ * when no parallel session exists. A check that fails is not the command's failure: the session's
+ * own refusal follows.
  */
 export async function sweepBeforeLeaseRefusal(
   engine: Engine,
@@ -52,16 +57,15 @@ export async function sweepBeforeLeaseRefusal(
   }
 }
 
-/** How many terminals hold a parallel session: its launchers, or its processes when none of them is
- *  a launcher (a session found running after its terminal was killed, or a background worker). */
-export function terminalsOf(holders: readonly Pick<LeaseHolder, 'role'>[]): number {
-  const launchers = holders.filter((h) => h.role === 'launcher').length;
-  return launchers > 0 ? launchers : holders.length;
-}
-
-/** "N terminal(s)" as a display phrase. */
-export function terminalsPhrase(n: number): string {
-  return `${n} terminal${n === 1 ? '' : 's'}`;
+/** What a parallel session is in use by right now, as `cctl status` and `cctl accounts list` say
+ *  it: its running terminals and background sessions (a quick judgment of its holders), or, when
+ *  none of its recorded processes runs any more, that it ends at the next check. */
+export function leaseInUse(view: Pick<LeaseView, 'holders'>): { phrase: string; running: boolean } {
+  const running = view.holders.filter((h) => h.state !== 'dead');
+  if (running.length === 0) {
+    return { phrase: 'no process of it runs; it ends at the next check', running: false };
+  }
+  return { phrase: occupantsPhrase(leaseOccupants(running)), running: true };
 }
 
 /** The minimal signal seam, so holding signals is testable without signalling the test runner. */

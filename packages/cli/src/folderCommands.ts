@@ -35,6 +35,7 @@ import {
   isLeaseRule,
   operatorRules,
   selfHolder,
+  shellQuoteArg,
   type AccountView,
   type ExcludeResult,
   type FolderRule,
@@ -49,6 +50,7 @@ import {
   type LeaseDeferReason,
   type LeaseHolder,
   type LeaseOccupancyProbe,
+  type LeaseView,
   type SessionSlotClaim,
   type SessionSlotPlan,
   type SlotId,
@@ -126,16 +128,11 @@ import {
 import {
   cliLeaseProbe,
   holdLeaseSignals,
-  terminalsOf,
-  terminalsPhrase,
+  leaseInUse,
+  sweepBeforeLeaseRefusal,
   trackChildHolder,
 } from './leaseCli.js';
-import {
-  VERSION,
-  daemonHeartbeatPath,
-  daemonSettingsPath,
-  readSettingsReport,
-} from './settings.js';
+import { daemonHeartbeatPath, daemonSettingsPath, readSettingsReport } from './settings.js';
 import {
   bannerContextForLaunch,
   buildLaunchEnv,
@@ -539,6 +536,7 @@ export function buildReservedViews(
   rules: readonly FolderRule[],
   live: ReadonlyMap<SlotId, string | null>,
   nowMs: number = Date.now(),
+  leases: readonly LeaseView[] = [],
 ): ReservedAccountView[] {
   return accounts
     .filter((a) => (a.ruleIds ?? []).length > 0)
@@ -552,12 +550,19 @@ export function buildReservedViews(
         billing: billingLabel(a, nowMs),
         quarantined: a.quarantined,
         live: including.some((r) => live.get(ruleSlotId(r.id)) === a.id),
-        // A parallel session is no rule the operator made: it says what holds the account.
-        includedBy: including.map((r) =>
-          isLeaseRule(r)
-            ? `in use: parallel session (${terminalsPhrase(terminalsOf(r.lease.holders))})`
-            : describeRuleScopes(r),
-        ),
+        reservedToRules: including.some((r) => !isLeaseRule(r)),
+        // A parallel session is no rule the operator made: it says what holds the account, judged
+        // from its holders (one whose processes all exited is not in use by them).
+        includedBy: including.map((r) => {
+          if (!isLeaseRule(r)) return describeRuleScopes(r);
+          const view = leases.find((l) => l.ruleId === r.id);
+          const use = view === undefined ? undefined : leaseInUse(view);
+          return use === undefined
+            ? 'in use: parallel session'
+            : use.running
+              ? `in use: parallel session (${use.phrase})`
+              : `parallel session (${use.phrase})`;
+        }),
       };
     });
 }
@@ -567,10 +572,28 @@ export async function renderReservedAppendix(engine: Engine, palette: Palette): 
   const rules = await engine.listRules();
   if (rules.length === 0) return '';
   const picture = await readFolderPicture(engine);
-  const text = renderReservedAccounts(
-    buildReservedViews(picture.accounts, picture.allRules, picture.live),
-    palette,
+  const leases = await engine.listLeases({ mode: 'quick' }).catch(() => [] as LeaseView[]);
+  const views = buildReservedViews(
+    picture.accounts,
+    picture.allRules,
+    picture.live,
+    Date.now(),
+    leases,
   );
+  // An account only a parallel session holds is reserved to no folder: it gets a section of its own.
+  const text = [
+    renderReservedAccounts(
+      views.filter((v) => v.reservedToRules),
+      palette,
+    ),
+    renderReservedAccounts(
+      views.filter((v) => !v.reservedToRules),
+      palette,
+      'In use by a parallel session (out of the pool until its terminals exit; * = live there):',
+    ),
+  ]
+    .filter((t) => t !== '')
+    .join('\n\n');
   return text === '' ? '' : '\n\n' + text;
 }
 
@@ -733,10 +756,19 @@ export function describeInclude(
   // An account another rule already reserved is shared between the folders that include it.
   for (const id of requested) {
     if (result.reserved.includes(id)) continue;
-    const others = rulesIncluding(id, ctx.rules).filter((r) => r.id !== rule.id);
+    const including = rulesIncluding(id, ctx.rules).filter((r) => r.id !== rule.id);
+    const name = sanitizeForTerminal(labelOf(ctx.accounts, id));
+    // A parallel session is no folder: while it runs, the account is held there and nowhere else.
+    if (including.some(isLeaseRule)) {
+      lines.push(
+        `  ${name} is in use by its parallel session; ${slotNoun(rule)} can use it once ` +
+          "that session's terminals exit.",
+      );
+    }
+    const others = including.filter((r) => !isLeaseRule(r));
     if (others.length === 0) continue;
     lines.push(
-      `  ${sanitizeForTerminal(labelOf(ctx.accounts, id))} is also included by ` +
+      `  ${name} is also included by ` +
         `${sanitizeForTerminal(others.map((r) => describeRuleScopes(r)).join('; '))}; ` +
         'those folders share it, live in one of them at a time.',
     );
@@ -790,6 +822,32 @@ export function describeExclude(
   return lines.join('\n');
 }
 
+/** Why accounts a reset took out of a rule stayed out of the shared pool: other folder rules still
+ *  include them, or a parallel session holds them (no folder: they rejoin the pool when it ends). */
+function stillReservedLines(
+  ids: readonly string[],
+  ruleId: string | undefined,
+  ctx: ChangeContext,
+): string[] {
+  const byRules = ids.filter((id) =>
+    rulesIncluding(id, ctx.rules).some((r) => r.id !== ruleId && !isLeaseRule(r)),
+  );
+  const bySession = ids.filter((id) => !byRules.includes(id));
+  const lines: string[] = [];
+  if (byRules.length > 0) {
+    lines.push(
+      `  still reserved to other folders: ${sanitizeForTerminal(labelsOf(ctx.accounts, byRules))}.`,
+    );
+  }
+  if (bySession.length > 0) {
+    lines.push(
+      `  still in use by a parallel session: ${sanitizeForTerminal(labelsOf(ctx.accounts, bySession))}` +
+        " (back in the pool when that session's terminals exit).",
+    );
+  }
+  return lines;
+}
+
 /** `cctl folder reset`'s report. `before` is the folder's rule as it was, so the report can say
  *  which named accounts were included and which excluded; `liveAfter` is the slot's live account
  *  now (a surviving rule only). */
@@ -831,11 +889,7 @@ export function describeReset(
       ...released,
     ];
     const stillReserved = (before?.include ?? []).filter((id) => !result.released.includes(id));
-    if (stillReserved.length > 0) {
-      lines.push(
-        `  still reserved to other folders: ${sanitizeForTerminal(labelsOf(ctx.accounts, stillReserved))}.`,
-      );
-    }
+    lines.push(...stillReservedLines(stillReserved, before?.id, ctx));
     lines.push('  the profile dir is kept for history; its live login was cleared.');
     if (result.runningSessions.length > 0) {
       lines.push(
@@ -877,11 +931,7 @@ export function describeReset(
   }
   lines.push(...released);
   const stillReserved = wasIncluded.filter((id) => !result.released.includes(id));
-  if (stillReserved.length > 0) {
-    lines.push(
-      `  still reserved to other folders: ${sanitizeForTerminal(labelsOf(ctx.accounts, stillReserved))}.`,
-    );
-  }
+  lines.push(...stillReservedLines(stillReserved, rule.id, ctx));
   lines.push(
     ...liveAndSessionLines(
       rule,
@@ -1043,6 +1093,9 @@ export function buildFolderCommands(program: Command): void {
         await refuseOnOlderDaemon();
         const engine = buildEngine();
         const ids = await resolveAccountArg(engine, 'exclude', accountsArg);
+        // A parallel session refuses the exclude while it holds an account: one whose processes
+        // are gone is ended first, as cctl switch does.
+        for (const id of ids) await sweepBeforeLeaseRefusal(engine, defaultPaths(), id);
         const result = await engineCall(() =>
           engine.excludeInFolder(folderArg, ids, {
             ...(opts.label ? { label: opts.label } : {}),
@@ -1200,7 +1253,9 @@ export function buildFolderCommands(program: Command): void {
     .description('launch Claude Code on the account for the current folder (or --account)')
     .option(
       '--account <ref>',
-      "launch a specific account (its folder's profile, or the global slot)",
+      'run a specific account in this terminal: on the slot where it is live (the global slot, or ' +
+        "a folder's slot it is reserved to), else in a parallel session of its own (out of the " +
+        'pool and never auto-switched until this terminal exits)',
     )
     .option('--override', 'allow this session in a folder whose rule runs on a DIFFERENT slot')
     .helpOption(false)
@@ -1240,9 +1295,13 @@ export function relaxationBannerLine(
     const folder = sanitizeForTerminal(outranked?.folder ?? cwd);
     if (outranked?.via === 'alias') {
       const alias = sanitizeForTerminal(outranked.alias ?? '');
+      // The command is printed to be pasted: an alias or label with a space must stay one argument.
+      const command =
+        `cctl session include ${shellQuoteArg(alias, process.platform)} ` +
+        shellQuoteArg(safeLabel, process.platform);
       return (
         `cctl: --account outranks the rule of session "${alias}" in ${folder} for this session ` +
-        `only. To keep this session on ${safeLabel}, run: cctl session include ${alias} ${safeLabel}\n`
+        `only. To keep this session on ${safeLabel}, run: ${command}\n`
       );
     }
     return `cctl: --account outranks the folder rule of ${folder} for this session only.\n`;
@@ -1468,12 +1527,13 @@ function routeContext(
       if (rule === undefined) {
         return { slot: 'the profile of a folder rule since removed', removed: true };
       }
-      return named(
-        labelIn(ruleSlotId(rule.id)),
-        isLeaseRule(rule)
-          ? slotName(ruleSlotId(rule.id), rules)
-          : `the folder slot of ${foldersOf(rule)}`,
-      );
+      if (isLeaseRule(rule)) {
+        return {
+          ...named(labelIn(ruleSlotId(rule.id)), slotName(ruleSlotId(rule.id), rules)),
+          parallel: true,
+        };
+      }
+      return named(labelIn(ruleSlotId(rule.id)), `the folder slot of ${foldersOf(rule)}`);
     },
     daemonRunning,
     say: (line) => process.stderr.write(`${sanitizeForTerminal(line)}\n`),
@@ -1705,12 +1765,11 @@ async function runClaude(opts: {
         // Everything that can refuse a parallel session is checked before anything is claimed.
         const refusal = leaseArgRefusal(opts.args, label);
         if (refusal !== undefined) fail(refusal);
-        await refuseOnOlderDaemonFor('lease');
-        const install = olderInstallReason({
-          cliBuild: VERSION,
-          daemonAlive: await daemonIsRunning(),
-        });
+        // An older install first: when the running daemon is that install's (its autostart starts
+        // it), restarting the daemon would only bring the same build back.
+        const install = olderInstallReason();
         if (install !== undefined) fail(`${sanitizeForTerminal(install)}. Nothing was changed.`);
+        await refuseOnOlderDaemonFor('lease');
         // A session the arguments open that runs in a background service is never taken from it,
         // and --account cannot move it there: refused before the claim.
         if (request !== undefined) {
@@ -1918,14 +1977,21 @@ async function runParallelSession(input: {
     }
     // The guard on disk is this build's, or none when parallel sessions are all there is.
     await reconcileFolderGuard(engine, paths);
-    const others = claim.joined ? claim.otherTerminals : 0;
+    // What else runs on the session now: other terminals, and background sessions its profile's
+    // service hosts (which no terminal shows).
+    const shared: string[] = [];
+    const terminals = claim.joined ? claim.otherTerminals : 0;
+    const background = claim.joined ? (claim.otherBackground ?? 0) : 0;
+    if (terminals > 0) shared.push(`${terminals} other terminal${terminals === 1 ? '' : 's'}`);
+    if (background > 0) {
+      shared.push(`${background} background session${background === 1 ? '' : 's'}`);
+    }
     const slot: LaunchSlot = {
       ...input.slot,
       profileDir: claim.profileDir,
       context:
-        others > 0
-          ? `parallel session, this terminal only; shared with ${others} other ` +
-            `terminal${others === 1 ? '' : 's'}`
+        shared.length > 0
+          ? `parallel session, this terminal only; shared with ${shared.join(' and ')}`
           : 'parallel session, this terminal only',
     };
     const child = trackChildHolder({
@@ -1970,11 +2036,13 @@ async function releaseParallelSession(
   probe: LeaseOccupancyProbe,
   label: string,
 ): Promise<void> {
-  const later = (reason: string): void =>
+  const later = (reason: string, fix?: string): void =>
     void process.stderr.write(
-      `cctl: could not return ${label} to the pool yet (${sanitizeForTerminal(reason)}); the ` +
-        `daemon does it on its next poll, or, with no daemon, the next cctl claude --account ` +
-        `${label} or cctl switch ${label} does.\n`,
+      `cctl: could not return ${label} to the pool yet (${sanitizeForTerminal(reason)}); ` +
+        (fix ??
+          `the daemon does it on its next poll, or, with no daemon, the next cctl claude ` +
+            `--account ${label} or cctl switch ${label} does.`) +
+        '\n',
     );
   try {
     const released = await engine.releaseLease(ruleId, holders, probe);
@@ -1982,6 +2050,23 @@ async function releaseParallelSession(
       process.stderr.write(
         `cctl: ${label} stays reserved while the background session(s) this session started ` +
           'run; it rejoins the pool when they end.\n',
+      );
+    } else if (released.heldBy !== undefined && released.heldBy.length > 0) {
+      // A Claude Code this session started (a backgrounded `claude -p`) outlived it on its
+      // profile: it holds the account now, and nothing ends the session while it runs.
+      const pids = released.heldBy.join(', ');
+      process.stderr.write(
+        `cctl: ${label} stays reserved: Claude Code process${released.heldBy.length === 1 ? '' : 'es'} ` +
+          `${pids}, started from this session, still run${released.heldBy.length === 1 ? 's' : ''} ` +
+          `on its profile and may use its login. It rejoins the pool when ` +
+          `${released.heldBy.length === 1 ? 'that process exits' : 'they exit'}; to free it now, ` +
+          `end ${released.heldBy.length === 1 ? 'it' : 'them'} (pid ${pids}).\n`,
+      );
+    } else if (released.deferred === 'login_unadopted') {
+      later(
+        LEASE_DEFER_WORDS.login_unadopted,
+        `log in again with cctl accounts relogin ${label}, which rewrites it; the next check ` +
+          'then frees the account.',
       );
     } else if (released.deferred !== undefined) {
       later(LEASE_DEFER_WORDS[released.deferred]);
@@ -1995,8 +2080,11 @@ async function releaseParallelSession(
 const LEASE_DEFER_WORDS: Record<LeaseDeferReason, string> = {
   roster_unreadable: 'its background-session roster could not be read',
   no_probe: 'its background-session roster could not be read',
-  unrecorded_child: 'a process still runs on its profile',
+  processes_unreadable:
+    'the process list that shows what still runs on its profile could not be read',
   slot_untrusted: 'its slot has an unfinished change',
+  login_unadopted: 'its slot holds a login that could not be saved to the vault',
+  teardown_failed: 'ending it failed part-way',
 };
 
 /** A host for {@link runHolding} when nothing is held. */
@@ -2133,7 +2221,8 @@ async function launchOnSlot(input: {
   if (input.outranks !== undefined) {
     // One line for --account outranking the rule here, not an --override line beside it.
     process.stderr.write(input.outranks);
-  } else if (input.override) {
+  } else if (input.override && !parallel) {
+    // A parallel session runs on a slot of its own, so --override relaxes nothing there.
     process.stderr.write(relaxationBannerLine('override', slot.label, process.cwd()));
   }
   if (explicitToken !== undefined && !parallel) {

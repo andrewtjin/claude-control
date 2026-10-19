@@ -603,6 +603,7 @@ const HOLDER_KEYS: ReadonlySet<string> = new Set([
   'platform',
   'bootId',
   'pidNs',
+  'machineId',
   'role',
   'parent',
 ]);
@@ -698,7 +699,7 @@ function validateHolder(raw: unknown, at: string): LeaseHolder {
   if (raw.role !== 'launcher' && raw.role !== 'claude' && raw.role !== 'background') {
     throw new VaultError(`${at} role is not launcher, claude or background`);
   }
-  for (const tag of ['bootId', 'pidNs'] as const) {
+  for (const tag of ['bootId', 'pidNs', 'machineId'] as const) {
     const v = raw[tag];
     if (v !== undefined && (typeof v !== 'string' || v.length > MAX_HOLDER_TAG_LENGTH)) {
       throw new VaultError(`${at} ${tag} is not a short string`);
@@ -715,6 +716,7 @@ function validateHolder(raw: unknown, at: string): LeaseHolder {
     role: raw.role,
     ...(typeof raw.bootId === 'string' ? { bootId: raw.bootId } : {}),
     ...(typeof raw.pidNs === 'string' ? { pidNs: raw.pidNs } : {}),
+    ...(typeof raw.machineId === 'string' ? { machineId: raw.machineId } : {}),
     ...(raw.parent !== undefined ? { parent: raw.parent } : {}),
   };
 }
@@ -2163,6 +2165,10 @@ export class Vault {
       // reserved account is as unusable as one it confuses with a shared account.
       assertLabelFree(allRowsOf(st), next, id);
       account.label = next;
+      // A parallel session is named by its account: it takes the new name in the same write.
+      for (const rule of st.rules) {
+        if (rule.lease !== undefined && rule.include[0] === id) rule.label = next;
+      }
     });
   }
 

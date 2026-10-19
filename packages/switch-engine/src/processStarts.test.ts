@@ -3,12 +3,18 @@
 // Windows box tests the Linux rules and the other way round.
 
 import { describe, it, expect } from 'vitest';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   LEASE_START_TOLERANCE_MS,
   childHolder,
   createProcFs,
   holderState,
+  isClaudeCodeProcess,
   parseProcessTable,
+  readProcessTable,
+  runQuery,
   selfHolder,
   windowsStartMs,
   type HolderEvidence,
@@ -95,8 +101,8 @@ describe('createProcFs', () => {
   const fs = createProcFs('/proc', io);
 
   it('reads fields 4 and 22 past a name holding spaces and parentheses', () => {
-    expect(fs.stat(812)).toEqual({ ppid: 700, startTicks: 5512345 });
-    expect(fs.stat(900)).toEqual({ ppid: 1, startTicks: 42 });
+    expect(fs.stat(812)).toEqual({ ppid: 700, startTicks: 5512345, state: 'S' });
+    expect(fs.stat(900)).toEqual({ ppid: 1, startTicks: 42, state: 'S' });
     expect(fs.stat(1234)).toBeUndefined();
   });
 
@@ -127,6 +133,8 @@ function linuxFs(over: Partial<ProcFs> & { starts?: Record<number, number> } = {
     pidNs: over.pidNs ?? (() => 'pid:[1]'),
     configDirOf: over.configDirOf ?? (() => undefined),
     pids: over.pids ?? (() => Object.keys(starts).map(Number)),
+    ...(over.machineId !== undefined ? { machineId: over.machineId } : {}),
+    ...(over.pidNsOf !== undefined ? { pidNsOf: over.pidNsOf } : {}),
   };
 }
 
@@ -295,5 +303,182 @@ describe('selfHolder and childHolder', () => {
       if (before === undefined) delete process.env.HOSTNAME;
       else process.env.HOSTNAME = before;
     }
+  });
+});
+
+describe('reading /proc the way the kernel stores it', () => {
+  it('decodes an environment as UTF-8, so a profile under a non-ASCII path matches', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ce-proc-'));
+    try {
+      await mkdir(join(root, '812'));
+      const profile = '/home/jos\u00e9/.local/share/claude-control/profiles/session-a';
+      // The bytes the kernel holds: node wrote the child's environment as UTF-8.
+      await writeFile(
+        join(root, '812', 'environ'),
+        Buffer.from(`HOME=/home/jos\u00e9\u0000CLAUDE_CONFIG_DIR=${profile}\u0000`, 'utf8'),
+      );
+      expect(createProcFs(root).configDirOf(812)).toBe(profile);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reads a process's state, and a zombie holder is dead", () => {
+    const io = fixtureIo(
+      {
+        '/proc/812/stat': statLine(812, 'claude', 1, 5000).replace(') S ', ') Z '),
+        '/proc/sys/kernel/random/boot_id': 'boot-1',
+      },
+      { '/proc/self/ns/pid': 'pid:[1]' },
+    );
+    const fs = createProcFs('/proc', io);
+    expect(fs.stat(812)).toMatchObject({ state: 'Z', startTicks: 5000 });
+    // kill-0 succeeds on a zombie and its start still matches: only the state says it exited.
+    expect(holderState(linuxHolder(), linuxEvidence({ procFs: fs }))).toBe('dead');
+  });
+});
+
+describe('holderState across a reboot, a rename and a restarted namespace', () => {
+  it('another boot is dead even when the pid namespace changed with it', () => {
+    const ev = linuxEvidence({
+      procFs: linuxFs({ bootId: () => 'boot-2', pidNs: () => 'pid:[9]' }),
+    });
+    expect(holderState(linuxHolder(), ev)).toBe('dead');
+  });
+
+  it('linux: a renamed machine is recognised by its machine id; another machine stays foreign', () => {
+    const fs = linuxFs({ bootId: () => 'boot-2', machineId: () => 'mid-1' });
+    const renamed = linuxHolder({ host: 'old-name', machineId: 'mid-1' });
+    expect(holderState(renamed, linuxEvidence({ procFs: fs }))).toBe('dead');
+    const other = linuxHolder({ host: 'old-name', machineId: 'mid-2' });
+    expect(holderState(other, linuxEvidence({ procFs: fs }))).toBe('foreign');
+  });
+
+  it('linux, same machine and boot: a namespace still visible from here is foreign, a gone one is dead', () => {
+    const gone = linuxFs({
+      pidNs: () => 'pid:[9]',
+      machineId: () => 'mid-1',
+      pids: () => [900],
+      pidNsOf: () => 'pid:[9]',
+    });
+    const holder = linuxHolder({ machineId: 'mid-1', pidNs: 'pid:[1]' });
+    expect(holderState(holder, linuxEvidence({ procFs: gone }))).toBe('dead');
+    const nested = linuxFs({
+      pidNs: () => 'pid:[9]',
+      machineId: () => 'mid-1',
+      pids: () => [900, 901],
+      pidNsOf: (pid) => (pid === 901 ? 'pid:[1]' : 'pid:[9]'),
+    });
+    expect(holderState(holder, linuxEvidence({ procFs: nested }))).toBe('foreign');
+    // Without a machine id nothing says the namespace belongs to this machine: foreign.
+    expect(holderState(linuxHolder({ pidNs: 'pid:[1]' }), linuxEvidence({ procFs: gone }))).toBe(
+      'foreign',
+    );
+  });
+
+  it('win32: a holder recorded under an earlier machine name is judged here', () => {
+    expect(
+      holderState(winHolder({ host: 'OLD-NAME' }), winEvidence({ isAlive: () => false })),
+    ).toBe('dead');
+    expect(holderState(winHolder({ host: 'OLD-NAME' }), winEvidence())).toBe('alive');
+  });
+});
+
+describe('a process query that does not finish', () => {
+  it('a query killed at its timeout is incomplete, with what it printed so far', async () => {
+    const hang = await runQuery(
+      process.execPath,
+      ['-e', "console.log('1 2 3'); setTimeout(() => {}, 60000)"],
+      process.env,
+      false,
+      1500,
+    );
+    expect(hang.complete).toBe(false);
+    expect(hang.lines).toContain('1 2 3');
+    const done = await runQuery(
+      process.execPath,
+      ['-e', "console.log('4 5 6')"],
+      process.env,
+      false,
+    );
+    expect(done).toMatchObject({ complete: true });
+    const failed = await runQuery(process.execPath, ['-e', 'process.exit(3)'], process.env, false);
+    expect(failed.complete).toBe(false);
+  });
+
+  it('a process table from an incomplete query is refused, never read as the whole table', async () => {
+    const partial = () => Promise.resolve({ lines: ['4 1 133000000000000000'], complete: false });
+    await expect(readProcessTable(partial)).rejects.toThrow();
+    const whole = () => Promise.resolve({ lines: ['4 1 133000000000000000'], complete: true });
+    expect(await readProcessTable(whole)).toHaveLength(1);
+  });
+});
+
+describe('telling a Claude Code from anything else that inherited its profile', () => {
+  it('a program named claude, or one run from where Claude Code is installed, is one', () => {
+    for (const argv of [
+      ['/home/u/.local/bin/claude', '-p', 'hi'],
+      ['claude'],
+      ['node', '/usr/local/bin/claude', '-p', 'hi'],
+      ['node', '/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js', '--resume', 'x'],
+      ['/home/u/.local/share/claude/versions/2.1.301', '--bg'],
+    ]) {
+      expect(isClaudeCodeProcess({ argv })).toBe(true);
+    }
+    expect(isClaudeCodeProcess({ image: 'claude.exe', commandLine: 'claude.exe -p hi' })).toBe(
+      true,
+    );
+    expect(
+      isClaudeCodeProcess({
+        image: 'node.exe',
+        commandLine: String.raw`"C:\Program Files\nodejs\node.exe" C:\Users\u\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js`,
+      }),
+    ).toBe(true);
+  });
+
+  it('a dev server, an editor or a shell is not, even when its arguments mention claude', () => {
+    for (const argv of [
+      ['node', '/home/u/app/node_modules/.bin/vite'],
+      ['sleep', '900'],
+      ['bash', '-c', 'claude -p hi'],
+      ['/usr/bin/code', '/home/u/claude'],
+    ]) {
+      expect(isClaudeCodeProcess({ argv })).toBe(false);
+    }
+    expect(
+      isClaudeCodeProcess({ image: 'node.exe', commandLine: 'node.exe C:/repo/server.js' }),
+    ).toBe(false);
+  });
+
+  it('a process whose command line cannot be read counts as one: a doubt keeps the session', () => {
+    expect(isClaudeCodeProcess({})).toBe(true);
+    expect(isClaudeCodeProcess({ argv: [] })).toBe(true);
+    expect(isClaudeCodeProcess({ image: 'node.exe' })).toBe(true);
+  });
+
+  it('the process table carries each name and command line; /proc gives each argument list', () => {
+    const ms = Date.UTC(2026, 3, 2);
+    const ft = (BigInt(ms) * 10_000n + 116_444_736_000_000_000n).toString();
+    expect(
+      parseProcessTable([
+        `10 4 ${ft} claude.exe|C:/u/claude.exe -p a|b`,
+        `11 10 ${ft} System Idle Process|`,
+      ]),
+    ).toEqual([
+      { pid: 10, ppid: 4, startMs: ms, name: 'claude.exe', commandLine: 'C:/u/claude.exe -p a|b' },
+      { pid: 11, ppid: 10, startMs: ms, name: 'System Idle Process' },
+    ]);
+    const fs = createProcFs(
+      '/proc',
+      fixtureIo({
+        '/proc/812/cmdline': ['node', '/opt/claude-code/cli.js', '-p', ''].join(
+          String.fromCharCode(0),
+        ),
+        '/proc/813/cmdline': 'claude',
+      }),
+    );
+    expect(fs.cmdlineOf?.(812)).toEqual(['node', '/opt/claude-code/cli.js', '-p']);
+    expect(fs.cmdlineOf?.(813)).toEqual(['claude']);
+    expect(fs.cmdlineOf?.(814)).toBeUndefined();
   });
 });

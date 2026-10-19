@@ -1668,6 +1668,21 @@ export class Daemon {
     if (sweep === undefined || this.leaseOccupancyProbe === undefined) return;
     try {
       const report = await sweep({ mode: 'full', probe: this.leaseOccupancyProbe });
+      // The engine's own lines for these are debug detail; the daemon log is where an operator
+      // looks for why an account came back to the pool, or why it is still held.
+      for (const e of report.ended) {
+        this.logger.info(
+          { accountId: e.accountId, adoptedRotation: e.adoptedRotation },
+          `ended the parallel session of ${e.label}: no process of it runs any more`,
+        );
+      }
+      for (const a of report.adopted) {
+        this.logger.info(
+          { accountId: a.accountId, pid: a.pid },
+          `parallel session of ${a.label}: process ${a.pid} still runs on its profile, so it now ` +
+            `holds the session; ${a.label} stays reserved until it exits`,
+        );
+      }
       const now = this.clock();
       for (const d of report.deferred) {
         const key = `${d.accountId}\u0000${d.reason}`;

@@ -167,8 +167,23 @@ export function startWslDaemonTaskNow(options: WslTaskOptions): void {
   startDaemonTaskNow(runnerFor(options), wslTaskName(options.host.distro));
 }
 
+/**
+ * The task as registered, its `execute` the cctl shim the distro runs rather than `wsl.exe` (which
+ * every WSL task runs): what a build check and a version check need to name. The shim is read back
+ * out of the `exec '<shim>'` word of the bash script {@link wslTaskAction} wrote; a task whose
+ * arguments do not hold one keeps `wsl.exe`.
+ */
 export function queryWslDaemonTask(options: WslTaskOptions): DaemonTaskQuery {
-  return queryDaemonTask(runnerFor(options), wslTaskName(options.host.distro));
+  const q = queryDaemonTask(runnerFor(options), wslTaskName(options.host.distro));
+  const shim = q.arguments === undefined ? undefined : wslShimOfArguments(q.arguments);
+  return shim === undefined ? q : { ...q, execute: shim };
+}
+
+/** The shim path inside a WSL task's arguments: the bash-quoted word after `exec` (an apostrophe
+ *  in it written as `'\''`, as {@link bashQuote} writes one). */
+export function wslShimOfArguments(args: string): string | undefined {
+  const m = /exec '((?:[^']|'\\'')*)'/.exec(args);
+  return m === null ? undefined : m[1]!.replace(/'\\''/g, "'");
 }
 
 export function uninstallWslDaemonTask(options: WslTaskOptions): DaemonUninstallOutcome {

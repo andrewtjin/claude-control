@@ -35,6 +35,7 @@ import {
   resolveAccountArg,
 } from './folderCommands.js';
 import { resumeSessionCommand } from './folderRender.js';
+import { sweepBeforeLeaseRefusal } from './leaseCli.js';
 import { SESSION_ID_ENV, type SessionAliasDeps } from './sessionAliases.js';
 
 export interface SessionRuleOptions {
@@ -201,6 +202,9 @@ export async function runSessionExclude(
   const engine = deps.engine ?? buildEngine(deps.paths);
   const target = await resolveAliasTarget(alias, options.cwd, deps);
   const ids = await resolveAccountArg(engine, 'exclude', accountsArg, 'session');
+  // A parallel session refuses the exclude while it holds an account: one whose processes are
+  // gone is ended first, as cctl switch does.
+  for (const id of ids) await sweepBeforeLeaseRefusal(engine, deps.paths, id);
   const result = await engineCall(() =>
     engine.excludeInAlias(target.folder, target.alias, ids, {
       ...(options.label !== undefined ? { label: options.label } : {}),

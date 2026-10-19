@@ -232,6 +232,9 @@ export interface LeaseHolder {
   /** linux: the pid namespace it was recorded in. Another namespace (another WSL distro, a
    *  container) is foreign: its pids mean nothing here. */
   pidNs?: string;
+  /** linux: `/etc/machine-id` of the machine that recorded it. A renamed machine keeps it, so a
+   *  holder recorded under the old host name is still judged here (see `holderState`). */
+  machineId?: string;
   /** launcher: the `cctl claude` process. claude: its Claude Code child, or a process found running
    *  on the slot's profile. background: a worker the profile's background service hosts. */
   role: 'launcher' | 'claude' | 'background';
@@ -648,12 +651,17 @@ export interface ProcessRow {
   ppid: number;
   /** Creation time, epoch ms (from an absolute FILETIME, so a wall-clock step does not move it). */
   startMs: number;
+  /** The image name (`claude.exe`, `node.exe`), when the query gave one. */
+  name?: string;
+  /** The command line, when the query could read it (another user's process gives none). */
+  commandLine?: string;
 }
 
 /** The Linux `/proc` reads a parallel session's checks use: synchronous file reads, no spawn. */
 export interface ProcFs {
-  /** Fields 4 (ppid) and 22 (start, clock ticks since boot) of `/proc/<pid>/stat`. */
-  stat(pid: number): { ppid: number; startTicks: number } | undefined;
+  /** Fields 3 (state), 4 (ppid) and 22 (start, clock ticks since boot) of `/proc/<pid>/stat`. A
+   *  zombie (`Z`) still answers kill-0 and keeps its start: only its state says it exited. */
+  stat(pid: number): { ppid: number; startTicks: number; state?: string } | undefined;
   /** `/proc/sys/kernel/random/boot_id`. */
   bootId(): string | undefined;
   /** This process's pid namespace (`readlink /proc/self/ns/pid`). */
@@ -662,6 +670,12 @@ export interface ProcFs {
   configDirOf(pid: number): string | undefined;
   /** Every pid listed under `/proc`. */
   pids(): number[];
+  /** `/etc/machine-id`: what identifies this machine across a rename and a reboot. */
+  machineId?(): string | undefined;
+  /** A process's pid namespace (`readlink /proc/<pid>/ns/pid`). */
+  pidNsOf?(pid: number): string | undefined;
+  /** A process's arguments (`/proc/<pid>/cmdline`), undefined when they cannot be read. */
+  cmdlineOf?(pid: number): string[] | undefined;
 }
 
 /** Whether a holder's process still runs, judged from this process (see `holderState`):
@@ -705,13 +719,27 @@ export type SessionSlotClaim =
       joined: boolean;
       /** Holders recorded after the claim. */
       holders: number;
-      /** Other terminals (launcher holders) on the session when this one joined. */
+      /** Other terminals still running on the session when this one joined (see `leaseOccupants`). */
       otherTerminals: number;
+      /** Background sessions its profile's service hosts, still running when this one joined. */
+      otherBackground?: number;
     };
 
-/** Why a parallel session that has no live holder left was not ended yet. */
+/** Why a parallel session that has no live holder left was not ended yet:
+ *  - `roster_unreadable` / `no_probe`: its background-session roster could not be read;
+ *  - `processes_unreadable`: the process table that shows what still runs on its profile could not
+ *    be read (Windows);
+ *  - `slot_untrusted`: its slot has a switch that cannot be settled;
+ *  - `login_unadopted`: its slot holds a login that could not be read or adopted into the vault, and
+ *    clearing it would lose the only copy of that token (a re-login of the account heals it);
+ *  - `teardown_failed`: ending it failed part-way (the sweep retries it). */
 export type LeaseDeferReason =
-  'roster_unreadable' | 'no_probe' | 'unrecorded_child' | 'slot_untrusted';
+  | 'roster_unreadable'
+  | 'no_probe'
+  | 'processes_unreadable'
+  | 'slot_untrusted'
+  | 'login_unadopted'
+  | 'teardown_failed';
 
 /** What `SwitchEngine.releaseLease` did. */
 export interface LeaseRelease {
@@ -721,6 +749,9 @@ export interface LeaseRelease {
   remaining: number;
   /** The lease outlived its terminals because its profile's background service still hosts workers. */
   deferredToBackground: boolean;
+  /** The lease outlived its terminals because these processes still run on its profile (started from
+   *  the session, outliving its Claude Code); they now hold it, and it ends when they exit. */
+  heldBy?: number[];
   /** Set when nothing was ended although no holder of this release is left: the sweep finishes it. */
   deferred?: LeaseDeferReason;
 }
@@ -746,4 +777,7 @@ export interface LeaseView {
   /** Full mode, when no recorded holder runs: processes running on the profile that no holder
    *  records (the next full sweep records them). */
   unrecorded?: number[];
+  /** Full mode, when no recorded holder runs: the process table that would show such processes could
+   *  not be read, so the sweep defers ending the session. */
+  processesUnreadable?: true;
 }
