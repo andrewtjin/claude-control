@@ -19,6 +19,7 @@ import {
   CLAUDE_CODE_TITLE_MAX_LENGTH,
   aliasFitsSessionTitle,
   isLeaseRule,
+  leaseOccupants,
   shellQuoteArg,
   type FolderRule,
   type LeaseOccupancyProbe,
@@ -543,15 +544,14 @@ export function checkSessionLeases(
     const label = sanitizeForTerminal(lease.label);
     const running = lease.holders.filter((h) => h.state === 'alive' || h.state === 'unverifiable');
     if (running.length > 0) {
-      const launchers = new Set(running.filter((h) => h.role === 'launcher').map((h) => h.pid));
-      const unattended = running.filter(
-        (h) => h.role === 'claude' && (h.parent === undefined || !launchers.has(h.parent)),
-      );
-      if (launchers.size === 0 && unattended.length === running.length) {
+      // Counted the way status and the account list count it, so the three never disagree.
+      const occupants = leaseOccupants(running);
+      if (occupants.terminals === 0 && occupants.background === 0 && occupants.leftover > 0) {
+        const left = running.filter((h) => h.role === 'claude' && h.found === true);
         notes.push(
-          `${label} is held only by process(es) ${unattended.map((h) => h.pid).join(', ')} that ` +
-            'no terminal runs (a session whose terminal closed, or something it started); it ' +
-            'rejoins the pool when they exit',
+          `${label} is held only by process(es) ${left.map((h) => h.pid).join(', ')} that ` +
+            'no terminal runs (a Claude Code the session started, still running after its ' +
+            'terminals exited); it rejoins the pool when they exit',
         );
       }
       continue;
@@ -562,7 +562,9 @@ export function checkSessionLeases(
         `the parallel session of ${label} is held by processes this machine cannot check (` +
           foreign.map((h) => `pid ${h.pid} on ${h.platform}`).join(', ') +
           ', another pid namespace or host): exit them where they run; the next cctl claude ' +
-          '--account or cctl switch there frees it.',
+          '--account or cctl switch there frees it. Processes of a WSL distro that has since ' +
+          'restarted read as ended once the WSL VM restarts (wsl --shutdown) or the machine ' +
+          'reboots.',
       );
       continue;
     }

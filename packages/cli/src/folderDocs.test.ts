@@ -90,3 +90,16 @@ describe('docs/CLI.md on folder rules', () => {
     expect(docText()).toContain('A session moves at most once an hour');
   });
 });
+
+describe('the parallel-session docs', () => {
+  it('a reserved account runs in the slot of the rule it is reserved to, a named session one included', () => {
+    const text = docText();
+    // A named session's rule has no folder, so "a folder it is reserved to" would send a reader to
+    // "a slot of its own", which `--account` does not give there.
+    expect(text).toContain(
+      'in the slot of a folder or named session `work` is reserved to (a rule that includes it), ' +
+        "when it is live there, from any folder. The session then follows that rule's switches",
+    );
+    expect(text).not.toContain('in the slot of a folder `work` is reserved to');
+  });
+});

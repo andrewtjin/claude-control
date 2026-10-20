@@ -269,7 +269,7 @@ export function renderSetupSummary(
     ? ok('discord: paired')
     : warn('discord: local-only (not paired) — pair later: cctl setup --reconfigure');
 
-  // An account a parallel session holds is out of the pool until its terminals exit; say so beside
+  // An account a parallel session holds is out of the pool until that session ends; say so beside
   // the accounts, since no switch reaches it meanwhile. One whose processes all exited is a warning:
   // it still holds the account until a check ends it.
   const sessions = s.parallelSessions ?? [];

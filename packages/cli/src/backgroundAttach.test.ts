@@ -1409,6 +1409,29 @@ describe("routeBackgroundLaunch — a session on a parallel session's slot", () 
     expect(d).toMatchObject(openUnder(P));
     expect(w.host.rowsOf()).toEqual([P]);
   });
+
+  it('runs nowhere, its latest row there and an older one on the folder slot: opened there, never moved', async () => {
+    const w = world();
+    w.host.extraDirs.push(P);
+    w.host.row(X, 'stopped', SID, { updatedAt: '2026-10-09T20:00:00Z' });
+    w.host.row(P, 'stopped', SID, { updatedAt: '2026-10-09T23:00:00Z' });
+    const d = await decideIn(w, attach(SHORT));
+    expect(d).toMatchObject(openUnder(P));
+    // Only the folder slot's older row goes, as for any session opened where it last ran.
+    expect(w.host.calls).toEqual([`rm ${X} ${SHORT}`]);
+    expect(w.host.rowsOf()).toEqual([P]);
+  });
+
+  it('runs nowhere, its latest row on the folder slot and an older one there: the parallel row is kept', async () => {
+    const w = world();
+    w.host.extraDirs.push(P);
+    w.host.row(P, 'stopped', SID, { updatedAt: '2026-10-09T20:00:00Z' });
+    w.host.row(X, 'stopped', SID, { updatedAt: '2026-10-09T23:00:00Z' });
+    const d = await decideIn(w, attach(SHORT));
+    expect(d).toMatchObject(openUnder(X));
+    expect(w.host.calls.some((c) => c.startsWith(`rm ${P}`))).toBe(false);
+    expect(w.host.rowsOf()).toContain(P);
+  });
 });
 
 describe('routeBackgroundLaunch — the session runs in no service', () => {

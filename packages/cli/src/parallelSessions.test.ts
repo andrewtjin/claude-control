@@ -7,7 +7,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { FolderRule, LeaseHolder, LeaseView } from '@claude-control/switch-engine';
+import type { FolderRule, LeaseHolder, LeaseView, ProcFs } from '@claude-control/switch-engine';
 import {
   SESSION_LEASES_REPORT_ROW,
   FOLDER_RULES_SUPPORTED,
@@ -20,7 +20,8 @@ import { resolveDaemonConfig, type SettingsReport } from './settings.js';
 import { leaseArgRefusal, startsBackgroundSession } from './backgroundAttach.js';
 import { holdLeaseSignals, leaseInUse, trackChildHolder } from './leaseCli.js';
 import { createLeaseOccupancyProbe } from './leaseProbe.js';
-import { cctlVersionOf, findCctlOnPath } from './installLookup.js';
+import { cctlVersionOf, findCctlOnPath, wrapperEntriesOf } from './installLookup.js';
+import { POWERSHELL_WRAPPER_MARKER, readPowerShellWrappers, renderShellInit } from './shellInit.js';
 import {
   checkDaemonScopeSupport,
   checkRuleScopes,
@@ -74,7 +75,7 @@ describe('the install fence', () => {
     let askedAutostart = false;
     const l: InstallLookup = {
       onPath: () => over.onPath,
-      wrapperEntry: () => over.wrapper,
+      wrapperEntries: () => (over.wrapper === undefined ? [] : [over.wrapper]),
       autostart: () => {
         askedAutostart = true;
         return over.auto;
@@ -196,6 +197,17 @@ describe('arguments a parallel session cannot run', () => {
           '--account cannot choose one for it. Run it without --account.',
       );
     }
+    // Flags may stand between the verb and the session it names: the verb is still what is quoted.
+    expect(refused(['kill', '--force', 'abc12345'])).toMatch(
+      /^"kill" acts on a background session/,
+    );
+    expect(refused(['stop', '--verbose', 'abc12345'])).toMatch(
+      /^"stop" acts on a background session/,
+    );
+    expect(refused(['attach', '--verbose', 'abc12345'])).toMatch(
+      /^"attach" opens a background session/,
+    );
+    expect(refused(['--', 'rm', '--verbose', 'abc12345'])).toMatch(/^"rm" acts on/);
     expect(refused(['auth', 'login'])).toBe(
       '"claude auth" is not a session; run it without --account.',
     );
@@ -474,7 +486,7 @@ describe('doctor and parallel sessions', () => {
   });
 
   it('names the processes holding a session that no terminal runs', () => {
-    const found = h(900, 'alive', { role: 'claude', parent: 812 });
+    const found = h(900, 'alive', { role: 'claude', parent: 812, found: true });
     const c = checkSessionLeases([view([found])]);
     expect(c.ok).toBe(true);
     expect(c.detail).toContain('W is held only by process(es) 900 that no terminal runs');
@@ -516,21 +528,190 @@ describe('doctor and parallel sessions', () => {
 });
 
 describe('the background-worker probe on Linux', () => {
-  it("verifies the roster even for a file-only read: a stale entry's reused pid is never a holder", async () => {
-    const asked: boolean[] = [];
-    const probe = createLeaseOccupancyProbe(
+  /** A `/proc` with one process, pid 2345, an unrelated program that took the pid over unless the
+   *  test says otherwise: its start ticks, its state and its environment's config dir. */
+  function proc(over: { state?: string; configDir?: string } = {}): ProcFs {
+    return {
+      stat: (pid) =>
+        pid === 2345 ? { ppid: 1, startTicks: 99999, state: over.state ?? 'S' } : undefined,
+      bootId: () => 'boot-1',
+      pidNs: () => 'pid:[1]',
+      configDirOf: (pid) => (pid === 2345 ? over.configDir : undefined),
+      pids: () => [2345],
+    };
+  }
+  /** A probe over a roster naming pid 2345 as given, whatever verification is asked for. */
+  function probeOf(
+    worker: { pid: number; procStart?: string },
+    fs: ProcFs,
+    starts: Map<number, string> = new Map(),
+  ) {
+    return createLeaseOccupancyProbe(
+      { hostedWorkerProcesses: () => Promise.resolve([worker]) },
       {
-        // A roster left by a service that died: its worker pid now runs another process, which
-        // only the verified read leaves out.
-        hostedWorkerProcesses: (_dir, opts) => {
-          asked.push(opts.verify);
-          return Promise.resolve(opts.verify ? [] : [{ pid: 2345, procStart: '4242' }]);
-        },
+        platform: 'linux',
+        hostname: () => 'box',
+        procFs: fs,
+        readStarts: () => Promise.resolve(starts),
       },
-      { platform: 'linux', hostname: () => 'box' },
     );
-    expect(await probe('/p', { verify: false })).toEqual([]);
-    expect(asked).toEqual([true]);
+  }
+  const PROFILE = '/home/u/.local/share/claude-control/profiles/session-w';
+
+  it('a roster entry with no recorded start whose environment names nothing is not a holder', async () => {
+    expect(await probeOf({ pid: 2345 }, proc())('/p', { verify: false })).toEqual([]);
+  });
+
+  it("a recorded start that ps cannot read now decides nothing: unreadable, never the reuser's", async () => {
+    expect(
+      await probeOf({ pid: 2345, procStart: 'Mon Oct 19 10:00:00 2026' }, proc())(PROFILE, {
+        verify: false,
+      }),
+    ).toBe('unreadable');
+  });
+
+  it('a recorded start that differs from the one read fresh now is another process', async () => {
+    const probe = probeOf(
+      { pid: 2345, procStart: 'Mon Oct 19 10:00:00 2026' },
+      proc(),
+      new Map([[2345, 'Mon Oct 19 11:30:00 2026']]),
+    );
+    expect(await probe(PROFILE, { verify: true })).toEqual([]);
+  });
+
+  it('a worker proven by its start, or by its environment naming the profile, holds it', async () => {
+    const byStart = probeOf(
+      { pid: 2345, procStart: 'Mon Oct 19 10:00:00 2026' },
+      proc(),
+      new Map([[2345, 'Mon Oct 19 10:00:00 2026']]),
+    );
+    expect(await byStart(PROFILE, { verify: false })).toMatchObject([
+      { pid: 2345, start: 99999, role: 'background', platform: 'linux' },
+    ]);
+    const byEnvironment = probeOf({ pid: 2345 }, proc({ configDir: `${PROFILE}/` }));
+    expect(await byEnvironment(PROFILE, { verify: false })).toMatchObject([
+      { pid: 2345, start: 99999, role: 'background' },
+    ]);
+  });
+
+  it('a worker that exited but was not reaped is gone', async () => {
+    for (const state of ['Z', 'X']) {
+      const probe = probeOf({ pid: 2345 }, proc({ state, configDir: PROFILE }));
+      expect(await probe(PROFILE, { verify: true })).toEqual([]);
+    }
+  });
+});
+
+describe("the PowerShell wrappers' installs, read from the profiles", () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(dirs.splice(0).map((d) => rm(d, { recursive: true, force: true })));
+  });
+
+  /** A cctl install at `version` under `root`, and the path of its entry script. */
+  async function install(root: string, version: string): Promise<string> {
+    const pkg = join(root, `v${version}`, 'node_modules', '@andrewtjin', 'cctl');
+    await mkdir(join(pkg, 'dist'), { recursive: true });
+    await writeFile(
+      join(pkg, 'package.json'),
+      JSON.stringify({ name: '@andrewtjin/cctl', version }),
+    );
+    await writeFile(join(pkg, 'dist', 'bin.js'), '');
+    return join(pkg, 'dist', 'bin.js');
+  }
+  const wrapper = (entry: string): string =>
+    renderShellInit('powershell', { nodePath: 'C:/node/node.exe', cctlEntry: entry });
+
+  /** The older-install refusal as a real lookup gives it for these profiles, PATH and autostart
+   *  aside. */
+  const refusal = (env: NodeJS.ProcessEnv): string | undefined =>
+    olderInstallReason({
+      onPath: () => undefined,
+      wrapperEntries: () => wrapperEntriesOf(env),
+      autostart: () => undefined,
+      versionOf: cctlVersionOf,
+    });
+
+  async function setup(): Promise<{ root: string; old: string; next: string }> {
+    const root = await mkdtemp(join(tmpdir(), 'cctl-wrappers-'));
+    dirs.push(root);
+    return { root, old: await install(root, '1.0.0'), next: await install(root, '1.1.0') };
+  }
+
+  async function profile(path: string, text: string): Promise<void> {
+    await mkdir(join(path, '..'), { recursive: true });
+    await writeFile(path, text);
+  }
+
+  it('the last wrapper a profile defines is the one in effect: an old one appended refuses', async () => {
+    const { root, old, next } = await setup();
+    const env = { USERPROFILE: root };
+    const ps5 = join(root, 'Documents', 'WindowsPowerShell', 'Microsoft.PowerShell_profile.ps1');
+    await profile(ps5, wrapper(next) + '\n' + wrapper(old));
+    expect(readPowerShellWrappers(env).map((w) => w.profile)).toEqual([ps5]);
+    expect(refusal(env)).toContain(
+      `the PowerShell claude wrapper runs the cctl at ${old} (v1.0.0)`,
+    );
+    // Upgraded by appending: the new one is in effect, nothing refuses.
+    await profile(ps5, wrapper(old) + '\n' + wrapper(next));
+    expect(refusal(env)).toBeUndefined();
+  });
+
+  it("every host's profile counts: PowerShell 7's own, and a OneDrive Documents beside a local one", async () => {
+    const { root, old, next } = await setup();
+    await profile(
+      join(root, 'Documents', 'WindowsPowerShell', 'Microsoft.PowerShell_profile.ps1'),
+      wrapper(next),
+    );
+    await profile(
+      join(root, 'Documents', 'PowerShell', 'Microsoft.PowerShell_profile.ps1'),
+      wrapper(old),
+    );
+    expect(refusal({ USERPROFILE: root })).toContain('(v1.0.0)');
+    const drive = join(root, 'OneDrive');
+    const local = await mkdtemp(join(tmpdir(), 'cctl-wrappers-'));
+    dirs.push(local);
+    await profile(
+      join(local, 'Documents', 'WindowsPowerShell', 'Microsoft.PowerShell_profile.ps1'),
+      wrapper(next),
+    );
+    await profile(
+      join(drive, 'Documents', 'WindowsPowerShell', 'Microsoft.PowerShell_profile.ps1'),
+      wrapper(old),
+    );
+    expect(refusal({ USERPROFILE: local, OneDrive: drive })).toContain('(v1.0.0)');
+  });
+
+  it('a profile whose last wrapper is the shim form runs PATH, which is checked on its own', async () => {
+    const { root, old } = await setup();
+    await profile(
+      join(root, 'Documents', 'WindowsPowerShell', 'profile.ps1'),
+      wrapper(old) + '\n' + renderShellInit('powershell'),
+    );
+    expect(readPowerShellWrappers({ USERPROFILE: root }).map((w) => w.wrapper.kind)).toEqual([
+      'shim',
+    ]);
+    expect(refusal({ USERPROFILE: root })).toBeUndefined();
+    expect(POWERSHELL_WRAPPER_MARKER).toBe('cctl claude wrapper (PowerShell)');
+  });
+});
+
+describe('what a parallel session is in use by', () => {
+  it('a Claude Code left running after its terminals exited is said as such, not as a terminal', () => {
+    const left: LeaseView['holders'][number] = {
+      pid: 900,
+      start: 1,
+      host: 'h',
+      platform: 'win32',
+      role: 'claude',
+      parent: 812,
+      found: true,
+      state: 'alive',
+    };
+    expect(leaseInUse({ holders: [left] })).toEqual({
+      phrase: '1 Claude Code process left running',
+      running: true,
+    });
   });
 });
 

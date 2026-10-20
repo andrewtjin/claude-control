@@ -263,6 +263,35 @@ export function powerShellProfilePaths(env: NodeJS.ProcessEnv = process.env): st
   return paths;
 }
 
+/**
+ * The cctl wrapper in effect in each candidate PowerShell profile that carries one: the LAST one it
+ * defines, since PowerShell runs the last `function claude` it loads, and `cctl shell-init
+ * powershell | Out-File -Append $PROFILE` run again (after an upgrade, from another install) stacks
+ * definitions. Every profile is read: Windows PowerShell and PowerShell 7 load their own, and a
+ * OneDrive-redirected Documents can sit beside a local one, so any of them may be what a terminal
+ * runs. `read` is a seam for tests.
+ */
+export function readPowerShellWrappers(
+  env: NodeJS.ProcessEnv = process.env,
+  read: (path: string) => string = (p) => readFileSync(p, 'utf8'),
+): Array<{ profile: string; wrapper: ParsedPowerShellWrapper }> {
+  const out: Array<{ profile: string; wrapper: ParsedPowerShellWrapper }> = [];
+  for (const profile of powerShellProfilePaths(env)) {
+    let text: string;
+    try {
+      text = read(profile);
+    } catch {
+      // Absent or unreadable profile: nothing runs from it.
+      continue;
+    }
+    if (!text.includes(POWERSHELL_WRAPPER_MARKER)) continue;
+    const last = text.slice(text.lastIndexOf(POWERSHELL_WRAPPER_MARKER));
+    const wrapper = parsePowerShellWrapper(last);
+    if (wrapper !== undefined) out.push({ profile, wrapper });
+  }
+  return out;
+}
+
 /** Read the first PowerShell profile that carries a cctl wrapper (by its marker), for the wrapper
  *  check. Returns undefined when none of the candidate profiles exist or carry the wrapper. */
 export function readPowerShellWrapperProfile(

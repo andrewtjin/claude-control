@@ -143,9 +143,9 @@ export const PARALLEL_SESSIONS_SINCE = '1.1.0';
 export interface InstallLookup {
   /** The `cctl` a shell runs (the first on PATH), or undefined when none is there. */
   onPath(): string | undefined;
-  /** The cctl entry script the PowerShell `claude` wrapper runs (it names one by path, not by
-   *  PATH), or undefined when there is no such wrapper. */
-  wrapperEntry?(): string | undefined;
+  /** The cctl entry scripts the PowerShell `claude` wrappers run (each names one by path, not by
+   *  PATH): the wrapper each PowerShell profile defines last, which is the one that runs there. */
+  wrapperEntries?(): string[];
   /** What the autostart registration starts, and what to call it, or undefined for none. */
   autostart(): { noun: string; execute: string } | undefined;
   /** The version of the cctl install a shim or entry script belongs to; undefined when it cannot
@@ -193,9 +193,12 @@ export function olderInstallReason(
   if (pathOld !== undefined) {
     return `the cctl at ${onPath} (v${pathOld}) predates parallel sessions: ${tail}`;
   }
-  const entry = lookup.wrapperEntry?.();
+  // Every profile's wrapper: Windows PowerShell and PowerShell 7 each load their own, and any of
+  // them may be the one a terminal runs.
+  const entries = lookup.wrapperEntries?.() ?? [];
+  const entry = entries.find((e) => version(e) !== undefined);
   const entryOld = entry === undefined ? undefined : version(entry);
-  if (entryOld !== undefined) {
+  if (entry !== undefined && entryOld !== undefined) {
     return (
       `the PowerShell claude wrapper runs the cctl at ${entry} (v${entryOld}), which predates ` +
       `parallel sessions: ${tail}, then point the wrapper at it (replace the old one in your ` +

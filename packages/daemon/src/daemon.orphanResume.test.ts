@@ -167,7 +167,8 @@ describe('Daemon: re-attaching a session whose account runs a parallel session',
     };
     expect(payload.code).toBe('resume_failed');
     expect(payload.message).toContain(
-      'account "spare" is in use by a parallel session in a terminal',
+      'account "spare" is in use by a parallel session (a terminal, or a background session or ' +
+        'Claude Code process it started)',
     );
     expect(manager.resumeOrphanCalls).toEqual([]);
   });

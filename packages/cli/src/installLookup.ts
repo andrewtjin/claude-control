@@ -9,7 +9,7 @@ import { delimiter, dirname, join } from 'node:path';
 import { queryAutostart } from './autostart.js';
 import type { InstallLookup } from './folderRulesSupport.js';
 import { unwrapNpmCmdShim } from './launcher.js';
-import { parsePowerShellWrapper, readPowerShellWrapperProfile } from './shellInit.js';
+import { readPowerShellWrappers } from './shellInit.js';
 
 /** The package a cctl install is published as. */
 const PACKAGE_NAME = '@andrewtjin/cctl';
@@ -81,16 +81,19 @@ export function cctlVersionOf(path: string): string | undefined {
   );
 }
 
+/** The cctl entry scripts the PowerShell `claude` wrappers in effect run: each profile's last
+ *  wrapper (see readPowerShellWrappers), where it runs an install by path rather than PATH. */
+export function wrapperEntriesOf(env: NodeJS.ProcessEnv = process.env): string[] {
+  return readPowerShellWrappers(env).flatMap(({ wrapper }) =>
+    wrapper.kind === 'node-direct' ? [wrapper.cctlEntry] : [],
+  );
+}
+
 /** The real machine's installs. */
 export function defaultInstallLookup(): InstallLookup {
   return {
     onPath: () => findCctlOnPath(),
-    wrapperEntry: () => {
-      if (process.platform !== 'win32') return undefined;
-      const text = readPowerShellWrapperProfile();
-      const parsed = text === undefined ? undefined : parsePowerShellWrapper(text);
-      return parsed?.kind === 'node-direct' ? parsed.cctlEntry : undefined;
-    },
+    wrapperEntries: () => (process.platform === 'win32' ? wrapperEntriesOf() : []),
     autostart: () => {
       const q = queryAutostart();
       return q.supported && q.registered && q.execute !== undefined

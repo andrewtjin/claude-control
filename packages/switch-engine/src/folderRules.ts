@@ -93,34 +93,76 @@ export function withoutHolders(
   return holders.filter((h) => !removed.some((r) => sameHolder(h, r)));
 }
 
-/** Who a parallel session is in use by, counted the way a person would: terminals and background
- *  sessions. A terminal is each launcher, and each Claude Code (or process found running on the
- *  profile) whose launcher is not among the holders: one whose terminal was killed under it still
- *  runs where that terminal was. A background session is a worker the profile's service hosts.
- *  The caller passes the holders it counts (the live ones, for a display of what runs now). */
-export function leaseOccupants(holders: readonly Pick<LeaseHolder, 'pid' | 'role' | 'parent'>[]): {
+/** Who a parallel session is in use by, counted the way a person would: terminals, background
+ *  sessions, and Claude Code processes left running. A terminal is each launcher, and each Claude
+ *  Code a launcher recorded whose launcher is not among the holders: one whose terminal was killed
+ *  under it still runs where that terminal was. A background session is a worker the profile's
+ *  service hosts. A process left running is one found running on the profile after its terminals
+ *  exited (`found`): something the session started, which no terminal runs. The caller passes the
+ *  holders it counts (the live ones, for a display of what runs now). */
+export function leaseOccupants(
+  holders: readonly Pick<LeaseHolder, 'pid' | 'role' | 'parent' | 'found'>[],
+): {
   terminals: number;
   background: number;
+  /** Claude Code processes left running on the profile, which no terminal runs. */
+  leftover: number;
 } {
   const launchers = new Set(holders.filter((h) => h.role === 'launcher').map((h) => h.pid));
   const orphans = holders.filter(
-    (h) => h.role === 'claude' && (h.parent === undefined || !launchers.has(h.parent)),
+    (h) =>
+      h.role === 'claude' &&
+      h.found !== true &&
+      (h.parent === undefined || !launchers.has(h.parent)),
   ).length;
   return {
     terminals: launchers.size + orphans,
     background: holders.filter((h) => h.role === 'background').length,
+    leftover: holders.filter((h) => h.role === 'claude' && h.found === true).length,
   };
 }
 
+/** How many separate things {@link leaseOccupants} counted. */
+export function occupantCount(o: {
+  terminals: number;
+  background: number;
+  leftover?: number;
+}): number {
+  return o.terminals + o.background + (o.leftover ?? 0);
+}
+
 /** {@link leaseOccupants} as a phrase: "2 terminals", "1 background session", "1 terminal and 1
- *  background session"; "no running process" when there is none. */
-export function occupantsPhrase(o: { terminals: number; background: number }): string {
+ *  background session", "1 Claude Code process left running"; "no running process" when there is
+ *  none. */
+export function occupantsPhrase(o: {
+  terminals: number;
+  background: number;
+  leftover?: number;
+}): string {
   const parts: string[] = [];
   if (o.terminals > 0) parts.push(`${o.terminals} terminal${o.terminals === 1 ? '' : 's'}`);
   if (o.background > 0) {
     parts.push(`${o.background} background session${o.background === 1 ? '' : 's'}`);
   }
-  return parts.length === 0 ? 'no running process' : parts.join(' and ');
+  const leftover = o.leftover ?? 0;
+  if (leftover > 0) {
+    parts.push(`${leftover} Claude Code process${leftover === 1 ? '' : 'es'} left running`);
+  }
+  if (parts.length === 0) return 'no running process';
+  return parts.length === 1 ? parts[0]! : `${parts.slice(0, -1).join(', ')} and ${parts.at(-1)!}`;
+}
+
+/** The processes a parallel session runs as, one per thing {@link leaseOccupants} counts, for a
+ *  message to name: each terminal's Claude Code (its launcher while that is not recorded yet), each
+ *  background worker, each process left running. */
+export function leaseSessionPids(holders: readonly LeaseHolder[]): number[] {
+  return holders
+    .filter(
+      (h) =>
+        h.role !== 'launcher' ||
+        !holders.some((c) => c.role === 'claude' && c.found !== true && c.parent === h.pid),
+    )
+    .map((h) => h.pid);
 }
 
 /** One consistent picture of the registry: the shared rows (`accounts.json`), the reserved rows and

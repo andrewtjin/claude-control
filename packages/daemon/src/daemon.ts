@@ -404,8 +404,8 @@ class SpawnBindingError extends Error {}
 /** Why a managed spawn or resume naming an account a parallel session holds is refused. */
 function leasedSpawnRefusal(label: string): string {
   return (
-    `account "${label}" is in use by a parallel session in a terminal; it rejoins the pool when ` +
-    'that session exits'
+    `account "${label}" is in use by a parallel session (a terminal, or a background session or ` +
+    'Claude Code process it started); it rejoins the pool when that session ends'
   );
 }
 

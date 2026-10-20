@@ -589,7 +589,7 @@ export async function renderReservedAppendix(engine: Engine, palette: Palette): 
     renderReservedAccounts(
       views.filter((v) => !v.reservedToRules),
       palette,
-      'In use by a parallel session (out of the pool until its terminals exit; * = live there):',
+      'In use by a parallel session (out of the pool until it ends; * = live there):',
     ),
   ]
     .filter((t) => t !== '')
@@ -1958,6 +1958,16 @@ async function runParallelSession(input: {
 }): Promise<void> {
   const { engine, paths, account } = input;
   const label = sanitizeForTerminal(account.label);
+  // The account's name when a later line is printed: it can be renamed while the session runs, and
+  // every command such a line suggests must still resolve.
+  const labelNow = async (): Promise<string> => {
+    try {
+      const now = (await engine.listAllAccounts()).find((a) => a.id === account.id)?.label;
+      return now === undefined ? label : sanitizeForTerminal(now);
+    } catch {
+      return label;
+    }
+  };
   const say = (line: string): void => void process.stderr.write(`${line}\n`);
   const shield = holdLeaseSignals();
   try {
@@ -1982,22 +1992,26 @@ async function runParallelSession(input: {
     const shared: string[] = [];
     const terminals = claim.joined ? claim.otherTerminals : 0;
     const background = claim.joined ? (claim.otherBackground ?? 0) : 0;
+    const leftover = claim.joined ? (claim.otherLeftover ?? 0) : 0;
     if (terminals > 0) shared.push(`${terminals} other terminal${terminals === 1 ? '' : 's'}`);
     if (background > 0) {
       shared.push(`${background} background session${background === 1 ? '' : 's'}`);
+    }
+    if (leftover > 0) {
+      shared.push(`${leftover} Claude Code process${leftover === 1 ? '' : 'es'} left running`);
     }
     const slot: LaunchSlot = {
       ...input.slot,
       profileDir: claim.profileDir,
       context:
         shared.length > 0
-          ? `parallel session, this terminal only; shared with ${shared.join(' and ')}`
+          ? `parallel session, this terminal only; shared with ${joinWords(shared)}`
           : 'parallel session, this terminal only',
     };
     const child = trackChildHolder({
       add: (holders) => engine.addLeaseHolders(claim.ruleId, holders),
       say,
-      label,
+      label: labelNow,
     });
     const probe = cliLeaseProbe(paths) ?? NO_LEASE_WORKERS;
     try {
@@ -2020,7 +2034,13 @@ async function runParallelSession(input: {
     } finally {
       child.stop();
       await child.settled();
-      await releaseParallelSession(engine, claim.ruleId, [me, ...child.holders()], probe, label);
+      await releaseParallelSession(
+        engine,
+        claim.ruleId,
+        [me, ...child.holders()],
+        probe,
+        await labelNow(),
+      );
     }
   } finally {
     shield.release();
@@ -2040,27 +2060,35 @@ async function releaseParallelSession(
     void process.stderr.write(
       `cctl: could not return ${label} to the pool yet (${sanitizeForTerminal(reason)}); ` +
         (fix ??
-          `the daemon does it on its next poll, or, with no daemon, the next cctl claude ` +
-            `--account ${label} or cctl switch ${label} does.`) +
+          // The next check can find a Claude Code this session left running, which then keeps the
+          // account: it is never promised back unconditionally.
+          `the daemon checks again on its next poll (with no daemon, the next cctl claude ` +
+            `--account ${label} or cctl switch ${label} does): it then returns ${label} to the ` +
+            `pool, or, if a Claude Code process started from this session still runs on its ` +
+            `profile, keeps ${label} reserved until that exits (cctl doctor names it).`) +
         '\n',
     );
   try {
     const released = await engine.releaseLease(ruleId, holders, probe);
-    if (released.deferredToBackground) {
+    if (released.heldBy !== undefined && released.heldBy.length > 0) {
+      // A Claude Code this session started (a backgrounded `claude -p`) outlived it on its
+      // profile: it holds the account now, and nothing ends the session while it runs.
+      const one = released.heldBy.length === 1;
+      const pids = released.heldBy.join(', ');
+      const alsoBackground = released.deferredToBackground
+        ? ', and so do the background session(s) this session started'
+        : '';
+      process.stderr.write(
+        `cctl: ${label} stays reserved: Claude Code process${one ? '' : 'es'} ` +
+          `${pids}, started from this session, still run${one ? 's' : ''} ` +
+          `on its profile and may use its login${alsoBackground}. It rejoins the pool when ` +
+          `${one ? 'that process exits' : 'they exit'}; to free it now, ` +
+          `end ${one ? 'it' : 'them'} (pid ${pids}).\n`,
+      );
+    } else if (released.deferredToBackground) {
       process.stderr.write(
         `cctl: ${label} stays reserved while the background session(s) this session started ` +
           'run; it rejoins the pool when they end.\n',
-      );
-    } else if (released.heldBy !== undefined && released.heldBy.length > 0) {
-      // A Claude Code this session started (a backgrounded `claude -p`) outlived it on its
-      // profile: it holds the account now, and nothing ends the session while it runs.
-      const pids = released.heldBy.join(', ');
-      process.stderr.write(
-        `cctl: ${label} stays reserved: Claude Code process${released.heldBy.length === 1 ? '' : 'es'} ` +
-          `${pids}, started from this session, still run${released.heldBy.length === 1 ? 's' : ''} ` +
-          `on its profile and may use its login. It rejoins the pool when ` +
-          `${released.heldBy.length === 1 ? 'that process exits' : 'they exit'}; to free it now, ` +
-          `end ${released.heldBy.length === 1 ? 'it' : 'them'} (pid ${pids}).\n`,
       );
     } else if (released.deferred === 'login_unadopted') {
       later(
@@ -2074,6 +2102,13 @@ async function releaseParallelSession(
   } catch (err) {
     later(err instanceof Error ? err.message : String(err));
   }
+}
+
+/** Phrases joined as a list: "a", "a and b", "a, b and c". */
+function joinWords(parts: readonly string[]): string {
+  return parts.length <= 1
+    ? (parts[0] ?? '')
+    : `${parts.slice(0, -1).join(', ')} and ${parts.at(-1)!}`;
 }
 
 /** Why a release was deferred, in words. */

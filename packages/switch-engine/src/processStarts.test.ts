@@ -4,15 +4,19 @@
 
 import { describe, it, expect } from 'vitest';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   LEASE_START_TOLERANCE_MS,
   childHolder,
   createProcFs,
+  INITIAL_PID_NS,
   holderState,
   isClaudeCodeProcess,
+  parseConfigDirLines,
   parseProcessTable,
+  readProcessConfigDirs,
   readProcessTable,
   runQuery,
   selfHolder,
@@ -354,26 +358,39 @@ describe('holderState across a reboot, a rename and a restarted namespace', () =
     expect(holderState(other, linuxEvidence({ procFs: fs }))).toBe('foreign');
   });
 
-  it('linux, same machine and boot: a namespace still visible from here is foreign, a gone one is dead', () => {
-    const gone = linuxFs({
-      pidNs: () => 'pid:[9]',
+  it('linux, same machine and boot: only the initial namespace may call a namespace gone', () => {
+    const holder = linuxHolder({ machineId: 'mid-1', pidNs: 'pid:[4026532221]' });
+    // Checked from the initial namespace, which sees every process: nothing runs in the holder's
+    // namespace any more (a WSL distro restarted in the same VM, a container that stopped).
+    const fromInit = linuxFs({
+      pidNs: () => INITIAL_PID_NS,
       machineId: () => 'mid-1',
       pids: () => [900],
-      pidNsOf: () => 'pid:[9]',
+      pidNsOf: () => INITIAL_PID_NS,
     });
-    const holder = linuxHolder({ machineId: 'mid-1', pidNs: 'pid:[1]' });
-    expect(holderState(holder, linuxEvidence({ procFs: gone }))).toBe('dead');
-    const nested = linuxFs({
-      pidNs: () => 'pid:[9]',
+    expect(holderState(holder, linuxEvidence({ procFs: fromInit }))).toBe('dead');
+    // From the initial namespace, one still running nested in it is foreign.
+    const nestedHere = linuxFs({
+      pidNs: () => INITIAL_PID_NS,
       machineId: () => 'mid-1',
       pids: () => [900, 901],
-      pidNsOf: (pid) => (pid === 901 ? 'pid:[1]' : 'pid:[9]'),
+      pidNsOf: (pid) => (pid === 901 ? 'pid:[4026532221]' : INITIAL_PID_NS),
     });
-    expect(holderState(holder, linuxEvidence({ procFs: nested }))).toBe('foreign');
+    expect(holderState(holder, linuxEvidence({ procFs: nestedHere }))).toBe('foreign');
+    // Checked from inside another namespace (a sandbox, `unshare --pid`, a container sharing this
+    // machine's id): the holder's namespace may be this one's parent, which no process here can
+    // see. It still runs there, so it is foreign, never dead.
+    const fromNested = linuxFs({
+      pidNs: () => 'pid:[4026532289]',
+      machineId: () => 'mid-1',
+      pids: () => [1, 2],
+      pidNsOf: () => 'pid:[4026532289]',
+    });
+    expect(holderState(holder, linuxEvidence({ procFs: fromNested }))).toBe('foreign');
     // Without a machine id nothing says the namespace belongs to this machine: foreign.
-    expect(holderState(linuxHolder({ pidNs: 'pid:[1]' }), linuxEvidence({ procFs: gone }))).toBe(
-      'foreign',
-    );
+    expect(
+      holderState(linuxHolder({ pidNs: 'pid:[4026532221]' }), linuxEvidence({ procFs: fromInit })),
+    ).toBe('foreign');
   });
 
   it('win32: a holder recorded under an earlier machine name is judged here', () => {
@@ -481,4 +498,68 @@ describe('telling a Claude Code from anything else that inherited its profile', 
     expect(fs.cmdlineOf?.(813)).toEqual(['claude']);
     expect(fs.cmdlineOf?.(814)).toBeUndefined();
   });
+});
+
+describe('the Agent SDK runs a Claude Code of its own', () => {
+  it("a node script under any of Anthropic's claude packages reads the login: it counts", () => {
+    expect(
+      isClaudeCodeProcess({
+        argv: ['node', '/home/u/app/node_modules/@anthropic-ai/claude-agent-sdk/cli.js', '-p'],
+      }),
+    ).toBe(true);
+    expect(
+      isClaudeCodeProcess({
+        image: 'node.exe',
+        commandLine: 'node.exe C:/app/node_modules/@anthropic-ai/claude-agent-sdk/cli.js',
+      }),
+    ).toBe(true);
+    // Another package of the same scope is not one.
+    expect(
+      isClaudeCodeProcess({ argv: ['node', '/app/node_modules/@anthropic-ai/sdk/index.js'] }),
+    ).toBe(false);
+  });
+});
+
+describe("reading a Windows process's CLAUDE_CONFIG_DIR from the process itself", () => {
+  it('parses set, unset and unreadable answers, only for the pids asked about', () => {
+    const dir = 'C:/Users/u/Local/claude-control/profiles/session-x é';
+    const b64 = Buffer.from(dir, 'utf8').toString('base64');
+    const read = parseConfigDirLines(
+      [`10 =${b64}`, '11 -', 'junk', `99 =${b64}`, ''],
+      [10, 11, 12],
+    );
+    expect([...read]).toEqual([
+      [10, dir],
+      [11, null],
+    ]);
+  });
+
+  it.skipIf(process.platform !== 'win32')(
+    'reads it from a live process started with it, and nothing for one it cannot open',
+    async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'ce-env é '));
+      const withDir = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+        env: { ...process.env, CLAUDE_CONFIG_DIR: dir },
+        stdio: 'ignore',
+      });
+      const env: NodeJS.ProcessEnv = { ...process.env };
+      delete env.CLAUDE_CONFIG_DIR;
+      const without = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+        env,
+        stdio: 'ignore',
+      });
+      try {
+        const read = await readProcessConfigDirs([withDir.pid!, without.pid!, 4]);
+        expect(read.get(withDir.pid!)).toBe(dir);
+        expect(read.get(without.pid!)).toBeNull();
+        // The System process cannot be opened: no answer, never a guess.
+        expect(read.has(4)).toBe(false);
+      } finally {
+        withDir.kill();
+        without.kill();
+        await rm(dir, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
 });

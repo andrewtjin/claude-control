@@ -183,6 +183,113 @@ export async function readProcessTable(run: QueryRunner = runQuery): Promise<Pro
   return rows;
 }
 
+/** How long the environment read may take: it compiles a small reader first, which a loaded box
+ *  can stretch past the process table's budget. */
+const CONFIG_DIR_QUERY_TIMEOUT_MS = 20_000;
+
+/**
+ * The reader {@link readProcessConfigDirs} runs: for each pid, the process's own environment block,
+ * read the way a debugger reads it (the process parameters its PEB points to), so a variable set at
+ * its start is seen whatever started it. A 64-bit reader only (a 32-bit one cannot follow a 64-bit
+ * PEB). Each line: `<pid> =<value as base64 UTF-8>` when CLAUDE_CONFIG_DIR is set, `<pid> -` when it
+ * is not, nothing when the process could not be read (gone, another user's, elevated). Base64 keeps
+ * a path with any character intact through the console's code page.
+ */
+function configDirReaderScript(pids: readonly number[]): string {
+  const csharp = [
+    'using System;',
+    'using System.Runtime.InteropServices;',
+    'using System.Text;',
+    'public static class CctlProcessEnvironment {',
+    '  [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(int access, bool inherit, int pid);',
+    '  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);',
+    '  [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadProcessMemory(IntPtr handle, IntPtr address, byte[] buffer, IntPtr size, out IntPtr read);',
+    '  [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr handle, int infoClass, byte[] info, int length, out int returned);',
+    '  static byte[] Read(IntPtr handle, long address, long size) {',
+    '    byte[] buffer = new byte[size]; IntPtr got;',
+    '    if (!ReadProcessMemory(handle, new IntPtr(address), buffer, new IntPtr(size), out got) || got.ToInt64() != size) return null;',
+    '    return buffer;',
+    '  }',
+    '  public static string Lookup(int pid, string name) {',
+    '    if (IntPtr.Size != 8) return null;',
+    // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ.
+    '    IntPtr handle = OpenProcess(0x0410, false, pid);',
+    '    if (handle == IntPtr.Zero) return null;',
+    '    try {',
+    '      byte[] basic = new byte[48]; int returned;',
+    '      if (NtQueryInformationProcess(handle, 0, basic, basic.Length, out returned) != 0) return null;',
+    // PROCESS_BASIC_INFORMATION.PebBaseAddress; PEB.ProcessParameters; its Environment and
+    // EnvironmentSize (x64 offsets).
+    '      long peb = BitConverter.ToInt64(basic, 8);',
+    '      byte[] p = Read(handle, peb + 0x20, 8); if (p == null) return null;',
+    '      long parameters = BitConverter.ToInt64(p, 0);',
+    '      byte[] e = Read(handle, parameters + 0x80, 8); byte[] s = Read(handle, parameters + 0x3F0, 8);',
+    '      if (e == null || s == null) return null;',
+    '      long block = BitConverter.ToInt64(e, 0); long size = BitConverter.ToInt64(s, 0);',
+    '      if (block == 0 || size <= 0 || size > 16777216) return null;',
+    '      byte[] bytes = Read(handle, block, size); if (bytes == null) return null;',
+    '      string prefix = name + "=";',
+    '      foreach (string entry in Encoding.Unicode.GetString(bytes).Split((char)0)) {',
+    // Windows compares variable names without case.
+    '        if (entry.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return "=" + entry.Substring(prefix.Length);',
+    '      }',
+    '      return "-";',
+    '    } finally { CloseHandle(handle); }',
+    '  }',
+    '}',
+  ].join('\n');
+  return [
+    `Add-Type -TypeDefinition @'\n${csharp}\n'@`,
+    `foreach ($id in @(${pids.join(',')})) {`,
+    "  $v = [CctlProcessEnvironment]::Lookup($id, 'CLAUDE_CONFIG_DIR')",
+    '  if ($v -eq $null) { continue }',
+    '  if ($v -eq \'-\') { "$id -" } else { "$id =" + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($v.Substring(1))) }',
+    '}',
+  ].join('\n');
+}
+
+/**
+ * Windows only: the CLAUDE_CONFIG_DIR each of `pids` was started with (null: not set), read from the
+ * processes' own environments. A pid missing from the answer could not be read; nothing is ever
+ * guessed for it. This is what ties a process to a parallel session's profile without its
+ * parentage, which Windows loses as soon as a process in between exits (a backgrounded `claude -p`
+ * whose shell returned). A query that failed answers what it read before it stopped.
+ */
+export async function readProcessConfigDirs(
+  pids: readonly number[],
+  run: QueryRunner = (command, args, env, detached) =>
+    runQuery(command, args, env, detached, CONFIG_DIR_QUERY_TIMEOUT_MS),
+): Promise<Map<number, string | null>> {
+  const out = new Map<number, string | null>();
+  const list = [...new Set(pids.filter((pid) => Number.isInteger(pid) && pid > 0))];
+  if (list.length === 0) return out;
+  const encoded = Buffer.from(configDirReaderScript(list), 'utf16le').toString('base64');
+  const { lines } = await run(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+    process.env,
+    false,
+  );
+  return parseConfigDirLines(lines, list);
+}
+
+/** The answer of {@link readProcessConfigDirs}' query, only for the pids it asked about. */
+export function parseConfigDirLines(
+  lines: readonly string[],
+  asked: readonly number[],
+): Map<number, string | null> {
+  const wanted = new Set(asked);
+  const out = new Map<number, string | null>();
+  for (const line of lines) {
+    const m = /^\s*(\d+) (?:(-)|=([A-Za-z0-9+/]*={0,2}))\s*$/.exec(line);
+    if (m === null) continue;
+    const pid = Number(m[1]);
+    if (!wanted.has(pid)) continue;
+    out.set(pid, m[2] === '-' ? null : Buffer.from(m[3]!, 'base64').toString('utf8'));
+  }
+  return out;
+}
+
 /** The rows of a process-table query's output (`<pid> <ppid> <filetime>`, then optionally
  *  ` <name>|<command line>`, per line). An empty command line is left out: it could not be read. */
 export function parseProcessTable(lines: readonly string[]): ProcessRow[] {
@@ -213,41 +320,52 @@ function programName(path: string): string {
   return base.toLowerCase().replace(/\.exe$/, '');
 }
 
-/** Paths only a Claude Code runs from: the npm package, and the native installer's version store
- *  (whose binaries are named by version, not `claude`). Compared with `/` separators, lower-cased. */
-const CLAUDE_CODE_PATH_MARKS = ['/@anthropic-ai/claude-code/', '/claude/versions/'];
+/** Paths only a Claude Code runs from: Anthropic's `claude-*` npm packages (the CLI, its native
+ *  platform builds, and the Agent SDK, which runs a Claude Code of its own and reads the same
+ *  login), and the native installer's version store (whose binaries are named by version, not
+ *  `claude`). Compared with `/` separators, lower-cased. */
+const CLAUDE_CODE_PATH_MARKS = ['/@anthropic-ai/claude-', '/claude/versions/'];
 
 /** The runtimes a script-installed Claude Code runs under. */
 const SCRIPT_HOSTS: ReadonlySet<string> = new Set(['node', 'nodejs', 'bun']);
 
-/**
- * Whether a process is a Claude Code (the CLI, its background service, the copy an Agent SDK
- * bundles), by how it was started: a program named `claude` (the native binary, a symlink to it, or
- * the title Claude Code gives its own process), or a command line that runs it from where Claude
- * Code is installed (`node .../@anthropic-ai/claude-code/cli.js`, the native version store). Only a
- * Claude Code reads a profile's login, so only one holds a parallel session; a dev server or an
- * editor that merely inherited the profile's CLAUDE_CONFIG_DIR does not. A process whose command
- * line cannot be read counts as one: a doubt keeps the session, as everywhere else here.
- */
-export function isClaudeCodeProcess(p: {
+/** How a process was started, as {@link claudeCodeIdentity} reads it. */
+export interface ProcessIdentity {
   /** The image name or executable path (Windows: Win32_Process.Name). */
   image?: string;
   /** The arguments, the program first (Linux: /proc/<pid>/cmdline). */
   argv?: readonly string[];
   /** The whole command line as one string (Windows). */
   commandLine?: string;
-}): boolean {
+}
+
+/**
+ * Whether a process is a Claude Code (the CLI, its background service, the copy an Agent SDK
+ * bundles), by how it was started: `yes` for a program named `claude` (the native binary, a symlink
+ * to it, or the title Claude Code gives its own process) or a command line that runs it from where
+ * Claude Code is installed (`node .../@anthropic-ai/claude-code/cli.js`, the native version store);
+ * `unknown` when its command line cannot be read (another user's process, an elevated one); `no`
+ * otherwise. Only a Claude Code reads a profile's login, so only one holds a parallel session; a
+ * dev server or an editor that merely inherited the profile's CLAUDE_CONFIG_DIR does not.
+ */
+export function claudeCodeIdentity(p: ProcessIdentity): 'yes' | 'no' | 'unknown' {
   const argv = p.argv ?? [];
   // The program, or the script a JavaScript runtime runs: an npm install's `claude` is a script
   // that `node` runs under the name it was started by (`node /usr/local/bin/claude`).
   const script =
     argv[0] !== undefined && SCRIPT_HOSTS.has(programName(argv[0])) ? argv[1] : undefined;
   const named = [p.image, argv[0], script].filter((w): w is string => w !== undefined);
-  if (named.some((w) => programName(w) === 'claude')) return true;
+  if (named.some((w) => programName(w) === 'claude')) return 'yes';
   const line = p.commandLine ?? (argv.length > 0 ? argv.join(' ') : undefined);
-  if (line === undefined || line.trim() === '') return true;
+  if (line === undefined || line.trim() === '') return 'unknown';
   const flat = line.toLowerCase().replace(/\\/g, '/');
-  return CLAUDE_CODE_PATH_MARKS.some((mark) => flat.includes(mark));
+  return CLAUDE_CODE_PATH_MARKS.some((mark) => flat.includes(mark)) ? 'yes' : 'no';
+}
+
+/** {@link claudeCodeIdentity} with a doubt counted as one: a process whose command line cannot be
+ *  read keeps the session, as everywhere else here, where something else ties it to the session. */
+export function isClaudeCodeProcess(p: ProcessIdentity): boolean {
+  return claudeCodeIdentity(p) !== 'no';
 }
 
 /** The file reads {@link createProcFs} makes, injectable so a fixture tree stands in for `/proc`. */
@@ -457,9 +575,18 @@ export function visibleNamespaces(fs: ProcFs): Set<string> {
   return seen;
 }
 
+/** The initial pid namespace's link text: a fixed inode (PROC_PID_INIT_INO) on every kernel that
+ *  has pid namespaces. */
+export const INITIAL_PID_NS = 'pid:[4026531836]';
+
 /** The states a Linux process has exited in but still shows under `/proc`: a zombie (not yet
  *  reaped by its parent) and a dead one being torn down. kill-0 succeeds on both. */
 const EXITED_STATES: ReadonlySet<string> = new Set(['Z', 'X', 'x']);
+
+/** Whether a Linux process state (field 3 of its stat) is one it has already exited in. */
+export function isExitedState(state: string | undefined): boolean {
+  return state !== undefined && EXITED_STATES.has(state);
+}
 
 /**
  * Whether a Linux holder was recorded on this machine: the same host name, or the same machine id
@@ -479,10 +606,13 @@ function sameLinuxMachine(h: LeaseHolder, now: HolderEvidence): boolean {
  *      tied to this machine and user, so a holder of another name was recorded here before a rename;
  *   2. (linux) another boot: `dead`, without a process query, whatever namespace it ran in (no
  *      namespace of an earlier boot still exists);
- *   3. (linux) another pid namespace in this boot: `foreign` while a process visible from here runs
- *      in it (a nested one, whose pids this check cannot read) or while nothing ties it to this
- *      machine (no matching machine id: another container's or distro's); `dead` when it is this
- *      machine's and no visible process runs in it (a WSL distro that restarted in the same VM);
+ *   3. (linux) another pid namespace in this boot: `dead` only when it is this machine's (same
+ *      machine id), this check runs in the initial namespace, which sees every process, and no
+ *      process runs in it any more. Otherwise `foreign`: a nested namespace's pids cannot be read
+ *      from here, another container's or distro's mean nothing here, and from inside a namespace
+ *      (a WSL distro, a sandbox) the holder's may be a parent this check cannot see into. A WSL
+ *      distro that restarted in the same VM leaves its holders foreign until the VM restarts (a new
+ *      boot id: `wsl --shutdown`, or a reboot);
  *   4. this process's own pid with another start: `dead` (this process owns that pid now);
  *   5. kill-0 says no such process: `dead`;
  *   6. start 0 (never known): `unverifiable`;
@@ -503,7 +633,12 @@ export function holderState(h: LeaseHolder, now: HolderEvidence): LeaseHolderSta
     if ((h.pidNs ?? null) !== (ns ?? null)) {
       const machine = now.procFs?.machineId?.();
       const ours = h.machineId !== undefined && h.machineId === machine;
-      if (!ours || h.pidNs === undefined || now.procFs === undefined) return 'foreign';
+      // Only the initial namespace sees every process of the machine. From any other (a WSL
+      // distro, a sandbox, a container sharing this machine's id) a namespace that shows no process
+      // may be this one's parent, whose processes a nested namespace can never see: still running.
+      if (!ours || h.pidNs === undefined || now.procFs === undefined || ns !== INITIAL_PID_NS) {
+        return 'foreign';
+      }
       const visible = (now.visibleNamespaces ?? (() => visibleNamespaces(now.procFs!)))();
       return visible.has(h.pidNs) ? 'foreign' : 'dead';
     }
@@ -516,7 +651,7 @@ export function holderState(h: LeaseHolder, now: HolderEvidence): LeaseHolderSta
   if (linux) {
     const stat = now.procFs?.stat(h.pid);
     if (stat === undefined) return 'unverifiable';
-    if (stat.state !== undefined && EXITED_STATES.has(stat.state)) return 'dead';
+    if (isExitedState(stat.state)) return 'dead';
     return stat.startTicks === h.start ? 'alive' : 'dead';
   }
   if (now.mode === 'quick') return 'alive';

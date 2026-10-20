@@ -606,6 +606,7 @@ const HOLDER_KEYS: ReadonlySet<string> = new Set([
   'machineId',
   'role',
   'parent',
+  'found',
 ]);
 
 /** Whether a value is an integer at least `min`. */
@@ -708,6 +709,9 @@ function validateHolder(raw: unknown, at: string): LeaseHolder {
   if (raw.parent !== undefined && !isIntAtLeast(raw.parent, 1)) {
     throw new VaultError(`${at} parent is not a positive integer`);
   }
+  if (raw.found !== undefined && raw.found !== true) {
+    throw new VaultError(`${at} found is not true`);
+  }
   return {
     pid: raw.pid,
     start: raw.start,
@@ -718,6 +722,7 @@ function validateHolder(raw: unknown, at: string): LeaseHolder {
     ...(typeof raw.pidNs === 'string' ? { pidNs: raw.pidNs } : {}),
     ...(typeof raw.machineId === 'string' ? { machineId: raw.machineId } : {}),
     ...(raw.parent !== undefined ? { parent: raw.parent } : {}),
+    ...(raw.found === true ? { found: true as const } : {}),
   };
 }
 

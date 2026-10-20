@@ -1424,8 +1424,7 @@ function usageRowsOf(state: UsageState): UsageRow[] {
 }
 
 /** How `cctl usage` and `cctl timeline` head the accounts parallel sessions hold. */
-const PARALLEL_SESSION_HEADING =
-  'In use by a parallel session (out of the pool until its terminals exit):';
+const PARALLEL_SESSION_HEADING = 'In use by a parallel session (out of the pool until it ends):';
 
 /** The accounts only a parallel session holds: out of the shared pool, so out of the usage rows and
  *  the pacing, and in no folder rule's section either. */

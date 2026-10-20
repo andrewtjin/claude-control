@@ -598,8 +598,9 @@ Where it runs:
 - on the global slot when `work` is live there. That session then follows global switches,
   from any terminal or the phone;
 - in this folder's slot when `work` is live there (it then follows the folder's switches);
-- in the slot of a folder `work` is reserved to, when it is live there, from any folder. The
-  session then follows that folder's switches, which can move it off `work`;
+- in the slot of a folder or named session `work` is reserved to (a rule that includes it),
+  when it is live there, from any folder. The session then follows that rule's switches,
+  which can move it off `work`;
 - otherwise in a parallel-session slot of its own.
 
 A shared account live in another folder's slot is refused: run it there, or switch that slot to

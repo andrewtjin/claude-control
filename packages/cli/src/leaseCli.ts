@@ -117,7 +117,9 @@ const CHILD_RETRY_STEADY_MS = 15_000;
 export function trackChildHolder(opts: {
   add: (holders: LeaseHolder[]) => Promise<void>;
   say: (line: string) => void;
-  label: string;
+  /** The account's name, or how to read it when the warning is printed (it can be renamed while
+   *  the session runs, and the command the warning suggests must resolve). */
+  label: string | (() => Promise<string>);
   /** The holder of a just-spawned pid (default: childHolder of this process). */
   holderOf?: (pid: number) => LeaseHolder;
   /** Waits between attempts; resolves early when `wake` is called (default: a real timer). */
@@ -153,11 +155,12 @@ export function trackChildHolder(opts: {
         if (!warned) {
           warned = true;
           const reason = err instanceof Error ? err.message : String(err);
+          const label = typeof opts.label === 'string' ? opts.label : await opts.label();
           opts.say(
             `cctl: warning: could not record this session's Claude Code process yet (${reason}); ` +
-              `retrying. If this terminal's cctl is killed first, ${opts.label} stays reserved ` +
+              `retrying. If this terminal's cctl is killed first, ${label} stays reserved ` +
               "until a full check finds that process: the daemon's next poll, or the next cctl " +
-              `switch ${opts.label}.`,
+              `switch ${label}.`,
           );
         }
         if (!running) return;

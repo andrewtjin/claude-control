@@ -14,7 +14,7 @@ import { InsecurePassthroughProtector } from './dpapi.js';
 import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
 import { Vault } from './vault.js';
 import { sandboxPaths, groupProfileDir, type Paths } from './paths.js';
-import { leaseRuleId } from './folderRules.js';
+import { leaseOccupants, leaseRuleId, occupantsPhrase } from './folderRules.js';
 import { ruleSlotId } from './types.js';
 import { LeaseHolderCapError, QuarantineError, SlotError } from './errors.js';
 import type {
@@ -45,6 +45,9 @@ interface Harness {
   /** Live pids; anything else is gone (ESRCH). */
   alive: Set<number>;
   table: ProcessRow[];
+  /** The CLAUDE_CONFIG_DIR each stand-in process was started with (null: unset). A pid not here
+   *  could not be read, as another user's process. */
+  env: Map<number, string | null>;
   faults: { at?: string | undefined };
   refreshed: string[];
   build: (platform?: NodeJS.Platform, procFs?: ProcFs) => SwitchEngine;
@@ -59,6 +62,7 @@ async function harness(platform: NodeJS.Platform = 'win32', procFs?: ProcFs): Pr
   const protector = new InsecurePassthroughProtector();
   const alive = new Set<number>([1]);
   const table: ProcessRow[] = [];
+  const env = new Map<number, string | null>();
   const faults: { at?: string | undefined } = {};
   const refreshed: string[] = [];
   const build = (p: NodeJS.Platform = platform, fs: ProcFs | undefined = procFs): SwitchEngine =>
@@ -89,6 +93,8 @@ async function harness(platform: NodeJS.Platform = 'win32', procFs?: ProcFs): Pr
         hostname: () => HOST,
         isAlive: (pid) => alive.has(pid),
         processTable: () => Promise.resolve(table),
+        processConfigDirs: (pids) =>
+          Promise.resolve(new Map(pids.filter((p) => env.has(p)).map((p) => [p, env.get(p)!]))),
         ...(fs !== undefined ? { procFs: fs } : {}),
         self: { pid: 1, start: NOW },
       },
@@ -100,6 +106,7 @@ async function harness(platform: NodeJS.Platform = 'win32', procFs?: ProcFs): Pr
     global: new CredentialStore(paths),
     alive,
     table,
+    env,
     faults,
     refreshed,
     build,
@@ -127,7 +134,14 @@ function leaseStore(paths: Paths, accountId: string): CredentialStore {
 /** A Windows launcher holder for pid `pid` (alive by default). */
 function launcher(h: Harness, pid: number, start = NOW + pid, live = true): LeaseHolder {
   if (live) h.alive.add(pid);
-  h.table.push({ pid, ppid: 1, startMs: start });
+  // A launcher is cctl under node: never a Claude Code, whatever runs on the profile.
+  h.table.push({
+    pid,
+    ppid: 1,
+    startMs: start,
+    name: 'node.exe',
+    commandLine: 'node C:/npm/node_modules/@andrewtjin/cctl/dist/bin.js claude --account B',
+  });
   return { pid, start, host: HOST, platform: 'win32', role: 'launcher' };
 }
 
@@ -671,7 +685,7 @@ describe('nothing else touches a parallel session', () => {
     const h = await harness();
     const { B } = await leased(h);
     await expect(h.engine.removeAccount(B.id)).rejects.toThrow(
-      'account "B" is in use by a parallel session (pid 4120); exit it first',
+      /^account "B" is in use by a parallel session \(pid 4120, since \d\d:\d\d\); exit it first$/,
     );
     h.alive.delete(4120);
     await h.engine.sweepLeases({ mode: 'full', probe: noWorkers, only: B.id });
@@ -1475,5 +1489,380 @@ describe('only a Claude Code keeps a session after its terminals exit', () => {
     const swept = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
     expect(swept.adopted).toEqual([]);
     expect(swept.ended.map((e) => e.accountId)).toEqual([B.id]);
+  });
+});
+
+/** The profile of an account's parallel session, as a process started on it names it. */
+function leaseProfile(h: Harness, accountId: string): string {
+  return groupProfileDir(h.paths.vaultDir, leaseRuleId(accountId));
+}
+
+/** A Windows Claude Code row (claude.exe) in the stand-in table, alive. */
+function claudeRow(h: Harness, pid: number, ppid: number, startMs: number): void {
+  h.alive.add(pid);
+  h.table.push({ pid, ppid, startMs, name: 'claude.exe', commandLine: 'claude.exe -p hi' });
+}
+
+describe('win32: a Claude Code on the profile is found by its own environment', () => {
+  it('a backgrounded claude -p whose shell exited still holds the session: the release keeps it', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    const kid = child(h, 4188, 4120);
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [kid]);
+    h.alive.delete(4188);
+    // Claude Code ran `bash -c "claude -p hi &"`: bash (5000) exited and left the table, so the
+    // survivor's parent id names a process the table no longer has.
+    claudeRow(h, 5002, 5000, NOW + 5002);
+    h.env.set(5002, leaseProfile(h, B.id));
+    const released = await h.engine.releaseLease(leaseRuleId(B.id), [me, kid], noWorkers);
+    expect(released).toMatchObject({ ended: false, heldBy: [5002] });
+    expect((await leaseStore(h.paths, B.id).readLiveCredentials())?.accessToken).toBe('B');
+    const holders = (await h.vault.listRules())[0]?.lease?.holders;
+    expect(holders?.map((x) => [x.pid, x.role, x.found])).toEqual([[5002, 'claude', true]]);
+  });
+
+  it("the launcher's own grandchild counts though its Claude Code was never recorded", async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    // Its Claude Code (4188, never recorded) exited; one it started still runs on the profile.
+    claudeRow(h, 5002, 4188, NOW + 5002);
+    h.env.set(5002, leaseProfile(h, B.id));
+    const released = await h.engine.releaseLease(leaseRuleId(B.id), [me], noWorkers);
+    expect(released).toMatchObject({ ended: false, heldBy: [5002] });
+  });
+
+  it('a Claude Code started on another profile does not hold it, wherever it sits in the tree', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    const kid = child(h, 4188, 4120);
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [kid]);
+    h.alive.delete(4188);
+    // A direct child of the session's Claude Code, started with another account's config dir.
+    claudeRow(h, 5000, 4188, NOW + 5000);
+    h.env.set(5000, 'C:/Users/me/.claude');
+    // An unrelated one with no config dir at all.
+    claudeRow(h, 5100, 300, NOW + 5100);
+    h.env.set(5100, null);
+    const released = await h.engine.releaseLease(leaseRuleId(B.id), [me, kid], noWorkers);
+    expect(released).toMatchObject({ ended: true });
+  });
+
+  it('an environment that cannot be read is judged by the table: an untraceable Claude Code started since keeps the session', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    const kid = child(h, 4188, 4120);
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [kid]);
+    h.alive.delete(4188);
+    claudeRow(h, 5002, 5000, NOW + 5002);
+    // An older one with no parent either was not started from this session.
+    claudeRow(h, 3000, 2999, NOW - HOUR);
+    const report = await h.engine.sweepLeases({
+      mode: 'full',
+      probe: noWorkers,
+      processConfigDirs: () => Promise.reject(new Error('timed out')),
+    });
+    expect(report.ended).toEqual([]);
+    // The release did not run: the sweep sees both recorded holders gone (4120 is still alive).
+    h.alive.delete(4120);
+    const after = await h.engine.sweepLeases({
+      mode: 'full',
+      probe: noWorkers,
+      processConfigDirs: () => Promise.reject(new Error('timed out')),
+    });
+    expect(after.adopted.map((a) => a.pid)).toEqual([5002]);
+    expect(after.ended).toEqual([]);
+  });
+
+  it("an orphaned Claude Code whose parent's pid was taken over is the session's only when its environment says so", async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120, NOW + 4120), { launchRuleId: null });
+    h.alive.delete(4120);
+    // A later process took over 4120, started a Claude Code on another account's profile and
+    // exited: its child carries ppid 4120 and started after the launcher, like a real child would.
+    h.table.splice(0, h.table.length);
+    claudeRow(h, 9001, 4120, NOW + HOUR);
+    h.env.set(9001, 'C:/Users/me/.claude');
+    // The session's own Claude Code, never recorded, under a shell whose pid was reused since; an
+    // unrelated Claude Code sits under that shell's pid too.
+    claudeRow(h, 4188, 4120, NOW + 4200);
+    h.env.set(4188, leaseProfile(h, B.id));
+    h.alive.add(5000);
+    h.table.push({
+      pid: 5000,
+      ppid: 4188,
+      startMs: NOW + 2 * HOUR,
+      name: 'bash.exe',
+      commandLine: 'bash',
+    });
+    claudeRow(h, 6000, 5000, NOW + HOUR + 30);
+    h.env.set(6000, 'C:/Users/other/.claude');
+    const report = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
+    expect(report.adopted.map((a) => a.pid)).toEqual([4188]);
+    h.alive.delete(4188);
+    const after = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
+    expect(after.ended.map((e) => e.accountId)).toEqual([B.id]);
+  });
+
+  it('a survivor holds the session though the roster could not be read: the release names it', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    claudeRow(h, 5002, 5000, NOW + 5002);
+    h.env.set(5002, leaseProfile(h, B.id));
+    const released = await h.engine.releaseLease(leaseRuleId(B.id), [me], () =>
+      Promise.resolve('unreadable'),
+    );
+    expect(released).toMatchObject({ ended: false, heldBy: [5002] });
+    expect(released.deferred).toBeUndefined();
+  });
+});
+
+describe("emptying a folder's slot counts every session that may run on it", () => {
+  /** A folder whose slot includes C, B's parallel session, and the shared roster listing this
+   *  process as a session working in that folder. */
+  async function setup(h: Harness): Promise<{ B: StoredAccount; folder: string }> {
+    const { B, C } = await seed(h);
+    const folder = await mkdtemp(join(tmpdir(), 'ce-lease-f-'));
+    dirs.push(folder);
+    await h.engine.includeInFolder(folder, [C.id]);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    await mkdir(join(h.paths.claudeDir, 'sessions'), { recursive: true });
+    await writeFile(
+      join(h.paths.claudeDir, 'sessions', `${process.pid}.json`),
+      JSON.stringify({ pid: process.pid, cwd: folder, sessionId: 's1' }),
+    );
+    return { B, folder };
+  }
+
+  it('a Claude Code started under the parallel session (on its profile) is left out', async () => {
+    const h = await harness();
+    const { B, folder } = await setup(h);
+    // Nested under the session's Claude Code, never recorded; its environment names the profile.
+    h.env.set(process.pid, leaseProfile(h, B.id));
+    const reset = await h.engine.resetFolder(folder);
+    expect(reset).toMatchObject({ dissolved: true, runningSessions: [] });
+  });
+
+  it('a stale holder on that pid with another start is not the session there: it counts', async () => {
+    const h = await harness();
+    const { B, folder } = await setup(h);
+    // B's record of a Claude Code that exited five hours ago, on the pid a session in this folder
+    // runs on now (the table shows that pid started much later).
+    h.alive.add(process.pid);
+    h.table.push({ pid: process.pid, ppid: 1, startMs: NOW + 77, name: 'claude.exe' });
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [
+      { pid: process.pid, start: NOW - 5 * HOUR, host: HOST, platform: 'win32', role: 'claude' },
+    ]);
+    await expect(h.engine.resetFolder(folder)).rejects.toThrow(/running session/);
+  });
+
+  it('a holder of another machine or platform never matches a pid here', async () => {
+    const h = await harness();
+    const { B, folder } = await setup(h);
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [
+      {
+        pid: process.pid,
+        start: 5,
+        host: 'OTHERBOX',
+        platform: 'linux',
+        role: 'claude',
+        bootId: 'b',
+        pidNs: 'pid:[1]',
+      },
+    ]);
+    await expect(h.engine.resetFolder(folder)).rejects.toThrow(/running session/);
+  });
+});
+
+describe('who holds a session, counted by what runs it', () => {
+  it('a refusal counts terminals, not recorded pids: two terminals with one Claude Code recorded', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    await h.engine.claimSessionSlot(B.id, launcher(h, 5120), { launchRuleId: null });
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [child(h, 4188, 4120)]);
+    await expect(h.engine.activate(B.id)).rejects.toThrow(
+      /account "B" is in use by a parallel session on 2 terminals \(pids 5120, 4188, since \d\d:\d\d\); it rejoins the pool when the last of them exits/,
+    );
+  });
+
+  it('removing an account several terminals hold names them all and asks to exit them', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    for (const pid of [4120, 5120, 6120]) {
+      await h.engine.claimSessionSlot(B.id, launcher(h, pid), { launchRuleId: null });
+      await h.engine.addLeaseHolders(leaseRuleId(B.id), [child(h, pid + 68, pid)]);
+    }
+    h.alive.add(7000);
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [
+      { pid: 7000, start: 0, host: HOST, platform: 'win32', role: 'background' },
+    ]);
+    await expect(h.engine.removeAccount(B.id)).rejects.toThrow(
+      /account "B" is in use by a parallel session on 3 terminals and 1 background session \(pids 4188, 5188, 6188, 7000, since \d\d:\d\d\); exit them first/,
+    );
+  });
+
+  it('a Claude Code left running after the terminals exited is no terminal', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    const kid = child(h, 4188, 4120);
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [kid]);
+    h.alive.delete(4188);
+    claudeRow(h, 5000, 4188, NOW + 5000);
+    h.env.set(5000, leaseProfile(h, B.id));
+    await h.engine.releaseLease(leaseRuleId(B.id), [me, kid], noWorkers);
+    h.alive.delete(4120);
+    const [view] = await h.engine.listLeases({ mode: 'quick' });
+    const running = view!.holders.filter((x) => x.state !== 'dead');
+    expect(leaseOccupants(running)).toEqual({ terminals: 0, background: 0, leftover: 1 });
+    expect(occupantsPhrase(leaseOccupants(running))).toBe('1 Claude Code process left running');
+    const claim = await h.engine.claimSessionSlot(B.id, launcher(h, 6120), { launchRuleId: null });
+    expect(claim).toMatchObject({ kind: 'lease', otherTerminals: 0, otherLeftover: 1 });
+  });
+
+  it('a join keeps room for the Claude Code of every terminal still starting, not only its own', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 1000), { launchRuleId: null });
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [child(h, 1001, 1000)]);
+    // 14 full terminals: 28 records, plus the first one's two.
+    for (let i = 0; i < 13; i += 1) {
+      await h.engine.addLeaseHolders(leaseRuleId(B.id), [
+        launcher(h, 2000 + i * 2),
+        child(h, 2001 + i * 2, 2000 + i * 2),
+      ]);
+    }
+    // A terminal joins with 28 recorded: 29, and its Claude Code makes 30.
+    await h.engine.claimSessionSlot(B.id, launcher(h, 8000), { launchRuleId: null });
+    // Another joins before that one recorded its Claude Code: 30, plus room for two Claude Codes.
+    await h.engine.claimSessionSlot(B.id, launcher(h, 8100), { launchRuleId: null });
+    // A third would leave one of those two with no room: refused.
+    await expect(
+      h.engine.claimSessionSlot(B.id, launcher(h, 8200), { launchRuleId: null }),
+    ).rejects.toThrow(LeaseHolderCapError);
+    // Both earlier terminals can still record their Claude Code.
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [child(h, 8001, 8000)]);
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [child(h, 8101, 8100)]);
+  });
+
+  it('win32: a join counts no dead holder whose pid another process took over', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    const kid = child(h, 4188, 4120);
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [kid]);
+    await h.engine.releaseLease(leaseRuleId(B.id), [me, kid], () => Promise.resolve('unreadable'));
+    // Both pids now run unrelated processes started long after.
+    for (const row of h.table) {
+      if (row.pid === 4120 || row.pid === 4188) row.startMs += 500_000;
+    }
+    const claim = await h.engine.claimSessionSlot(B.id, launcher(h, 5120), { launchRuleId: null });
+    expect(claim).toMatchObject({ kind: 'lease', otherTerminals: 0 });
+  });
+});
+
+describe('a background holder is judged by the roster that names it', () => {
+  it('a worker no readable roster lists any more is gone, whatever its pid runs now', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    const worker: LeaseHolder = {
+      pid: 6000,
+      start: NOW + 6000,
+      host: HOST,
+      platform: 'win32',
+      role: 'background',
+    };
+    h.alive.add(6000);
+    h.table.push({ pid: 6000, ppid: 1, startMs: NOW + 6000, name: 'node.exe', commandLine: 'x' });
+    const released = await h.engine.releaseLease(leaseRuleId(B.id), [me], () =>
+      Promise.resolve([worker]),
+    );
+    expect(released).toMatchObject({ deferredToBackground: true });
+    // The roster no longer lists it; its pid still answers (another process, or not reaped yet).
+    const report = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
+    expect(report.ended.map((e) => e.accountId)).toEqual([B.id]);
+  });
+});
+
+describe('a re-login heals a parallel-session slot whose credentials file is torn', () => {
+  it('the torn file is set aside, the fresh login written, and the next check ends the session', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    const profile = leaseProfile(h, B.id);
+    await writeFile(join(profile, '.credentials.json'), '{"claudeAiOauth":{"accessTo');
+    expect(await h.engine.releaseLease(leaseRuleId(B.id), [me], noWorkers)).toMatchObject({
+      deferred: 'login_unadopted',
+    });
+    const capture = join(h.paths.vaultDir, '..', 'relogin-B');
+    await mkdir(capture, { recursive: true });
+    const store = new CredentialStore({
+      claudeDir: capture,
+      credentialsPath: join(capture, '.credentials.json'),
+      claudeJsonPath: join(capture, '.claude.json'),
+      vaultDir: h.paths.vaultDir,
+    });
+    await store.writeLiveCredentials({
+      accessToken: 'B-fresh',
+      refreshToken: 'r-B-fresh',
+      expiresAt: NOW + 30 * HOUR,
+    });
+    await store.writeOauthAccount({ accountUuid: 'uuid-B', emailAddress: 'B@x.com' });
+    const res = await h.engine.reloginFromConfigDir(B.id, capture);
+    expect(res.healedLiveLogin).toBe(true);
+    expect(await readFile(join(profile, '.credentials.json.corrupt'), 'utf8')).toContain(
+      'accessTo',
+    );
+    h.alive.delete(4120);
+    const report = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
+    expect(report.ended.map((e) => e.accountId)).toEqual([B.id]);
+  });
+});
+
+describe('linux: a holder that exited but was not reaped', () => {
+  it('reads as exited, not as a pid another program took over', async () => {
+    const proc = linuxProc(new Map([[812, 5000]]), new Map());
+    const zombie: ProcFs = {
+      ...proc,
+      stat: (pid) => (pid === 812 ? { ppid: 1, startTicks: 5000, state: 'Z' } : undefined),
+    };
+    const h = await harness('linux', zombie);
+    const { B } = await seed(h);
+    h.alive.add(812);
+    await h.engine.claimSessionSlot(B.id, linuxHolder(812, 5000, 'launcher'), {
+      launchRuleId: null,
+    });
+    const [view] = await h.engine.listLeases({ mode: 'quick' });
+    expect(view?.holders.map((x) => [x.state, x.reused === true])).toEqual([['dead', false]]);
+  });
+});
+
+describe("win32: another user's process is no Claude Code of the session", () => {
+  it('an untraceable process whose command line cannot be read, started since, does not hold it', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    // A service started after the session, its parent gone: nothing here can read what it runs.
+    h.alive.add(7100);
+    h.table.push({ pid: 7100, ppid: 7000, startMs: NOW + HOUR, name: 'svchost.exe' });
+    const released = await h.engine.releaseLease(leaseRuleId(B.id), [me], noWorkers);
+    expect(released).toMatchObject({ ended: true });
   });
 });

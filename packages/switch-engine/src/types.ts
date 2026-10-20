@@ -241,6 +241,10 @@ export interface LeaseHolder {
   /** For a claude holder a launcher recorded: that launcher's pid, so a check can tell whether a dead
    *  launcher's child was ever recorded. */
   parent?: number;
+  /** A claude holder no launcher recorded: found running on the profile once the session's terminals
+   *  had exited (something the session started that outlived it). It holds the session the same
+   *  way; it is only counted apart, since no terminal runs it. */
+  found?: true;
 }
 
 /** What makes a rule a parallel-session slot (see {@link FolderRule.lease}). */
@@ -723,6 +727,8 @@ export type SessionSlotClaim =
       otherTerminals: number;
       /** Background sessions its profile's service hosts, still running when this one joined. */
       otherBackground?: number;
+      /** Claude Code processes left running on it after earlier terminals exited. */
+      otherLeftover?: number;
     };
 
 /** Why a parallel session that has no live holder left was not ended yet:

@@ -1433,12 +1433,15 @@ async function decide(
     message: `could not start ${label(target)} on ${onWhat(await ctx.view(configDir))}: ${why}.`,
   });
   // Opened under one config dir: every other row it has goes first, while it runs nowhere, so no
-  // row is left elsewhere to reach it once it runs. One recording a worktree stays.
+  // row is left elsewhere to reach it once it runs. One recording a worktree stays, and so does one
+  // on a parallel session's slot: that account was chosen for the session, and only the operator
+  // naming a slot (which never reaches here) takes a session off it.
   const keepOnly = async (configDir: string | null): Promise<void> => {
     for (const r of rows) {
       if (sameConfigDir(r.configDir, configDir, platform) || r.row.worktreePath !== undefined) {
         continue;
       }
+      if ((await ctx.view(r.configDir)).parallel === true) continue;
       await ctx.host
         .removeRow(r.configDir, r.row.short)
         .catch((err: unknown) =>
@@ -1471,14 +1474,10 @@ async function decide(
             'worktree Claude Code made for it, which a move would delete. Opening it there.',
     );
   }
-  if (home.unusable !== undefined) return { kind: 'refuse', message: home.unusable };
-  const here = rows.find((r) => sameConfigDir(r.configDir, home.configDir, platform));
-  if (here !== undefined) return openRow(here);
-  // The slot it belongs to holds no row: start it there from its latest row, on the terms a move
-  // carries options over on (its rows elsewhere go, so it is left one only there).
   const latest = rows[0]!;
   // Its latest row is on a parallel session's slot: the account was chosen for that session, and
-  // a start elsewhere would take the session off it. It is opened where its row is.
+  // opening it anywhere else (even where an older row of it sits) would take the session off it.
+  // It is opened where that row is.
   const latestOn = await ctx.view(latest.configDir);
   if (latestOn.parallel === true) {
     return openRow(
@@ -1487,6 +1486,11 @@ async function decide(
         'chosen for that parallel session. Opening it there.',
     );
   }
+  if (home.unusable !== undefined) return { kind: 'refuse', message: home.unusable };
+  const here = rows.find((r) => sameConfigDir(r.configDir, home.configDir, platform));
+  if (here !== undefined) return openRow(here);
+  // The slot it belongs to holds no row: start it there from its latest row, on the terms a move
+  // carries options over on (its rows elsewhere go, so it is left one only there).
   let hint: string | undefined;
   const started = await ctx.shield(
     (hold) =>
@@ -1605,7 +1609,13 @@ export function startsBackgroundSession(args: readonly string[]): boolean {
 export function leaseArgRefusal(args: readonly string[], label: string): string | undefined {
   const request = parseBackgroundRequest(args);
   if (request?.verb === 'attach' || request?.verb === 'control') {
-    const verb = request.args[request.refAt - 1] ?? request.verb;
+    // The verb itself, found where the parser found it: flags may stand between it and the
+    // session it names (`kill --force abc12345`).
+    const verbAt =
+      request.verb === 'attach'
+        ? request.args.indexOf('attach')
+        : request.args.findIndex((w) => CONTROL.has(w));
+    const verb = request.args[verbAt] ?? request.verb;
     // attach opens a session; stop, kill, rm and respawn act on one. Either way it is a session
     // its service runs, on the account that service holds.
     const what = request.verb === 'attach' ? 'opens' : 'acts on';

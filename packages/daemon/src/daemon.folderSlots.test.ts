@@ -2272,7 +2272,7 @@ describe('daemon and parallel sessions', () => {
     await waitFor(() => errorFrames(rig.relay).some((e) => e.relatesTo !== undefined));
     const err = errorFrames(rig.relay)[0];
     expect(err?.message).toContain(
-      'account "Work" is in use by a parallel session in a terminal; it rejoins the pool when that session exits',
+      'account "Work" is in use by a parallel session (a terminal, or a background session or Claude Code process it started); it rejoins the pool when that session ends',
     );
     expect(spawnCalls.count).toBe(0);
   });

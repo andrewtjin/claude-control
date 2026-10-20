@@ -2113,8 +2113,46 @@ describe('cctl claude --account: where it runs', () => {
     const r = await launch(['--account', 'W']);
     expect(r.exitCode).toBe(3);
     expect(r.err).toContain(
-      'cctl: could not return W to the pool yet (lock busy); the daemon does it on its next poll',
+      'cctl: could not return W to the pool yet (lock busy); the daemon checks again on its next poll',
     );
+  });
+
+  it('a deferred end never promises the account back: the next check may find a Claude Code left on it', async () => {
+    for (const deferred of ['processes_unreadable', 'roster_unreadable', 'no_probe'] as const) {
+      engine.planSessionSlot.mockResolvedValueOnce(lease());
+      engine.releaseLease.mockResolvedValueOnce({
+        ended: false,
+        adoptedRotation: false,
+        remaining: 0,
+        deferredToBackground: false,
+        deferred,
+      });
+      const r = await launch(['--account', 'W']);
+      expect(r.err).not.toContain('the daemon does it on its next poll');
+      expect(r.err).toContain(
+        'it then returns W to the pool, or, if a Claude Code process started from this session ' +
+          'still runs on its profile, keeps W reserved until that exits (cctl doctor names it).',
+      );
+    }
+  });
+
+  it('an account renamed while its session runs is named by its new name when the terminal exits', async () => {
+    engine.planSessionSlot.mockResolvedValueOnce(lease());
+    launcher.spawnClaude.mockImplementationOnce(() => {
+      engine.listAllAccounts.mockResolvedValue([A, B, E, { ...W, label: 'Wx' }]);
+      return Promise.resolve(0);
+    });
+    engine.releaseLease.mockResolvedValueOnce({
+      ended: false,
+      adoptedRotation: false,
+      remaining: 0,
+      deferredToBackground: false,
+      deferred: 'login_unadopted',
+    });
+    const r = await launch(['--account', 'W']);
+    expect(r.err).toContain('cctl: could not return Wx to the pool yet');
+    expect(r.err).toContain('cctl accounts relogin Wx');
+    expect(r.err).not.toContain('relogin W,');
   });
 
   it('a launch that fails still releases the parallel session', async () => {
@@ -2331,9 +2369,7 @@ describe('views and parallel sessions', () => {
     expect(line).toContain('in use: parallel session (2 terminals)');
     // A parallel session is no folder rule: W is not listed as reserved to one.
     expect(r.out).not.toContain('Reserved to folder rules');
-    expect(r.out).toContain(
-      'In use by a parallel session (out of the pool until its terminals exit',
-    );
+    expect(r.out).toContain('In use by a parallel session (out of the pool until it ends');
   });
 
   it('accounts list does not show a session whose processes all exited as in use by them', async () => {

@@ -1749,12 +1749,12 @@ describe('the banner and the plan agree with the running daemon', () => {
         },
       ]);
       const usage = await runCli(['usage']);
-      const at = usage.out.indexOf('In use by a parallel session (out of the pool until its');
+      const at = usage.out.indexOf('In use by a parallel session (out of the pool until it ends');
       expect(at).toBeGreaterThan(0);
       expect(usage.out.slice(at)).toContain('vee');
       const timeline = await runCli(['timeline']);
       expect(timeline.out).toContain(
-        'In use by a parallel session (out of the pool until its terminals exit): vee',
+        'In use by a parallel session (out of the pool until it ends): vee',
       );
     } finally {
       engine.listAllAccounts.mockImplementation(() => engine.listAccounts());
