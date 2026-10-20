@@ -121,3 +121,23 @@ describe('bracketed paste', () => {
     ]);
   });
 });
+
+describe('cursor position reports', () => {
+  it('are handed to the listener, never read as keys, even split across reads', () => {
+    const reports: Array<[number, number]> = [];
+    const decoder = new KeyDecoder((row, col) => reports.push([row, col]));
+    expect(decoder.feed(`j${ESC}[2;3Rk${ESC}[12;`)).toEqual([
+      { name: 'char', char: 'j' },
+      { name: 'char', char: 'k' },
+    ]);
+    expect(decoder.feed('40Rq')).toEqual([{ name: 'char', char: 'q' }]);
+    expect(reports).toEqual([
+      [2, 3],
+      [12, 40],
+    ]);
+  });
+
+  it('are dropped without a listener, as any sequence the view does not bind', () => {
+    expect(parseKeys(`${ESC}[2;3Rq`)).toEqual([{ name: 'char', char: 'q' }]);
+  });
+});

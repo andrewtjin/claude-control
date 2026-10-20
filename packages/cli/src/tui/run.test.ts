@@ -30,8 +30,17 @@ import { AccountActionError } from '../accountActions.js';
 import { CadenceError } from '@claude-control/switch-engine';
 import { SessionClientError } from '../sessionClient.js';
 import { daemonHeartbeatPath } from '../settings.js';
-import { everyStateAccounts, snapshotOf } from '../testing/tuiFixtures.js';
-import { ENTER_SCREEN, LEAVE_SCREEN, StatusLog, paintFrame, runTui, type TuiDeps } from './run.js';
+import { account, everyStateAccounts, snapshotOf, usage } from '../testing/tuiFixtures.js';
+import {
+  AMBIGUOUS_WIDTH_PROBE,
+  ENTER_SCREEN,
+  LEAVE_SCREEN,
+  StatusLog,
+  paintFrame,
+  runTui,
+  type TuiDeps,
+} from './run.js';
+import { ambiguousWidth, setAmbiguousWidth } from './text.js';
 import { createTuiSources } from './sources.js';
 import type { TuiSources } from './types.js';
 
@@ -1181,5 +1190,94 @@ describe('paintFrame', () => {
     const ED = `${ESC}[J`;
     expect(paintFrame(['abc', 'xy'], 3)).toBe(`${H}abc\r\nxy${EL}${ED}`);
     expect(paintFrame(['ab', 'xyz'], 3)).toBe(`${H}ab${EL}\r\nxyz`);
+  });
+});
+
+describe('how wide the terminal draws ambiguous-width characters', () => {
+  afterEach(() => setAmbiguousWidth(1));
+
+  // An account row whose label, folder and poll error each hold characters a terminal set up for
+  // CJK text draws two wide: at 80 columns it fills the line when they are counted one wide.
+  const wideRow = (): TuiSources =>
+    scripted({
+      load: vi.fn(() =>
+        Promise.resolve(
+          snapshotOf([
+            account('id-o', 'Ωmega·α', {
+              folders: ['C:/proj—client'],
+              usage: usage([], undefined, { error: 'HTTP 429 × 3 retries' }),
+            }),
+          ]),
+        ),
+      ),
+    });
+  const WIDE_HERE = /[—Ωα·×]/u;
+  /** The columns a line takes on such a terminal, counted without the code under test. */
+  const drawn = (line: string): number =>
+    [...line].reduce((n, ch) => n + (WIDE_HERE.test(ch) ? 2 : 1), 0);
+  const ANSWER_TWO = `${ESC}[2;3R`;
+
+  it('is asked once, on the screen just entered, before the first frame', async () => {
+    const rig = start(scripted());
+    expect(rig.output.all.startsWith(ENTER_SCREEN + AMBIGUOUS_WIDTH_PROBE + `${ESC}[H`)).toBe(true);
+    rig.input.type('q');
+    await rig.exit;
+    expect(rig.output.all.split(AMBIGUOUS_WIDTH_PROBE)).toHaveLength(2);
+  });
+
+  it('measures every cell two wide once the terminal answers that it draws them so', async () => {
+    const rig = start(wideRow());
+    rig.output.columns = 80;
+    await until(() => expect(rig.output.text()).toContain('Ωmega'));
+    rig.input.type(ANSWER_TWO);
+    expect(ambiguousWidth()).toBe(2);
+    await until(() => {
+      const lines = rig.output.screen();
+      expect(lines.join(' ')).toContain('Ωmega');
+      for (const line of lines) expect(drawn(line), line).toBeLessThanOrEqual(80);
+    });
+    rig.input.type('q');
+    await rig.exit;
+  });
+
+  it('takes an answer split across reads', async () => {
+    const rig = start(scripted());
+    rig.input.type(`${ESC}[2;`);
+    rig.input.type('3R');
+    expect(ambiguousWidth()).toBe(2);
+    rig.input.type('q');
+    await rig.exit;
+  });
+
+  it('keeps one column for a terminal that answers one, or does not answer', async () => {
+    const one = start(scripted());
+    one.input.type(`${ESC}[2;2R`);
+    expect(ambiguousWidth()).toBe(1);
+    one.input.type('q');
+    await one.exit;
+    const silent = start(scripted());
+    silent.input.type('q');
+    await silent.exit;
+    expect(ambiguousWidth()).toBe(1);
+  });
+
+  it('does not take a modified F3 key, spelled as a report from row 1, for the answer', async () => {
+    const rig = start(scripted());
+    rig.input.type(`${ESC}[1;3R`);
+    expect(ambiguousWidth()).toBe(1);
+    // Nor is it a key: the view is still there to quit.
+    rig.input.type('q');
+    expect(await rig.exit).toEqual({ code: 0 });
+  });
+
+  it('only takes the first answer, and puts the width back when the view ends', async () => {
+    const rig = start(scripted());
+    rig.input.type(ANSWER_TWO);
+    rig.input.type(`${ESC}[2;2R`);
+    expect(ambiguousWidth()).toBe(2);
+    rig.input.type('q');
+    await rig.exit;
+    expect(ambiguousWidth()).toBe(1);
+    expectRestored(rig);
   });
 });

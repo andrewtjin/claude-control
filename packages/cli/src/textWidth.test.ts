@@ -1,12 +1,19 @@
 // Column widths, and the ASCII spelling of cctl's own messages that keeps their width the same on
 // every terminal.
 
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
 import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
-import { charWidth, displayWidth, plainPunctuation } from './textWidth.js';
+import { EAST_ASIAN_AMBIGUOUS } from './eastAsianAmbiguous.js';
+import {
+  ambiguousWidth,
+  charWidth,
+  displayWidth,
+  plainPunctuation,
+  setAmbiguousWidth,
+} from './textWidth.js';
 
 const PACKAGES_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** The packages whose text can reach the full-screen view: its own, and every package whose
@@ -95,5 +102,63 @@ describe('plainPunctuation', () => {
         ({ char, at }) => `U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase()} at ${at}`,
       ),
     ).toEqual([]);
+  });
+});
+
+describe('ambiguous-width characters', () => {
+  afterEach(() => setAmbiguousWidth(1));
+
+  // Punctuation cctl writes, letters a label can hold, and symbols a foreign error carries.
+  const AMBIGUOUS = ['…', '·', '—', '–', '→', '×', '§', '±', '°', '※', 'Ω', 'α', 'Я', 'é', '①'];
+
+  it('count one column until the terminal says otherwise', () => {
+    expect(ambiguousWidth()).toBe(1);
+    for (const ch of AMBIGUOUS) expect(charWidth(ch.codePointAt(0)!), ch).toBe(1);
+    expect(displayWidth('Fix auth — refresh flow…')).toBe(24);
+  });
+
+  it('count two columns on a terminal that draws them two wide, in every kind of text', () => {
+    setAmbiguousWidth(2);
+    for (const ch of AMBIGUOUS) expect(charWidth(ch.codePointAt(0)!), ch).toBe(2);
+    // A session label a model wrote, an account label, a folder, a foreign error.
+    expect(displayWidth('Fix auth — refresh flow…')).toBe(26);
+    expect(displayWidth('Ωmega·α')).toBe(10);
+    expect(displayWidth('C:/proj—client')).toBe(15);
+    expect(displayWidth('HTTP 429 × 3 retries')).toBe(21);
+    expect(displayWidth('§ ± ° ※')).toBe(11);
+    // A letter with a combining accent takes its base letter's width; only é itself is ambiguous.
+    expect(displayWidth('cafe\u0301')).toBe(4);
+    expect(displayWidth('café')).toBe(5);
+  });
+
+  it('leave every other width as it was: ASCII, wide CJK, emoji, marks', () => {
+    setAmbiguousWidth(2);
+    expect(displayWidth('plain ascii')).toBe(11);
+    expect(displayWidth('日本語')).toBe(6);
+    expect(displayWidth('\u{1F680}')).toBe(2);
+    expect(charWidth(0x0301)).toBe(0);
+    expect(charWidth(0xfe0f)).toBe(0);
+    // Characters outside the table that are neither wide nor zero-width.
+    expect(displayWidth('çñ')).toBe(2);
+  });
+
+  it('keep an emoji forced to text presentation at the ambiguous width when it is one', () => {
+    // U+2194 (left right arrow) is ambiguous; U+FE0E asks for its narrow text glyph.
+    expect(displayWidth('\u2194\uFE0E')).toBe(1);
+    setAmbiguousWidth(2);
+    expect(displayWidth('\u2194\uFE0E')).toBe(2);
+  });
+
+  it('are listed as sorted, non-overlapping ranges, so the search finds each one', () => {
+    let previous = -1;
+    for (const [from, to] of EAST_ASIAN_AMBIGUOUS) {
+      expect(from).toBeGreaterThan(previous);
+      expect(to).toBeGreaterThanOrEqual(from);
+      previous = to;
+    }
+    setAmbiguousWidth(2);
+    for (const [from, to] of EAST_ASIAN_AMBIGUOUS) {
+      for (const cp of [from, to]) expect(charWidth(cp), cp.toString(16)).toBe(2);
+    }
   });
 });

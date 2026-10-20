@@ -8,9 +8,16 @@
 //
 // The widths follow what wcwidth-based terminals (Windows Terminal, iTerm2, VTE, kitty) draw: East
 // Asian Wide and emoji-presentation characters take two columns, nonspacing marks and format
-// characters none. Ambiguous-width characters are counted as one column, which is how most
-// terminals are set up. So that nothing cctl draws depends on that setting, renderers keep their
-// own glyphs ASCII, and the full-screen view draws cctl's own messages through `plainPunctuation`.
+// characters none. Ambiguous-width characters (Greek and Cyrillic letters, many accented Latin
+// ones, typographic punctuation; see ./eastAsianAmbiguous.ts) take one column on most terminals
+// and two on one set up for CJK text. Nothing in the text says which, so they are counted as one
+// until the terminal itself has been asked (`setAmbiguousWidth`): the full-screen view measures a
+// probe glyph when it starts and sets the answer here, so every label, path and error it draws is
+// measured as that terminal draws it. Renderers keep their own glyphs ASCII, and the view spells
+// cctl's own messages through `plainPunctuation`, so a terminal that never answers still gets
+// lines as wide as they were measured wherever cctl wrote the text.
+
+import { EAST_ASIAN_AMBIGUOUS } from './eastAsianAmbiguous.js';
 
 /** Wide (two-column) code point ranges: CJK, Hangul syllables, full-width forms. Emoji are found
  *  by their Unicode property instead, so a new emoji block needs no new range here. */
@@ -49,12 +56,46 @@ const PRINTABLE_ASCII = /^[\x20-\x7e]*$/;
 
 const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 
+/** Columns an ambiguous-width character takes on the terminal this process draws on. A process
+ *  has one terminal, so this is set once for every renderer rather than passed to each. */
+let ambiguousColumns: 1 | 2 = 1;
+
+/** Say how wide the terminal draws ambiguous-width characters, once it has been measured. */
+export function setAmbiguousWidth(columns: 1 | 2): void {
+  ambiguousColumns = columns;
+}
+
+/** How wide ambiguous-width characters are counted now: 1 until the terminal says otherwise. */
+export function ambiguousWidth(): 1 | 2 {
+  return ambiguousColumns;
+}
+
+/** Whether a code point is East Asian Ambiguous: a binary search of the sorted ranges. */
+function isAmbiguous(codePoint: number): boolean {
+  let lo = 0;
+  let hi = EAST_ASIAN_AMBIGUOUS.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const [from, to] = EAST_ASIAN_AMBIGUOUS[mid]!;
+    if (codePoint < from) hi = mid - 1;
+    else if (codePoint > to) lo = mid + 1;
+    else return true;
+  }
+  return false;
+}
+
+/** Columns a character that is neither wide nor zero-width takes: one, or the terminal's
+ *  ambiguous width for an ambiguous one. The table is only searched when that width is not 1. */
+function narrowWidth(codePoint: number): number {
+  return ambiguousColumns !== 1 && isAmbiguous(codePoint) ? ambiguousColumns : 1;
+}
+
 /** Columns one code point takes on its own: 0 for controls, marks and joiners (and the Hangul
- *  vowel and final jamo that join a leading one), 2 for wide and emoji-presentation characters, 1
- *  otherwise. */
+ *  vowel and final jamo that join a leading one), 2 for wide and emoji-presentation characters,
+ *  the terminal's ambiguous width for an ambiguous one, 1 otherwise. */
 export function charWidth(codePoint: number): number {
   if (codePoint < 0x20 || (codePoint >= 0x7f && codePoint < 0xa0)) return 0;
-  if (codePoint < 0x300) return 1;
+  if (codePoint < 0x300) return narrowWidth(codePoint);
   const ch = String.fromCodePoint(codePoint);
   if (
     ZERO_WIDTH.test(ch) ||
@@ -66,7 +107,7 @@ export function charWidth(codePoint: number): number {
   for (const [lo, hi] of WIDE) {
     if (codePoint >= lo && codePoint <= hi) return 2;
   }
-  return EMOJI_PRESENTATION.test(ch) ? 2 : 1;
+  return EMOJI_PRESENTATION.test(ch) ? 2 : narrowWidth(codePoint);
 }
 
 /** Columns one grapheme cluster takes. An emoji sequence (a presentation selector, a joined
@@ -76,7 +117,11 @@ export function clusterWidth(cluster: string): number {
   if (cluster.length === 1) return charWidth(cluster.charCodeAt(0));
   const codePoints = [...cluster];
   if (codePoints.length > 1) {
-    if (cluster.includes(VS15)) return charWidth(codePoints[0]!.codePointAt(0) ?? 0) > 0 ? 1 : 0;
+    if (cluster.includes(VS15)) {
+      // Text presentation: an emoji drawn as a narrow glyph, which an ambiguous one still is.
+      const base = codePoints[0]!.codePointAt(0) ?? 0;
+      return charWidth(base) > 0 ? narrowWidth(base) : 0;
+    }
     if (
       cluster.includes(VS16) ||
       (cluster.includes(ZWJ) && PICTOGRAPHIC.test(cluster)) ||
@@ -111,11 +156,11 @@ export function padEndColumns(text: string, width: number): string {
 }
 
 /** Typographic punctuation and the ASCII each is spelled with on screen. Every one is ambiguous
- *  width: one column on most terminals, two on one set up for CJK text, so a line cut to the
- *  terminal's width that holds one can run past the edge there. Every non-ASCII character that
- *  takes a column in the string literals of the packages whose text reaches the view is in this
- *  table (the test reads their sources to hold that), so a new one in a message is caught when it
- *  is written. */
+ *  width: one column on most terminals, two on one set up for CJK text, so on a terminal that did
+ *  not say which, a line cut to its width that holds one can run past the edge. Every non-ASCII
+ *  character that takes a column in the string literals of the packages whose text reaches the
+ *  view is in this table (the test reads their sources to hold that), so a new one in a message
+ *  is caught when it is written. */
 const PLAIN_PUNCTUATION: ReadonlyMap<string, string> = new Map([
   ['–', '-'], // en dash
   ['—', '-'], // em dash
@@ -132,8 +177,9 @@ const TYPOGRAPHIC = new RegExp(`[${[...PLAIN_PUNCTUATION.keys()].join('')}]`, 'g
 
 /**
  * A message of cctl's own (an auto-switch reason, a refusal, an error) with its typographic
- * punctuation spelled in ASCII, so a terminal set up for CJK text draws it as wide as it is
- * measured. Only for messages: a label is shown as it is stored, since a person types it back.
+ * punctuation spelled in ASCII, so it is as wide on every terminal, including one that never
+ * says how it draws ambiguous-width characters. Only for messages: a label is shown as it is
+ * stored, since a person types it back, and is measured with the terminal's ambiguous width.
  */
 export function plainPunctuation(text: string): string {
   return text.replace(TYPOGRAPHIC, (ch) => PLAIN_PUNCTUATION.get(ch) ?? ch);

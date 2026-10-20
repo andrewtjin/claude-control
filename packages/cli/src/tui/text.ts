@@ -9,7 +9,7 @@
 
 import { clusterWidth, clustersOf, displayWidth } from '../textWidth.js';
 
-export { charWidth, displayWidth } from '../textWidth.js';
+export { ambiguousWidth, charWidth, displayWidth, setAmbiguousWidth } from '../textWidth.js';
 
 const ESC = String.fromCharCode(27);
 const BEL = String.fromCharCode(7);

@@ -37,6 +37,9 @@ const SEQUENCES: Readonly<Record<string, Key['name']>> = {
 
 /** A CSI/SS3 body: parameter bytes, then one final byte. */
 const SEQUENCE_BODY = /^[0-?]*[ -/]*[@-~]/;
+/** The body of a cursor position report (`ESC [ row ; col R`), the terminal's answer to a cursor
+ *  position query. A modified F3 key is spelled the same way with row 1. */
+const CURSOR_REPORT = /^(\d+);(\d+)R$/;
 /** The bracketed-paste markers (the body after `ESC [`). */
 const PASTE_START = '200~';
 const PASTE_END = `${ESC}[201~`;
@@ -54,6 +57,10 @@ export class KeyDecoder {
   private held = '';
   /** Text of a paste whose end marker has not arrived; undefined when not inside a paste. */
   private paste: string | undefined;
+
+  /** `onCursorReport` hears each cursor position report, which is the terminal answering a
+   *  query, not a key, and so never comes out as one. */
+  constructor(private readonly onCursorReport?: (row: number, col: number) => void) {}
 
   /** Whether held bytes are waiting on more input (not counting an open paste, which waits for
    *  its end marker however long it takes). */
@@ -92,6 +99,11 @@ export class KeyDecoder {
           i += 2 + body[0].length;
           if (intro === '[' && body[0] === PASTE_START) {
             this.paste = '';
+            continue;
+          }
+          const report = intro === '[' ? CURSOR_REPORT.exec(body[0]) : null;
+          if (report) {
+            this.onCursorReport?.(Number(report[1]), Number(report[2]));
             continue;
           }
           const name = SEQUENCES[body[0]] ?? SEQUENCES[body[0].replace(/^1;\d+/, '')];

@@ -19,7 +19,7 @@ import { shellQuote } from '../folderRender.js';
 import { SessionClientError } from '../sessionClient.js';
 import { ESCAPE_WAIT_MS, KeyDecoder } from './input.js';
 import { isFrameTooSmall, renderFrame, settleScroll } from './render.js';
-import { stripAnsi, visibleWidth } from './text.js';
+import { ambiguousWidth, setAmbiguousWidth, stripAnsi, visibleWidth } from './text.js';
 import {
   accountsOf,
   applyLoadError,
@@ -42,6 +42,15 @@ export const ENTER_SCREEN = `${ESC}[?1049h${ESC}[?25l${ESC}[?7l${ESC}[2J${ESC}[?
  *  it. */
 export const LEAVE_SCREEN = `${ESC}[?2004l${ESC}[?7h${ESC}[?25h${ESC}[?1049l`;
 const HOME = `${ESC}[H`;
+/** The row the ambiguous-width probe is drawn on. Not the first: a modified F3 key arrives as a
+ *  cursor report from row 1, and must not be taken for the answer. */
+const PROBE_ROW = 2;
+/**
+ * How wide this terminal draws an ambiguous-width character, asked the only way that works for
+ * every terminal: draw one (an ellipsis) at the start of a row, then ask where the cursor is. The
+ * answer's column is one past the glyph. The frame drawn right after paints over it.
+ */
+export const AMBIGUOUS_WIDTH_PROBE = `${ESC}[${PROBE_ROW};1H\u2026${ESC}[6n`;
 const CLEAR_TO_EOL = `${ESC}[K`;
 const CLEAR_BELOW = `${ESC}[J`;
 
@@ -236,7 +245,21 @@ export function runTui(deps: TuiDeps): Promise<TuiExit> {
     let timer: unknown;
     let escapeTimer: unknown;
     let savedStderrWrite: TuiStderr['write'] | undefined;
-    let decoder = new KeyDecoder();
+    /** Whether the ambiguous-width probe has been sent and its answer is awaited. A terminal
+     *  that never answers leaves it waiting, and the width at one column. */
+    let widthProbe: 'unsent' | 'waiting' | 'answered' = 'unsent';
+    /** The width counted before the view measured its terminal, put back when it ends. */
+    const ambiguousBefore = ambiguousWidth();
+    /** The probe's answer: from then on, every cell is measured as this terminal draws it. Each
+     *  read is followed by a redraw, which picks the new width up. */
+    const onCursorReport = (row: number, col: number): void => {
+      if (widthProbe !== 'waiting' || row !== PROBE_ROW) return;
+      const columns = col - 1;
+      if (columns !== 1 && columns !== 2) return;
+      widthProbe = 'answered';
+      setAmbiguousWidth(columns);
+    };
+    let decoder = new KeyDecoder(onCursorReport);
     /** An action is running (its promise has not settled). */
     let actionRunning = false;
     /** Warnings logged while the current action ran, said with its outcome. */
@@ -373,7 +396,11 @@ export function runTui(deps: TuiDeps): Promise<TuiExit> {
       write(ENTER_SCREEN);
       // From here on the way out restores the screen just entered, whatever below fails.
       screenUp = true;
-      decoder = new KeyDecoder();
+      if (widthProbe === 'unsent') {
+        write(AMBIGUOUS_WIDTH_PROBE);
+        widthProbe = 'waiting';
+      }
+      decoder = new KeyDecoder(onCursorReport);
       stdin.setRawMode(true);
       stdin.setEncoding('utf8');
       stdin.on('data', onData);
@@ -446,6 +473,7 @@ export function runTui(deps: TuiDeps): Promise<TuiExit> {
     function settle(result: { code: number } | { error: unknown }): void {
       if (settled) return;
       settled = true;
+      setAmbiguousWidth(ambiguousBefore);
       for (const [signal, handler] of signalHandlers) proc.removeListener(signal, handler);
       proc.removeListener('exit', onProcessExit);
       if ('error' in result) {

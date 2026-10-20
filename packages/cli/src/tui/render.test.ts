@@ -2,7 +2,7 @@
 // without color, for every tag and error state; the column-drop order; and the width arithmetic
 // every line depends on.
 
-import { describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { ANSI_PALETTE, PLAIN_PALETTE } from '../ansi.js';
 import {
@@ -24,7 +24,15 @@ import {
   settleScroll,
 } from './render.js';
 import { accountsOf, reduce } from './state.js';
-import { clip, displayWidth, fit, truncateAnsi, visibleWidth } from './text.js';
+import {
+  clip,
+  displayWidth,
+  fit,
+  setAmbiguousWidth,
+  stripAnsi,
+  truncateAnsi,
+  visibleWidth,
+} from './text.js';
 import type { TuiSnapshot, TuiState } from './types.js';
 
 const ESC = String.fromCharCode(27);
@@ -523,6 +531,78 @@ describe("cctl's own punctuation", () => {
     // The messages are there, spelled in ASCII, not dropped.
     expect(frame(states[0]!, 200, ROWS, false).join('\n')).toContain('weekly - home');
     expect(frame(states[2]!, 200, ROWS, false).join('\n')).toContain('error: work is at 96%');
+  });
+});
+
+describe('text from data on a terminal that draws ambiguous-width characters two wide', () => {
+  // Labels, folders and foreign error text are drawn as they are, so the frame must measure them
+  // as the terminal draws them. Every character in these frames is ASCII but these, so a line's
+  // drawn width is counted here without the code under test.
+  const WIDE_HERE = /[—…Ωα·×§±°※]/u;
+  const drawn = (line: string): number =>
+    [...stripAnsi(line)].reduce((n, ch) => n + (WIDE_HERE.test(ch) ? 2 : 1), 0);
+  /** Drawn column at which `needle` starts in `line`. */
+  const drawnColumn = (line: string, needle: string): number =>
+    drawn(line.slice(0, line.indexOf(needle)));
+
+  beforeEach(() => setAmbiguousWidth(2));
+  afterEach(() => setAmbiguousWidth(1));
+
+  it('keeps the sessions table lined up under a label a model wrote', () => {
+    const st = stateWith(
+      snapshotOf(everyStateAccounts(), {
+        sessions: {
+          ok: true,
+          value: {
+            rows: [
+              { id: 's1', kind: 'interactive', state: 'active', label: 'Fix auth — refresh flow…' },
+              { id: 's2', kind: 'interactive', state: 'idle', label: 'plain' },
+            ],
+            header: {},
+          },
+        },
+      }),
+    );
+    for (const cols of [40, 64, 80, 120]) {
+      const lines = frame({ ...st, pane: 'sessions' }, cols, ROWS, false);
+      for (const line of lines)
+        expect(drawn(line), `at ${cols}: ${line}`).toBeLessThanOrEqual(cols);
+      if (cols < 80) continue;
+      const model = lines.find((l) => l.includes('Fix auth'))!;
+      const plain = lines.find((l) => l.includes('plain'))!;
+      expect(drawnColumn(model, 'interactive')).toBe(drawnColumn(plain, 'interactive'));
+    }
+  });
+
+  it('fits an account row with an ambiguous label, folder and poll error to the width', () => {
+    const st = stateWith(
+      snapshotOf([
+        account('id-o', 'Ωmega·α', {
+          folders: ['C:/proj—client'],
+          usage: usage([], undefined, { error: 'HTTP 429 × 3 retries' }),
+        }),
+        account('id-p', 'plain'),
+      ]),
+    );
+    for (const cols of [40, 80, 120, 200]) {
+      const lines = frame(st, cols, ROWS, false);
+      for (const line of lines)
+        expect(drawn(line), `at ${cols}: ${line}`).toBeLessThanOrEqual(cols);
+    }
+  });
+
+  it('wraps a foreign error on the status line by the width it is drawn at', () => {
+    const foreign = 'Zugriff verweigert § 3 ± 2 ° ※ ' + 'Pfad nicht gefunden '.repeat(4);
+    const st = {
+      ...stateWith(snapshotOf(everyStateAccounts())),
+      status: { text: foreign, tone: 'error' as const },
+    };
+    for (const cols of [40, 41, 61, 80]) {
+      const lines = frame(st, cols, ROWS, false);
+      for (const line of lines)
+        expect(drawn(line), `at ${cols}: ${line}`).toBeLessThanOrEqual(cols);
+      expect(lines.join('\n'), `at ${cols}`).toContain('§');
+    }
   });
 });
 
