@@ -5,12 +5,19 @@
 // real credential files, so a broken guard leaves at most a stray probe file (removed below)
 // rather than a damaged login.
 
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import { existsSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
+import { Worker } from 'node:worker_threads';
 import { afterEach, describe, expect, it } from 'vitest';
+import { powerShellRunner, startDaemonTaskNow } from '../packages/cli/src/daemonInstall.js';
+import { managedDropInDir } from '../packages/cli/src/managedSettings.js';
+import {
+  CLAUDE_CLI_KEYCHAIN_SERVICE,
+  resolveClaudeCliKeychainTarget,
+} from '../packages/switch-engine/src/keychain.js';
 import { defaultPaths } from '../packages/switch-engine/src/paths.js';
 
 const realHome = userInfo().homedir;
@@ -134,5 +141,171 @@ describe('live-state guard', () => {
     );
     expect(child.status).not.toBe(0);
     expect(child.stderr).toContain('test sandbox refused');
+  });
+});
+
+const scratch: string[] = [];
+afterEach(() => {
+  for (const dir of scratch.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/**
+ * Run `code` (an ES module) in a node child whose guard also protects a fresh scratch folder,
+ * passing that folder and a second, unprotected one as argv[1] and argv[2]. The real locations
+ * stay protected in the child too. Returns what the child printed, and the two folders.
+ */
+function inGuardedChild(
+  code: string,
+  setUp: (prot: string) => void = () => undefined,
+): { out: string; prot: string; free: string } {
+  const prot = fs.mkdtempSync(join(tmpdir(), 'cctl-guard-prot-'));
+  const free = fs.mkdtempSync(join(tmpdir(), 'cctl-guard-free-'));
+  scratch.push(prot, free);
+  setUp(prot);
+  const protectedList = [
+    ...(JSON.parse(process.env.CCTL_TEST_PROTECTED_PATHS ?? '[]') as unknown[]),
+    { kind: 'tree', path: prot },
+  ];
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', code, prot, free], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      CCTL_TEST_PROTECTED_PATHS: JSON.stringify(protectedList),
+      CCTL_TEST_GUARD_LOG: join(free, 'trips.log'),
+    },
+  });
+  return { out: child.stdout, prot, free };
+}
+
+describe('live-state guard: ways around the fs functions', () => {
+  it('refuses a hard link to a protected file, which a later write would go through', () => {
+    const run = inGuardedChild(
+      `import fs from 'node:fs';
+       const [prot, free] = process.argv.slice(1);
+       try {
+         fs.linkSync(prot + '/real.txt', free + '/link.txt');
+         fs.writeFileSync(free + '/link.txt', 'OVERWRITTEN');
+         console.log('WROTE');
+       } catch (err) { console.log(err.code); }`,
+      (prot) => fs.writeFileSync(join(prot, 'real.txt'), 'original'),
+    );
+    expect(run.out.trim()).toBe('ELIVEGUARD');
+    expect(fs.readFileSync(join(run.prot, 'real.txt'), 'utf8')).toBe('original');
+  });
+
+  it('refuses a SQLite database opened in a protected folder, by either import', () => {
+    const run = inGuardedChild(
+      `import { DatabaseSync } from 'node:sqlite';
+       import sqlite from 'node:sqlite';
+       const [prot] = process.argv.slice(1);
+       for (const Db of [DatabaseSync, sqlite.DatabaseSync]) {
+         try {
+           const db = new Db(prot + '/daemon.db');
+           db.exec('create table t(x)');
+           db.close();
+           console.log('WROTE');
+         } catch (err) { console.log(err.code); }
+       }`,
+    );
+    expect(run.out.trim().split(/\s+/)).toEqual(['ELIVEGUARD', 'ELIVEGUARD']);
+    expect(fs.readdirSync(run.prot)).toEqual([]);
+  });
+
+  it('arms the guard in the worker threads of a node child', () => {
+    const run = inGuardedChild(
+      `import { Worker } from 'node:worker_threads';
+       const [prot] = process.argv.slice(1);
+       const target = JSON.stringify(prot + '/worker.txt');
+       const w = new Worker("process.getBuiltinModule('node:fs').writeFileSync(" + target + ", 'x')", { eval: true });
+       w.on('error', (err) => console.log(err.code ?? err.message));`,
+    );
+    expect(run.out.trim()).toBe('ELIVEGUARD');
+    expect(fs.readdirSync(run.prot)).toEqual([]);
+  });
+
+  it('arms the guard in the worker threads of the test process itself', async () => {
+    // The worker is told to protect a scratch folder as well, so a guard that is not armed there
+    // writes only into scratch.
+    const prot = fs.mkdtempSync(join(tmpdir(), 'cctl-guard-prot-'));
+    scratch.push(prot);
+    const protectedList = [
+      ...(JSON.parse(process.env.CCTL_TEST_PROTECTED_PATHS ?? '[]') as unknown[]),
+      { kind: 'tree', path: prot },
+    ];
+    const target = JSON.stringify(join(prot, 'worker.txt'));
+    const worker = new Worker(`process.getBuiltinModule('node:fs').writeFileSync(${target}, 'x')`, {
+      eval: true,
+      env: { ...process.env, CCTL_TEST_PROTECTED_PATHS: JSON.stringify(protectedList) },
+    });
+    const failure = await new Promise((resolve) => {
+      worker.on('error', resolve);
+      worker.on('exit', () => resolve(undefined));
+    });
+    expect(failure).toEqual(refused);
+    expect(fs.readdirSync(prot)).toEqual([]);
+  });
+
+  it('refuses a shell child handed a protected path', () => {
+    const run = inGuardedChild(
+      `import { spawnSync } from 'node:child_process';
+       import { join } from 'node:path';
+       const [prot] = process.argv.slice(1);
+       const target = join(prot, 'c.txt');
+       try {
+         const res = process.platform === 'win32'
+           ? spawnSync('cmd.exe', ['/c', 'echo hi> ' + target])
+           : spawnSync('sh', ['-c', 'echo hi > ' + target]);
+         console.log(res.error?.code ?? 'RAN');
+       } catch (err) { console.log(err.code); }`,
+    );
+    expect(run.out.trim()).toBe('ELIVEGUARD');
+    expect(fs.readdirSync(run.prot)).toEqual([]);
+  });
+
+  it('keeps the guard in a node child spawned with an environment of its own', () => {
+    // A child given only PATH would resolve the real home from the OS account.
+    const run = inGuardedChild(
+      `import { spawnSync } from 'node:child_process';
+       import { join } from 'node:path';
+       const [prot] = process.argv.slice(1);
+       const write = "require('node:fs').writeFileSync(" + JSON.stringify(join(prot, 'g.txt')) + ", 'x')";
+       const res = spawnSync(process.execPath, ['-e', write], {
+         encoding: 'utf8',
+         env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot },
+       });
+       console.log(res.stderr.includes('test sandbox refused') ? 'REFUSED' : 'RAN');`,
+    );
+    expect(run.out.trim()).toBe('REFUSED');
+    expect(fs.readdirSync(run.prot)).toEqual([]);
+  });
+});
+
+describe('live-state guard: machine-wide state no home folder redirects', () => {
+  it("refuses a change to the Task Scheduler, cctl's autostart on Windows", () => {
+    // The executables do not exist, so a guard that lets a call through fails with ENOENT instead
+    // of touching any task.
+    const run = powerShellRunner('cctl-guard-no-such-powershell.exe');
+    expect(() => startDaemonTaskNow(run, 'cctl-guard-no-such-task')).toThrow(refused);
+    expect(() =>
+      execFileSync('cctl-guard-no-such-schtasks.exe', ['/Delete', '/TN', 'cctl-guard-none', '/F']),
+    ).toThrow(refused);
+  });
+
+  it('refuses the macOS Keychain tool unless a test opts in', () => {
+    expect(() =>
+      execFileSync('security', ['find-generic-password', '-s', 'cctl-guard-no-such-item'], {
+        stdio: 'ignore',
+      }),
+    ).toThrow(refused);
+  });
+
+  it("points the CLI's Keychain item at the sandbox, never the real login's", () => {
+    const { service } = resolveClaudeCliKeychainTarget();
+    expect(service).not.toBe(CLAUDE_CLI_KEYCHAIN_SERVICE);
+    expect(service.startsWith(`${CLAUDE_CLI_KEYCHAIN_SERVICE}-`)).toBe(true);
+  });
+
+  it("refuses writes into Claude Code's machine-wide managed settings", () => {
+    expect(() => fs.writeFileSync(probe(managedDropInDir()), 'x')).toThrow(refused);
   });
 });
