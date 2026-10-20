@@ -12,6 +12,7 @@ import { Readable } from 'node:stream';
 import {
   CredentialStore,
   FileCredentialChannel,
+  ImportInterruptedError,
   InsecurePassthroughProtector,
   LockTimeoutError,
   SwitchEngine,
@@ -2137,9 +2138,11 @@ describe('accounts a rule of the file reserves', () => {
           plan: {
             rules: specs.map(() => ({ kind: 'refused' as const, message: 'refused here' })),
             handOffs: [],
+            seats: [],
           },
           outcomes: specs.map(() => undefined),
           handedOff: [],
+          seated: [],
         }),
     });
     const file = await clientFile();
@@ -2390,7 +2393,12 @@ function asDone(line: string): string {
   return line
     .replace(/^(\s+\S.*?): create\b/, '$1: created')
     .replace(': add to the rule here', ': added to the rule here')
-    .replace(/ moves off (.+) onto (.+)$/, ' switched off $1 (now reserved) and is on $2');
+    .replace(/ moves off (.+) onto (.+)$/, ' switched off $1 (now reserved) and is on $2')
+    .replace(/ will run on (.+) instead of (.+)$/, ' now runs on $1 instead of $2')
+    .replace(
+      / will be left with no account \((.+) is signed out of it\)$/,
+      ' was left with no account ($1 was signed out of it)',
+    );
 }
 
 /** Import `file` into `m` as a dry run and then for real, returning both runs' rule lines and the
@@ -2412,6 +2420,7 @@ async function dryThenReal(
  *  account the run kept out of, or handed back to, auto-switch. */
 const AFTER_THE_WRITE = [
   /^ {4}no account is live in its slot yet/,
+  /^ {4}its slot was left (?:on .+|as it was): \d+ running session\(s\) use it/,
   /^ {4}\d+ running session\(s\) under /,
   /^ {2}\S.*: (?:still )?kept out of auto-switch\b/,
   /^ {2}\S.*: handed back to auto-switch\b/,
@@ -3071,6 +3080,7 @@ describe('an account held back for a rule the plan would not make', () => {
         Promise.resolve({
           rules: specs.map(() => ({ kind: 'refused' as const, message: 'not yet' })),
           handOffs: [],
+          seats: [],
         }),
     });
 
@@ -3082,5 +3092,108 @@ describe('an account held back for a rule the plan would not make', () => {
     expect(b.out.join('')).toContain(
       'fresh: handed back to auto-switch (the rule it is reserved to was made after all)',
     );
+  });
+});
+
+describe('slots the seat step moves, and an import stopped part-way', () => {
+  it('names a running slot the seat step moves, in the dry run and the real run alike', async () => {
+    const b = await machine();
+    const g = await b.engine.addAccount('g', bundle('G1', 'u-g'));
+    const a = await b.engine.addAccount('a', bundle('A1', 'u-a'));
+    const was = await b.engine.addAccount('b', bundle('B1', 'u-b'));
+    const d = await b.engine.addAccount('d', bundle('D1', 'u-d'));
+    await b.engine.activate(g.id);
+    const p1 = await folder(b, 'p1');
+    const origin = '5c5c5c5c-5c5c-4c5c-8c5c-5c5c5c5c5c5c';
+    const rule = await b.vault.createRule({ folders: [p1], include: [a.id], origin });
+    // Auto-switch had moved the slot onto an inherited account; a session runs under the rule.
+    await b.engine.activate(was.id, { slot: ruleSlotId(rule.id) });
+    await mkdir(join(b.paths.claudeDir, 'sessions'), { recursive: true });
+    await writeFile(
+      join(b.paths.claudeDir, 'sessions', 'running.json'),
+      JSON.stringify({ pid: process.pid, cwd: p1 }),
+    );
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: ['a', 'b', 'd', 'g'].map((label) => ({
+          label,
+          accountUuid: `u-${label}`,
+          autoSwitchExcluded: false,
+        })),
+        rules: [
+          { label: 'p1', origin, folders: [p1], aliases: [], include: ['u-a', 'u-d'], exclude: [] },
+        ],
+      }),
+    );
+
+    const run = await dryThenReal(b, file);
+    expect(run.failed).toBe(0);
+    expect(run.dry).toContain(`  the folder slot of ${p1} will run on d instead of b`);
+    expectSameVerdicts(run);
+    expect(await b.engine.getActiveId(ruleSlotId(rule.id))).toBe(d.id);
+  });
+
+  it('finds the rule it made from a file rule with no identity, when the file comes again', async () => {
+    const b = await machine();
+    await b.engine.addAccount('x', bundle('X1', 'u-x'));
+    await b.engine.addAccount('s', bundle('S1', 'u-s'));
+    const p = await folder(b, 'p');
+    const q = await folder(b, 'q');
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: [{ label: 'x', accountUuid: 'u-x', autoSwitchExcluded: false }],
+        rules: [{ label: 'theirs', folders: [p, q], aliases: [], include: [], exclude: ['u-x'] }],
+      }),
+    );
+
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    b.out.length = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    expect(b.out.join('')).toContain('skipped - this machine already has this rule');
+    expect(await b.engine.listRules()).toHaveLength(1);
+  });
+
+  it('reports the slots an import moved before it stopped, and brings the guard up to date', async () => {
+    const b = await machine();
+    const x = await b.engine.addAccount('x', bundle('X1', 'u-x'));
+    const y = await b.engine.addAccount('y', bundle('Y1', 'u-y'));
+    await b.engine.activate(x.id);
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: [
+          { label: 'x', accountUuid: 'u-x', autoSwitchExcluded: false },
+          { label: 'y', accountUuid: 'u-y', autoSwitchExcluded: false },
+        ],
+        rules: [
+          {
+            label: 'p',
+            folders: [await folder(b, 'p')],
+            aliases: [],
+            include: ['u-x'],
+            exclude: [],
+          },
+        ],
+      }),
+    );
+    b.deps.engine = engineWith(b.engine, {
+      importRules: () =>
+        Promise.reject(
+          new ImportInterruptedError(
+            [{ slot: 'global', from: x.id, to: y.id }],
+            [],
+            new Error('the disk went away'),
+          ),
+        ),
+    });
+
+    b.out.length = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 1 });
+    const report = b.out.join('');
+    expect(report).toContain('the global slot switched off x (now reserved) and is on y');
+    expect(report).toContain('the import stopped part-way (the disk went away)');
+    expect(b.guardRuns).toBe(1);
   });
 });

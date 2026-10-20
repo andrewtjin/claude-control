@@ -178,11 +178,18 @@ real run settles it first), an account a slot is moved onto that cannot be switc
 login will not refresh: the real run moves the slot onto the next account that can, or fails the
 rule, and reports every slot it moved), or an account, rule or login changed in between. With
 `--replace`, a quarantined login the file brings tokens for counts as usable in the dry run too,
-since the real run always takes them. Which account each slot ends up running is decided by the
-real run.
+since the real run always takes them. Both runs also name every folder slot holding a login that
+seating the rules puts on another account (an account the file newly includes there, one it no
+longer excludes, the account another rule took, or a quarantined login replaced) or on none. A
+slot that sessions run in is moved only as the dry run said, and never left with no account: a
+rule that would leave it so fails, and when the account chosen for it cannot be switched to at
+run time, the slot is left as it was and the run says so.
 
 An import is safe to run twice: everything already in place is reported as such and left
-alone, and a run that stopped part-way is completed by the next one. A rule that failed because
+alone, and a run that stopped part-way (it still reports every slot it moved) is completed by
+the next one. A rule the file carries without an identity (one exported from a rule cctl did not
+make, by an older build) is given one from its folders and sessions, so the next import of the
+same file finds the rule the first one made. A rule that failed because
 a rule of this machine is in its way fails again until that rule is removed. A wrong passphrase, a file
 changed after it was written, one cut short, or one whose rules hold more than 1024 folders and
 session aliases in all is refused before anything is imported.

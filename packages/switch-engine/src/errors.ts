@@ -1,6 +1,8 @@
 // Typed errors so callers can branch on failure mode rather than string-matching.
 // Each carries a stable `code` for logs and protocol mapping.
 
+import type { SlotHandOff, SlotSeat } from './types.js';
+
 export class SwitchEngineError extends Error {
   constructor(
     message: string,
@@ -138,5 +140,26 @@ export class UnknownAccountError extends SwitchEngineError {
 export class ProfileError extends SwitchEngineError {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, 'profile_error', options);
+  }
+}
+
+/**
+ * An import of rules that stopped part-way, after it had already changed something: the slots it
+ * moved (`handedOff`, `seated`) are carried here, because the caller has to report them and bring
+ * the guard up to date even though the batch did not finish. `cause` is what stopped it (the lock
+ * taken over, a file that could not be read). Running the import again finishes it.
+ */
+export class ImportInterruptedError extends SwitchEngineError {
+  constructor(
+    readonly handedOff: readonly SlotHandOff[],
+    readonly seated: readonly SlotSeat[],
+    cause: unknown,
+  ) {
+    super(
+      `the import stopped part-way (${cause instanceof Error ? cause.message : String(cause)}); ` +
+        'running it again finishes it',
+      'import_interrupted',
+      { cause },
+    );
   }
 }

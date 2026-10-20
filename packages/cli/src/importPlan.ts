@@ -32,7 +32,9 @@ import {
   type PlanImportRulesOptions,
   type RuleScopeRef,
   type SlotHandOff,
+  type SlotSeat,
 } from '@claude-control/switch-engine';
+import { createHash } from 'node:crypto';
 import { loginOf, type ExportPayload, type ExportedAccount } from './exportPayload.js';
 import { slotName } from './folderRender.js';
 import {
@@ -131,6 +133,8 @@ export interface ImportPlan {
   rules: RuleStep[];
   /** The slots the rules move off an account they reserve, as the engine chose them. */
   handOffs: SlotHandOff[];
+  /** The folder slots holding a login that seating the rules puts on another account, or none. */
+  seats: SlotSeat[];
   settings: SettingStep[];
   /** Facts about the file worth saying before the plan (another platform, and so on). */
   notes: string[];
@@ -459,7 +463,7 @@ function draftRules(input: PlanInput, steps: readonly AccountStep[]): RuleStep[]
       include: [],
       exclude: [],
       dropped: [],
-      ...(rule.origin !== undefined ? { origin: rule.origin } : {}),
+      origin: rule.origin ?? scopesOrigin(rule),
       ...(rule.label.trim() !== '' && rule.label !== defaultRuleLabel(rule)
         ? { label: rule.label }
         : {}),
@@ -482,6 +486,23 @@ function draftRules(input: PlanInput, steps: readonly AccountStep[]): RuleStep[]
     const noScope = noScopeLeft(step.scopes);
     return noScope !== undefined ? { ...step, skip: noScope } : step;
   });
+}
+
+/**
+ * The identity of a rule the file carries without one (exported from a rule whose id was not a
+ * rule id, by hand-editing say): one made from its scopes as the file names them, so the rule the
+ * first import makes is found again by every later import of the same file, rather than refused
+ * as a rule of this machine's own. Shaped as a rule id, which is what the vault stores.
+ */
+function scopesOrigin(rule: ExportPayload['rules'][number]): string {
+  const hex = createHash('sha256')
+    .update(JSON.stringify({ folders: rule.folders, aliases: rule.aliases }))
+    .digest('hex');
+  const variant = ((parseInt(hex[16]!, 16) & 0x3) | 0x8).toString(16);
+  return (
+    `${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-` +
+    `${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`
+  );
 }
 
 /**
@@ -529,13 +550,16 @@ function fileReserved(input: PlanInput, steps: readonly AccountStep[]): Set<numb
 }
 
 /**
- * The login the import gives a stored row that records none: a replaced row's, which its tokens
- * prove. The engine records it whether it takes the file's tokens or keeps the newer copy stored
- * here (see SwitchEngine.importBundle), so the plan counts it either way, as the real run will.
+ * The login the import gives a stored row that records none: the one the file's tokens name, which
+ * they prove. The engine records it whether it takes the file's tokens or keeps the newer copy
+ * stored here (see SwitchEngine.importBundle), so the plan counts it either way, as the real run
+ * will. The login the file's entry states beside its tokens is not counted: the engine is given
+ * only the tokens, so a login they do not name is never recorded.
  */
 function newLoginOf(step: AccountStep, input: PlanInput): string | undefined {
   if (step.kind !== 'replace' || step.existing.accountUuid !== undefined) return undefined;
-  return loginOf(input.payload.accounts[step.entry]!);
+  const login = input.payload.accounts[step.entry]!.bundle?.oauthAccount?.accountUuid;
+  return typeof login === 'string' && login !== '' ? login : undefined;
 }
 
 /**
@@ -549,7 +573,7 @@ async function decideRules(
   input: PlanInput,
   steps: readonly AccountStep[],
   rules: readonly RuleStep[],
-): Promise<{ handOffs: SlotHandOff[]; labels: Map<string, string> }> {
+): Promise<{ handOffs: SlotHandOff[]; seats: SlotSeat[]; labels: Map<string, string> }> {
   const labels = new Map(input.accounts.map((a) => [a.id, a.label]));
   const forRule = fileReserved(input, steps);
   const pending: PendingImportAccount[] = steps.flatMap((s) => {
@@ -568,7 +592,7 @@ async function decideRules(
   });
   for (const p of pending) labels.set(p.id, p.label);
   const sent = rules.filter((r) => r.skip === undefined);
-  if (sent.length === 0) return { handOffs: [], labels };
+  if (sent.length === 0) return { handOffs: [], seats: [], labels };
   const logins = steps.flatMap((s) => {
     const login = newLoginOf(s, input);
     return s.kind === 'replace' && login !== undefined
@@ -588,7 +612,7 @@ async function decideRules(
     { keepOut, pending, logins, revived },
   );
   for (const [k, r] of sent.entries()) r.verdict = plan.rules[k]!;
-  return { handOffs: plan.handOffs, labels };
+  return { handOffs: plan.handOffs, seats: plan.seats, labels };
 }
 
 /** Whether a verdict writes the rule (creates or grows it). */
@@ -710,12 +734,13 @@ export async function planImport(input: PlanInput): Promise<ImportPlan> {
     );
   }
   const rules = draftRules(input, accounts);
-  const { handOffs, labels } = await decideRules(input, accounts, rules);
+  const { handOffs, seats, labels } = await decideRules(input, accounts, rules);
   holdBackOrphans(input, accounts, rules);
   return {
     accounts,
     rules,
     handOffs,
+    seats,
     settings: planSettings(input),
     notes,
     platform: input.platform,
@@ -905,6 +930,22 @@ export function handOffLine(hand: SlotHandOff, tense: 'plan' | 'done', names: Re
     : `${slot} switched off ${from} (now reserved) and is on ${to}`;
 }
 
+/** The line a folder slot the seat step moves gets: in the plan (`plan`), or as made (`done`). A
+ *  slot holding a login no account here is recognized as names it so. */
+export function seatLine(seat: SlotSeat, tense: 'plan' | 'done', names: ReportNames): string {
+  const slot = safe(names.slotName(seat.slot));
+  const from = seat.from === null ? 'a login no account here is' : safe(names.labelOf(seat.from));
+  if (seat.to === null) {
+    return tense === 'plan'
+      ? `${slot} will be left with no account (${from} is signed out of it)`
+      : `${slot} was left with no account (${from} was signed out of it)`;
+  }
+  const to = safe(names.labelOf(seat.to));
+  return tense === 'plan'
+    ? `${slot} will run on ${to} instead of ${from}`
+    : `${slot} now runs on ${to} instead of ${from}`;
+}
+
 /** The command that hands an account kept out of auto-switch back to it, quoted for the shell. */
 export function includeCommand(label: string, platform: NodeJS.Platform): string {
   return `cctl accounts include ${shellQuoteArg(safe(label), platform)}`;
@@ -997,6 +1038,7 @@ export function renderImportPlan(plan: ImportPlan): string {
     lines.push(`  ${first!}`, ...rest.map((l) => `    ${l}`));
   }
   for (const hand of plan.handOffs) lines.push(`  ${handOffLine(hand, 'plan', names)}`);
+  for (const seat of plan.seats) lines.push(`  ${seatLine(seat, 'plan', names)}`);
   lines.push('Settings:');
   if (plan.settings.length === 0) lines.push('  (none in the file)');
   for (const step of plan.settings) lines.push(`  ${describeSettingStep(step)}`);

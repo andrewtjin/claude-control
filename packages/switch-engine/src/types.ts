@@ -515,11 +515,24 @@ export type ImportRuleVerdict =
   | { kind: 'unchanged'; reason: string; rule?: FolderRule; leftOut: ImportLeftOut[] }
   | { kind: 'refused'; message: string; conflict?: ImportConflict };
 
-/** Everything an import of rules would do: the verdict on each spec, in spec order, and every slot
- *  it would move off an account it reserves. */
+/** Everything an import of rules would do: the verdict on each spec, in spec order, every slot it
+ *  would move off an account it reserves, and every slot holding a login that seating the rules it
+ *  writes would put on another account (or none). */
 export interface ImportRulesPlan {
   rules: ImportRuleVerdict[];
   handOffs: SlotHandOff[];
+  seats: SlotSeat[];
+}
+
+/** A rule's slot that held a login and that an import's seat step put on another account, or on
+ *  none: its occupant left the rule's pool, a rule seated before it took the account, the batch
+ *  newly includes an account there, or a quarantined occupant was replaced. */
+export interface SlotSeat {
+  slot: SlotId;
+  /** The account the slot held, or null for a login no stored account is. */
+  from: string | null;
+  /** The account it holds now, or null when it was cleared. */
+  to: string | null;
 }
 
 /** What {@link SwitchEngine.importRules} did with one spec it wrote (a `create` or `grow`). */
@@ -542,11 +555,13 @@ export type ImportRuleOutcome =
 
 /** What {@link SwitchEngine.importRules} decided (`plan`, the same decision
  *  {@link SwitchEngine.planImportRules} reports), what it then did with each spec it wrote
- *  (`outcomes`, undefined for one it did not write), and the slots it moved first. */
+ *  (`outcomes`, undefined for one it did not write), the slots it moved first, and the slots its
+ *  seat step moved (see {@link ImportRulesPlan.seats}). */
 export interface ImportRulesResult {
   plan: ImportRulesPlan;
   outcomes: Array<ImportRuleOutcome | undefined>;
   handedOff: SlotHandOff[];
+  seated: SlotSeat[];
 }
 
 /** What {@link SwitchEngine.importBundle} did with a credential bundle brought from another
@@ -663,6 +678,10 @@ export interface RuleLiveResult {
    *  repair/doctor report the eviction (an eviction leaves `activated` false, so it would otherwise
    *  be silent). */
   clearedSquatter?: boolean;
+  /** Set by an import's seat step when it left the slot as it was although the slot should have
+   *  moved: sessions run under the rule (this many), and the move the import decided on could not
+   *  be made, so it moved the slot nowhere else and cleared nothing. */
+  heldForSessions?: number;
 }
 
 /** A slot moved off an account because the account could no longer be live there (see

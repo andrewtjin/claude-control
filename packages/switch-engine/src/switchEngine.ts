@@ -26,6 +26,7 @@ import { type Protector } from './dpapi.js';
 import { defaultLiveCredentialChannel, defaultProtector } from './protector.js';
 import {
   CadenceError,
+  ImportInterruptedError,
   LockTimeoutError,
   QuarantineError,
   RefreshError,
@@ -78,19 +79,20 @@ import {
   allSlots,
   assignDistinct,
   availableInOrder,
+  chooseSeat,
   withoutKeptOut,
   describeRuleScopes,
   exactAliasRule,
   exactFolderRule,
-  legitimateOccupancy,
-  liveElsewhere,
   resolveFolderRule,
   resolveSessionRule,
+  ruleOfSlot,
   ruleScopeCount,
   rulesIncluding,
   slotMayHold,
   slotPool,
   withRule,
+  type SeatOccupant,
   type RulesPicture,
 } from './folderRules.js';
 import { readdir, readFile, rm } from 'node:fs/promises';
@@ -136,6 +138,7 @@ import type {
   SessionIdentity,
   SessionIdentityLookup,
   SlotHandOff,
+  SlotSeat,
   SlotId,
   SlotLiveToken,
   SlotViolation,
@@ -497,6 +500,8 @@ interface ImportDecision {
   plan: ImportRulesPlan;
   writes: ImportWrite[];
   handOffs: Array<{ slotId: SlotId; from: StoredAccount; to: string }>;
+  /** The slots holding a login that the seat step moves (see {@link ImportRulesPlan.seats}). */
+  seats: SlotSeat[];
 }
 
 /**
@@ -575,6 +580,42 @@ async function writeImportBatch(
 type HandOffPlan =
   | { ok: true; steps: Array<{ slotId: SlotId; from: StoredAccount; to: string }> }
   | { ok: false; slotId: SlotId; from: StoredAccount; error: RefreshError };
+
+/** Who holds each slot as an import decides (see SwitchEngine.importStates): every account its live
+ *  login may belong to, the one account it is recognized as (null when none, or no login), and the
+ *  slots holding a login at all. */
+interface SlotStates {
+  owners: Map<SlotId, Set<string>>;
+  active: Map<SlotId, string | null>;
+  withLogin: Set<SlotId>;
+}
+
+/**
+ * Hand-off moves in an order each can be made in: a slot that takes an account another slot of the
+ * plan leaves moves after that slot, since no account is ever live in two slots. Undefined when the
+ * moves wait on each other in a ring (two slots trading accounts), which no order can make.
+ */
+function orderedMoves<M extends { from: { id: string }; to: string }>(
+  moves: readonly M[],
+): M[] | undefined {
+  const out: M[] = [];
+  const done = new Set<number>();
+  const visiting = new Set<number>();
+  const visit = (i: number): boolean => {
+    if (done.has(i)) return true;
+    if (visiting.has(i)) return false;
+    visiting.add(i);
+    for (const [j, other] of moves.entries()) {
+      if (j !== i && other.from.id === moves[i]!.to && !visit(j)) return false;
+    }
+    visiting.delete(i);
+    done.add(i);
+    out.push(moves[i]!);
+    return true;
+  };
+  for (let i = 0; i < moves.length; i += 1) if (!visit(i)) return undefined;
+  return out;
+}
 
 /** Import specs tried against a draft of the registry (see decideImportLocked): their writes, the
  *  ones the draft refused, the rule each write landed in, and the registry as they leave it. */
@@ -1641,27 +1682,6 @@ export class SwitchEngine {
     return this.adoptRotationIfNeeded(liveAccount, liveNow, liveOauth);
   }
 
-  /**
-   * The login (uuid) live in each slot that no stored account is recognized as: the slot has live
-   * credentials, {@link getActiveId} names nobody, and its identity block names a uuid. A login used
-   * here before cctl stored it — the main login of a machine an import is about to fill. Once an
-   * account with that uuid is stored, getActiveId names it, so a decision about what an import will
-   * do to the slots has to count it as live there already (see importOccupancy).
-   */
-  private async unrecognizedLiveLogins(): Promise<Map<SlotId, string>> {
-    const out = new Map<SlotId, string>();
-    for (const slotId of await this.allSlotIds()) {
-      const rt = this.slotRuntime(slotId);
-      const live = await rt.credStore.readLiveCredentials().catch(() => undefined);
-      if (live === undefined || (await this.getActiveId(slotId)) !== null) continue;
-      const uuid = anchorValue(
-        (await rt.credStore.readOauthAccount().catch(() => undefined))?.accountUuid,
-      );
-      if (uuid !== undefined) out.set(slotId, uuid);
-    }
-    return out;
-  }
-
   /** The reconciled live account of every slot — the doctor/daemon view of "who is where". */
   async liveSlots(): Promise<Map<SlotId, string | null>> {
     const out = new Map<SlotId, string | null>();
@@ -1832,8 +1852,8 @@ export class SwitchEngine {
    * keeps on record for an account another rule reserves can no longer be made once that
    * reservation exists. In order:
    *   1. decide ({@link decideImportLocked}, the decision {@link planImportRules} reports): every
-   *      refusal, the batch tried against a draft of the registry, and the hand-offs, chosen for
-   *      all the slots together.
+   *      refusal, the batch tried against a draft of the registry, the hand-offs, chosen for all the
+   *      slots together, and the seat step played out on the draft.
    *   2. hand off every slot that holds an account the batch reserves and may not keep it. A slot
    *      that cannot take the account chosen for it (its token will not refresh) stays as it was;
    *      the decision is then made again from the slots as they are, without that account, and
@@ -1842,14 +1862,18 @@ export class SwitchEngine {
    *      account a later rule reserves is still shared while the exclusions are written, as it was
    *      on the source when they were made.
    *   4. seat each written rule's slot, once every reservation is in place, so no slot is given an
-   *      account another rule of the batch includes.
+   *      account another rule of the batch includes; every slot holding a login that this moves is
+   *      reported. A slot sessions run under is moved only as the decision said, and never cleared
+   *      (see ensureRuleLiveLocked's `guard`): when that move cannot be made it is left as it was.
    *   5. write the guard snapshot LAST.
    * Each write is one of the vault's own crash-safe writes, and the batch was tried whole before
    * any of them, so a write fails part-way only when something changed under the lock's holder
    * (another process writing the files by hand) or the process dies; a run that dies part-way
    * leaves rules the next import grows to completion by their identity. The lock is renewed between
    * steps (each move and each seat may refresh a token over the network), so no other process takes
-   * it over while the batch runs.
+   * it over while the batch runs. A run stopped part-way by anything else (the lock taken over all
+   * the same, a file that cannot be read) throws {@link ImportInterruptedError} carrying every slot
+   * it had moved, so they are still reported.
    *
    * `keepOut` names accounts no slot may be moved to or seated with in steps 2 and 4 unless its own
    * rule includes them (see withoutKeptOut): accounts the import brought for a rule of the machine
@@ -1863,89 +1887,135 @@ export class SwitchEngine {
     this.refuseRuleSlotsOnDarwin();
     await this.vault.readStoredTokens().catch(() => undefined);
     return this.withCredentialLock(async (renew) => {
-      const allIds = memberIdsOf(specs);
-      await this.resolveRequested(allIds);
-      await this.settleForAccountsLocked(allIds);
-
-      // 1-2. Decide, and hand off. A slot that cannot take the account it was handed (its token
-      // will not refresh, say) stays where it was; the decision is then made again from the slots
-      // as they now are, without that account, and every hand-off made along the way is reported.
-      const keepOut = new Set(opts.keepOut ?? []);
-      const avoid = new Map<string, string>();
-      const handedOff: SlotHandOff[] = [];
-      let decision: ImportDecision;
-      for (;;) {
-        renew();
-        decision = await this.decideImportLocked(specs, {
-          keepOut,
-          pending: [],
-          logins: [],
-          settle: true,
-          avoid,
-        });
-        const moves = await this.executeHandOffLocked(decision.handOffs, renew);
-        handedOff.push(...moves.made);
-        if (moves.failed === undefined) break;
-        avoid.set(moves.failed.to, moves.failed.error.message);
-        this.log.warn(
-          { accountId: moves.failed.to, reason: errorReason(moves.failed.error) },
-          'an import could not move a slot onto an account; deciding again without it',
-        );
+      const moved = { handedOff: [] as SlotHandOff[], seated: [] as SlotSeat[], wrote: false };
+      try {
+        return await this.importRulesLocked(specs, opts, renew, moved);
+      } catch (err) {
+        const changed = moved.wrote || moved.handedOff.length + moved.seated.length > 0;
+        if (!changed || this.isSimulatedDeath(err)) throw err;
+        throw new ImportInterruptedError(moved.handedOff, moved.seated, err);
       }
-
-      // 3. Scopes, then exclusions, then inclusions.
-      renew();
-      const outcomes: Array<ImportRuleOutcome | undefined> = specs.map(() => undefined);
-      const ruleIds = await writeImportBatch(
-        this.vault,
-        decision.writes,
-        async (write, err, at) => {
-          const partial = at !== undefined ? await this.vault.getRule(at) : undefined;
-          outcomes[write.index] = {
-            ok: false,
-            message: err.message,
-            ...(partial ? { partial } : {}),
-          };
-        },
-      );
-
-      // 4. Seat each written rule's slot. Only an account the batch includes in a rule is a reason
-      // to move its slot off an account it may keep.
-      let written = false;
-      for (const write of decision.writes) {
-        const ruleId = ruleIds.get(write);
-        if (ruleId === undefined) continue;
-        written = true;
-        if (outcomes[write.index] !== undefined) continue;
-        const rule = await this.vault.getRule(ruleId);
-        if (!rule) continue;
-        renew();
-        let live: RuleLiveResult | null = null;
-        try {
-          live = await this.ensureRuleLiveLocked(rule, {
-            preferIncluded: write.include.length > 0,
-            keepOut,
-          });
-        } catch (err) {
-          if (!(err instanceof SwitchEngineError)) throw err;
-          this.log.warn(
-            { ruleId, reason: errorReason(err) },
-            'an imported rule could not be seated',
-          );
-        }
-        outcomes[write.index] = {
-          ok: true,
-          rule: (await this.vault.getRule(ruleId)) ?? rule,
-          created: write.ruleId === undefined,
-          live,
-          runningSessions: await this.runningSessionsInRule(rule),
-        };
-      }
-
-      // 5. The guard snapshot, last.
-      if (written || handedOff.length > 0) await this.writeSnapshotLocked();
-      return { plan: decision.plan, outcomes, handedOff };
     });
+  }
+
+  /** The body of {@link importRules}, under its lock. Every slot it moves goes into `moved` as it
+   *  moves (and `wrote` once it starts writing rules), so a run that stops part-way still reports
+   *  what it changed. */
+  private async importRulesLocked(
+    specs: readonly ImportRuleSpec[],
+    opts: ImportRulesOptions,
+    renew: () => void,
+    moved: { handedOff: SlotHandOff[]; seated: SlotSeat[]; wrote: boolean },
+  ): Promise<ImportRulesResult> {
+    const allIds = memberIdsOf(specs);
+    await this.resolveRequested(allIds);
+    await this.settleForAccountsLocked(allIds);
+
+    // 1-2. Decide, and hand off. A slot that cannot take the account it was handed (its token will
+    // not refresh, say) stays where it was; the decision is then made again from the slots as they
+    // now are, without that account, and every hand-off made along the way is reported.
+    const keepOut = new Set(opts.keepOut ?? []);
+    const avoid = new Map<string, string>();
+    let decision: ImportDecision;
+    for (;;) {
+      renew();
+      decision = await this.decideImportLocked(specs, {
+        keepOut,
+        pending: [],
+        logins: [],
+        settle: true,
+        avoid,
+      });
+      const moves = await this.executeHandOffLocked(decision.handOffs, renew);
+      moved.handedOff.push(...moves.made);
+      if (moves.stopped !== undefined) throw moves.stopped;
+      if (moves.failed === undefined) break;
+      avoid.set(moves.failed.to, moves.failed.error.message);
+      this.log.warn(
+        { accountId: moves.failed.to, reason: errorReason(moves.failed.error) },
+        'an import could not move a slot onto an account; deciding again without it',
+      );
+    }
+
+    // 3. Scopes, then exclusions, then inclusions. The rules as they stand before, for whose
+    // sessions run on each grown rule's slot now (a scope it gains ran on another slot).
+    renew();
+    const rulesBefore = await this.vault.listRules();
+    moved.wrote = true;
+    const outcomes: Array<ImportRuleOutcome | undefined> = specs.map(() => undefined);
+    const ruleIds = await writeImportBatch(this.vault, decision.writes, async (write, err, at) => {
+      const partial = at !== undefined ? await this.vault.getRule(at) : undefined;
+      outcomes[write.index] = {
+        ok: false,
+        message: err.message,
+        ...(partial ? { partial } : {}),
+      };
+    });
+
+    // 4. Seat each written rule's slot. Only an account the batch newly includes in a rule is a
+    // reason to move its slot off an account it may keep.
+    let written = false;
+    const avoided = new Set(avoid.keys());
+    for (const write of decision.writes) {
+      const ruleId = ruleIds.get(write);
+      if (ruleId === undefined) continue;
+      written = true;
+      if (outcomes[write.index] !== undefined) continue;
+      const rule = await this.vault.getRule(ruleId);
+      if (!rule) continue;
+      renew();
+      const slotId = ruleSlotId(ruleId);
+      const before = await this.seatOccupant(slotId);
+      /** Report the slot as the seat left it, when it held a login and holds another now. */
+      const report = async (): Promise<void> => {
+        const now = await this.seatOccupant(slotId);
+        if (!before.hasLogin || (now.hasLogin && now.id === before.id)) return;
+        moved.seated.push({ slot: slotId, from: before.id, to: now.hasLogin ? now.id : null });
+      };
+      let live: RuleLiveResult | null = null;
+      try {
+        live = await this.ensureRuleLiveLocked(rule, {
+          ...(write.include.length > 0 ? { preferIncluded: new Set(write.include) } : {}),
+          keepOut,
+          avoid: avoided,
+          renew,
+          guard: {
+            move: decision.seats.find((s) => s.slot === slotId),
+            rule: rulesBefore.find((r) => r.id === ruleId) ?? rule,
+          },
+        });
+      } catch (err) {
+        if (
+          !(err instanceof SwitchEngineError) ||
+          err.code === 'lock_lost' ||
+          this.isSimulatedDeath(err)
+        ) {
+          if (!this.isSimulatedDeath(err)) await report();
+          throw err;
+        }
+        this.log.warn({ ruleId, reason: errorReason(err) }, 'an imported rule could not be seated');
+      }
+      await report();
+      outcomes[write.index] = {
+        ok: true,
+        rule: (await this.vault.getRule(ruleId)) ?? rule,
+        created: write.ruleId === undefined,
+        live,
+        runningSessions: await this.runningSessionsInRule(rule),
+      };
+    }
+
+    // 5. The guard snapshot, last, while the lock is still this run's.
+    if (written || moved.handedOff.length > 0) {
+      renew();
+      await this.writeSnapshotLocked();
+    }
+    return {
+      plan: decision.plan,
+      outcomes,
+      handedOff: moved.handedOff,
+      seated: moved.seated,
+    };
   }
 
   /**
@@ -1971,10 +2041,10 @@ export class SwitchEngine {
    *      take (never one the batch excludes from its rule; first one the batch includes in it).
    *      When some slot is left with nothing, the spec refused is the first, in spec order, whose
    *      addition leaves it so.
-   *   7. a rule's slot the batch moves off its account (the rule now excludes it) with nothing left
-   *      to seat while sessions run under the rule, judged after the hand-offs, against the rules
-   *      as the batch leaves them, without the accounts kept out, and with the written rules seated
-   *      in turn: the spec growing that rule is refused.
+   *   7. the seat step played out on the draft ({@link seatBatch}): after the hand-offs, each
+   *      written rule's slot seated in turn by the same choice the real seat step makes, so every
+   *      slot it moves is in the plan; a slot holding a login that it would clear while sessions run
+   *      under the rule refuses the spec writing that rule.
    * Who is live in each slot is read from the slots themselves ({@link possibleLiveOwners}), not
    * from what is recorded for them; an account in `pending` or `logins` counts as live where its
    * login runs unrecognized, and an account in `revived` as usable. `avoid` names accounts a slot
@@ -2025,7 +2095,8 @@ export class SwitchEngine {
       { ...stored, shared: [...stored.shared, ...pendingRows] },
       revived,
     );
-    const occupancy = await this.importOccupancy(stored, [...opts.pending, ...opts.logins]);
+    const states = await this.importStates(stored, [...opts.pending, ...opts.logins]);
+    const occupancy = states.owners;
 
     // 2. The rule each spec is, and the scopes no other rule may hold.
     const targets: Array<FolderRule | undefined> = specs.map(() => undefined);
@@ -2172,6 +2243,7 @@ export class SwitchEngine {
     let capped = new Map<number, SwitchEngineError>();
     let handOffs: Array<{ slotId: SlotId; from: StoredAccount; to: string }> = [];
     let writes: ImportWrite[] = [];
+    let seats: SlotSeat[] = [];
     for (;;) {
       // 4. The caps, in spec order.
       capped = importCapRefusals(
@@ -2210,21 +2282,16 @@ export class SwitchEngine {
         continue;
       }
 
-      // 7. A slot the batch moves off its account and leaves with nothing, while sessions run there.
-      const emptied = await this.importEmptyingRefusal(
-        tried,
-        plan.steps,
-        picture,
-        occupancy,
-        targets,
-        opts,
-      );
-      if (emptied !== undefined) {
-        refuse(emptied.index, emptied.error);
+      // 7. The seat step, played out on the draft; a slot it would clear while sessions run there
+      //    refuses the spec writing that rule.
+      const seated = await this.seatBatch(tried, plan.steps, states, targets, picture, opts);
+      if (!seated.ok) {
+        refuse(seated.index, seated.error);
         continue;
       }
       handOffs = plan.steps;
       writes = tried.writes;
+      seats = seated.seats;
       break;
     }
     for (const [i, err] of capped) refuse(i, err);
@@ -2241,9 +2308,11 @@ export class SwitchEngine {
       plan: {
         rules: verdicts as ImportRuleVerdict[],
         handOffs: handOffs.map((h) => ({ slot: h.slotId, from: h.from.id, to: h.to })),
+        seats,
       },
       writes,
       handOffs,
+      seats,
     };
   }
 
@@ -2262,78 +2331,130 @@ export class SwitchEngine {
   }
 
   /**
-   * The running-session refusal for a batch: a rule's slot the batch moves off its account (the rule
-   * now excludes it) with nothing left to seat while sessions run under the rule. Judged as the real
-   * run will meet it: after the hand-offs, against the rules as the batch leaves them (so an account
-   * another spec reserves is no replacement), without the accounts kept out, and with the written
-   * rules seated in turn, each taking the first account left for it. The spec refused is the one
-   * growing that rule.
+   * The seat step of a batch (step 4 of {@link importRules}) played out on the draft, so the
+   * decision states what it will do: starting from who holds each slot with the hand-offs made,
+   * each written rule's slot is seated in write order by the choice the real step makes
+   * ({@link chooseSeat}, with the same accounts preferred, kept out and avoided), each seat seeing
+   * the ones before it, against the rules as the batch leaves them. Returns every slot holding a
+   * login that it moves or clears, or the refusal of the first spec whose rule's slot it would clear
+   * while sessions run under the rule.
    */
-  private async importEmptyingRefusal(
+  private async seatBatch(
     tried: TriedBatch,
     handOffs: ReadonlyArray<{ slotId: SlotId; from: StoredAccount; to: string }>,
-    before: RulesPicture,
-    occupancy: Map<SlotId, Set<string>>,
+    states: SlotStates,
     targets: ReadonlyArray<FolderRule | undefined>,
+    before: RulesPicture,
     opts: { keepOut: ReadonlySet<string>; avoid?: ReadonlyMap<string, string> },
-  ): Promise<{ index: number; error: unknown } | undefined> {
-    const live = new Map([...occupancy].map(([slot, owners]) => [slot, new Set(owners)]));
-    for (const step of handOffs) {
-      const owners = live.get(step.slotId);
-      owners?.delete(step.from.id);
-      owners?.add(step.to);
-    }
-    const { after } = tried;
+  ): Promise<{ ok: true; seats: SlotSeat[] } | { ok: false; index: number; error: unknown }> {
+    const owners = new Map([...states.owners].map(([slot, ids]) => [slot, new Set(ids)]));
+    const active = new Map(states.active);
+    const withLogin = new Set(states.withLogin);
+    let picture: RulesPicture = tried.after;
+    /** The slot now holds `id`, or nothing; a rule records whom its slot holds. */
+    const hold = (slotId: SlotId, id: string | null): void => {
+      owners.set(slotId, new Set(id === null ? [] : [id]));
+      active.set(slotId, id);
+      if (id === null) withLogin.delete(slotId);
+      else withLogin.add(slotId);
+      const rule = ruleOfSlot(slotId, picture.rules);
+      if (rule !== undefined) picture = withRule(picture, { ...rule, activeId: id });
+    };
+    for (const step of handOffs) hold(step.slotId, step.to);
+    const avoid = new Set(opts.avoid?.keys() ?? []);
+    const seats: SlotSeat[] = [];
     for (const write of tried.writes) {
       const ruleId = tried.ruleIds.get(write);
       if (ruleId === undefined) continue;
       const slotId = ruleSlotId(ruleId);
-      const owners = live.get(slotId) ?? new Set<string>();
-      const legit = legitimateOccupancy(live, after);
-      const keeps = [...owners].some(
-        (id) => slotMayHold(slotId, id, after) && liveElsewhere(slotId, id, legit) === null,
-      );
-      if (keeps) continue;
-      const next = availableInOrder(
-        withoutKeptOut(slotPool(slotId, after, live), opts.keepOut),
-      ).filter((a) => opts.avoid?.has(a.id) !== true);
-      if (next.length > 0) {
-        live.set(slotId, new Set([next[0]!.id]));
-        continue;
-      }
+      const from: SeatOccupant = {
+        id: active.get(slotId) ?? null,
+        hasLogin: withLogin.has(slotId),
+      };
+      const choice = chooseSeat(slotId, picture, owners, from, {
+        ...(write.include.length > 0 ? { prefer: new Set(write.include) } : {}),
+        keepOut: opts.keepOut,
+        avoid,
+      });
+      const to = choice.candidates[0]?.id ?? choice.keeps;
+      hold(slotId, to);
+      // An empty slot seated, or a login kept, moves nothing anyone runs on.
+      if (!from.hasLogin || (to !== null && to === from.id)) continue;
+      seats.push({ slot: slotId, from: from.id, to });
       const into = targets[write.index];
-      const movedOff = [...owners].find(
-        (id) => slotMayHold(slotId, id, before) && !slotMayHold(slotId, id, after),
-      );
-      if (into === undefined || movedOff === undefined) continue;
+      if (to !== null || into === undefined) continue;
+      // Cleared. Sessions running under the rule now would lose their account: the import never
+      // does that, so the spec writing the rule is refused.
+      const movedOff =
+        from.id !== null &&
+        slotMayHold(slotId, from.id, before) &&
+        !slotMayHold(slotId, from.id, picture)
+          ? from.id
+          : undefined;
       const label =
-        [...before.shared, ...before.reserved].find((a) => a.id === movedOff)?.label ?? movedOff;
+        movedOff === undefined
+          ? undefined
+          : ([...before.shared, ...before.reserved].find((a) => a.id === movedOff)?.label ??
+            movedOff);
       try {
-        await this.refuseEmptyingWhileRunning(into, [], `excluding "${label}"`, false);
+        await this.refuseEmptyingWhileRunning(
+          into,
+          [],
+          label !== undefined ? `excluding "${label}"` : 'importing it',
+          false,
+        );
       } catch (err) {
-        return { index: write.index, error: err };
+        return { ok: false, index: write.index, error: err };
       }
     }
-    return undefined;
+    return { ok: true, seats };
   }
 
   /**
-   * Who is live in every slot ({@link slotOccupancy}), plus, in a slot whose live login no stored
-   * account is recognized as, every account of `named` with that login: once the import has stored
-   * it (or given it that login), it is the account live there.
+   * Who holds each slot as an import decides ({@link SlotStates}): the accounts its live login may
+   * belong to ({@link slotOccupancy}), the account it is recognized as, and whether it holds a login
+   * at all. A slot whose live login no stored account is recognized as holds every account of
+   * `named` with that login: once the import has stored it (or given it that login), it is the
+   * account live there.
    */
-  private async importOccupancy(
+  private async importStates(
     picture: RulesPicture,
     named: ReadonlyArray<{ id: string; accountUuid?: string }>,
-  ): Promise<Map<SlotId, Set<string>>> {
-    const occupancy = await this.slotOccupancy(picture);
-    if (named.length === 0) return occupancy;
-    for (const [slotId, login] of await this.unrecognizedLiveLogins()) {
-      const owners = occupancy.get(slotId);
-      if (owners === undefined) continue;
-      for (const account of named) if (account.accountUuid === login) owners.add(account.id);
+  ): Promise<SlotStates> {
+    const owners = await this.slotOccupancy(picture);
+    const active = new Map<SlotId, string | null>();
+    const withLogin = new Set<SlotId>();
+    for (const slotId of allSlots(picture.rules)) {
+      const occupant = await this.seatOccupant(slotId);
+      let id = occupant.id;
+      if (occupant.hasLogin) {
+        withLogin.add(slotId);
+        if (id === null && named.length > 0) {
+          const login = anchorValue(
+            (
+              await this.slotRuntime(slotId)
+                .credStore.readOauthAccount()
+                .catch(() => undefined)
+            )?.accountUuid,
+          );
+          const matches = login === undefined ? [] : named.filter((a) => a.accountUuid === login);
+          for (const account of matches) owners.get(slotId)?.add(account.id);
+          id = matches[0]?.id ?? null;
+        }
+      }
+      active.set(slotId, id);
     }
-    return occupancy;
+    return { owners, active, withLogin };
+  }
+
+  /** Who holds a slot, as a seat is chosen for it ({@link chooseSeat}): the account its live login
+   *  is recognized as, and whether it holds a login at all. A slot with none holds nobody. */
+  private async seatOccupant(slotId: SlotId): Promise<SeatOccupant> {
+    const creds = await this.slotRuntime(slotId)
+      .credStore.readLiveCredentials()
+      .catch(() => undefined);
+    if (creds === undefined) return { id: null, hasLogin: false };
+    return { id: await this.getActiveId(slotId), hasLogin: true };
   }
 
   /**
@@ -2829,26 +2950,36 @@ export class SwitchEngine {
   /**
    * Make a rule's slot live, assuming the caller holds the credential lock. Idempotent.
    *
-   * The account live there is KEPT when the slot may hold it (an included account, or a shared one the
-   * rule does not exclude) and it is live in no other slot; only a drifted `activeId` is healed then.
-   * Two cases still move a kept account: a quarantined one (a dead login, though a legitimate one) is
-   * replaced by any available account and kept only when none is — reported as `noWorkingAccount`,
-   * since a dead login is no working account; and `preferIncluded` (a deliberate include) moves an
-   * inherited account aside for an available included one.
+   * What it seats is {@link chooseSeat}'s choice: the account live there is KEPT when the slot may
+   * hold it and it is live in no other slot (only a drifted `activeId` is healed then), except that
+   * a quarantined occupant is replaced by any available account (kept only when none is, reported
+   * as `noWorkingAccount`, since a dead login is no working account), and `preferIncluded` moves an
+   * inherited occupant aside for an available included account (any one, or one of a set).
+   * Otherwise the slot is seated with the first account available in pool order, the recorded
+   * `activeId` first for continuity. Usage-based choice is the daemon's; this is the engine's
+   * usable default. When nothing can be seated, a login that does not belong (outside the pool, live
+   * in another slot too, or unrecognized) is cleared after its rotation is adopted, failing the slot
+   * closed, and the rule's recorded account is cleared with it: a record naming an account the slot
+   * no longer holds would have every reader that falls back on it (who is live, which profile an
+   * account's session runs in) place that account in an empty slot. The rule still stands, and the
+   * result says the folder has no working account.
    *
-   * Otherwise the slot is seated with the first account available in pool order — the recorded
-   * `activeId` first for continuity, then the pool's auto targets, then a globally excluded shared
-   * account as a last resort (see `availableInOrder`). Usage-based choice is the daemon's; this is
-   * the engine's usable default. When nothing can be seated, a login that does not belong (outside
-   * the pool, live in another slot too, or unrecognized) is cleared after its rotation is adopted,
-   * failing the slot closed, and the rule's recorded account is cleared with it — a record naming an
-   * account the slot no longer holds would have every reader that falls back on it (who is live,
-   * which profile an account's session runs in) place that account in an empty slot. The rule still
-   * stands, and the result says the folder has no working account.
+   * `guard` is an import's: the seat it decided on for this slot (`move`, undefined when it decided
+   * the slot keeps what it holds), and the rule as it stood before the import wrote it, whose scopes
+   * are the ones running on this slot now. While sessions run there, a slot holding a login is then
+   * moved only by exactly that move and never cleared; when that move cannot be made, the slot is
+   * left as it was and the result says so (`heldForSessions`), rather than moved somewhere no report
+   * named. `renew` keeps the caller's lock claimed between the accounts it tries.
    */
   private async ensureRuleLiveLocked(
     rule: FolderRule,
-    opts: { preferIncluded?: boolean; keepOut?: ReadonlySet<string> } = {},
+    opts: {
+      preferIncluded?: true | ReadonlySet<string>;
+      keepOut?: ReadonlySet<string>;
+      avoid?: ReadonlySet<string>;
+      renew?: () => void;
+      guard?: { move: SlotSeat | undefined; rule: FolderRule };
+    } = {},
   ): Promise<RuleLiveResult> {
     const slotId = ruleSlotId(rule.id);
     const rt = this.slotRuntime(slotId);
@@ -2866,10 +2997,19 @@ export class SwitchEngine {
     const picture = await this.vault.readPicture();
     const current = picture.rules.find((r) => r.id === rule.id) ?? rule;
     const occupancy = await this.slotOccupancy(picture);
-    const pool = slotPool(slotId, picture, occupancy);
-    const available = availableInOrder(withoutKeptOut(pool, opts.keepOut));
     const live = await this.getActiveId(slotId);
     const liveCreds = await rt.credStore.readLiveCredentials().catch(() => undefined);
+    const choice = chooseSeat(
+      slotId,
+      picture,
+      occupancy,
+      { id: live, hasLogin: liveCreds !== undefined },
+      {
+        ...(opts.preferIncluded !== undefined ? { prefer: opts.preferIncluded } : {}),
+        ...(opts.keepOut !== undefined ? { keepOut: opts.keepOut } : {}),
+        ...(opts.avoid !== undefined ? { avoid: opts.avoid } : {}),
+      },
+    );
     const seated = (liveAccount: string, activated: boolean): RuleLiveResult => ({
       ruleId: rule.id,
       liveAccount,
@@ -2877,43 +3017,72 @@ export class SwitchEngine {
       noWorkingAccount: false,
     });
 
-    // Whether the occupant may stay is judged against the other slots' LEGITIMATE copies only: a copy
-    // squatting where its pool does not have it is evicted by that slot's own repair, and must not
-    // cost this slot the account. A new account, below, is still chosen against every copy.
-    const legitimate =
-      live !== null &&
+    // An import's seat step on a slot holding a login that sessions run under: only the move the
+    // import decided on, and never a clear. Looked at only when the seat would change the slot.
+    let candidates = choice.candidates;
+    let sessions = 0;
+    if (
+      opts.guard !== undefined &&
       liveCreds !== undefined &&
-      slotMayHold(slotId, live, picture) &&
-      liveElsewhere(slotId, live, legitimateOccupancy(occupancy, picture)) === null;
-    if (legitimate) {
-      const entry = pool.find((e) => e.account.id === live);
-      const better =
-        entry === undefined
-          ? available.filter((a) => a.id !== live)
-          : opts.preferIncluded === true && entry.source === 'inherited'
-            ? pool
-                .filter((e) => e.source === 'include' && e.liveElsewhere === null)
-                .map((e) => e.account)
-            : [];
-      const moved = await this.seatFirst(rt, better, 'moving the folder slot to a better account');
+      (candidates.length > 0 || choice.keeps === null)
+    ) {
+      sessions = (await this.runningSessionsInRule(opts.guard.rule)).length;
+      if (sessions > 0) {
+        const move = opts.guard.move;
+        const planned = move !== undefined && move.from === live ? move.to : undefined;
+        candidates = candidates.filter((a) => a.id === planned);
+      }
+    }
+    // The slot is left as it was for its sessions when the seat would have moved it (or cleared it)
+    // and the one move the import decided on, if any, could not be made.
+    const held = sessions > 0 ? { heldForSessions: sessions } : {};
+
+    if (choice.keeps !== null) {
+      const moved = await this.seatFirst(
+        rt,
+        candidates,
+        'moving the folder slot to a better account',
+        opts.renew,
+      );
       if (moved !== null) return seated(moved, true);
       // The live account stays. If the registry drifted from it (an external /login), commit it: adopt
       // its rotation, then record it. Not a switch — nothing live changes, and a switch's candidacy
       // checks every copy, so a squatter's copy elsewhere (the one judged irrelevant above, which its
       // own slot's repair evicts) would refuse the very account just kept.
-      if (current.activeId !== live) {
+      if (current.activeId !== choice.keeps) {
+        opts.renew?.();
         await this.adoptSlotRotation(rt);
-        await this.vault.setRuleActive(rule.id, live);
+        await this.vault.setRuleActive(rule.id, choice.keeps);
       }
       // A quarantined account kept for want of any other is live, but not working.
-      return { ...seated(live, false), noWorkingAccount: entry === undefined };
+      const working = slotPool(slotId, picture, occupancy).some(
+        (e) => e.account.id === choice.keeps,
+      );
+      return {
+        ...seated(choice.keeps, false),
+        noWorkingAccount: !working,
+        ...(choice.candidates.length > 0 ? held : {}),
+      };
     }
 
     // Nothing legitimate is live: seat the recorded account first (continuity), then pool order.
-    const recorded = available.find((a) => a.id === current.activeId);
-    const order = recorded ? [recorded, ...available.filter((a) => a !== recorded)] : available;
-    const filled = await this.seatFirst(rt, order, 'ensuring the folder slot has a live account');
+    const filled = await this.seatFirst(
+      rt,
+      candidates,
+      'ensuring the folder slot has a live account',
+      opts.renew,
+    );
     if (filled !== null) return seated(filled, true);
+    if (sessions > 0) {
+      // Sessions run on this login, and no move the import decided on could be made: leave it.
+      return {
+        ruleId: rule.id,
+        liveAccount: live,
+        activated: false,
+        noWorkingAccount: true,
+        ...held,
+      };
+    }
 
     // Nothing could be seated. Credentials still in the profile belong to an account the slot may not
     // hold, one live in another slot too, or an unrecognized login: a legitimate occupant would have
@@ -2921,6 +3090,7 @@ export class SwitchEngine {
     // it may not use — but adopt the occupant's rotation first, so clearing costs it nothing.
     let clearedSquatter = false;
     if (liveCreds !== undefined) {
+      opts.renew?.();
       await this.adoptSlotRotation(rt);
       await this.clearSlotLive(rt);
       clearedSquatter = true;
@@ -2938,13 +3108,16 @@ export class SwitchEngine {
 
   /** Activate the first of `candidates` that will go live in `rt`'s slot, returning its id, or null
    *  when none would. One account's failure (a dead token, a transient error, a candidacy that
-   *  changed) must not stop the next; a process that died mid-activation does not go on. */
+   *  changed) must not stop the next; a process that died mid-activation does not go on. `renew`
+   *  restamps the caller's lock before each account, since each may refresh over the network. */
   private async seatFirst(
     rt: SlotRuntime,
     candidates: readonly StoredAccount[],
     reason: string,
+    renew?: () => void,
   ): Promise<string | null> {
     for (const account of candidates) {
+      renew?.();
       try {
         await this.activateInSlot(rt, account.id, { force: true, origin: 'recovery', reason });
         return account.id;
@@ -2979,6 +3152,7 @@ export class SwitchEngine {
     const plan = await this.planHandOffLocked(reserving, picture, (slotId) => slotId === ownSlot);
     if (!plan.ok) throw plan.error;
     const moves = await this.executeHandOffLocked(plan.steps);
+    if (moves.stopped !== undefined) throw moves.stopped;
     if (moves.failed !== undefined) throw moves.failed.error;
     return moves.made;
   }
@@ -2990,7 +3164,9 @@ export class SwitchEngine {
    *  what it already read (`occupancy`). A slot's replacements come from its pool once the accounts
    *  are reserved, or, for a caller that writes more than the reservations (an import batch), from
    *  the registry as it will leave it (`after`); `avoid` names accounts a slot could not be moved
-   *  onto just now, and why, which are no replacement. */
+   *  onto just now, and why, which are no replacement. An account another slot of the plan moves off
+   *  is a replacement too (a grown rule's slot can take the account the batch newly includes in it
+   *  from the slot that has to leave it); the moves then come in the order that frees it first. */
   private async planHandOffLocked(
     reserving: readonly StoredAccount[],
     picture: RegistryPicture,
@@ -3007,19 +3183,44 @@ export class SwitchEngine {
       rules: picture.rules,
     };
     const live = occupancy ?? (await this.slotOccupancy(picture));
-    const moving: Array<{ slotId: SlotId; from: StoredAccount; options: StoredAccount[] }> = [];
+    const moving: Array<{ slotId: SlotId; from: StoredAccount }> = [];
     for (const [slotId, owners] of live) {
       const from = reserving.find((a) => owners.has(a.id) && !mayKeep(slotId, a.id));
-      if (from === undefined) continue;
-      moving.push({
-        slotId,
-        from,
-        options: availableInOrder(withoutKeptOut(slotPool(slotId, after, live), keepOut)).filter(
-          (a) => leaves.avoid?.has(a.id) !== true,
-        ),
-      });
+      if (from !== undefined) moving.push({ slotId, from });
     }
-    const assigned = assignDistinct(moving.map((m) => m.options.map((a) => a.id)));
+    /** Each moving slot's replacements, best first, with the slots holding `held` taken. */
+    const assign = (
+      held: ReadonlyMap<SlotId, ReadonlySet<string>>,
+    ): ReturnType<typeof assignDistinct> =>
+      assignDistinct(
+        moving.map((m) =>
+          availableInOrder(withoutKeptOut(slotPool(m.slotId, after, held), keepOut))
+            .filter((a) => leaves.avoid?.has(a.id) !== true)
+            .map((a) => a.id),
+        ),
+      );
+    const leaving = new Map(moving.map((m) => [m.slotId, m.from.id]));
+    const freed = new Map(
+      [...live].map(([slotId, owners]) => [
+        slotId,
+        new Set([...owners].filter((id) => id !== leaving.get(slotId))),
+      ]),
+    );
+    const steps = (
+      chosen: readonly string[],
+    ): Array<{
+      slotId: SlotId;
+      from: StoredAccount;
+      to: string;
+    }> => moving.map((m, i) => ({ slotId: m.slotId, from: m.from, to: chosen[i]! }));
+    const withFreed = assign(freed);
+    if (withFreed.ok) {
+      const ordered = orderedMoves(steps(withFreed.chosen));
+      if (ordered !== undefined) return { ok: true, steps: ordered };
+    }
+    // No order frees what the freed accounts' takers need (slots trading accounts), or nothing
+    // fits even with them: choose among accounts no slot holds.
+    const assigned = withFreed.ok ? assign(live) : withFreed;
     if (!assigned.ok) {
       const short = moving[assigned.unserved]!;
       return {
@@ -3029,28 +3230,32 @@ export class SwitchEngine {
         error: this.noReplacementError(short.slotId, short.from, picture, leaves.avoid),
       };
     }
-    return {
-      ok: true,
-      steps: moving.map((m, i) => ({ slotId: m.slotId, from: m.from, to: assigned.chosen[i]! })),
-    };
+    return { ok: true, steps: steps(assigned.chosen) };
   }
 
   /**
    * Make the hand-offs {@link planHandOffLocked} chose, in order. A move that fails (the account's
-   * token will not refresh, say) is undone in its own slot by the switch, and stops the rest: the
-   * moves already made are returned with the one that failed, so the caller reports every slot
-   * that moved and decides what to do about the rest. `renew` keeps the lock claimed between moves.
+   * token will not refresh, its stored tokens cannot be read) is undone in its own slot by the
+   * switch, and stops the rest: the moves already made are returned with the one that failed, so the
+   * caller reports every slot that moved and decides what to do about the rest. A failure after
+   * which nothing more may run (the lock taken over, or a switch that committed and then failed in
+   * its bookkeeping) is returned as `stopped`, with every move made, that one included when it
+   * did move the slot. `renew` keeps the lock claimed between moves.
    */
   private async executeHandOffLocked(
     plan: ReadonlyArray<{ slotId: SlotId; from: StoredAccount; to: string }>,
     renew?: () => void,
-  ): Promise<{ made: SlotHandOff[]; failed?: { to: string; error: SwitchEngineError } }> {
+  ): Promise<{
+    made: SlotHandOff[];
+    failed?: { to: string; error: SwitchEngineError };
+    stopped?: Error;
+  }> {
     // A slot whose switch is stuck would refuse its move only after the slots before it had moved.
     for (const step of plan) await this.requireSettledLocked(this.slotRuntime(step.slotId));
     const made: SlotHandOff[] = [];
     for (const step of plan) {
-      renew?.();
       try {
+        renew?.();
         // A deliberate operator move: forced past the cadence guard (an include should never be
         // blocked by a recent hop), and the outgoing account's rotation is adopted by the switch.
         const res = await this.activateInSlot(this.slotRuntime(step.slotId), step.to, {
@@ -3060,8 +3265,17 @@ export class SwitchEngine {
         });
         made.push({ slot: step.slotId, from: step.from.id, to: res.activeAccountId });
       } catch (err) {
-        if (!(err instanceof SwitchEngineError) || this.isSimulatedDeath(err)) throw err;
-        return { made, failed: { to: step.to, error: err } };
+        if (this.isSimulatedDeath(err)) throw err;
+        const moved = (await this.getActiveId(step.slotId).catch(() => null)) === step.to;
+        if (moved) made.push({ slot: step.slotId, from: step.from.id, to: step.to });
+        if (moved || (err instanceof SwitchEngineError && err.code === 'lock_lost')) {
+          return { made, stopped: err instanceof Error ? err : new Error(String(err)) };
+        }
+        const error =
+          err instanceof SwitchEngineError
+            ? err
+            : new SwitchEngineError(errorReason(err), 'switch_failed', { cause: err });
+        return { made, failed: { to: step.to, error } };
       }
     }
     return { made };

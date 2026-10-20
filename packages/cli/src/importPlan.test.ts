@@ -85,6 +85,7 @@ function engineCreating(asked?: Asked[]): PlanRules {
         leftOut: [],
       })),
       handOffs: [],
+      seats: [],
     });
   };
 }
@@ -555,6 +556,24 @@ describe('planImport: rules', () => {
     expect(asked[0]!.opts.logins).toEqual([{ id: ID1, accountUuid: 'u-c' }]);
   });
 
+  it('counts only the login the tokens name, not one the entry states beside them', async () => {
+    const asked: Asked[] = [];
+    const e = entry('c', { id: ID1, emailAddress: 'c@x.com', accountUuid: 'u-c' });
+    e.bundle!.oauthAccount = { emailAddress: 'c@x.com' };
+    await planImport(
+      input({
+        payload: payload({
+          accounts: [e],
+          rules: [fileRule({ folders: ['/proj'], include: ['u-c'] })],
+        }),
+        accounts: [local(ID1, 'c', { emailAddress: 'c@x.com' })],
+        replace: true,
+        planRules: engineCreating(asked),
+      }),
+    );
+    expect(asked[0]!.opts.logins).toEqual([]);
+  });
+
   it("shows the engine's verdicts: a grown rule, an unchanged one, and what it leaves out", async () => {
     const plan = await planImport(
       input({
@@ -590,6 +609,7 @@ describe('planImport: rules', () => {
               },
             ],
             handOffs: [],
+            seats: [],
           }),
       }),
     );
@@ -621,6 +641,7 @@ describe('planImport: rules', () => {
             },
           ],
           handOffs: [],
+          seats: [],
         });
     const rules = [
       fileRule({
@@ -677,6 +698,7 @@ describe('planImport: rules', () => {
               { slot: 'global', from: 'id-o', to: PENDING(0) },
               { slot: ruleSlotId(HERE_RULE.id), from: PENDING(0), to: 'id-o' },
             ],
+            seats: [],
           }),
       }),
     );
@@ -687,7 +709,7 @@ describe('planImport: rules', () => {
 
   it('keeps out of auto-switch an added account whose only rule is not made here', async () => {
     const refusing: PlanRules = () =>
-      Promise.resolve({ rules: [{ kind: 'refused', message: 'no' }], handOffs: [] });
+      Promise.resolve({ rules: [{ kind: 'refused', message: 'no' }], handOffs: [], seats: [] });
     for (const { folder, planRules, made } of [
       { folder: '/gone', planRules: engineCreating(), made: false },
       { folder: '/proj', planRules: refusing, made: false },

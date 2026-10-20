@@ -16,6 +16,7 @@ import { createInterface } from 'node:readline';
 import type { Command } from 'commander';
 import { readHeartbeat } from '@claude-control/daemon';
 import {
+  ImportInterruptedError,
   LockTimeoutError,
   SwitchEngineError,
   canonicalizeFolder,
@@ -26,6 +27,9 @@ import {
   type CredentialBundle,
   type FolderRule,
   type ImportRuleSpec,
+  type RuleLiveResult,
+  type SlotHandOff,
+  type SlotSeat,
   type SwitchEngine,
 } from '@claude-control/switch-engine';
 import { buildEngine, fail } from './context.js';
@@ -59,6 +63,7 @@ import {
   ruleLines,
   ruleSpec,
   sameSettingLine,
+  seatLine,
   type FolderLookup,
   type ImportPlan,
   type MemberTarget,
@@ -873,27 +878,38 @@ async function importRules(
 
   let changed = false;
   const handOffLines: string[] = [];
+  /** The lines every slot the run moved gets, whether it finished or not. */
+  const moved = (
+    moves: { handedOff: readonly SlotHandOff[]; seated: readonly SlotSeat[] },
+    names: ReportNames,
+  ): void => {
+    for (const hand of moves.handedOff) handOffLines.push(handOffLine(hand, 'done', names));
+    for (const seat of moves.seated) handOffLines.push(seatLine(seat, 'done', names));
+  };
   if (sent.length > 0) {
+    // A slot is named by its rule as it was when the slot moved (before the batch grew it), as
+    // the dry run names it.
+    const rulesBefore = await engine.listRules();
+    const namesNow = async (): Promise<ReportNames> => {
+      const accounts = await engine.listAllAccounts();
+      return {
+        labelOf: (id) => accounts.find((a) => a.id === id)?.label ?? id,
+        slotName: (slot) => slotName(slot, rulesBefore),
+        platform: plan.platform,
+      };
+    };
     // An account the file reserves to a rule runs in no slot here but that rule's: not as the
     // replacement for a slot a rule moves, nor as the seat of a rule the import makes.
     const keepOut = plan.accounts.flatMap((s) =>
       s.kind === 'add' && s.forRule === true ? (localIds.get(s.entry) ?? []) : [],
     );
     try {
-      // A slot is named by its rule as it was when the slot moved (before the batch grew it), as
-      // the dry run names it.
-      const rulesBefore = await engine.listRules();
       const result = await engine.importRules(
         sent.map((s) => s.spec),
         { keepOut },
       );
-      const accounts = await engine.listAllAccounts();
-      const names: ReportNames = {
-        labelOf: (id) => accounts.find((a) => a.id === id)?.label ?? id,
-        slotName: (slot) => slotName(slot, rulesBefore),
-        platform: plan.platform,
-      };
-      changed = result.handedOff.length > 0;
+      const names = await namesNow();
+      changed = result.handedOff.length + result.seated.length > 0;
       for (const [k, { step }] of sent.entries()) {
         const verdict = result.plan.rules[k]!;
         const outcome = result.outcomes[k];
@@ -917,19 +933,21 @@ async function importRules(
           text: [
             ...shown.lines,
             ...(outcome !== undefined
-              ? slotLines(
-                  outcome.rule,
-                  outcome.live?.liveAccount ?? null,
-                  outcome.runningSessions.length,
-                )
+              ? slotLines(outcome.rule, outcome.live, outcome.runningSessions.length, names)
               : []),
           ],
           ok: shown.ok,
         });
       }
-      for (const hand of result.handedOff) handOffLines.push(handOffLine(hand, 'done', names));
+      moved(result, names);
     } catch (err) {
       if (!(err instanceof SwitchEngineError)) throw err;
+      if (err instanceof ImportInterruptedError) {
+        // It stopped part-way: what it wrote and moved is in place, the guard has to hear of it, and
+        // every slot it moved is reported; the next run finishes the rest.
+        changed = true;
+        moved(err, await namesNow());
+      }
       for (const { step } of sent) {
         lines.set(step, {
           text: [`${describeRuleStep(step)}: not imported - ${safe(err.message)}`],
@@ -948,11 +966,27 @@ async function importRules(
   return changed;
 }
 
-/** The lines under a rule the import wrote: a slot with no working account, and sessions that keep
- *  their account until relaunched. */
-function slotLines(rule: FolderRule, liveAccount: string | null, sessions: number): string[] {
+/** The lines under a rule the import wrote: a slot with no working account, a slot left as it was
+ *  for the sessions running on it, and sessions that keep their account until relaunched. */
+function slotLines(
+  rule: FolderRule,
+  live: RuleLiveResult | null,
+  sessions: number,
+  names: ReportNames,
+): string[] {
   const out: string[] = [];
-  if (liveAccount === null) {
+  if (live?.heldForSessions !== undefined && live.liveAccount !== null) {
+    out.push(
+      `its slot was left on ${safe(names.labelOf(live.liveAccount))}: ${live.heldForSessions} ` +
+        'running session(s) use it, and the move the import decided on could not be made ' +
+        '(cctl folders shows the slot)',
+    );
+  } else if (live?.heldForSessions !== undefined) {
+    out.push(
+      `its slot was left as it was: ${live.heldForSessions} running session(s) use it, and the ` +
+        'move the import decided on could not be made (cctl folders shows the slot)',
+    );
+  } else if ((live?.liveAccount ?? null) === null) {
     out.push(`no account is live in its slot yet (cctl folders shows why)`);
   }
   if (sessions > 0) {
