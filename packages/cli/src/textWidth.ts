@@ -9,7 +9,8 @@
 // The widths follow what wcwidth-based terminals (Windows Terminal, iTerm2, VTE, kitty) draw: East
 // Asian Wide and emoji-presentation characters take two columns, nonspacing marks and format
 // characters none. Ambiguous-width characters are counted as one column, which is how most
-// terminals are set up; renderers keep their own glyphs ASCII so they never depend on that setting.
+// terminals are set up. So that nothing cctl draws depends on that setting, renderers keep their
+// own glyphs ASCII, and the full-screen view draws cctl's own messages through `plainPunctuation`.
 
 /** Wide (two-column) code point ranges: CJK, Hangul syllables, full-width forms. Emoji are found
  *  by their Unicode property instead, so a new emoji block needs no new range here. */
@@ -40,9 +41,9 @@ const REGIONAL_INDICATOR = /^\p{Regional_Indicator}$/u;
 /** An emoji that takes a skin tone, then the tone: drawn as one toned emoji, joiner or not. */
 const TONED = /^\p{Emoji_Modifier_Base}\p{Emoji_Modifier}/u;
 // Written as escapes: as literal characters these are invisible in an editor or a diff.
-const VS15 = '︎';
-const VS16 = '️';
-const ZWJ = '‍';
+const VS15 = '\uFE0E';
+const VS16 = '\uFE0F';
+const ZWJ = '\u200D';
 /** Plain printable ASCII: one column per character, the case worth a fast path. */
 const PRINTABLE_ASCII = /^[\x20-\x7e]*$/;
 
@@ -107,4 +108,33 @@ export function displayWidth(text: string): number {
  *  wide or wider is returned as it is. */
 export function padEndColumns(text: string, width: number): string {
   return text + ' '.repeat(Math.max(0, width - displayWidth(text)));
+}
+
+/** Typographic punctuation and the ASCII each is spelled with on screen. Every one is ambiguous
+ *  width: one column on most terminals, two on one set up for CJK text, so a line cut to the
+ *  terminal's width that holds one can run past the edge there. Every non-ASCII character that
+ *  takes a column in the string literals of the packages whose text reaches the view is in this
+ *  table (the test reads their sources to hold that), so a new one in a message is caught when it
+ *  is written. */
+const PLAIN_PUNCTUATION: ReadonlyMap<string, string> = new Map([
+  ['–', '-'], // en dash
+  ['—', '-'], // em dash
+  ['…', '...'], // ellipsis
+  ['·', '-'], // middle dot
+  ['•', '-'], // bullet
+  ['‘', "'"],
+  ['’', "'"],
+  ['“', '"'],
+  ['”', '"'],
+  ['→', '->'],
+]);
+const TYPOGRAPHIC = new RegExp(`[${[...PLAIN_PUNCTUATION.keys()].join('')}]`, 'gu');
+
+/**
+ * A message of cctl's own (an auto-switch reason, a refusal, an error) with its typographic
+ * punctuation spelled in ASCII, so a terminal set up for CJK text draws it as wide as it is
+ * measured. Only for messages: a label is shown as it is stored, since a person types it back.
+ */
+export function plainPunctuation(text: string): string {
+  return text.replace(TYPOGRAPHIC, (ch) => PLAIN_PUNCTUATION.get(ch) ?? ch);
 }

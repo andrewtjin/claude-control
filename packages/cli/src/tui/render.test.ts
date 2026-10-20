@@ -23,7 +23,7 @@ import {
   renderFrame,
   settleScroll,
 } from './render.js';
-import { reduce } from './state.js';
+import { accountsOf, reduce } from './state.js';
 import { clip, displayWidth, fit, truncateAnsi, visibleWidth } from './text.js';
 import type { TuiSnapshot, TuiState } from './types.js';
 
@@ -153,7 +153,7 @@ describe('renderFrame: the other panes, overlays and the status line', () => {
   it('shows the help overlay with every key', () => {
     const lines = frame({ ...s, mode: { kind: 'help', scroll: 0 } }, 120, 21, false);
     for (const [keys] of KEY_HELP) expect(lines.join('\n')).toContain(keys);
-    expect(lines[20]).toBe('any key: back');
+    expect(lines[20]).toBe('Esc: back');
   });
 
   it('shows the launch line quoted for the platform shell', () => {
@@ -208,6 +208,9 @@ describe('renderFrame: the other panes, overlays and the status line', () => {
       'Terminal too short: make it 6 rows tall (q quits).',
     );
     expect(frame(s, 10, 3, false)).toEqual(['Too small:', 'q quits', '']);
+    // Too small even for that, the way out is what is left.
+    expect(frame(s, 7, 2, false)).toEqual(['q quits', '']);
+    expect(frame(s, 7, 1, false)).toEqual(['q quits']);
   });
 });
 
@@ -373,7 +376,7 @@ describe('regressions: what the frame must never do', () => {
   it('lets a short terminal scroll the help overlay to its last key', () => {
     const top = frame({ ...s, mode: { kind: 'help', scroll: 0 } }, 40, 12, false);
     expect(top.join('\n')).not.toContain('q or Esc');
-    expect(top[11]).toBe('k/j scroll | any other key: back');
+    expect(top[11]).toBe('k/j scroll | Esc: back');
     const end = frame({ ...s, mode: { kind: 'help', scroll: 999 } }, 40, 12, false);
     expect(end.join('\n')).toContain('q or Esc');
   });
@@ -449,6 +452,80 @@ describe('regressions: what the frame must never do', () => {
   });
 });
 
+describe("cctl's own punctuation", () => {
+  // The em dash, en dash, ellipsis, middle dot, bullet, arrow and curly quotes are two columns
+  // wide on a terminal set up for CJK text, and one elsewhere, so a line cut to the width that
+  // holds one can run past the edge.
+  const AMBIGUOUS = /[–—…·•→‘’“”]/;
+  const reason = 'work is at 96% weekly — home has the soonest weekly reset (“next”…) • a → b';
+
+  it('is drawn in ASCII in an auto-switch reason on the Outages pane', () => {
+    const at = NOW - 3_600_000;
+    const st = stateWith(
+      snapshotOf(everyStateAccounts(), {
+        outages: {
+          ok: true,
+          value: {
+            episodes: [
+              {
+                start: {
+                  v: 1,
+                  event: 'exhausted',
+                  id: 'ep-1',
+                  at,
+                  time: new Date(at).toISOString(),
+                  summary: '',
+                  active: 'work',
+                  accounts: [],
+                  switches: [{ at: at - 60_000, from: 'work', to: 'home', origin: 'auto', reason }],
+                },
+              },
+            ],
+            open: [],
+            logPath: '/data/exhaustion.jsonl',
+          },
+        },
+      }),
+    );
+    for (const cols of [40, 61, 80, 122, 200]) {
+      const lines = frame({ ...st, pane: 'outages' }, cols, 40, false);
+      expect(lines.join('\n'), `at ${cols}`).toContain('work -> home');
+      for (const line of lines) expect(line, `at ${cols}`).not.toMatch(AMBIGUOUS);
+    }
+  });
+
+  it('is drawn in ASCII wherever the view shows a message', () => {
+    const base = stateWith(snapshotOf(everyStateAccounts()));
+    const states: TuiState[] = [
+      { ...base, status: { text: reason, tone: 'error' } },
+      { ...base, busy: reason },
+      // A poll error, as the account row's error tag.
+      stateWith(
+        snapshotOf([account('id-e', 'e', { usage: usage([], undefined, { error: reason }) })]),
+      ),
+      { ...base, loadError: reason },
+      { ...base, status: { text: reason, tone: 'error' }, mode: { kind: 'message', scroll: 0 } },
+      {
+        ...base,
+        mode: { kind: 'prompt', purpose: 'add', input: '', note: reason },
+      },
+      stateWith(snapshotOf([], { accounts: { ok: false, error: reason } })),
+      {
+        ...stateWith(snapshotOf(everyStateAccounts())),
+        snapshot: { ...snapshotOf(everyStateAccounts()), usageError: reason },
+      },
+    ];
+    for (const st of states) {
+      for (const cols of [40, 80, 200]) {
+        for (const line of frame(st, cols, ROWS, false)) expect(line).not.toMatch(AMBIGUOUS);
+      }
+    }
+    // The messages are there, spelled in ASCII, not dropped.
+    expect(frame(states[0]!, 200, ROWS, false).join('\n')).toContain('weekly - home');
+    expect(frame(states[2]!, 200, ROWS, false).join('\n')).toContain('error: work is at 96%');
+  });
+});
+
 describe('a message longer than the status line', () => {
   const s = stateWith(snapshotOf(everyStateAccounts()));
   const id = '3f2b9c1e-7a4d-4e1b-9c2a-5d6e7f8a1b5e';
@@ -488,6 +565,69 @@ describe('a message longer than the status line', () => {
     expect(lines.slice(2).join(' ')).toContain('"home" already refers to');
     expect(all.slice(2).join(' ')).toContain('to use it.');
     expect(reduce(open, { name: 'char', char: 'x' }).state.mode).toEqual({ kind: 'browse' });
+  });
+
+  it('says how to read a refusal cut short in a reopened prompt', () => {
+    const refusal =
+      'Not renamed: could not write C:/Users/someone/AppData/Local/claude-control/vault/' +
+      'accounts.json (EPERM: operation not permitted, rename); close the program holding it ' +
+      'and try again';
+    const prompt = {
+      ...s,
+      mode: {
+        kind: 'prompt' as const,
+        purpose: 'rename' as const,
+        account: { id: 'id-work', label: 'work' },
+        input: 'other',
+        note: refusal,
+        refusal,
+      },
+    };
+    for (const [cols, rows] of [
+      [40, ROWS],
+      [80, MIN_ROWS],
+    ] as const) {
+      const lines = frame(prompt, cols, rows, false);
+      expect(lines[rows - 1], `${cols}x${rows}`).toContain('Esc, then m: full note');
+      expect(lines[rows - 1], `${cols}x${rows}`).toContain('Enter confirm');
+    }
+    // A note that fits needs no such hint.
+    const short = frame(
+      { ...prompt, mode: { ...prompt.mode, note: 'Not renamed.', refusal: 'Not renamed.' } },
+      80,
+      ROWS,
+      false,
+    );
+    expect(short[ROWS - 1]).toBe('Enter confirm | Esc cancel');
+  });
+
+  it('does not offer m while an action runs, when m would do nothing', () => {
+    const busy = { ...s, busy: `Renaming ${'x'.repeat(200)}...` };
+    expect(frame(busy, 40, ROWS, false)[ROWS - 1]!.startsWith('m message')).toBe(false);
+  });
+
+  it('never takes the row of the selected account, however short the terminal', () => {
+    const accounts = accountsOf(s);
+    const last = accounts[accounts.length - 1]!;
+    const said = {
+      ...s,
+      selectedId: last.id,
+      status: { text: `${taken} ${added}`, tone: 'error' as const },
+    };
+    for (const [cols, rows] of [
+      [40, MIN_ROWS],
+      [40, MIN_ROWS + 1],
+      [80, MIN_ROWS],
+      [80, MIN_ROWS + 1],
+    ] as const) {
+      const lines = frame(said, cols, rows, false);
+      const selected = lines.filter((l) => l.startsWith('>'));
+      expect(selected, `${cols}x${rows}`).toHaveLength(1);
+      expect(selected[0], `${cols}x${rows}`).toContain(last.label.slice(0, 3));
+      // The message still keeps its end, and says how to read the rest.
+      expect(lines.join(' '), `${cols}x${rows}`).toContain('to use it.');
+      expect(lines[rows - 1]!.startsWith('m message | '), `${cols}x${rows}`).toBe(true);
+    }
   });
 
   it('keeps the remedy of an unreadable accounts file in a short terminal', () => {

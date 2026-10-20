@@ -97,6 +97,25 @@ export class SharedTokenError extends SwitchEngineError {
   }
 }
 
+/** A removal confirmed by the account's label found, once it held the credential lock, that the
+ *  account no longer has that label (`currentLabel`), or is gone (`null`): another process renamed
+ *  or removed it while the removal waited. Nothing was removed, since the person confirmed a name
+ *  the account no longer answers to. */
+export class AccountLabelChangedError extends SwitchEngineError {
+  constructor(
+    readonly accountId: string,
+    readonly expectedLabel: string,
+    readonly currentLabel: string | null,
+  ) {
+    super(
+      currentLabel === null
+        ? `account ${accountId} (${expectedLabel}) is no longer stored`
+        : `account ${accountId} is now called ${currentLabel}, not ${expectedLabel}`,
+      'label_changed',
+    );
+  }
+}
+
 /** Why the vault refused an account write that was asked of it in error, as opposed to a vault
  *  that could not do its job:
  *  - `label_empty`: the label is empty once stripped;

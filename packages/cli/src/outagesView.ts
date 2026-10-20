@@ -28,7 +28,7 @@ import {
   type Recovery,
 } from '@claude-control/daemon';
 import { PLAIN_PALETTE, type Palette } from './ansi.js';
-import { displayWidth, padEndColumns } from './textWidth.js';
+import { displayWidth, padEndColumns, plainPunctuation } from './textWidth.js';
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -72,9 +72,14 @@ function accountLine(a: ExhaustedAccount, now: number): string {
   return `${describeWalls(a.spent)}, ${back}`;
 }
 
-/** One switch in the walk that led there: "11:40  work1 -> work2  auto: work1 at 95% of ...". */
+/** One switch in the walk that led there: "11:40  work1 -> work2  auto: work1 at 95% of ...". The
+ *  reason is auto-switch's own sentence, written with typographic dashes (and kept so in logs
+ *  already on disk); it is the last field on a line the full-screen view cuts to its width, so it
+ *  is spelled in ASCII here, where every terminal draws it as wide as it is measured. */
 function switchLine(s: ExhaustionSwitch, now: number, palette: Palette): string {
-  const why = [s.origin, s.reason].filter((p) => p !== undefined && p !== '').join(': ');
+  const why = plainPunctuation(
+    [s.origin, s.reason].filter((p) => p !== undefined && p !== '').join(': '),
+  );
   return (
     `    ${formatLocalTime(s.at, now)}  ${s.from ?? '(none)'} -> ${s.to}` +
     (why !== '' ? `  ${palette.dim(why)}` : '')

@@ -145,7 +145,7 @@ export function settleAction(
   delete next.busy;
   delete next.reopenOnRefusal;
   if (!outcome.ok && state.reopenOnRefusal !== undefined) {
-    next.mode = { ...state.reopenOnRefusal, note: text };
+    next.mode = { ...state.reopenOnRefusal, note: text, refusal: text };
   }
   return next;
 }
@@ -270,6 +270,7 @@ function start(state: TuiState, what: string, effect: Effect, from?: TuiPrompt):
   if (from !== undefined) {
     const reopen: TuiPrompt = { ...from };
     delete reopen.note;
+    delete reopen.refusal;
     next.reopenOnRefusal = reopen;
   }
   return { state: next, effect };
@@ -291,10 +292,10 @@ function scrollOverlay(
  *
  * Ctrl-C quits from anywhere; while an action runs it quits once the action ends (a switch cut off
  * half way would leave its recovery to the next command), and a second Ctrl-C quits at once.
- * The help and message overlays scroll with the movement keys and close on any other; the launch
- * line closes on any key. A prompt takes text until Enter or Escape. Otherwise the key map
- * applies, with the account verbs answering only in the Accounts pane. Pasted text is only ever
- * prompt input.
+ * The help and message overlays scroll with the movement keys and close on any other but Enter;
+ * the launch line closes on any key but Enter. A prompt takes text until Enter or Escape.
+ * Otherwise the key map applies, with the account verbs answering only in the Accounts pane.
+ * Pasted text is only ever prompt input.
  */
 export function reduce(state: TuiState, key: Key): Transition {
   if (key.name === 'ctrl-c') {
@@ -316,6 +317,11 @@ export function reduce(state: TuiState, key: Key): Transition {
   if (state.busy !== undefined) return { state };
 
   const mode = state.mode;
+  // Enter never closes an overlay: closed by it, a second Enter in the same burst (a double press,
+  // a bounce) would land on the account list, where Enter switches the live login. Any other key
+  // closes it.
+  const overlay = mode.kind === 'help' || mode.kind === 'message' || mode.kind === 'launch';
+  if (overlay && key.name === 'enter') return { state };
   if (mode.kind === 'help' || mode.kind === 'message') {
     const step = scrollStep(key);
     if (step === undefined) return { state: { ...state, mode: { kind: 'browse' } } };
@@ -497,10 +503,19 @@ function typed(state: TuiState, mode: PromptMode, text: string): Transition {
   return { state: { ...state, mode: next } };
 }
 
-/** A key while a prompt is open. A prompt whose account is gone answers Escape only. */
+/** A key while a prompt is open. A prompt whose account is gone answers Escape only. Escape on a
+ *  prompt opened again after a refusal leaves the refusal as the last word rather than
+ *  "Cancelled.": the prompt had only a row or two for it, and m (which types into a prompt) can
+ *  show it whole once the prompt is closed. */
 function reducePrompt(state: TuiState, mode: PromptMode, key: Key): Transition {
   if (key.name === 'escape') {
-    return { state: withStatus({ ...state, mode: { kind: 'browse' } }, 'Cancelled.', 'info') };
+    const browse: TuiState = { ...state, mode: { kind: 'browse' } };
+    return {
+      state:
+        mode.refusal !== undefined
+          ? withStatus(browse, mode.refusal, 'error')
+          : withStatus(browse, 'Cancelled.', 'info'),
+    };
   }
   if (mode.gone === true) return { state };
   switch (key.name) {

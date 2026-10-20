@@ -14,6 +14,7 @@ import { spawnSync } from 'node:child_process';
 import { dirname } from 'node:path';
 import type { LogSink } from '@claude-control/shared-protocol';
 import {
+  AccountLabelChangedError,
   CadenceError,
   LockTimeoutError,
   QuarantineError,
@@ -394,7 +395,9 @@ export interface RemoveOutcome {
 /** Remove a stored account. A reserved member is dropped from its group, and a group left with no
  *  members is dissolved (the engine's job). `confirmed.label` is the label the person typed to
  *  confirm it (the full-screen view asks for one): when another process has renamed the account
- *  since, nothing is removed, since the person confirmed a name the account no longer has. */
+ *  since, nothing is removed, since the person confirmed a name the account no longer has. The
+ *  engine makes that comparison under the credential lock; made here, before the lock, it would
+ *  miss a rename committed while the removal waited for it. */
 export async function removeAccount(
   ref: string,
   ctx: AccountActionContext = {},
@@ -402,19 +405,26 @@ export async function removeAccount(
 ): Promise<RemoveOutcome> {
   const engine = engineOf(ctx);
   const { account } = await resolveRef(engine, ref);
-  if (confirmed.label !== undefined && confirmed.label !== account.label) {
-    throw new AccountActionError(
-      'label_changed',
-      `The account confirmed as ${confirmed.label} is now called ${account.label}; ` +
-        'nothing was removed.',
-    );
-  }
   try {
-    await engine.removeAccount(account.id);
+    if (confirmed.label === undefined) await engine.removeAccount(account.id);
+    else await engine.removeAccount(account.id, { expectedLabel: confirmed.label });
   } catch (err) {
+    if (err instanceof AccountLabelChangedError) {
+      throw new AccountActionError(
+        'label_changed',
+        `The account confirmed as ${err.expectedLabel} ` +
+          (err.currentLabel === null
+            ? 'is no longer stored'
+            : `is now called ${err.currentLabel}`) +
+          '; nothing was removed.',
+        { cause: err },
+      );
+    }
     throw contentionRefusal(err) ?? err;
   }
-  return { account, message: `Removed ${account.label}.` };
+  // The label the removal was confirmed against is the one it had when it went; without one, the
+  // label it had when it was looked up.
+  return { account, message: `Removed ${confirmed.label ?? account.label}.` };
 }
 
 /** The vault's refusal of a write (a label taken or empty, a login stored already) as the refusal

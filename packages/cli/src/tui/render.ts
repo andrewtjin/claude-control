@@ -18,6 +18,7 @@ import { renderFolders, shellQuote } from '../folderRender.js';
 import { renderOutages } from '../outagesView.js';
 import { renderSessionStatus } from '../sessionRender.js';
 import { sanitizeForTerminal, severityPaint, type Palette } from '../ansi.js';
+import { plainPunctuation } from '../textWidth.js';
 import { accountsOf, lastMessage, selectedAccount } from './state.js';
 import {
   clip,
@@ -41,9 +42,20 @@ const CHROME_ROWS = 4;
 /** A long status message wraps onto at most this many rows (taken from the body) rather than
  *  being cut at the edge, where its remedy usually sits. */
 const MAX_STATUS_ROWS = 3;
+/** Body rows a long status message never takes: the accounts' column header and one account row
+ *  under it, so the selected account (the one Enter would switch to) stays on screen however
+ *  short the terminal. */
+const BODY_ROWS_KEPT = 2;
 /** Separator between header parts and between key hints. ASCII: a middle dot is ambiguous width,
  *  two columns on a terminal set up for CJK text, and would push the hints past the edge. */
 const SEP = ' | ';
+
+/** A message (a refusal, an error, an outcome) as the view draws it: only printable text, and its
+ *  typographic punctuation in ASCII, for the same reason as {@link SEP}. Messages only: a label in
+ *  its own cell is drawn as stored, since a person may type it back (a removal asks for it). */
+function messageText(text: string): string {
+  return plainPunctuation(sanitizeForTerminal(text));
+}
 
 /** Pane names as the tabs show them. */
 const PANE_TITLES: Readonly<Record<PaneId, string>> = {
@@ -173,7 +185,7 @@ export function accountTags(account: TuiAccount): TuiTag[] {
   if (account.excluded) tags.push({ text: 'excluded', tone: 'dim' });
   if (account.quarantined) tags.push({ text: 'quarantined', tone: 'error' });
   if (account.usage?.error) {
-    tags.push({ text: `error: ${sanitizeForTerminal(account.usage.error)}`, tone: 'error' });
+    tags.push({ text: `error: ${messageText(account.usage.error)}`, tone: 'error' });
   }
   return [...tags, ...account.extraTags];
 }
@@ -325,7 +337,7 @@ function accountsBody(state: TuiState, cols: number, height: number, palette: Pa
   const note =
     usageError === undefined
       ? []
-      : wrap(`Usage could not be read: ${sanitizeForTerminal(usageError)}`, cols).map((l) =>
+      : wrap(`Usage could not be read: ${messageText(usageError)}`, cols).map((l) =>
           palette.yellow(l),
         );
   const visible = Math.max(1, height - 1 - note.length);
@@ -354,7 +366,7 @@ function failedLines(
   palette: Palette,
   rows = Number.POSITIVE_INFINITY,
 ): string[] {
-  const text = `Could not read ${what}: ${sanitizeForTerminal(error)}`;
+  const text = `Could not read ${what}: ${messageText(error)}`;
   return wrapWithin(text, cols, rows).lines.map((l) => palette.red(l));
 }
 
@@ -489,11 +501,11 @@ function statusText(
     const quitting = state.quitWhenIdle
       ? ' - quitting when this finishes (Ctrl-C again to quit now)'
       : '';
-    return { text: state.busy + quitting, paint: palette.yellow };
+    return { text: messageText(state.busy + quitting), paint: palette.yellow };
   }
   const text = lastMessage(state);
   if (text === undefined) return { text: '', paint: (t) => t };
-  const safe = sanitizeForTerminal(text);
+  const safe = messageText(text);
   switch (state.status?.tone ?? 'error') {
     case 'error':
       return { text: safe, paint: palette.red };
@@ -508,9 +520,9 @@ function statusText(
 
 /**
  * The status line's rows, and whether the message had to be cut to fit them. It wraps onto as
- * many as {@link MAX_STATUS_ROWS} rows while at least one body row is left; a message longer than
- * that keeps its start (what happened) and its end (what to do about it), and the message
- * overlay (m) shows it whole. An open prompt is its last row, under the note saying why its last
+ * many as {@link MAX_STATUS_ROWS} rows while {@link BODY_ROWS_KEPT} body rows are left; a message
+ * longer than that keeps its start (what happened) and its end (what to do about it), and the
+ * message overlay (m) shows it whole. An open prompt is its last row, under the note saying why its last
  * Enter did not go through.
  */
 function statusLines(
@@ -519,7 +531,7 @@ function statusLines(
   rows: number,
   palette: Palette,
 ): { lines: string[]; cut: boolean } {
-  const allowed = Math.min(MAX_STATUS_ROWS, 1 + Math.max(0, rows - CHROME_ROWS - 1));
+  const allowed = Math.min(MAX_STATUS_ROWS, 1 + Math.max(0, rows - CHROME_ROWS - BODY_ROWS_KEPT));
   const mode = state.mode;
   if (mode.kind === 'prompt') {
     const label = mode.account ? sanitizeForTerminal(mode.account.label) : '';
@@ -531,7 +543,8 @@ function statusLines(
           : `Type ${label} to remove it: `;
     const prompt = promptLine(ask, sanitizeForTerminal(mode.input), cols, palette);
     if (mode.note === undefined) return { lines: [prompt], cut: false };
-    const note = wrapWithin(sanitizeForTerminal(mode.note), cols, Math.max(1, allowed - 1));
+    // The prompt line above keeps the label as stored; the note is a message.
+    const note = wrapWithin(messageText(mode.note), cols, Math.max(1, allowed - 1));
     return { lines: [...note.lines.map((l) => palette.yellow(l)), prompt], cut: note.cut };
   }
   const { text, paint } = statusText(state, palette);
@@ -601,6 +614,17 @@ function fittedHints(hints: ReadonlyArray<readonly [string, number]>, cols: numb
 
 /** Offered first when the status line had to cut its message. */
 const CUT_MESSAGE_HINT: readonly [string, number] = ['m message', 1];
+/** A prompt's hints; with a refusal cut short above it, how to read the refusal whole comes
+ *  before the plain cancel, which gives way first on a narrow line. */
+const PROMPT_HINTS: ReadonlyArray<readonly [string, number]> = [
+  ['Enter confirm', 1],
+  ['Esc cancel', 1],
+];
+const PROMPT_CUT_HINTS: ReadonlyArray<readonly [string, number]> = [
+  ['Enter confirm', 1],
+  ['Esc cancel', 2],
+  ['Esc, then m: full note', 1],
+];
 
 /** The key hints for what the screen is doing now. `overflow`: an overlay is taller than the
  *  body, so it says how to scroll it. `cut`: the status line cut its message, so the key that
@@ -614,18 +638,25 @@ function hintsLine(
 ): string {
   const mode = state.mode;
   if (mode.kind === 'prompt') {
-    return palette.dim(mode.gone === true ? 'Esc close' : `Enter confirm${SEP}Esc cancel`);
+    if (mode.gone === true) return palette.dim('Esc close');
+    // m types into the prompt, so a refusal cut short here is read whole after Esc, which leaves
+    // it on the status line (see the reducer).
+    const refusalCut = cut && mode.refusal !== undefined && mode.note === mode.refusal;
+    return palette.dim(fittedHints(refusalCut ? PROMPT_CUT_HINTS : PROMPT_HINTS, cols));
   }
+  // Enter does not close an overlay (see the reducer), so the hint names the key that does.
   const overlay = mode.kind === 'help' || mode.kind === 'message';
-  if (overlay && overflow) return palette.dim(`k/j scroll${SEP}any other key: back`);
-  if (overlay || mode.kind === 'launch') return palette.dim('any key: back');
+  if (overlay && overflow) return palette.dim(`k/j scroll${SEP}Esc: back`);
+  if (overlay || mode.kind === 'launch') return palette.dim('Esc: back');
   const hints = state.pane === 'accounts' ? ACCOUNT_HINTS : TEXT_PANE_HINTS;
-  return palette.dim(fittedHints(cut ? [CUT_MESSAGE_HINT, ...hints] : hints, cols));
+  // While an action runs every key but Ctrl-C waits, m included, so it is not offered then.
+  const offerMessage = cut && state.busy === undefined;
+  return palette.dim(fittedHints(offerMessage ? [CUT_MESSAGE_HINT, ...hints] : hints, cols));
 }
 
 /** The message overlay: the last message whole, wrapped to `cols`. */
 function messageBody(state: TuiState, cols: number): string[] {
-  return wrap(sanitizeForTerminal(lastMessage(state) ?? ''), cols);
+  return wrap(messageText(lastMessage(state) ?? ''), cols);
 }
 
 /** The help overlay, wrapped to `cols` (a description continues under itself rather than being
@@ -692,9 +723,10 @@ export function renderFrame(
         ? `Terminal too narrow: widen it to ${MIN_COLS} columns (q quits).`
         : `Terminal too short: make it ${MIN_ROWS} rows tall (q quits).`;
     // Wrapped, so the way out (q) is never cut off; in a terminal too small even for that, the
-    // short form.
+    // short form, and then the way out alone.
     let lines = wrap(notice, cols);
     if (lines.length > height) lines = wrap('Too small: q quits', cols);
+    if (lines.length > height) lines = wrap('q quits', cols);
     const shown = lines.slice(0, height);
     return [...shown, ...Array<string>(Math.max(0, height - shown.length)).fill('')];
   }

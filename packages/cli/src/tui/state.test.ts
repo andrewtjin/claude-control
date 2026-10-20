@@ -2,11 +2,13 @@
 
 import { describe, it, expect } from 'vitest';
 import { NOW, account, everyStateAccounts, snapshotOf, stateWith } from '../testing/tuiFixtures.js';
+import { KeyDecoder } from './input.js';
 import {
   applyLoadError,
   applySnapshot,
   describeRepoll,
   initialState,
+  lastMessage,
   reduce,
   refreshBlocker,
   selectedAccount,
@@ -231,14 +233,17 @@ describe('refresh', () => {
 });
 
 describe('overlays and prompts', () => {
-  it('closes help and the launch line on any key, without acting on it', () => {
+  it('closes help and the launch line on any key but Enter, without acting on it', () => {
     for (const opener of [char('?'), char('l')]) {
       const open = reduce(base(), opener).state;
-      for (const k of [char('q'), key('enter'), char('d'), key('escape')]) {
+      for (const k of [char('q'), char('d'), key('escape')]) {
         const t = reduce(open, k);
         expect(t.state.mode).toEqual({ kind: 'browse' });
         expect(t.effect).toBeUndefined();
       }
+      const enter = reduce(open, key('enter'));
+      expect(enter.state.mode).toEqual(open.mode);
+      expect(enter.effect).toBeUndefined();
     }
   });
 
@@ -274,6 +279,24 @@ describe('overlays and prompts', () => {
     expect(t.state.mode).toEqual({ kind: 'browse' });
     expect(t.effects).toEqual([]);
     expect(t.state.status).toEqual({ text: 'Cancelled.', tone: 'info' });
+  });
+
+  it('keeps the refusal a prompt was reopened with when it is cancelled, so m shows it whole', () => {
+    const refusal =
+      'Not renamed: could not write C:/Users/someone/AppData/Local/claude-control/vault/' +
+      'accounts.json (EPERM: operation not permitted, rename); close the program holding it ' +
+      'and try again';
+    const started = press(base(), char('r'), ...[...'other'].map(char), key('enter')).state;
+    expect(started.busy).toBeDefined();
+    const refused = settleAction(started, { ok: false, message: refusal });
+    expect(refused.mode).toMatchObject({ kind: 'prompt', purpose: 'rename', note: refusal });
+    // Typing drops the note from the prompt; the refusal is still what Esc leaves behind.
+    const cancelled = press(refused, char('x'), key('escape')).state;
+    expect(cancelled.mode).toEqual({ kind: 'browse' });
+    expect(cancelled.status).toEqual({ text: refusal, tone: 'error' });
+    const shown = press(cancelled, char('m')).state;
+    expect(shown.mode).toEqual({ kind: 'message', scroll: 0 });
+    expect(lastMessage(shown)).toBe(refusal);
   });
 
   it('submits a rename and an add, trimmed nowhere: the vault decides what a label is', () => {
@@ -414,6 +437,21 @@ describe('keys that must not reach the account under the cursor', () => {
     const t = press(base(), char('d'), ...[...'Work'].map(char), key('enter'), key('enter'));
     expect(t.effects).toEqual([]);
     expect(t.state.busy).toBeUndefined();
+  });
+
+  it('a doubled Enter in help, the message or the launch line does not switch', () => {
+    // Whole chunks through the real decoder, as a double press or a bounce arrives.
+    const said = withStatus(base(), 'Switched to home.', 'ok');
+    for (const chunk of ['?\r\r', 'l\r\r', 'm\r\r', '?\r\r\r\r']) {
+      let t: Transition = { state: said };
+      const effects: unknown[] = [];
+      for (const k of new KeyDecoder().feed(chunk)) {
+        t = reduce(t.state, k);
+        if (t.effect) effects.push(t.effect);
+      }
+      expect(effects, JSON.stringify(chunk)).toEqual([]);
+      expect(t.state.mode.kind, JSON.stringify(chunk)).not.toBe('browse');
+    }
   });
 
   it('a second Enter after an empty rename or add does not switch', () => {

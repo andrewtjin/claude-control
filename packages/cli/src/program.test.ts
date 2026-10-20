@@ -141,6 +141,17 @@ vi.mock('./tui/run.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./tui/run.js')>()),
   runTui: tuiIo.runTui,
 }));
+// Whether the console answers the cursor query the view's gate asks on Windows. The test's stdin is
+// no console, so the gate is handed the answer instead (its own tests drive the query itself).
+const consoleIo = vi.hoisted(() => ({ answers: true }));
+vi.mock('./terminalSupport.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./terminalSupport.js')>();
+  return {
+    ...real,
+    fullScreenBlocker: (env?: NodeJS.ProcessEnv, platform: NodeJS.Platform = 'win32') =>
+      real.fullScreenBlocker(env, platform, () => Promise.resolve(consoleIo.answers)),
+  };
+});
 
 /** Run one command through commander with stdout/stderr captured. `fail()` throws a CliFailure
  *  that the entry point turns into an error line and exit 1, so a refusal comes back here as
@@ -2236,6 +2247,23 @@ describe('where bare `cctl` and `cctl tui` go', () => {
     process.exitCode = undefined;
     await runCli(['tui']);
     expect(process.exitCode).toBeUndefined();
+  });
+
+  it('prints the summary, and `cctl tui` refuses, on a console that does not answer', async () => {
+    setTty(true, true);
+    engine.listAccounts.mockResolvedValue([acct('work')]);
+    consoleIo.answers = false;
+    try {
+      const bare = await runCli([]);
+      expect(bare.exited).toBe(false);
+      expect(bare.out).toContain('work');
+      const tui = await runCli(['tui']);
+      expect(tui.exited).toBe(true);
+      expect(tui.err).toContain('open a new console window');
+      expect(tuiIo.runTui).not.toHaveBeenCalled();
+    } finally {
+      consoleIo.answers = true;
+    }
   });
 
   it('lists `tui` in the help', async () => {

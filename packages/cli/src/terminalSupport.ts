@@ -5,7 +5,15 @@
 // passes the first and fails the second (an Emacs shell buffer, the legacy Windows console) is
 // still a terminal, and gets the plain output a pipe gets rather than a screen of escape codes.
 
-import { spawnSync } from 'node:child_process';
+const ESC = String.fromCharCode(27);
+/** "Where is the cursor?" (DSR 6), answered with ESC [ row ; col R by any terminal that processes
+ *  escape sequences. */
+const CURSOR_QUERY = `${ESC}[6n`;
+const CURSOR_REPORT = new RegExp(`${ESC}\\[\\d+;\\d+R`);
+/** How long to wait for the answer. A console that processes escape sequences answers within a
+ *  few milliseconds (measured: 2-11 ms under ConPTY and winpty); this leaves a loaded machine
+ *  plenty of room, and is only ever waited out in full on a console that will never answer. */
+export const CURSOR_QUERY_TIMEOUT_MS = 1_000;
 
 /** Whether a person is at both ends of this process: input and output are both a terminal. The
  *  full-screen view needs both — keys in, a screen out — and anything less (a pipe, a file, CI)
@@ -17,57 +25,92 @@ export function isInteractiveTerminal(
   return stdin.isTTY === true && stdout.isTTY === true;
 }
 
+/** The input side of a terminal, as the cursor query uses it. */
+export interface ProbeInput {
+  setRawMode(mode: boolean): unknown;
+  setEncoding(encoding: BufferEncoding): unknown;
+  on(event: 'data', listener: (chunk: string | Buffer) => void): unknown;
+  removeListener(event: 'data', listener: (chunk: string | Buffer) => void): unknown;
+  resume(): unknown;
+  pause(): unknown;
+}
+
 /**
  * Why this terminal cannot draw the full-screen view, or undefined when it can.
  *
  * - `TERM=dumb` is a terminal that says it cannot move the cursor: an Emacs `M-x shell` buffer
  *   runs its shell on a pseudo-terminal with that setting, so both ends are TTYs, yet every frame
  *   would be appended to the buffer as text.
- * - The legacy Windows console ("Use legacy console", `HKCU\Console` `ForceV2` = 0) has no VT
- *   processing; Node emulates a few sequences, but not the alternate screen, so the view would
- *   wipe the visible console and leave its last frame behind on exit. The setting is read on
- *   every Windows terminal, because no environment variable says which console this process
- *   is attached to: Git Bash, MSYS2 and Cygwin set `TERM` inside a plain console window, and
+ * - The legacy Windows console has no VT processing; Node emulates a few sequences, but not the
+ *   alternate screen, so the view would wipe the visible console and leave its last frame behind
+ *   on exit. Nothing outside the console can say which kind this process is attached to: no
+ *   environment variable does (Git Bash sets `TERM` inside a plain console window, and
  *   `WT_SESSION` or `TERM_PROGRAM` are inherited by a console window started from Windows
- *   Terminal or VS Code. The cost of that is a refusal inside Windows Terminal for someone who
- *   has the legacy setting on, which names the setting to change; the alternative, trusting a
- *   variable, wipes the screen of someone whose console cannot draw the view.
+ *   Terminal or VS Code), and the "Use legacy console" setting is only read when a window
+ *   starts, so a window opened before it was changed is still the other kind. So the console is
+ *   asked directly (`answersCursorQuery`): one that processes escape sequences answers a cursor
+ *   position query, and the legacy console, which does not, stays silent.
  *
- * `readForceV2` reads the console setting (injectable; the default asks `reg`).
+ * Only Windows is asked: every other terminal that reaches here processes escape sequences.
  */
-export function fullScreenBlocker(
+export async function fullScreenBlocker(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
-  readForceV2: () => number | undefined = readConsoleForceV2,
-): string | undefined {
+  answersCursorQuery: () => Promise<boolean> = () =>
+    consoleAnswersCursorQuery(process.stdin, process.stdout),
+): Promise<string | undefined> {
   if (env.TERM === 'dumb') {
     return 'this terminal (TERM=dumb) cannot move the cursor, which the full-screen view needs';
   }
   if (platform !== 'win32') return undefined;
-  return readForceV2() === 0
-    ? 'the Windows console is set to "Use legacy console" (HKCU\\Console ForceV2 = 0), which ' +
-        'has no alternate screen for the full-screen view; turn that off in the properties of ' +
-        'a console window'
-    : undefined;
+  if (await answersCursorQuery()) return undefined;
+  return (
+    'this Windows console does not process terminal escape sequences (the legacy console does ' +
+    'not), so it has no alternate screen for the full-screen view; if "Use legacy console" is ' +
+    "ticked in the window's properties, untick it and open a new console window"
+  );
 }
 
-/** The `ForceV2` value out of `reg query HKCU\Console /v ForceV2` output, or undefined when the
- *  value is absent (the modern console, the default). */
-export function parseForceV2(output: string): number | undefined {
-  const match = /ForceV2\s+REG_DWORD\s+0x([0-9a-f]+)/i.exec(output);
-  return match ? Number.parseInt(match[1]!, 16) : undefined;
-}
-
-/** The console's `ForceV2` setting, or undefined when it is absent or cannot be read. */
-function readConsoleForceV2(): number | undefined {
-  try {
-    const result = spawnSync('reg', ['query', 'HKCU\\Console', '/v', 'ForceV2'], {
-      encoding: 'utf8',
-      windowsHide: true,
-      timeout: 2_000,
-    });
-    return typeof result.stdout === 'string' ? parseForceV2(result.stdout) : undefined;
-  } catch {
-    return undefined;
-  }
+/**
+ * Ask the console where its cursor is and wait up to `timeoutMs` for the answer. True when it
+ * answers. Input is raw only while asking; keys typed meanwhile are dropped with the answer, as
+ * they arrived before any screen was there to act on them. The console is left as it was found:
+ * cooked, nobody listening, not reading. An input that cannot go raw counts as no answer, since
+ * the view cannot run on it either.
+ */
+export function consoleAnswersCursorQuery(
+  stdin: ProbeInput,
+  stdout: { write(chunk: string): unknown },
+  timeoutMs: number = CURSOR_QUERY_TIMEOUT_MS,
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let heard = '';
+    // Only ever called once the timer below exists: data arrives no sooner than the next tick.
+    const done = (answered: boolean): void => {
+      clearTimeout(timer);
+      stdin.removeListener('data', onData);
+      try {
+        stdin.setRawMode(false);
+      } catch {
+        // An input that is already closed has no mode left to restore.
+      }
+      stdin.pause();
+      resolve(answered);
+    };
+    const onData = (chunk: string | Buffer): void => {
+      heard += String(chunk);
+      if (CURSOR_REPORT.test(heard)) done(true);
+    };
+    try {
+      stdin.setRawMode(true);
+    } catch {
+      resolve(false);
+      return;
+    }
+    const timer = setTimeout(() => done(false), timeoutMs);
+    stdin.setEncoding('utf8');
+    stdin.on('data', onData);
+    stdin.resume();
+    stdout.write(CURSOR_QUERY);
+  });
 }

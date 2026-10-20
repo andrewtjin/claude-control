@@ -140,6 +140,22 @@ describe('renderOutages', () => {
     );
   });
 
+  it("spells an auto-switch reason's dashes in ASCII, whose width every terminal agrees on", () => {
+    const s = start(local(10, 1, 14, 0), {
+      switches: [
+        {
+          at: local(10, 1, 13, 0),
+          from: 'work1',
+          to: 'w2',
+          origin: 'auto',
+          reason: 'work1 is at 96% weekly \u2014 w2 has the soonest weekly reset',
+        },
+      ],
+    });
+    const out = renderOutages([{ start: s }], { now: NOW, logPath: 'x', open: [] });
+    expect(out).toContain('auto: work1 is at 96% weekly - w2 has the soonest weekly reset');
+  });
+
   it('names every limit holding an account out, and the reset of the last', () => {
     const s = start(local(10, 1, 14, 0), {
       accounts: [

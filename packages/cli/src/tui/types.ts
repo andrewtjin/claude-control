@@ -167,6 +167,10 @@ export interface TuiPrompt {
    *  and only Escape closes it. Closing it at once would hand the rest of what the person was
    *  typing, and the Enter meant for the prompt, to the account list. */
   gone?: true;
+  /** The refusal this prompt was opened again with (see `reopenOnRefusal`), kept after typing
+   *  drops it from `note`: the note may be cut to the rows a prompt has, and m types into the
+   *  prompt, so Escape leaves the refusal on the status line, where m shows it whole. */
+  refusal?: string;
 }
 
 /** How a status line reads. */

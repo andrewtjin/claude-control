@@ -1031,7 +1031,7 @@ export function buildProgram(): Command {
             'For plain output use: cctl usage',
         );
       }
-      const blocker = fullScreenBlocker();
+      const blocker = await fullScreenBlocker();
       if (blocker !== undefined)
         fail(`cctl tui cannot run here: ${blocker}. For plain output use: cctl usage`);
       await openTui();
@@ -1063,8 +1063,8 @@ export function buildProgram(): Command {
       );
     }
     // A terminal that cannot draw the view (TERM=dumb, the legacy Windows console) gets the
-    // summary, as a pipe does.
-    if (isInteractiveTerminal() && fullScreenBlocker() === undefined) {
+    // summary, as a pipe does. The console is only asked when both ends are a terminal.
+    if (isInteractiveTerminal() && (await fullScreenBlocker()) === undefined) {
       // "Set up" means what the summary's own check means: an account in the shared pool.
       if ((await buildEngine().listAccounts()).length === 0) {
         process.stdout.write('Not set up yet. Run: cctl setup\n');

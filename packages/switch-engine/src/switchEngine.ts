@@ -25,6 +25,7 @@ import { CredentialStore, type LiveCredentialChannel } from './credentialStore.j
 import { type Protector } from './dpapi.js';
 import { defaultLiveCredentialChannel, defaultProtector } from './protector.js';
 import {
+  AccountLabelChangedError,
   CadenceError,
   LockTimeoutError,
   QuarantineError,
@@ -798,9 +799,21 @@ export class SwitchEngine {
    * holding its latest token) with an empty seat the rule re-fills, and a rerun completes the
    * removal. The reverse order leaves the removed login live in the profile — and when the removal
    * dissolved the rule, in a profile no slot owns, which nothing else would ever clear.
+   *
+   * `expectedLabel` is the label a person typed to confirm the removal. It is compared here, under
+   * the lock, against the registry the lock protects: compared before the lock is taken, a rename
+   * another process commits while this removal waits for the lock would go unseen, and the account
+   * would be removed under a name nobody confirmed. A mismatch (or an account already gone) throws
+   * {@link AccountLabelChangedError} before anything is touched.
    */
-  removeAccount(id: string): Promise<void> {
+  removeAccount(id: string, options: { expectedLabel?: string } = {}): Promise<void> {
     return this.withCredentialLock(async () => {
+      if (options.expectedLabel !== undefined) {
+        const current = (await this.vault.listAllAccounts()).find((a) => a.id === id);
+        if (current?.label !== options.expectedLabel) {
+          throw new AccountLabelChangedError(id, options.expectedLabel, current?.label ?? null);
+        }
+      }
       // A pending switch to or from this account needs its bundle to be settled correctly; one that
       // cannot be settled yet refuses the removal.
       const untrusted = await this.settleForAccountsLocked([id]);

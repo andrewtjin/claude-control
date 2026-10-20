@@ -8,6 +8,7 @@ import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  AccountLabelChangedError,
   CadenceError,
   LockTimeoutError,
   QuarantineError,
@@ -104,7 +105,7 @@ function fakeEngine() {
     renameAccount: vi.fn((id: string, label: string): Promise<StoredAccount> =>
       Promise.resolve({ ...work, id, label: label.trim() }),
     ),
-    removeAccount: vi.fn((_id: string) => Promise.resolve()),
+    removeAccount: vi.fn((_id: string, _opts?: { expectedLabel?: string }) => Promise.resolve()),
     captureCurrentLogin: vi.fn((label: string): Promise<StoredAccount> =>
       Promise.resolve({ ...work, id: 'new-1', label }),
     ),
@@ -411,15 +412,27 @@ describe('removeAccount', () => {
     expect(out).toMatchObject({ account: { label: 'Work' }, message: 'Removed Work.' });
   });
 
-  it('removes nothing when the account no longer has the label the person confirmed', async () => {
-    await expectRefused(
-      removeAccount('id-1', ctx, { label: 'Home' }),
-      'label_changed',
-      'The account confirmed as Home is now called Work; nothing was removed.',
+  it('hands the label the person confirmed to the engine, which checks it under the lock', async () => {
+    const out = await removeAccount('id-1', ctx, { label: 'Work' });
+    expect(engine.removeAccount).toHaveBeenCalledWith('id-1', { expectedLabel: 'Work' });
+    expect(out.message).toBe('Removed Work.');
+  });
+
+  it('removes nothing when the account is renamed or removed while the removal waits', async () => {
+    engine.removeAccount.mockRejectedValueOnce(
+      new AccountLabelChangedError('id-1', 'Work', 'Other'),
     );
-    expect(engine.removeAccount).not.toHaveBeenCalled();
-    await removeAccount('id-1', ctx, { label: 'Work' });
-    expect(engine.removeAccount).toHaveBeenCalledWith('id-1');
+    await expectRefused(
+      removeAccount('id-1', ctx, { label: 'Work' }),
+      'label_changed',
+      'The account confirmed as Work is now called Other; nothing was removed.',
+    );
+    engine.removeAccount.mockRejectedValueOnce(new AccountLabelChangedError('id-1', 'Work', null));
+    await expectRefused(
+      removeAccount('id-1', ctx, { label: 'Work' }),
+      'label_changed',
+      'The account confirmed as Work is no longer stored; nothing was removed.',
+    );
   });
 });
 
