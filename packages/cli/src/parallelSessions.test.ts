@@ -530,7 +530,7 @@ describe('doctor and parallel sessions', () => {
 describe('the background-worker probe on Linux', () => {
   /** A `/proc` with one process, pid 2345, an unrelated program that took the pid over unless the
    *  test says otherwise: its start ticks, its state and its environment's config dir. */
-  function proc(over: { state?: string; configDir?: string } = {}): ProcFs {
+  function proc(over: { state?: string; configDir?: string; argv?: string[] } = {}): ProcFs {
     return {
       stat: (pid) =>
         pid === 2345 ? { ppid: 1, startTicks: 99999, state: over.state ?? 'S' } : undefined,
@@ -538,6 +538,10 @@ describe('the background-worker probe on Linux', () => {
       pidNs: () => 'pid:[1]',
       configDirOf: (pid) => (pid === 2345 ? over.configDir : undefined),
       pids: () => [2345],
+      // No arguments given: they cannot be read, which counts as a doubt everywhere.
+      ...(over.argv !== undefined
+        ? { cmdlineOf: (pid: number) => (pid === 2345 ? over.argv : undefined) }
+        : {}),
     };
   }
   /** A probe over a roster naming pid 2345 as given, whatever verification is asked for. */
@@ -590,6 +594,37 @@ describe('the background-worker probe on Linux', () => {
     ]);
     const byEnvironment = probeOf({ pid: 2345 }, proc({ configDir: `${PROFILE}/` }));
     expect(await byEnvironment(PROFILE, { verify: false })).toMatchObject([
+      { pid: 2345, start: 99999, role: 'background' },
+    ]);
+  });
+
+  it('a dev server that took over the pid and inherited the profile holds nothing, recorded start or not', async () => {
+    // Left running from the session's shell, so its environment names the profile; it never reads
+    // the login, and its start is not the one the roster recorded.
+    const devServer = proc({
+      configDir: PROFILE,
+      argv: ['node', '/home/u/app/node_modules/.bin/vite'],
+    });
+    const recorded = probeOf(
+      { pid: 2345, procStart: 'Mon Oct 19 10:00:00 2026' },
+      devServer,
+      new Map([[2345, 'Mon Oct 19 11:30:00 2026']]),
+    );
+    expect(await recorded(PROFILE, { verify: false })).toEqual([]);
+    expect(await recorded(PROFILE, { verify: true })).toEqual([]);
+    expect(await probeOf({ pid: 2345 }, devServer)(PROFILE, { verify: false })).toEqual([]);
+  });
+
+  it('a Claude Code on the profile holds it by its environment, even when the clock moved its start', async () => {
+    // A wall-clock step moves what `ps` prints for a process's start; its environment still says
+    // it reads this profile's login.
+    const worker = proc({ configDir: PROFILE, argv: ['claude', '--bg-worker'] });
+    const probe = probeOf(
+      { pid: 2345, procStart: 'Mon Oct 19 10:00:00 2026' },
+      worker,
+      new Map([[2345, 'Mon Oct 19 10:00:07 2026']]),
+    );
+    expect(await probe(PROFILE, { verify: false })).toMatchObject([
       { pid: 2345, start: 99999, role: 'background' },
     ]);
   });

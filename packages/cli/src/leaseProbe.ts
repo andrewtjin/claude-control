@@ -6,6 +6,7 @@
 import { hostname } from 'node:os';
 import { sameConfigDir } from '@claude-control/daemon';
 import {
+  isClaudeCodeProcess,
   isExitedState,
   linuxTags,
   procFs as realProcFs,
@@ -38,12 +39,16 @@ export interface LeaseProbeDeps {
  * Linux: a holder's start there is the `/proc` start of whatever runs on that pid now, so a worker
  * becomes a holder only once it is proven to be the worker the roster names; a holder taken from
  * anything less would match an unrelated process that took over the pid exactly, and keep the
- * session for as long as that runs. Proof is one of: its environment names this profile (a worker
- * of this profile's service inherits its CLAUDE_CONFIG_DIR), or the start Claude Code recorded for
- * it equals the one `ps` reports now, read fresh here (never a cached read, which can predate a pid
- * being reused). A worker that has exited but was not reaped yet is gone. A worker with no recorded
- * start and an environment that does not name the profile is not proven, so it is not a holder. One
- * whose start `ps` could not read leaves the question open: the probe answers `'unreadable'`.
+ * session for as long as that runs. Proof is one of: it is a Claude Code whose environment names
+ * this profile (a worker of this profile's service inherits its CLAUDE_CONFIG_DIR), or the start
+ * Claude Code recorded for it equals the one `ps` reports now, read fresh here (never a cached read,
+ * which can predate a pid being reused). The environment proof is the engine's own rule for what
+ * runs on a profile (see isClaudeCodeProcess): a Claude Code there reads the login, so it holds the
+ * session whatever its recorded start says (a wall-clock step moves what `ps` prints), while a dev
+ * server or an editor that took over the pid merely inherited the profile from the session's shell
+ * and never holds it. A worker that has exited but was not reaped yet is gone. A worker proven by
+ * neither is not a holder. One whose start `ps` could not read leaves the question open: the probe
+ * answers `'unreadable'`.
  */
 export function createLeaseOccupancyProbe(
   host: Pick<ClaudeBackgroundHost, 'hostedWorkerProcesses'>,
@@ -77,7 +82,10 @@ export function createLeaseOccupancyProbe(
     });
     const byEnvironment = running.filter((w) => {
       const dir = fs.configDirOf(w.pid);
-      return dir !== undefined && sameConfigDir(dir, profileDir, platform);
+      if (dir === undefined || !sameConfigDir(dir, profileDir, platform)) return false;
+      // Arguments that cannot be read are a doubt, which keeps the session as everywhere else.
+      const argv = fs.cmdlineOf?.(w.pid);
+      return isClaudeCodeProcess(argv === undefined ? {} : { argv });
     });
     const toCheck = running.filter((w) => !byEnvironment.includes(w) && w.procStart !== undefined);
     let starts = new Map<number, string>();
