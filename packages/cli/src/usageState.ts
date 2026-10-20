@@ -9,12 +9,7 @@
 // as long as it runs (see {@link UsageReader}).
 
 import type { StoredAccount } from '@claude-control/switch-engine';
-import {
-  Store,
-  readFleetHistory,
-  type FleetHistory,
-  type SessionRow,
-} from '@claude-control/daemon';
+import { Store, readFleetHistory, readFleetResets, type SessionRow } from '@claude-control/daemon';
 import { AccountUsage } from '@claude-control/shared-protocol';
 import { planWeight } from '@claude-control/usage-advisor';
 import { buildEngine, daemonDbPath } from './context.js';
@@ -34,7 +29,8 @@ export interface UsageState {
   /** Next weekly reset predicted from stored history, for accounts the endpoint has stopped
    *  publishing one for. Absent when the account has no observed reset in history at all. */
   predictedResetFor: (accountId: string) => number | undefined;
-  /** Fleet burn in Pro-equivalent units/day, or undefined when history cannot measure one. */
+  /** Fleet burn in Pro-equivalent units/day, or undefined when history cannot measure one (or
+   *  the reader was built not to measure it). */
   burnUnitsPerDay: number | undefined;
 }
 
@@ -44,31 +40,26 @@ export interface UsageReaderOptions {
   dbPath?: string;
   /** The history measurement (injectable so a test can count it). */
   readHistory?: typeof readFleetHistory;
-  /** How long a history measurement is reused. */
-  historyTtlMs?: number;
+  /** Whether to measure the fleet's burn rate (default true). Measuring it reads every reading of
+   *  the last days; without it a reset prediction reads one row per account. */
+  burn?: boolean;
 }
-
-/** Reuse a history measurement this long by default. History moves by one observation per
- *  account per poll, and what it predicts (a weekly reset days away) barely moves in a minute,
- *  while measuring it reads every observation of the last ten days. */
-const HISTORY_TTL_MS = 60_000;
 
 /**
  * Reads the usage picture, keeping the daemon's database open between reads. Opening the store
  * runs its migration (a scan of the snapshot table), so a caller that reads every couple of
- * seconds (the full-screen view) opens it once, not on every read; and it reuses the history
- * measurement for {@link UsageReaderOptions.historyTtlMs}. A read that fails drops the connection,
- * so the next one starts fresh (a database replaced or repaired meanwhile is picked up). All of it
- * is synchronous SQLite on the caller's thread; keeping it to one open and one measurement a
- * minute is what keeps a live view responsive.
+ * seconds (the full-screen view) opens it once, not on every read. Such a caller also builds it
+ * without the burn rate (see {@link UsageReaderOptions.burn}), which it never shows and which is
+ * the one costly part of a read. A read that fails drops the connection, so the next one starts
+ * fresh (a database replaced or repaired meanwhile is picked up). All of it is synchronous SQLite
+ * on the caller's thread.
  */
 export class UsageReader {
   private store: Store | undefined;
   private closed = false;
-  private history: { key: string; atMs: number; value: FleetHistory } | undefined;
   private readonly dbPath: string;
   private readonly readHistory: typeof readFleetHistory;
-  private readonly historyTtlMs: number;
+  private readonly burn: boolean;
 
   constructor(
     private readonly engine: Pick<Engine, 'listAccounts' | 'getActiveId'>,
@@ -76,7 +67,7 @@ export class UsageReader {
   ) {
     this.dbPath = options.dbPath ?? daemonDbPath();
     this.readHistory = options.readHistory ?? readFleetHistory;
-    this.historyTtlMs = options.historyTtlMs ?? HISTORY_TTL_MS;
+    this.burn = options.burn ?? true;
   }
 
   /** The usage picture now. `only` names the accounts to read instead of the shared pool;
@@ -106,6 +97,32 @@ export class UsageReader {
     });
   }
 
+  /** The history-derived measurements: both, through the same measurement the daemon makes each
+   *  poll cycle (so a number the CLI prints never disagrees with the one the phone got), or only
+   *  the reset predictions, from the newest reported reset per account. */
+  private historyFor(
+    store: Store,
+    accounts: StoredAccount[],
+    nowMs: number,
+  ): { predictedResetByAccount: Map<string, number>; burnUnitsPerDay: number | undefined } {
+    if (!this.burn) {
+      return {
+        predictedResetByAccount: readFleetResets(
+          store,
+          accounts.map((a) => a.id),
+          nowMs,
+        ),
+        burnUnitsPerDay: undefined,
+      };
+    }
+    const inputs = accounts.map((a) => ({ accountId: a.id, ...resolvedWeight(a) }));
+    const history = this.readHistory(store, inputs, nowMs);
+    return {
+      predictedResetByAccount: history.predictedResetByAccount,
+      burnUnitsPerDay: history.burnUnitsPerDay,
+    };
+  }
+
   /** The sessions the daemon tracks, through the same open database. */
   listSessions(): SessionRow[] {
     return this.withStore((store) => store.listSessions());
@@ -132,21 +149,6 @@ export class UsageReader {
       this.drop();
       throw err;
     }
-  }
-
-  /** The history measurement for these accounts, reused while it is fresh. The same measurement
-   *  the daemon makes each poll cycle, over the same store and the one implementation, so a
-   *  number the CLI prints can never disagree with the one the phone got. */
-  private historyFor(store: Store, accounts: StoredAccount[], nowMs: number): FleetHistory {
-    const inputs = accounts.map((a) => ({ accountId: a.id, ...resolvedWeight(a) }));
-    const key = JSON.stringify(inputs);
-    const cached = this.history;
-    if (cached !== undefined && cached.key === key && nowMs - cached.atMs < this.historyTtlMs) {
-      return cached.value;
-    }
-    const value = this.readHistory(store, inputs, nowMs);
-    this.history = { key, atMs: nowMs, value };
-    return value;
   }
 }
 

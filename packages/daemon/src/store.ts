@@ -665,6 +665,25 @@ export class Store {
     });
   }
 
+  /**
+   * The weekly reset the newest reading from `sinceMs` onward reported, among the readings that
+   * reported one: the anchor a reset prediction needs, and nothing else. One row from the same
+   * covering index {@link listWeeklyObservationsSince} reads, scanned from the newest end, so a
+   * caller that predicts resets every couple of seconds (the full-screen view) never turns ten
+   * days of readings into objects to keep only the last.
+   */
+  latestWeeklyResetSince(accountId: string, sinceMs: number): number | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT weeklyResetsAtMs FROM usage_snapshots
+         WHERE accountId = ? AND fetchedAtMs >= ? AND weeklyPercent IS NOT NULL
+           AND weeklyResetsAtMs IS NOT NULL
+         ORDER BY fetchedAtMs DESC LIMIT 1`,
+      )
+      .get(accountId, sinceMs);
+    return row ? requireNumber(row, 'weeklyResetsAtMs') : undefined;
+  }
+
   latestUsageSnapshot(accountId: string): UsageSnapshotRow | undefined {
     const row = this.db
       .prepare(

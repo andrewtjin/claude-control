@@ -112,6 +112,46 @@ export function wrap(text: string, width: number): string[] {
 }
 
 /**
+ * `text` wrapped to `width` columns in at most `rows` rows. When it needs more, the middle gives
+ * way: the first row keeps the start (what happened) and the other rows the end (what to do
+ * about it, which a refusal or an error says last), the joint marked by the ellipsis. In one row,
+ * half of each. `cut` says whether anything was dropped.
+ */
+export function wrapWithin(
+  text: string,
+  width: number,
+  rows: number,
+): { lines: string[]; cut: boolean } {
+  const lines = wrap(text, width);
+  if (lines.length <= rows) return { lines, cut: false };
+  if (rows <= 0 || width <= 0) return { lines: [], cut: true };
+  if (width <= ELLIPSIS.length) return { lines: [cut(text, width)], cut: true };
+  if (rows === 1) {
+    const room = width - ELLIPSIS.length;
+    const head = Math.ceil(room / 2);
+    return { lines: [cut(text, head) + ELLIPSIS + cutTail(text, room - head)], cut: true };
+  }
+  const tailRows = rows - 1;
+  const words = text.split(' ');
+  const tailFrom = (k: number): string[] => wrap(ELLIPSIS + words.slice(k).join(' '), width);
+  // The longest run of whole last words that fits the rows left, never reaching back into the
+  // first row. Fewer words never take more rows, so the shortest fitting start is searched for.
+  let lo = Math.max(1, lines[0]!.split(' ').length);
+  let hi = words.length - 1;
+  if (lo > hi || tailFrom(hi).length > tailRows) {
+    // The last word alone does not fit (a long path): the end of the text, cut mid-word.
+    const end = cutTail(text, tailRows * width - ELLIPSIS.length);
+    return { lines: [lines[0]!, ...wrap(ELLIPSIS + end, width).slice(-tailRows)], cut: true };
+  }
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (tailFrom(mid).length <= tailRows) hi = mid;
+    else lo = mid + 1;
+  }
+  return { lines: [lines[0]!, ...tailFrom(lo)], cut: true };
+}
+
+/**
  * Cut an already-painted line to at most `width` visible columns. Escape sequences are kept and
  * cost nothing; a line that was cut and had opened a style ends with a full reset.
  */

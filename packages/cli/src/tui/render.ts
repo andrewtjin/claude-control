@@ -18,7 +18,7 @@ import { renderFolders, shellQuote } from '../folderRender.js';
 import { renderOutages } from '../outagesView.js';
 import { renderSessionStatus } from '../sessionRender.js';
 import { sanitizeForTerminal, severityPaint, type Palette } from '../ansi.js';
-import { accountsOf, selectedAccount } from './state.js';
+import { accountsOf, lastMessage, selectedAccount } from './state.js';
 import {
   clip,
   cutTail,
@@ -28,6 +28,7 @@ import {
   truncateAnsi,
   visibleWidth,
   wrap,
+  wrapWithin,
 } from './text.js';
 import { PANES, type PaneId, type TuiAccount, type TuiState, type TuiTag } from './types.js';
 
@@ -64,6 +65,7 @@ export const KEY_HELP: ReadonlyArray<readonly [string, string]> = [
   ['d', 'remove the selected account (asks you to type its label)'],
   ['u', 'ask the daemon to refresh usage now'],
   ['l', 'show the command that runs Claude as the selected account'],
+  ['m', 'show the last message in full (a long one is cut on the status line)'],
   ['?', 'this help'],
   ['q or Esc', 'quit'],
 ];
@@ -306,7 +308,9 @@ function accountRow(
 function accountsBody(state: TuiState, cols: number, height: number, palette: Palette): string[] {
   const section = state.snapshot?.accounts;
   if (section === undefined) return [palette.dim('Reading accounts...')];
-  if (!section.ok) return failedLines('the accounts', section.error, cols, palette);
+  // The Accounts pane does not scroll, so a failure taller than the body keeps its start and its
+  // end (the file, and what to do about it) rather than running off the bottom.
+  if (!section.ok) return failedLines('the accounts', section.error, cols, palette, height);
   const accounts = section.value;
   if (accounts.length === 0) {
     return [
@@ -340,12 +344,18 @@ function accountsBody(state: TuiState, cols: number, height: number, palette: Pa
   ];
 }
 
-/** A pane read failure, wrapped over the body: the end of such a message (the file, what to do
- *  about it) is the part that matters, and a single line cut at the edge would hide it. */
-function failedLines(what: string, error: string, cols: number, palette: Palette): string[] {
-  return wrap(`Could not read ${what}: ${sanitizeForTerminal(error)}`, cols).map((l) =>
-    palette.red(l),
-  );
+/** A pane read failure, wrapped over the body (at most `rows` rows, keeping its start and end):
+ *  the end of such a message (the file, what to do about it) is the part that matters, and a
+ *  single line cut at the edge would hide it. */
+function failedLines(
+  what: string,
+  error: string,
+  cols: number,
+  palette: Palette,
+  rows = Number.POSITIVE_INFINITY,
+): string[] {
+  const text = `Could not read ${what}: ${sanitizeForTerminal(error)}`;
+  return wrapWithin(text, cols, rows).lines.map((l) => palette.red(l));
 }
 
 // ---------------------------------------------------------------------------
@@ -401,10 +411,12 @@ export function settleScroll(
   palette: Palette,
   cols = Number.POSITIVE_INFINITY,
 ): TuiState {
-  const body = bodyHeight(rows) - (statusLines(state, cols, rows, palette).length - 1);
-  if (state.mode.kind === 'help') {
-    const limit = maxScroll(helpBody(palette, cols).length, body);
-    return state.mode.scroll <= limit ? state : { ...state, mode: { kind: 'help', scroll: limit } };
+  const body = bodyHeight(rows) - (statusLines(state, cols, rows, palette).lines.length - 1);
+  const mode = state.mode;
+  if (mode.kind === 'help' || mode.kind === 'message') {
+    const lines = mode.kind === 'help' ? helpBody(palette, cols) : messageBody(state, cols);
+    const limit = maxScroll(lines.length, body);
+    return mode.scroll <= limit ? state : { ...state, mode: { kind: mode.kind, scroll: limit } };
   }
   if (state.pane === 'accounts') return state;
   const pane = state.pane;
@@ -479,31 +491,35 @@ function statusText(
       : '';
     return { text: state.busy + quitting, paint: palette.yellow };
   }
-  if (state.status !== undefined) {
-    const text = sanitizeForTerminal(state.status.text);
-    switch (state.status.tone) {
-      case 'error':
-        return { text, paint: palette.red };
-      case 'warn':
-        return { text, paint: palette.yellow };
-      case 'ok':
-        return { text, paint: palette.green };
-      case 'info':
-        return { text, paint: (t) => t };
-    }
+  const text = lastMessage(state);
+  if (text === undefined) return { text: '', paint: (t) => t };
+  const safe = sanitizeForTerminal(text);
+  switch (state.status?.tone ?? 'error') {
+    case 'error':
+      return { text: safe, paint: palette.red };
+    case 'warn':
+      return { text: safe, paint: palette.yellow };
+    case 'ok':
+      return { text: safe, paint: palette.green };
+    case 'info':
+      return { text: safe, paint: (t) => t };
   }
-  if (state.loadError !== undefined) {
-    return { text: `Could not read: ${sanitizeForTerminal(state.loadError)}`, paint: palette.red };
-  }
-  return { text: '', paint: (t) => t };
 }
 
 /**
- * The status line's rows: an open prompt (one row), else the message, wrapped onto as many as
- * {@link MAX_STATUS_ROWS} rows while at least one body row is left, so a refusal's remedy (which
- * comes last) is read rather than cut off at the edge.
+ * The status line's rows, and whether the message had to be cut to fit them. It wraps onto as
+ * many as {@link MAX_STATUS_ROWS} rows while at least one body row is left; a message longer than
+ * that keeps its start (what happened) and its end (what to do about it), and the message
+ * overlay (m) shows it whole. An open prompt is its last row, under the note saying why its last
+ * Enter did not go through.
  */
-function statusLines(state: TuiState, cols: number, rows: number, palette: Palette): string[] {
+function statusLines(
+  state: TuiState,
+  cols: number,
+  rows: number,
+  palette: Palette,
+): { lines: string[]; cut: boolean } {
+  const allowed = Math.min(MAX_STATUS_ROWS, 1 + Math.max(0, rows - CHROME_ROWS - 1));
   const mode = state.mode;
   if (mode.kind === 'prompt') {
     const label = mode.account ? sanitizeForTerminal(mode.account.label) : '';
@@ -513,17 +529,15 @@ function statusLines(state: TuiState, cols: number, rows: number, palette: Palet
         : mode.purpose === 'rename'
           ? `New label for ${label}: `
           : `Type ${label} to remove it: `;
-    return [promptLine(ask, sanitizeForTerminal(mode.input), cols, palette)];
+    const prompt = promptLine(ask, sanitizeForTerminal(mode.input), cols, palette);
+    if (mode.note === undefined) return { lines: [prompt], cut: false };
+    const note = wrapWithin(sanitizeForTerminal(mode.note), cols, Math.max(1, allowed - 1));
+    return { lines: [...note.lines.map((l) => palette.yellow(l)), prompt], cut: note.cut };
   }
   const { text, paint } = statusText(state, palette);
-  const allowed = Math.min(MAX_STATUS_ROWS, 1 + Math.max(0, rows - CHROME_ROWS - 1));
-  const wrapped = wrap(text, cols);
-  if (wrapped.length === 0) return [''];
-  const lines = wrapped.slice(0, allowed);
-  if (wrapped.length > allowed) {
-    lines[allowed - 1] = clip(wrapped.slice(allowed - 1).join(' '), cols);
-  }
-  return lines.map((l) => paint(l));
+  if (text === '') return { lines: [''], cut: false };
+  const { lines, cut } = wrapWithin(text, cols, allowed);
+  return { lines: lines.map((l) => paint(l)), cut };
 }
 
 /**
@@ -585,21 +599,33 @@ function fittedHints(hints: ReadonlyArray<readonly [string, number]>, cols: numb
     .join(HINT_SEP);
 }
 
-/** The key hints for what the screen is doing now. `overflow`: the help overlay is taller than
- *  the body, so it says how to scroll it. A prompt whose last Enter did not go through says why. */
-function hintsLine(state: TuiState, cols: number, palette: Palette, overflow: boolean): string {
+/** Offered first when the status line had to cut its message. */
+const CUT_MESSAGE_HINT: readonly [string, number] = ['m message', 1];
+
+/** The key hints for what the screen is doing now. `overflow`: an overlay is taller than the
+ *  body, so it says how to scroll it. `cut`: the status line cut its message, so the key that
+ *  shows it whole comes first. */
+function hintsLine(
+  state: TuiState,
+  cols: number,
+  palette: Palette,
+  overflow: boolean,
+  cut: boolean,
+): string {
   const mode = state.mode;
   if (mode.kind === 'prompt') {
-    if (mode.note !== undefined) return palette.yellow(sanitizeForTerminal(mode.note));
-    return palette.dim(`Enter confirm${SEP}Esc cancel`);
+    return palette.dim(mode.gone === true ? 'Esc close' : `Enter confirm${SEP}Esc cancel`);
   }
-  if (mode.kind === 'help' && overflow) {
-    return palette.dim(`k/j scroll${SEP}any other key: back`);
-  }
-  if (mode.kind === 'help' || mode.kind === 'launch') return palette.dim('any key: back');
-  return palette.dim(
-    fittedHints(state.pane === 'accounts' ? ACCOUNT_HINTS : TEXT_PANE_HINTS, cols),
-  );
+  const overlay = mode.kind === 'help' || mode.kind === 'message';
+  if (overlay && overflow) return palette.dim(`k/j scroll${SEP}any other key: back`);
+  if (overlay || mode.kind === 'launch') return palette.dim('any key: back');
+  const hints = state.pane === 'accounts' ? ACCOUNT_HINTS : TEXT_PANE_HINTS;
+  return palette.dim(fittedHints(cut ? [CUT_MESSAGE_HINT, ...hints] : hints, cols));
+}
+
+/** The message overlay: the last message whole, wrapped to `cols`. */
+function messageBody(state: TuiState, cols: number): string[] {
+  return wrap(sanitizeForTerminal(lastMessage(state) ?? ''), cols);
 }
 
 /** The help overlay, wrapped to `cols` (a description continues under itself rather than being
@@ -673,11 +699,11 @@ export function renderFrame(
     return [...shown, ...Array<string>(Math.max(0, height - shown.length)).fill('')];
   }
   const status = statusLines(state, cols, rows, palette);
-  const bodyRows = bodyHeight(rows) - (status.length - 1);
+  const bodyRows = bodyHeight(rows) - (status.lines.length - 1);
   let body: string[];
   let overflow = false;
-  if (state.mode.kind === 'help') {
-    const lines = helpBody(palette, cols);
+  if (state.mode.kind === 'help' || state.mode.kind === 'message') {
+    const lines = state.mode.kind === 'help' ? helpBody(palette, cols) : messageBody(state, cols);
     overflow = lines.length > bodyRows;
     const start = Math.min(state.mode.scroll, maxScroll(lines.length, bodyRows));
     body = lines.slice(start, start + bodyRows);
@@ -695,8 +721,8 @@ export function renderFrame(
     headerLine(state, palette),
     tabsLine(state, palette),
     ...padded,
-    ...status,
-    hintsLine(state, cols, palette, overflow),
+    ...status.lines,
+    hintsLine(state, cols, palette, overflow, status.cut),
   ].map((line) => {
     // Whatever a pane renderer was handed (a session label, an error from a file), only color
     // reaches the terminal: no cursor move, screen switch, title write or carriage return.

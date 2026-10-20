@@ -183,7 +183,8 @@ function readSessions(
 export function createTuiSources(deps: TuiSourceDeps): TuiSources {
   const { engine } = deps;
   const ctx = { engine };
-  const reader = new UsageReader(engine);
+  // No burn rate: the view never shows one, and measuring it is the costly part of a read.
+  const reader = new UsageReader(engine, { burn: false });
   return {
     async load(nowMs): Promise<TuiSnapshot> {
       const registry = await section(() => readRegistry(engine, reader, nowMs));
@@ -211,7 +212,7 @@ export function createTuiSources(deps: TuiSourceDeps): TuiSources {
     switchAccount: (id) => switchAccount(id, {}, ctx),
     setExcluded: (id, excluded) => setExcluded(id, excluded, ctx),
     renameAccount: (id, label) => renameAccount(id, label, ctx),
-    removeAccount: (id) => removeAccount(id, ctx),
+    removeAccount: (id, label) => removeAccount(id, ctx, { label }),
     addAccount: (label, onStored) =>
       addAccount(
         label,

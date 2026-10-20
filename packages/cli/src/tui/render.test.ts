@@ -151,9 +151,9 @@ describe('renderFrame: the other panes, overlays and the status line', () => {
   });
 
   it('shows the help overlay with every key', () => {
-    const lines = frame({ ...s, mode: { kind: 'help', scroll: 0 } }, 120, 20, false);
+    const lines = frame({ ...s, mode: { kind: 'help', scroll: 0 } }, 120, 21, false);
     for (const [keys] of KEY_HELP) expect(lines.join('\n')).toContain(keys);
-    expect(lines[19]).toBe('any key: back');
+    expect(lines[20]).toBe('any key: back');
   });
 
   it('shows the launch line quoted for the platform shell', () => {
@@ -392,6 +392,112 @@ describe('regressions: what the frame must never do', () => {
     const narrow = frame(s, 80, ROWS, true).join('\n');
     expect(narrow).not.toMatch(/[\u00b7\u2026]/);
   });
+
+  it('draws nothing but ASCII in any pane when everything it was handed is ASCII', () => {
+    // Every pane, with the parts that carry the renderers' own separators: the session header's
+    // runway, and the warning on an alias no session title can carry.
+    const full = stateWith(
+      snapshotOf(everyStateAccounts(), {
+        sessions: {
+          ok: true,
+          value: {
+            rows: [{ id: 's1', kind: 'interactive', state: 'active', label: 'build' }],
+            header: {
+              activeLabel: 'work',
+              weeklyResetInMs: 3 * 86_400_000,
+              weeklyResetPredicted: true,
+            },
+          },
+        },
+        folders: {
+          ok: true,
+          value: {
+            rules: [
+              {
+                label: 'client-a',
+                folders: ['/repos/client-a'],
+                aliases: [{ folder: '/repos/client-a', alias: 'x'.repeat(300) }],
+                include: ['home'],
+                exclude: [],
+                live: { label: 'home', source: 'include', quarantined: false },
+                pool: [
+                  {
+                    label: 'home',
+                    source: 'include',
+                    live: true,
+                    liveElsewhere: null,
+                    quarantined: false,
+                    autoTarget: true,
+                  },
+                ],
+                profileDir: '/data/profiles/client-a',
+              },
+            ],
+            global: { live: null, pool: [] },
+            footer: { present: true, fresh: true, enforce: 'block' },
+          },
+        },
+      }),
+    );
+    for (const pane of ['accounts', 'sessions', 'folders', 'outages'] as const) {
+      for (const cols of [40, 80, 200, 400]) {
+        for (const line of frame({ ...full, pane }, cols, 40, false)) {
+          expect(line, `${pane} at ${cols}`).toMatch(/^[\x20-\x7e]*$/);
+        }
+      }
+    }
+  });
+});
+
+describe('a message longer than the status line', () => {
+  const s = stateWith(snapshotOf(everyStateAccounts()));
+  const id = '3f2b9c1e-7a4d-4e1b-9c2a-5d6e7f8a1b5e';
+  const taken =
+    `"home" already refers to account ${id} ("home"); ` +
+    'two accounts answering to one name could not be told apart on switch';
+  const added =
+    `Added research-team-shared-account (${id}). Your current login was not touched - ` +
+    '`cctl switch research-team-shared-account` to use it.';
+
+  it.each([
+    [taken, 40, ROWS, 'could not be told apart on switch', true],
+    [taken, 60, ROWS, 'could not be told apart on switch', false],
+    [taken, 60, MIN_ROWS, 'apart on switch', true],
+    [added, 40, ROWS, 'to use it.', true],
+    [added, 60, MIN_ROWS, 'to use it.', true],
+  ])('keeps its start and its end (%#)', (text, cols, rows, end, cut) => {
+    const lines = frame({ ...s, status: { text, tone: 'error' } }, cols, rows, false);
+    const said = lines.slice(2, rows - 1).join(' ');
+    expect(said).toContain(text.slice(0, 8));
+    expect(said).toContain(end);
+    // A message that had to be cut says how to read the rest.
+    expect(lines[rows - 1]!.startsWith('m message | ')).toBe(cut);
+  });
+
+  it('is shown whole, and scrolls, in the message overlay (m)', () => {
+    const said = { ...s, status: { text: `${taken} ${added}`, tone: 'warn' as const } };
+    const open = reduce(said, { name: 'char', char: 'm' }).state;
+    expect(open.mode).toEqual({ kind: 'message', scroll: 0 });
+    const lines = frame(open, 40, ROWS, false);
+    const all = frame(
+      settleScroll({ ...open, mode: { kind: 'message', scroll: 999 } }, ROWS, PLAIN_PALETTE, 40),
+      40,
+      ROWS,
+      false,
+    );
+    expect(lines.slice(2).join(' ')).toContain('"home" already refers to');
+    expect(all.slice(2).join(' ')).toContain('to use it.');
+    expect(reduce(open, { name: 'char', char: 'x' }).state.mode).toEqual({ kind: 'browse' });
+  });
+
+  it('keeps the remedy of an unreadable accounts file in a short terminal', () => {
+    const error =
+      'C:/Users/someone/AppData/Local/claude-control/vault/accounts.json is not valid JSON (Unexpected end of JSON input); fix the file or move it aside';
+    const st = stateWith(snapshotOf([], { accounts: { ok: false, error } }));
+    const body = frame(st, 80, MIN_ROWS, false).join('\n');
+    expect(body).toContain('Could not read the accounts');
+    expect(body).toContain('fix the file or move it aside');
+  });
 });
 
 describe('width of emoji and combining marks', () => {
@@ -407,6 +513,10 @@ describe('width of emoji and combining marks', () => {
     ['नमस्ते', 4],
     ['\u1112\u1161\u11ab', 2],
     ['a\u20d7', 1],
+    // A skin tone joins its emoji into one glyph, with or without a joiner.
+    ['\ud83d\udc4d\ud83c\udffdx', 3],
+    ['\ud83d\udc4b\ud83c\udffb\ud83d\udc4b\ud83c\udfff', 4],
+    ['\u261d\u{1f3fd}', 2],
   ])('%s is %i columns', (text, width) => {
     expect(displayWidth(text)).toBe(width);
   });

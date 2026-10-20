@@ -25,9 +25,13 @@ export function isInteractiveTerminal(
  *   would be appended to the buffer as text.
  * - The legacy Windows console ("Use legacy console", `HKCU\Console` `ForceV2` = 0) has no VT
  *   processing; Node emulates a few sequences, but not the alternate screen, so the view would
- *   wipe the visible console and leave its last frame behind on exit. A terminal that sets its
- *   own marker (Windows Terminal's `WT_SESSION`, `TERM_PROGRAM`, `TERM`) speaks VT whatever that
- *   setting says, and the registry is not asked.
+ *   wipe the visible console and leave its last frame behind on exit. The setting is read on
+ *   every Windows terminal, because no environment variable says which console this process
+ *   is attached to: Git Bash, MSYS2 and Cygwin set `TERM` inside a plain console window, and
+ *   `WT_SESSION` or `TERM_PROGRAM` are inherited by a console window started from Windows
+ *   Terminal or VS Code. The cost of that is a refusal inside Windows Terminal for someone who
+ *   has the legacy setting on, which names the setting to change; the alternative, trusting a
+ *   variable, wipes the screen of someone whose console cannot draw the view.
  *
  * `readForceV2` reads the console setting (injectable; the default asks `reg`).
  */
@@ -40,12 +44,10 @@ export function fullScreenBlocker(
     return 'this terminal (TERM=dumb) cannot move the cursor, which the full-screen view needs';
   }
   if (platform !== 'win32') return undefined;
-  if (env.WT_SESSION !== undefined || env.TERM_PROGRAM !== undefined || env.TERM !== undefined) {
-    return undefined;
-  }
   return readForceV2() === 0
-    ? 'this is the legacy Windows console, which has no alternate screen for the full-screen ' +
-        'view (turn off "Use legacy console" in its properties, or use Windows Terminal)'
+    ? 'the Windows console is set to "Use legacy console" (HKCU\\Console ForceV2 = 0), which ' +
+        'has no alternate screen for the full-screen view; turn that off in the properties of ' +
+        'a console window'
     : undefined;
 }
 

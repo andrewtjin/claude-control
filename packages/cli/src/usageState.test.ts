@@ -1,5 +1,6 @@
 // The usage reader: a snapshot row of the wrong shape is skipped like an unparsable one, and a
-// long-lived reader (the full-screen view) does not redo the history measurement on every read.
+// reader that wants no burn rate (the full-screen view) predicts resets without reading the whole
+// history.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -72,16 +73,77 @@ describe('UsageReader', () => {
     }
   });
 
-  it('measures history once a minute, not on every read', async () => {
+  /** Weekly readings `ago` ms before NOW, each with the reset it reported (or none). */
+  function seedWeekly(rows: Array<[string, number, number | undefined]>): void {
+    const store = new Store(dbPath);
+    for (const [accountId, ago, resetIn] of rows) {
+      const limit = {
+        kind: 'weekly_all',
+        percent: 40,
+        isActive: true,
+        ...(resetIn !== undefined ? { resetsAt: new Date(NOW + resetIn).toISOString() } : {}),
+      };
+      store.insertUsageSnapshot({
+        accountId,
+        fetchedAtMs: NOW - ago,
+        source: 'live',
+        json: JSON.stringify({
+          accountId,
+          fetchedAtMs: NOW - ago,
+          source: 'live',
+          limits: [limit],
+        }),
+      });
+    }
+    store.close();
+  }
+
+  it('predicts resets without reading the whole history when no burn rate is wanted', async () => {
+    const DAY = 86_400_000;
+    seedWeekly([
+      // An old anchor, then a newer one, then readings that stopped reporting it.
+      ['a', 9 * DAY, -8 * DAY],
+      ['a', 3_600_000, 2 * DAY],
+      ['a', 60_000, undefined],
+      // Only an anchor that has passed: advanced by whole weeks.
+      ['b', 9 * DAY, -8.5 * DAY],
+      // Never reported one.
+      ['c', 60_000, undefined],
+    ]);
+    const readHistory = vi.fn(readFleetHistory);
+    const reader = new UsageReader(engine, { dbPath, readHistory, burn: false });
+    const store = new Store(dbPath);
+    try {
+      const expected = readFleetHistory(
+        store,
+        ['a', 'b', 'c'].map((accountId) => ({ accountId })),
+        NOW,
+      );
+      for (const at of [NOW + 2_000, NOW + 61_000]) {
+        expect((await reader.read(at)).burnUnitsPerDay).toBeUndefined();
+      }
+      const usage = await reader.read(NOW);
+      expect(usage.burnUnitsPerDay).toBeUndefined();
+      expect(usage.predictedResetFor('a')).toBe(NOW + 2 * DAY);
+      expect(usage.predictedResetFor('b')).toBeGreaterThan(NOW);
+      expect(usage.predictedResetFor('c')).toBeUndefined();
+      for (const id of ['a', 'b', 'c']) {
+        expect(usage.predictedResetFor(id)).toBe(expected.predictedResetByAccount.get(id));
+      }
+      // Not one measurement of the whole history: each read asks for one row per account.
+      expect(readHistory).not.toHaveBeenCalled();
+    } finally {
+      store.close();
+      reader.close();
+    }
+  });
+
+  it('still measures the burn rate for a reader that wants it', async () => {
     const readHistory = vi.fn(readFleetHistory);
     const reader = new UsageReader(engine, { dbPath, readHistory });
     try {
       await reader.read(NOW);
-      await reader.read(NOW + 2_000);
-      await reader.read(NOW + 30_000);
       expect(readHistory).toHaveBeenCalledTimes(1);
-      await reader.read(NOW + 61_000);
-      expect(readHistory).toHaveBeenCalledTimes(2);
     } finally {
       reader.close();
     }

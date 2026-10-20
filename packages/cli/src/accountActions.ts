@@ -84,7 +84,9 @@ export type AccountActionErrorCode =
   /** A fresh add could not open the login window. */
   | 'launch_failed'
   /** A fresh add's window closed without a completed login in it. */
-  | 'no_capture_login';
+  | 'no_capture_login'
+  /** A removal confirmed against one label found the account called something else by then. */
+  | 'label_changed';
 
 /** An expected refusal from an account action. `message` is the whole user-facing line, already
  *  phrased the way `cctl` prints it after `error: `; `code` lets a caller react without parsing
@@ -390,13 +392,23 @@ export interface RemoveOutcome {
 }
 
 /** Remove a stored account. A reserved member is dropped from its group, and a group left with no
- *  members is dissolved (the engine's job). */
+ *  members is dissolved (the engine's job). `confirmed.label` is the label the person typed to
+ *  confirm it (the full-screen view asks for one): when another process has renamed the account
+ *  since, nothing is removed, since the person confirmed a name the account no longer has. */
 export async function removeAccount(
   ref: string,
   ctx: AccountActionContext = {},
+  confirmed: { label?: string } = {},
 ): Promise<RemoveOutcome> {
   const engine = engineOf(ctx);
   const { account } = await resolveRef(engine, ref);
+  if (confirmed.label !== undefined && confirmed.label !== account.label) {
+    throw new AccountActionError(
+      'label_changed',
+      `The account confirmed as ${confirmed.label} is now called ${account.label}; ` +
+        'nothing was removed.',
+    );
+  }
   try {
     await engine.removeAccount(account.id);
   } catch (err) {

@@ -53,6 +53,7 @@ export {
 
 export {
   readFleetHistory,
+  readFleetResets,
   measureBurnUnitsPerDay,
   predictWeeklyReset,
   extractWeeklyReading,
@@ -62,6 +63,7 @@ export {
   type ExtractedWeeklyReading,
   type FleetHistory,
   type UsageHistoryReader,
+  type WeeklyResetReader,
   type WeeklyObservation,
 } from './usageHistory.js';
 

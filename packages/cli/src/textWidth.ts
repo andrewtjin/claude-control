@@ -37,6 +37,9 @@ const ZERO_WIDTH = /^[\p{Mn}\p{Me}\p{Cf}]$/u;
 const EMOJI_PRESENTATION = /^\p{Emoji_Presentation}$/u;
 const PICTOGRAPHIC = /\p{Extended_Pictographic}/u;
 const REGIONAL_INDICATOR = /^\p{Regional_Indicator}$/u;
+/** An emoji that takes a skin tone, then the tone: drawn as one toned emoji, joiner or not. */
+const TONED = /^\p{Emoji_Modifier_Base}\p{Emoji_Modifier}/u;
+// Written as escapes: as literal characters these are invisible in an editor or a diff.
 const VS15 = '︎';
 const VS16 = '️';
 const ZWJ = '‍';
@@ -66,8 +69,8 @@ export function charWidth(codePoint: number): number {
 }
 
 /** Columns one grapheme cluster takes. An emoji sequence (a presentation selector, a joined
- *  family, a flag) is one two-column glyph; anything else is the sum of its code points, so a
- *  letter with its marks takes the letter's width. */
+ *  family, a flag, a skin tone) is one two-column glyph; anything else is the sum of its code
+ *  points, so a letter with its marks takes the letter's width. */
 export function clusterWidth(cluster: string): number {
   if (cluster.length === 1) return charWidth(cluster.charCodeAt(0));
   const codePoints = [...cluster];
@@ -76,7 +79,8 @@ export function clusterWidth(cluster: string): number {
     if (
       cluster.includes(VS16) ||
       (cluster.includes(ZWJ) && PICTOGRAPHIC.test(cluster)) ||
-      REGIONAL_INDICATOR.test(codePoints[0]!)
+      REGIONAL_INDICATOR.test(codePoints[0]!) ||
+      TONED.test(cluster)
     ) {
       return 2;
     }

@@ -247,7 +247,9 @@ function aliasScopeLines(view: Pick<FolderRuleView, 'aliases'>, palette: Palette
         ? ''
         : '  ' +
           palette.yellow(
-            `(never matches: no session title can carry it — longer than ` +
+            // ASCII only: a dash or dot outside ASCII is ambiguous width, two columns on a
+            // terminal set up for CJK text, and the full-screen view draws this line.
+            `(never matches: no session title can carry it - longer than ` +
               `${CLAUDE_CODE_TITLE_MAX_LENGTH} characters, or not well-formed text; reset it)`,
           )),
   );

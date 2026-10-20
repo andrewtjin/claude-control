@@ -13,6 +13,7 @@ import {
   type Key,
   type PaneId,
   type TuiAccount,
+  type TuiPrompt,
   type TuiSnapshot,
   type TuiState,
   type TuiStatus,
@@ -41,49 +42,77 @@ export function accountsOf(state: TuiState): TuiAccount[] {
   return section?.ok === true ? section.value : [];
 }
 
-/** The selected account: the one with `selectedId`, else the first. */
+/** The selected account, or undefined when none is (before the first read, with no accounts, or
+ *  once the selected one is gone). Never a stand-in: an account verb acts only on an account the
+ *  person picked. */
 export function selectedAccount(state: TuiState): TuiAccount | undefined {
-  const accounts = accountsOf(state);
-  return accounts.find((a) => a.id === state.selectedId) ?? accounts[0];
+  return accountsOf(state).find((a) => a.id === state.selectedId);
 }
 
-/** Take a fresh read. The selection stays on its account while that account exists; when it is
- *  gone (removed here or elsewhere) it moves to the first. A read whose accounts section failed
- *  says nothing about which accounts exist, so it leaves the selection where it was: moving it
- *  would quietly put the next Enter on an account nobody picked. An open prompt follows its
- *  account the same way (see {@link followPrompt}). */
+/**
+ * Take a fresh read. The first read with accounts in it selects the first one. After that the
+ * selection stays on its account while it exists, and when it is gone (removed here or elsewhere)
+ * nothing is selected until the person moves: putting it on another row would quietly hand the
+ * next Enter, or a key already on its way, an account nobody picked. A read whose accounts section
+ * failed says nothing about which accounts exist, so it leaves the selection alone. An open
+ * prompt follows its account the same way (see {@link followPrompt}).
+ */
 export function applySnapshot(state: TuiState, snapshot: TuiSnapshot): TuiState {
-  const next: TuiState = { ...state, snapshot, nowMs: snapshot.readAtMs };
+  let next: TuiState = { ...state, snapshot, nowMs: snapshot.readAtMs };
   delete next.loadError;
   if (next.status?.untilRead === true) delete next.status;
   if (!snapshot.accounts.ok) return next;
   const accounts = snapshot.accounts.value;
-  const kept = accounts.some((a) => a.id === state.selectedId) ? state.selectedId : accounts[0]?.id;
-  if (kept === undefined) delete next.selectedId;
-  else next.selectedId = kept;
+  if (state.selectedId === undefined) {
+    if (accounts[0] !== undefined) next.selectedId = accounts[0].id;
+  } else if (!accounts.some((a) => a.id === state.selectedId)) {
+    next = saySelectionGone(next, state);
+  }
   return followPrompt(next, accounts);
+}
+
+/** Say that the selected account is gone, once: on the read that first finds it missing after
+ *  one that had it (or after one that could not tell). The id stays as the selection, matching
+ *  nothing, so the next read does not pick a stand-in or say it again. */
+function saySelectionGone(next: TuiState, before: TuiState): TuiState {
+  const previous = before.snapshot?.accounts;
+  const had = previous?.ok === true ? previous.value.find((a) => a.id === before.selectedId) : null;
+  if (had === undefined) return next;
+  const who = had === null ? 'The selected account' : had.label;
+  return withStatus(
+    next,
+    `${who} is no longer stored, so no account is selected (j/k selects one).`,
+    'info',
+  );
 }
 
 /**
  * Keep an open rename or remove prompt about the account as it is now. The prompt names its
  * account by id, but the person reads (and, for a remove, types) its label: when another process
  * renames it, the prompt shows the new label, so the typed confirmation is checked against the
- * label the account has, not one it used to have. When the account is gone the prompt closes.
+ * label the account has, not one it used to have (a note about the old label is dropped). When the
+ * account is gone the prompt stays open, taking nothing and starting nothing, until Escape: keys
+ * the person is still typing into it must not reach the account list.
  */
 function followPrompt(state: TuiState, accounts: readonly TuiAccount[]): TuiState {
   const mode = state.mode;
-  if (mode.kind !== 'prompt' || mode.account === undefined) return state;
+  if (mode.kind !== 'prompt' || mode.account === undefined || mode.gone === true) return state;
   const target = mode.account;
   const now = accounts.find((a) => a.id === target.id);
   if (now === undefined) {
-    return withStatus(
-      { ...state, mode: { kind: 'browse' } },
-      `${target.label} is no longer stored, so the prompt was closed.`,
-      'info',
-    );
+    return {
+      ...state,
+      mode: {
+        ...mode,
+        gone: true,
+        note: `${target.label} is no longer stored. Esc closes this prompt.`,
+      },
+    };
   }
   if (now.label === target.label) return state;
-  return { ...state, mode: { ...mode, account: { id: now.id, label: now.label } } };
+  const followed: TuiPrompt = { ...mode, account: { id: now.id, label: now.label } };
+  delete followed.note;
+  return { ...state, mode: followed };
 }
 
 /** A read that failed: the last good picture stays, and the failure is said. */
@@ -103,25 +132,31 @@ export function withStatus(
 
 /** How an action the runtime ran ended: its own words on success, the refusal's on a refusal.
  *  Clears `busy`. `notes` are the warnings logged while it ran: the status line showed the
- *  running action then, so they are said with the outcome rather than lost under it. */
+ *  running action then, so they are said with the outcome rather than lost under it. A refused
+ *  action started from a prompt opens that prompt again, saying why (see `reopenOnRefusal`). */
 export function settleAction(
   state: TuiState,
   outcome: { ok: true; message: string } | { ok: false; message: string },
   notes: readonly string[] = [],
 ): TuiState {
   const tone = !outcome.ok ? 'error' : notes.length > 0 ? 'warn' : 'ok';
-  const next = withStatus(state, withNotes(outcome.message, notes), tone);
+  const text = withNotes(outcome.message, notes);
+  const next = withStatus(state, text, tone);
   delete next.busy;
+  delete next.reopenOnRefusal;
+  if (!outcome.ok && state.reopenOnRefusal !== undefined) {
+    next.mode = { ...state.reopenOnRefusal, note: text };
+  }
   return next;
 }
 
-/** An outcome line with the warnings logged while it ran. */
+/** An outcome line with every warning logged while it ran. A long one is cut on the status line
+ *  but read whole in the message overlay (m) or, after quitting, on the normal screen. */
 export function withNotes(message: string, notes: readonly string[]): string {
   if (notes.length === 0) return message;
-  const last = notes[notes.length - 1]!;
   return notes.length === 1
-    ? `${message} Warning: ${last}`
-    : `${message} ${notes.length} warnings, the last: ${last}`;
+    ? `${message} Warning: ${notes[0]!}`
+    : `${message} ${notes.length} warnings: ${notes.join('; ')}`;
 }
 
 /** Why a refresh cannot be asked for right now, or undefined when it can. The daemon does the
@@ -174,14 +209,12 @@ function cyclePane(pane: PaneId, step: 1 | -1): PaneId {
   return PANES[(i + step + PANES.length) % PANES.length]!;
 }
 
-/** Move the selection by `delta` rows, stopping at either end. */
+/** Move the selection by `delta` rows, stopping at either end. With nothing selected, moving
+ *  down picks the first row and moving up stays there too (End picks the last). */
 function moveSelection(state: TuiState, delta: number): TuiState {
   const accounts = accountsOf(state);
   if (accounts.length === 0) return state;
-  const current = Math.max(
-    0,
-    accounts.findIndex((a) => a.id === selectedAccount(state)?.id),
-  );
+  const current = accounts.findIndex((a) => a.id === state.selectedId);
   const next = Math.min(accounts.length - 1, Math.max(0, current + delta));
   return { ...state, selectedId: accounts[next]!.id };
 }
@@ -230,9 +263,27 @@ function scrollStep(key: Key): number | undefined {
   }
 }
 
-/** Mark `state` busy with `what` and hand `effect` to the runtime. */
-function start(state: TuiState, what: string, effect: Effect): Transition {
-  return { state: { ...state, busy: what }, effect };
+/** Mark `state` busy with `what` and hand `effect` to the runtime. `from` is the prompt the
+ *  action was asked for in, opened again if the action is refused. */
+function start(state: TuiState, what: string, effect: Effect, from?: TuiPrompt): Transition {
+  const next: TuiState = { ...state, busy: what };
+  if (from !== undefined) {
+    const reopen: TuiPrompt = { ...from };
+    delete reopen.note;
+    next.reopenOnRefusal = reopen;
+  }
+  return { state: next, effect };
+}
+
+/** Scroll an overlay that scrolls (help, the message) by `step`, never above the top; the
+ *  bottom is clamped where the overlay's height is known. */
+function scrollOverlay(
+  state: TuiState,
+  mode: Extract<TuiState['mode'], { kind: 'help' | 'message' }>,
+  step: number,
+): TuiState {
+  const scroll = Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, mode.scroll + step));
+  return { ...state, mode: { kind: mode.kind, scroll } };
 }
 
 /**
@@ -240,9 +291,10 @@ function start(state: TuiState, what: string, effect: Effect): Transition {
  *
  * Ctrl-C quits from anywhere; while an action runs it quits once the action ends (a switch cut off
  * half way would leave its recovery to the next command), and a second Ctrl-C quits at once.
- * The help overlay scrolls with the movement keys and closes on any other; the launch line closes
- * on any key. A prompt takes text until Enter or Escape. Otherwise the key map applies, with the
- * account verbs answering only in the Accounts pane. Pasted text is only ever prompt input.
+ * The help and message overlays scroll with the movement keys and close on any other; the launch
+ * line closes on any key. A prompt takes text until Enter or Escape. Otherwise the key map
+ * applies, with the account verbs answering only in the Accounts pane. Pasted text is only ever
+ * prompt input.
  */
 export function reduce(state: TuiState, key: Key): Transition {
   if (key.name === 'ctrl-c') {
@@ -264,12 +316,10 @@ export function reduce(state: TuiState, key: Key): Transition {
   if (state.busy !== undefined) return { state };
 
   const mode = state.mode;
-  if (mode.kind === 'help') {
+  if (mode.kind === 'help' || mode.kind === 'message') {
     const step = scrollStep(key);
     if (step === undefined) return { state: { ...state, mode: { kind: 'browse' } } };
-    // Never above the top; the bottom is clamped where the overlay's height is known.
-    const scroll = Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, mode.scroll + step));
-    return { state: { ...state, mode: { kind: 'help', scroll } } };
+    return { state: scrollOverlay(state, mode, step) };
   }
   if (mode.kind === 'launch') return { state: { ...state, mode: { kind: 'browse' } } };
   if (mode.kind === 'prompt') return reducePrompt(state, mode, key);
@@ -335,6 +385,10 @@ function reduceChar(state: TuiState, char: string): Transition {
       return reduce(state, { name: 'down' });
     case '?':
       return { state: { ...state, mode: { kind: 'help', scroll: 0 } } };
+    case 'm':
+      return lastMessage(state) === undefined
+        ? { state: withStatus(state, 'There is no message to show.', 'info') }
+        : { state: { ...state, mode: { kind: 'message', scroll: 0 } } };
     case 'a':
       return { state: { ...state, mode: { kind: 'prompt', purpose: 'add', input: '' } } };
     case 'u': {
@@ -352,8 +406,16 @@ function reduceChar(state: TuiState, char: string): Transition {
   }
 }
 
-/** Why there is no selected account to act on: not read yet, unreadable, or none stored. Only
- *  the last is "there is no account"; saying so before the read lands would be false. */
+/** The message the status line says when nothing is running, in full: the last word, else a read
+ *  that failed. Undefined when there is none. */
+export function lastMessage(state: TuiState): string | undefined {
+  if (state.status !== undefined) return state.status.text;
+  return state.loadError !== undefined ? `Could not read: ${state.loadError}` : undefined;
+}
+
+/** Why there is no selected account to act on: not read yet, unreadable, none stored, or none
+ *  selected (the selected one is gone). Only the third is "there is no account"; saying so
+ *  before the read lands would be false. */
 function noAccountStatus(state: TuiState, what: string): TuiState {
   const section = state.snapshot?.accounts;
   if (section === undefined) {
@@ -365,6 +427,9 @@ function noAccountStatus(state: TuiState, what: string): TuiState {
       `The accounts could not be read, so there is nothing to ${what}.`,
       'warn',
     );
+  }
+  if (section.value.length > 0) {
+    return withStatus(state, `No account is selected; pick one with j/k to ${what}.`, 'info');
   }
   return withStatus(state, `There is no account to ${what}.`, 'info');
 }
@@ -416,7 +481,7 @@ function accountVerb(state: TuiState, verb: 'enter' | 'e' | 'r' | 'd' | 'l'): Tr
   }
 }
 
-type PromptMode = Extract<TuiState['mode'], { kind: 'prompt' }>;
+type PromptMode = TuiPrompt;
 
 /** `text` added to a prompt's input: printable characters only (a pasted line break is not an
  *  Enter), up to the input cap. Clears the note, which was about the input as it was. */
@@ -432,11 +497,13 @@ function typed(state: TuiState, mode: PromptMode, text: string): Transition {
   return { state: { ...state, mode: next } };
 }
 
-/** A key while a prompt is open. */
+/** A key while a prompt is open. A prompt whose account is gone answers Escape only. */
 function reducePrompt(state: TuiState, mode: PromptMode, key: Key): Transition {
+  if (key.name === 'escape') {
+    return { state: withStatus({ ...state, mode: { kind: 'browse' } }, 'Cancelled.', 'info') };
+  }
+  if (mode.gone === true) return { state };
   switch (key.name) {
-    case 'escape':
-      return { state: withStatus({ ...state, mode: { kind: 'browse' } }, 'Cancelled.', 'info') };
     case 'backspace': {
       const chars = [...mode.input];
       chars.pop();
@@ -462,11 +529,18 @@ function stayOpen(state: TuiState, mode: PromptMode, note: string): Transition {
   return { state: { ...state, mode: { ...mode, note } } };
 }
 
-/** The account that already answers to `label` (by id, or by label in any case, as the vault
- *  refuses it), if one does. */
-function labelHolder(state: TuiState, label: string): TuiAccount | undefined {
+/** Why `label` cannot be given to an account (`exceptId`: the account being renamed, whose own
+ *  label it may keep): another account already answers to it, by id or by label in any case, as
+ *  the vault refuses it. Undefined when it is free. */
+function labelTaken(state: TuiState, label: string, exceptId?: string): string | undefined {
   const lower = label.toLowerCase();
-  return accountsOf(state).find((a) => a.id === label || a.label.toLowerCase() === lower);
+  const holder = accountsOf(state).find(
+    (a) => a.id === label || (a.id !== exceptId && a.label.toLowerCase() === lower),
+  );
+  if (holder === undefined) return undefined;
+  return holder.id === label
+    ? `"${label}" is an account id. Pick another label, or Esc to cancel.`
+    : `"${label}" is already the label of ${holder.label}. Pick another, or Esc to cancel.`;
 }
 
 /** Enter in a prompt: the action it was asking for, or why not, with the prompt still open. */
@@ -479,28 +553,24 @@ function submitPrompt(state: TuiState, mode: PromptMode): Transition {
       if (label === '') return stayOpen(state, mode, 'Type a label first, or Esc to cancel.');
       // Refused here, before the login window: the vault would refuse it only after the person
       // had completed a whole browser login.
-      const holder = labelHolder(state, label);
-      if (holder !== undefined) {
-        return stayOpen(
-          state,
-          mode,
-          holder.id === label
-            ? `"${label}" is an account id. Pick another label, or Esc to cancel.`
-            : `"${label}" is already the label of ${holder.label}. Pick another, or Esc to cancel.`,
-        );
-      }
+      const taken = labelTaken(state, label);
+      if (taken !== undefined) return stayOpen(state, mode, taken);
       return start(browse, `Adding ${label}...`, { kind: 'add', label: input });
     }
     case 'rename': {
       const account = mode.account!;
-      if (input.trim() === '')
-        return stayOpen(state, mode, 'Type a label first, or Esc to cancel.');
-      return start(browse, `Renaming ${account.label}...`, {
-        kind: 'rename',
-        id: account.id,
-        from: account.label,
-        to: input,
-      });
+      const label = input.trim();
+      if (label === '') return stayOpen(state, mode, 'Type a label first, or Esc to cancel.');
+      // Refused here rather than by the vault a moment later: the prompt stays open, so a second
+      // Enter cannot reach the account list.
+      const taken = labelTaken(state, label, account.id);
+      if (taken !== undefined) return stayOpen(state, mode, taken);
+      return start(
+        browse,
+        `Renaming ${account.label}...`,
+        { kind: 'rename', id: account.id, from: account.label, to: input },
+        mode,
+      );
     }
     case 'remove': {
       const account = mode.account!;
@@ -513,11 +583,12 @@ function submitPrompt(state: TuiState, mode: PromptMode): Transition {
           `Not removed: the label typed was not ${account.label}. Fix it, or Esc to cancel.`,
         );
       }
-      return start(browse, `Removing ${account.label}...`, {
-        kind: 'remove',
-        id: account.id,
-        label: account.label,
-      });
+      return start(
+        browse,
+        `Removing ${account.label}...`,
+        { kind: 'remove', id: account.id, label: account.label },
+        mode,
+      );
     }
   }
 }

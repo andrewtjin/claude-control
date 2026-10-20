@@ -34,6 +34,7 @@ import {
 import type { Effect, Key, TuiSources, TuiState } from './types.js';
 
 const ESC = String.fromCharCode(27);
+const CTRL_C = String.fromCharCode(3);
 /** Alternate screen on, cursor hidden, line wrap off (so a full-width last line cannot scroll the
  *  frame), screen cleared, and pastes marked (so pasted text is never run as key commands). */
 export const ENTER_SCREEN = `${ESC}[?1049h${ESC}[?25l${ESC}[?7l${ESC}[2J${ESC}[?2004h`;
@@ -243,6 +244,8 @@ export function runTui(deps: TuiDeps): Promise<TuiExit> {
     /** Input is being discarded: the screen just came back from a login window. */
     let draining = false;
     let drained: Promise<void> | undefined;
+    let endDrain: (() => void) | undefined;
+    let drainTimer: unknown;
     /** How the view will exit once the running action finishes, when it ended during one. */
     let pendingExit: { code: number } | undefined;
     let toldWaiting = false;
@@ -278,17 +281,16 @@ export function runTui(deps: TuiDeps): Promise<TuiExit> {
       }
     };
 
-    /** A line someone wrote while the screen is up: shown on the status line, never over it, and
-     *  kept with the outcome of an action it was written during. */
+    /** What someone wrote while the screen is up: shown on the status line, never over it, and
+     *  each of its lines kept with the outcome of an action it was written during. */
     const divert = (text: string): void => {
-      const line = text
+      const lines = text
         .split('\n')
         .map((l) => sanitizeTerminalText(stripAnsi(l)).trim())
-        .filter((l) => l !== '')
-        .pop();
-      if (line === undefined) return;
-      if (actionRunning) actionNotes.push(line);
-      state = withStatus(state, line, 'warn');
+        .filter((l) => l !== '');
+      if (lines.length === 0) return;
+      if (actionRunning) actionNotes.push(...lines);
+      state = withStatus(state, lines.join(' '), 'warn');
       draw();
     };
 
@@ -310,7 +312,14 @@ export function runTui(deps: TuiDeps): Promise<TuiExit> {
     };
 
     const onData = (chunk: string | Buffer): void => {
-      if (draining) return;
+      if (draining) {
+        // Input is still arriving (a key held down repeats): the drain lasts until it stops. A
+        // Ctrl-C byte can only have been typed since the screen came back (the login window had
+        // cooked input, where Ctrl-C is a signal, not a byte), so it is the person's and is kept.
+        armDrainEnd();
+        if (String(chunk).includes(CTRL_C)) handleKeys([{ name: 'ctrl-c' }]);
+        return;
+      }
       if (escapeTimer !== undefined) {
         timers.clearTimeout(escapeTimer);
         escapeTimer = undefined;
@@ -485,6 +494,9 @@ export function runTui(deps: TuiDeps): Promise<TuiExit> {
       runAction(effect).catch((err: unknown) => {
         // A fault outside the action itself (bringing the screen back after a login window).
         actionRunning = false;
+        hideScreen();
+        for (const note of actionNotes) say(`Warning: ${note}`);
+        actionNotes = [];
         if (finished) settle({ error: err });
         else finish({ error: err });
       });
@@ -494,18 +506,37 @@ export function runTui(deps: TuiDeps): Promise<TuiExit> {
      * Bring the screen back after a login window, and discard the input the terminal queued while
      * the window had it: an Enter pressed at what looked like a hung screen is still waiting in
      * the terminal and would arrive as soon as the view reads again, after it is idle, and switch
-     * the live login.
+     * the live login. The discarding lasts until no input has arrived for {@link DRAIN_MS}.
      */
     function comeBack(): void {
       if (screenUp || finished) return;
       showScreen();
       draining = true;
       drained = new Promise<void>((resolve) => {
-        timers.setTimeout(() => {
-          draining = false;
-          resolve();
-        }, DRAIN_MS);
+        endDrain = resolve;
       });
+      armDrainEnd();
+    }
+
+    /**
+     * (Re)start the wait that ends the drain. When it runs out the drain does not end there and
+     * then: it ends in the loop turn's check phase, after that turn has read whatever input was
+     * already waiting. Ending it from the timer itself would let a stall longer than the wait (a
+     * descheduled process, a long collection) pass the queued keys to a view that is idle again:
+     * after a stall the timers run before the input is read.
+     */
+    function armDrainEnd(): void {
+      if (drainTimer !== undefined) timers.clearTimeout(drainTimer);
+      drainTimer = timers.setTimeout(() => {
+        drainTimer = undefined;
+        setImmediate(() => {
+          // Input read in this turn started the wait again.
+          if (drainTimer !== undefined || !draining) return;
+          draining = false;
+          endDrain?.();
+          endDrain = undefined;
+        });
+      }, DRAIN_MS);
     }
 
     /** Carry out one action, then report how it went and re-read. */
@@ -529,6 +560,10 @@ export function runTui(deps: TuiDeps): Promise<TuiExit> {
       const notes = actionNotes;
       actionNotes = [];
       if (fault !== undefined) {
+        // The fault ends the view, and the warnings logged on the way to it (a login not saved,
+        // a file left behind) matter most here: said on the normal screen, before the fault is.
+        hideScreen();
+        for (const note of notes) say(`Warning: ${note}`);
         if (finished) settle(fault);
         else finish(fault);
         return;
@@ -584,7 +619,7 @@ export function runTui(deps: TuiDeps): Promise<TuiExit> {
         case 'rename':
           return (await sources.renameAccount(effect.id, effect.to)).message;
         case 'remove':
-          return (await sources.removeAccount(effect.id)).message;
+          return (await sources.removeAccount(effect.id, effect.label)).message;
         case 'add': {
           // The login window needs the real terminal: cooked input, the main screen, a cursor.
           drained = undefined;

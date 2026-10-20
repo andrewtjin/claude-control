@@ -114,7 +114,9 @@ export interface TuiSources {
   switchAccount(id: string): Promise<TuiActionResult>;
   setExcluded(id: string, excluded: boolean): Promise<TuiActionResult>;
   renameAccount(id: string, label: string): Promise<TuiActionResult>;
-  removeAccount(id: string): Promise<TuiActionResult>;
+  /** Remove the account, refused when it no longer has `label`, the label the person typed to
+   *  confirm the removal. */
+  removeAccount(id: string, label: string): Promise<TuiActionResult>;
   /** Log a NEW account in, in a window that owns the terminal while it runs: the caller must have
    *  stepped its own screen aside first. `onStored` is told as soon as the account is stored,
    *  before the add's own cleanup (which can take seconds), so the caller can take the terminal
@@ -145,17 +147,27 @@ export type TuiMode =
   | { kind: 'browse' }
   /** `scroll`: how many lines of the key table are scrolled off the top, for a short terminal. */
   | { kind: 'help'; scroll: number }
+  /** The last message in full, for one longer than the status line has room for; `scroll` as
+   *  for help. */
+  | { kind: 'message'; scroll: number }
   | { kind: 'launch'; label: string }
-  | {
-      kind: 'prompt';
-      purpose: PromptPurpose;
-      /** The account the prompt is about (rename, remove); absent for an add. */
-      account?: { id: string; label: string };
-      input: string;
-      /** Why the last Enter did not go through (an empty label, a mistyped confirmation), shown
-       *  with the prompt, which stays open so the input can be fixed. */
-      note?: string;
-    };
+  | TuiPrompt;
+
+/** A prompt taking text until Enter or Escape. */
+export interface TuiPrompt {
+  kind: 'prompt';
+  purpose: PromptPurpose;
+  /** The account the prompt is about (rename, remove); absent for an add. */
+  account?: { id: string; label: string };
+  input: string;
+  /** Why the last Enter did not go through (an empty label, a mistyped confirmation, a refusal),
+   *  shown with the prompt, which stays open so the input can be fixed. */
+  note?: string;
+  /** The account was removed while the prompt was open: it takes no input and starts nothing,
+   *  and only Escape closes it. Closing it at once would hand the rest of what the person was
+   *  typing, and the Enter meant for the prompt, to the account list. */
+  gone?: true;
+}
 
 /** How a status line reads. */
 export type TuiTone = 'info' | 'ok' | 'warn' | 'error';
@@ -187,6 +199,10 @@ export interface TuiState {
   status?: TuiStatus;
   /** What is running now; while set, keys other than Ctrl-C wait. */
   busy?: string;
+  /** The prompt the running action was started from: opened again, with the refusal as its note,
+   *  when the action is refused, so the Enter that follows a quick refusal goes to the prompt and
+   *  not to the account list. */
+  reopenOnRefusal?: TuiPrompt;
   /** Ctrl-C arrived while busy: quit as soon as the running action ends. */
   quitWhenIdle: boolean;
 }

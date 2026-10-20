@@ -11,6 +11,7 @@ import {
   refreshBlocker,
   selectedAccount,
   settleAction,
+  withStatus,
 } from './state.js';
 import { PANES, type Key, type PaneId, type TuiState, type Transition } from './types.js';
 
@@ -344,17 +345,60 @@ describe('while an action runs', () => {
 });
 
 describe('reads', () => {
-  it('keeps the selection on its account across reads, and moves it off a removed one', () => {
+  it('keeps the selection on its account across reads', () => {
     const s = press(base(), key('down')).state;
     const reordered = applySnapshot(s, snapshotOf([...everyStateAccounts()].reverse()));
     expect(reordered.selectedId).toBe('id-home');
+  });
+
+  it('selects nothing, and says so, when the selected account is removed elsewhere', () => {
+    const s = press(base(), key('down')).state;
     const removed = applySnapshot(
       s,
       snapshotOf([account('id-work', 'work'), account('id-x', 'x')]),
     );
-    expect(removed.selectedId).toBe('id-work');
-    const none = applySnapshot(s, snapshotOf([]));
+    expect(selectedAccount(removed)).toBeUndefined();
+    expect(removed.status?.text).toBe(
+      'home is no longer stored, so no account is selected (j/k selects one).',
+    );
+    // No account verb lands on an account nobody picked.
+    for (const k of [key('enter'), char('e'), char('l'), char('r'), char('d')]) {
+      const t = reduce(removed, k);
+      expect(t.effect).toBeUndefined();
+      expect(t.state.mode).toEqual({ kind: 'browse' });
+      expect(t.state.status?.text).toMatch(/^No account is selected/);
+    }
+    // Said once, not again on every read after.
+    const later = applySnapshot(
+      withStatus(removed, 'x', 'info'),
+      snapshotOf([account('id-work', 'work')]),
+    );
+    expect(later.status?.text).toBe('x');
+    // Moving picks one again.
+    expect(selectedAccount(reduce(removed, char('j')).state)?.id).toBe('id-work');
+    expect(selectedAccount(reduce(removed, key('end')).state)?.id).toBe('id-x');
+  });
+
+  it('selects nothing when the selected account is gone after a read that failed', () => {
+    const onThird = press(base(), key('down'), key('down')).state;
+    const failed = applySnapshot(onThird, {
+      ...snapshotOf([]),
+      accounts: { ok: false, error: 'database is locked' },
+    });
+    const back = applySnapshot(
+      failed,
+      snapshotOf(everyStateAccounts().filter((a) => a.id !== 'id-dead')),
+    );
+    expect(selectedAccount(back)).toBeUndefined();
+    expect(back.status?.text).toMatch(/no longer stored, so no account is selected/);
+    expect(reduce(back, key('enter')).effect).toBeUndefined();
+  });
+
+  it('selects the first account on the first read, and on the first after none were stored', () => {
+    expect(base().selectedId).toBe('id-work');
+    const none = applySnapshot(initialState(NOW, 'linux'), snapshotOf([]));
     expect(none.selectedId).toBeUndefined();
+    expect(applySnapshot(none, snapshotOf([account('id-new', 'new')])).selectedId).toBe('id-new');
   });
 
   it('keeps the last picture when a read fails, and drops the failure once one succeeds', () => {
@@ -408,14 +452,81 @@ describe('keys that must not reach the account under the cursor', () => {
     expect(t.effects).toEqual([]);
   });
 
-  it('a prompt whose account is gone closes, saying so', () => {
-    const open = press(base(), char('r')).state;
-    const after = applySnapshot(
-      open,
-      snapshotOf(everyStateAccounts().filter((a) => a.id !== 'id-work')),
+  it('a prompt whose account is gone stays open, acting on nothing, until Esc', () => {
+    for (const opener of [char('r'), char('d')]) {
+      const open = press(base(), opener, char('w'), char('o')).state;
+      const after = applySnapshot(
+        open,
+        snapshotOf(everyStateAccounts().filter((a) => a.id !== 'id-work')),
+      );
+      expect(after.mode).toMatchObject({
+        kind: 'prompt',
+        gone: true,
+        note: 'work is no longer stored. Esc closes this prompt.',
+      });
+      // The rest of what the person was typing, and the Enter meant for the prompt, act on
+      // nothing: not the account list, not the account now under the cursor.
+      const t = press(
+        after,
+        char('r'),
+        char('k'),
+        key('enter'),
+        key('enter'),
+        char('e'),
+        { name: 'paste', text: 'x' },
+        key('backspace'),
+      );
+      expect(t.effects).toEqual([]);
+      expect(t.state.mode).toMatchObject({ kind: 'prompt', gone: true, input: 'wo' });
+      const closed = press(t.state, key('escape'));
+      expect(closed.state.mode).toEqual({ kind: 'browse' });
+      expect(closed.effects).toEqual([]);
+    }
+  });
+
+  it('refuses a rename to a label another account answers to, before it starts', () => {
+    const t = press(base(), char('r'), ...[...'HOME'].map(char), key('enter'), key('enter'));
+    expect(t.effects).toEqual([]);
+    expect(t.state.mode).toMatchObject({
+      kind: 'prompt',
+      purpose: 'rename',
+      note: '"HOME" is already the label of home. Pick another, or Esc to cancel.',
+    });
+    // Its own label, in another case, is not taken.
+    expect(press(base(), char('r'), ...[...'WORK'].map(char), key('enter')).effects).toEqual([
+      { kind: 'rename', id: 'id-work', from: 'work', to: 'WORK' },
+    ]);
+  });
+
+  it.each([
+    ['rename', [char('r'), char('x')]],
+    ['remove', [char('d'), ...[...'work'].map(char)]],
+  ] as const)(
+    'a %s the vault refused opens its prompt again, so Enter cannot switch',
+    (_, keys) => {
+      const started = press(base(), ...keys, key('enter'));
+      expect(started.effects).toHaveLength(1);
+      const refused = settleAction(started.state, { ok: false, message: 'the vault is busy' });
+      expect(refused.mode).toMatchObject({ kind: 'prompt', note: 'the vault is busy' });
+      expect(refused.busy).toBeUndefined();
+      const again = press(refused, key('enter'));
+      expect(again.effects).not.toContainEqual(expect.objectContaining({ kind: 'switch' }));
+      // A success goes back to browsing as before.
+      expect(settleAction(started.state, { ok: true, message: 'done' }).mode).toEqual({
+        kind: 'browse',
+      });
+    },
+  );
+
+  it('drops a refusal note once the prompt follows a rename made elsewhere', () => {
+    const refused = press(base(), char('d'), char('x'), key('enter')).state;
+    expect(refused.mode).toHaveProperty('note');
+    const renamed = everyStateAccounts().map((a) =>
+      a.id === 'id-work' ? { ...a, label: 'job' } : a,
     );
-    expect(after.mode).toEqual({ kind: 'browse' });
-    expect(after.status?.text).toBe('work is no longer stored, so the prompt was closed.');
+    const after = applySnapshot(refused, snapshotOf(renamed));
+    expect(after.mode).toMatchObject({ account: { id: 'id-work', label: 'job' } });
+    expect(after.mode).not.toHaveProperty('note');
   });
 
   it('keeps the selection through a read that could not read the accounts', () => {
@@ -479,5 +590,16 @@ describe('warnings logged while an action ran', () => {
       text: 'Activated work. Warning: refused to adopt the live token',
       tone: 'warn',
     });
+  });
+
+  it('keeps every one of several warnings, not only the last', () => {
+    const busy = reduce(base(), key('enter')).state;
+    const s = settleAction(busy, { ok: true, message: 'Activated work.' }, [
+      'refused to adopt the live token',
+      'minor: cache refresh skipped',
+    ]);
+    expect(s.status?.text).toBe(
+      'Activated work. 2 warnings: refused to adopt the live token; minor: cache refresh skipped',
+    );
   });
 });

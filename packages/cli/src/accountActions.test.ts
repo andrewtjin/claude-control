@@ -410,6 +410,17 @@ describe('removeAccount', () => {
     expect(engine.removeAccount).toHaveBeenCalledWith('id-1');
     expect(out).toMatchObject({ account: { label: 'Work' }, message: 'Removed Work.' });
   });
+
+  it('removes nothing when the account no longer has the label the person confirmed', async () => {
+    await expectRefused(
+      removeAccount('id-1', ctx, { label: 'Home' }),
+      'label_changed',
+      'The account confirmed as Home is now called Work; nothing was removed.',
+    );
+    expect(engine.removeAccount).not.toHaveBeenCalled();
+    await removeAccount('id-1', ctx, { label: 'Work' });
+    expect(engine.removeAccount).toHaveBeenCalledWith('id-1');
+  });
 });
 
 describe('addAccount (the current login)', () => {

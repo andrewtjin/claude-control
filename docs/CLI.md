@@ -625,6 +625,7 @@ predicted from history rather than reported.
 | d                   | remove the selected account; you type its label to confirm                                                                                                                                                                            |
 | u                   | ask the running daemon to refresh usage now; it still honors each account's poll floor and any rate-limit backoff, and says which accounts it held back and until when. Unavailable, with the reason, while the daemon is not running |
 | l                   | show the command that runs Claude as the selected account, to paste in another terminal                                                                                                                                               |
+| m                   | show the last message in full (a long one is cut on the status line)                                                                                                                                                                  |
 | ?                   | the key list                                                                                                                                                                                                                          |
 | q or Esc            | quit                                                                                                                                                                                                                                  |
 
@@ -633,20 +634,26 @@ Ctrl-C gives the screen back at once, and cctl exits when the action has finishe
 cut off part way). Either way, how the action ended is printed on the normal screen, and a
 refused action makes the exit code non-zero.
 
-The help overlay scrolls with the movement keys in a short terminal. A rename, add or remove
-prompt whose Enter does not go through (an empty label, a label another account already has, a
-mistyped confirmation) stays open and says why. Pasted text only ever goes into a prompt; in the
-list it does nothing. Keys typed while the screen is stepped aside for a login window are
-dropped when it comes back.
+The help and message overlays scroll with the movement keys in a short terminal. A rename, add or
+remove prompt whose Enter does not go through (an empty label, a label another account already
+has, a mistyped confirmation) stays open and says why, and a rename or remove the vault refuses
+opens its prompt again with the reason. A prompt whose account is removed elsewhere while it is
+open takes nothing more and closes on Esc. When the selected account is removed, here or
+elsewhere, no account is selected until j/k picks one, so no key lands on an account you did not
+pick. Pasted text only ever goes into a prompt; in the list it does nothing. Keys typed while the
+screen is stepped aside for a login window are dropped when it comes back, for as long as they
+keep arriving.
 
 As the terminal narrows, columns give way in a fixed order: per-model windows first, then reset
 times, then the plan. Below 40 columns (or 6 rows) the view shows a notice instead, and only q,
 Esc and Ctrl-C do anything until it is larger. A long message wraps onto up to three status
-rows. Diagnostics that would normally go to stderr appear on the status line, so they never draw
-over the screen; one logged while an action ran is shown with that action's result. Quitting, a
-signal, a closed terminal and an error all give the terminal back as it was. `cctl tui` refuses
-to start when its input or output is redirected, or on a terminal that cannot draw it, and
-points at `cctl usage` for plain output.
+rows; one longer than that keeps its start and its end, and m shows all of it. Diagnostics that
+would normally go to stderr appear on the status line, so they never draw over the screen; every
+one logged while an action ran is shown with that action's result (and printed after an error
+ends the view). Quitting, a signal, a closed terminal and an error all give the terminal back as
+it was. `cctl tui` refuses to start when its input or output is redirected, or on a terminal that
+cannot draw it (`TERM=dumb`, or Windows with "Use legacy console" turned on), and points at
+`cctl usage` for plain output.
 
 ## Switching and recovery
 

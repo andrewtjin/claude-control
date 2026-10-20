@@ -98,9 +98,11 @@ function renderHeader(header: SessionStatusHeader | undefined, palette: Palette)
     return palette.dim('Active account: (none - start the daemon: cctl daemon run)');
   }
   const mark = header.weeklyResetPredicted === true ? ' (predicted)' : '';
+  // ASCII separator: a middle dot is ambiguous width (two columns on a terminal set up for CJK
+  // text), and the full-screen view draws this header measured as one.
   const budget =
     header.weeklyResetInMs !== undefined
-      ? `  ·  ${humanizeDaysUntil(header.weeklyResetInMs)} left${mark}`
+      ? `  |  ${humanizeDaysUntil(header.weeklyResetInMs)} left${mark}`
       : '';
   return `Active account: ${palette.bold(header.activeLabel)}${palette.dim(budget)}`;
 }

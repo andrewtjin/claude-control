@@ -5,6 +5,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { stat } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -81,12 +82,15 @@ class FakeInput extends EventEmitter {
     // turn of the loop, as a real tty's queued input does.
     if (this.held.length > 0) {
       const held = this.held.splice(0);
-      setImmediate(() => {
+      this.deliverHeld(() => {
         for (const text of held) this.emit('data', text);
       });
     }
     return this;
   }
+  /** When held input is delivered once reading resumes: on the next turn of the loop by default.
+   *  A test replaces it to deliver the way a real terminal on a loaded machine can. */
+  deliverHeld: (send: () => void) => void = (send) => setImmediate(send);
   /** Input the terminal holds while it is not being read. */
   held: string[] = [];
   pause(): this {
@@ -737,6 +741,82 @@ describe('keys that arrive when the person did not mean them for the view', () =
     await rig.exit;
   });
 
+  /** Sources whose add is refused after the login window, with an Enter typed at the terminal
+   *  while it looked hung. */
+  function refusedAdd(): { sources: TuiSources & { calls: string[] }; rig: Rig } {
+    const sources: TuiSources & { calls: string[] } = scripted({
+      addAccount: (label) => {
+        sources.calls.push(`add:${label}`);
+        rig.input.typeAhead('\r');
+        return Promise.reject(new AccountActionError('no_capture_login', 'no login in the window'));
+      },
+    });
+    const rig = start(sources);
+    return { sources, rig };
+  }
+
+  it('drops held keys that are only read after a stall longer than the drain', async () => {
+    const { sources, rig } = refusedAdd();
+    // As a terminal on Linux or macOS delivers them on a loaded machine: the process stalls just
+    // after the screen comes back, and the held Enter is read in the loop turn after the stall,
+    // once the timers that were due during it have already run.
+    rig.input.deliverHeld = (send) =>
+      setImmediate(() => {
+        stat(import.meta.dirname, () => send());
+        const until = Date.now() + 250;
+        while (Date.now() < until) {
+          // A stall: a descheduled process or a long collection.
+        }
+      });
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.input.type('a');
+    rig.input.type('fresh\r');
+    await until(() => expect(rig.output.text()).toContain('no login in the window'));
+    await new Promise((r) => setTimeout(r, 600));
+    expect(sources.calls).toEqual(['add:fresh']);
+    rig.input.type('q');
+    await rig.exit;
+  });
+
+  it('keeps dropping input while a held key is still repeating when the screen comes back', async () => {
+    const { sources, rig } = refusedAdd();
+    rig.input.deliverHeld = (send) => {
+      setImmediate(send);
+      // The key is still held: the terminal repeats it every 40 ms for a while.
+      let repeats = 0;
+      const repeat = setInterval(() => {
+        rig.input.emit('data', '\r');
+        if ((repeats += 1) === 10) clearInterval(repeat);
+      }, 40);
+    };
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.input.type('a');
+    rig.input.type('fresh\r');
+    await until(() => expect(rig.output.text()).toContain('no login in the window'));
+    await new Promise((r) => setTimeout(r, 800));
+    expect(sources.calls).toEqual(['add:fresh']);
+    rig.input.type('q');
+    await rig.exit;
+  });
+
+  it('still hears Ctrl-C while dropping input after a login window', async () => {
+    const { sources, rig } = refusedAdd();
+    rig.input.deliverHeld = (send) =>
+      setImmediate(() => {
+        send();
+        rig.input.emit('data', CTRL_C);
+      });
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.input.type('a');
+    rig.input.type('fresh\r');
+    // The refused add ends the view, as Ctrl-C during an action does, and says how it went.
+    expect(await rig.exit).toEqual({ code: 1 });
+    expect(rig.output.all.slice(rig.output.all.lastIndexOf(LEAVE_SCREEN))).toContain(
+      'no login in the window',
+    );
+    expect(sources.calls).toEqual(['add:fresh']);
+  });
+
   it('brings the screen back as soon as the add has stored the account', async () => {
     let finishCleanup: () => void = () => {};
     const rig = start(
@@ -1045,6 +1125,50 @@ describe('refusals in the words of the view', () => {
         'Activated work. Warning: refused to adopt the live token',
       ),
     );
+    rig.input.type('q');
+    await rig.exit;
+  });
+
+  it('prints the warnings of an action that faulted, after the screen is given back', async () => {
+    const boom = new Error('EPERM: operation not permitted, rename');
+    const rig = start(
+      scripted({
+        switchAccount: () => {
+          rig.log.write('refused to adopt the live token\n');
+          return Promise.reject(boom);
+        },
+      }),
+    );
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.input.type('\r');
+    await expect(rig.exit).rejects.toBe(boom);
+    expectRestored(rig);
+    const after = rig.output.all.slice(rig.output.all.lastIndexOf(LEAVE_SCREEN));
+    expect(after).toContain('Warning: refused to adopt the live token');
+  });
+
+  it('keeps every warning and every line of one write', async () => {
+    const rig = start(
+      scripted({
+        switchAccount: () => {
+          rig.log.write('refused to adopt the live token\n');
+          (rig.stderr.write as unknown as (s: string) => boolean)(
+            'the vault was repaired\nsee the audit log\n',
+          );
+          return Promise.resolve({ message: 'Activated work.' });
+        },
+      }),
+    );
+    await until(() => expect(rig.output.text()).toContain('work'));
+    rig.input.type('\r');
+    await until(() => expect(rig.output.text()).toContain('Activated work. 3 warnings'));
+    // The status line keeps the start and end; the message overlay has all of it.
+    rig.input.type('m');
+    const said = rig.output.text().split('\n').join(' ');
+    for (const part of ['refused to adopt the live token', 'the vault was repaired', 'audit log']) {
+      expect(said).toContain(part);
+    }
+    rig.input.type('q');
     rig.input.type('q');
     await rig.exit;
   });

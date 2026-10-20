@@ -26,10 +26,27 @@ describe('fullScreenBlocker', () => {
     expect(fullScreenBlocker({}, 'win32', () => undefined)).toBeUndefined();
   });
 
-  it('does not ask the registry inside a terminal that is known to speak VT', () => {
+  it('asks the console setting on Windows whatever the environment claims', () => {
+    // TERM is set by Git Bash, MSYS2 and Cygwin running in a plain console window, and by people
+    // who set it user-wide; WT_SESSION and TERM_PROGRAM are inherited by a console window started
+    // from Windows Terminal or VS Code. None of them says what the console under this process is.
+    for (const env of [
+      { TERM: 'xterm-256color' },
+      { TERM: 'cygwin' },
+      { WT_SESSION: 'x' },
+      { TERM_PROGRAM: 'vscode' },
+    ]) {
+      const ask = vi.fn(() => 0);
+      expect(fullScreenBlocker(env, 'win32', ask), JSON.stringify(env)).toMatch(/legacy console/);
+      expect(ask).toHaveBeenCalledTimes(1);
+    }
+    expect(fullScreenBlocker({ TERM: 'xterm-256color' }, 'win32', () => 1)).toBeUndefined();
+  });
+
+  it('never asks the registry off Windows', () => {
     const ask = vi.fn(() => 0);
-    expect(fullScreenBlocker({ WT_SESSION: 'x' }, 'win32', ask)).toBeUndefined();
-    expect(fullScreenBlocker({ TERM_PROGRAM: 'vscode' }, 'win32', ask)).toBeUndefined();
+    expect(fullScreenBlocker({}, 'linux', ask)).toBeUndefined();
+    expect(fullScreenBlocker({}, 'darwin', ask)).toBeUndefined();
     expect(ask).not.toHaveBeenCalled();
   });
 
