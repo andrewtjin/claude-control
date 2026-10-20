@@ -340,7 +340,7 @@ describe('a slot that cannot take the account it was handed', () => {
     expect(await h.engine.getActiveId('global')).toBe(good);
   });
 
-  it('reports a slot already moved when a later one has nowhere to go, writing what it can', async () => {
+  it('puts a slot it moved back when the rule it moved it for is then refused', async () => {
     const h = await harness();
     const { a, b, c } = await accounts(h, 'a', 'b', 'c');
     const d = await h.engine.addAccount('d', bundle('D1', 'u-d', NOW - HOUR));
@@ -363,7 +363,38 @@ describe('a slot that cannot take the account it was handed', () => {
     ]);
     const res = await h.engine.importRules(specs);
     expect(refusalOf(res.plan.rules[0])).toContain('"d"');
-    expect(res.handedOff).toEqual([{ slot: 'global', from: a, to: c }]);
+    // The global slot left a only for that rule: with the rule refused it is back on a, and the run
+    // moved nothing anyone runs on.
+    expect(res.handedOff).toEqual([]);
+    expect(await h.engine.getActiveId('global')).toBe(a);
+    expect(await h.engine.getActiveId(ruleSlotId(side.rule.id))).toBe(b);
+    expect(await h.engine.listRules()).toHaveLength(1);
+  });
+
+  it('says so when a slot it moved for a refused rule cannot be put back', async () => {
+    const h = await harness();
+    const { a, b, c } = await accounts(h, 'a', 'b', 'c');
+    await accounts(h, 'd');
+    await h.engine.activate(a!);
+    const side = await h.engine.excludeInFolder(await ruleFolder(h, 'q'), [c!]);
+    expect(await h.engine.getActiveId(ruleSlotId(side.rule.id))).toBe(b);
+    // Every stored token is near its end by now, so each switch refreshes first: c's refresh
+    // works, d's and a's do not.
+    h.advance(HOUR);
+    h.onRefresh((cur) =>
+      cur.refreshToken === 'r-D' || cur.refreshToken === 'r-A'
+        ? Promise.reject(new RefreshError('network error during token refresh'))
+        : Promise.resolve({ ...cur, accessToken: 'NET', expiresAt: h.clock() + HOUR }),
+    );
+    const specs: ImportRuleSpec[] = [
+      { scopes: [folder(await ruleFolder(h, 'p'))], include: [a!, b!], exclude: [] },
+    ];
+
+    const res = await h.engine.importRules(specs);
+    expect(refusalOf(res.plan.rules[0])).toContain('"d"');
+    expect(res.handedOff).toHaveLength(1);
+    expect(res.handedOff[0]).toMatchObject({ slot: 'global', from: a, to: c });
+    expect(res.handedOff[0]?.stranded).toContain('network error');
     expect(await h.engine.getActiveId('global')).toBe(c);
     expect(await h.engine.getActiveId(ruleSlotId(side.rule.id))).toBe(b);
     expect(await h.engine.listRules()).toHaveLength(1);
@@ -679,18 +710,18 @@ describe('an import interrupted after it moved a slot', () => {
     return { a: a!, b: b!, c: c1.id, d: d!, side: side.rule.id, specs };
   }
 
-  it('reports the slot moved when a later move fails on a file it cannot read', async () => {
+  it('puts the slot it moved back when a later move fails on a file it cannot read', async () => {
     const h = await harness();
-    const { a, b, c, d, side, specs } = await twoMoves(h, { expiresAt: NOW + HOUR });
+    const { a, b, d, side, specs } = await twoMoves(h, { expiresAt: NOW + HOUR });
     // The account's stored tokens cannot be read: a folder stands where the file should be.
     const enc = join(h.paths.vaultDir, d, 'cred.enc');
     await rm(enc, { force: true });
     await mkdir(enc);
 
     const res = await h.engine.importRules(specs);
-    expect(res.handedOff).toEqual([{ slot: 'global', from: a, to: c }]);
     expect(refusalOf(res.plan.rules[0])).toContain('"d"');
-    expect(await h.engine.getActiveId('global')).toBe(c);
+    expect(res.handedOff).toEqual([]);
+    expect(await h.engine.getActiveId('global')).toBe(a);
     expect(await h.engine.getActiveId(ruleSlotId(side))).toBe(b);
   });
 
@@ -915,6 +946,28 @@ function expectReported(
   expect(new Set(live).size, `seed ${seed}: an account live in two slots`).toBe(live.length);
 }
 
+/**
+ * Every slot a finished run reports as handed off left an account that the rules, as the run leaves
+ * them, no longer let it hold ("now reserved"), unless the run says the slot could not be put back.
+ * A slot moved for a rule the run then refused is put back, so it is not reported at all.
+ */
+async function expectHandOffsKept(
+  seed: number,
+  h: Harness,
+  moves: { handedOff: readonly SlotHandOff[] },
+): Promise<void> {
+  const rules = await h.engine.listRules();
+  for (const hand of moves.handedOff) {
+    if (hand.stranded !== undefined) continue;
+    const own = rules.find((r) => r.id === ruleIdOfSlot(hand.slot));
+    const reserved = rules.some((r) => r.include.includes(hand.from));
+    expect(
+      reserved && own?.include.includes(hand.from) !== true,
+      `seed ${seed}, ${hand.slot}`,
+    ).toBe(true);
+  }
+}
+
 describe('random batches through the real engine', () => {
   const SEEDS_PER_TEST = 10;
   for (const block of [0, 1, 2]) {
@@ -957,6 +1010,7 @@ describe('random batches through the real engine', () => {
           throw err;
         });
         expectReported(seed, before, await holdings(h), running, moves);
+        if (!(moves instanceof ImportInterruptedError)) await expectHandOffsKept(seed, h, moves);
       }
     }, 600_000);
   }

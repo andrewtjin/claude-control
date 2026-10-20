@@ -15,6 +15,7 @@ import {
   ImportInterruptedError,
   InsecurePassthroughProtector,
   LockTimeoutError,
+  RefreshError,
   SwitchEngine,
   Vault,
   VaultError,
@@ -65,8 +66,12 @@ interface Machine {
   deps: TransferDeps;
 }
 
-/** A sandboxed machine. Token refreshes are marked, so a test can tell one happened. */
-async function machine(overrides: Partial<TransferDeps> = {}): Promise<Machine> {
+/** A sandboxed machine. Token refreshes are marked, so a test can tell one happened, unless the
+ *  test says how they go (`refresh`). */
+async function machine(
+  overrides: Partial<TransferDeps> = {},
+  opts: { refresh?: (cur: ClaudeOauth) => Promise<ClaudeOauth> } = {},
+): Promise<Machine> {
   const root = realpathSync.native(await mkdtemp(join(tmpdir(), 'cctl-xfer-')));
   dirs.push(root);
   const paths = sandboxPaths(root);
@@ -77,8 +82,10 @@ async function machine(overrides: Partial<TransferDeps> = {}): Promise<Machine> 
     paths,
     protector,
     liveCredentialChannel: new FileCredentialChannel(paths.credentialsPath),
-    refresh: (cur: ClaudeOauth) =>
-      Promise.resolve({ ...cur, accessToken: 'NETWORK-' + cur.accessToken }),
+    refresh:
+      opts.refresh ??
+      ((cur: ClaudeOauth) =>
+        Promise.resolve({ ...cur, accessToken: 'NETWORK-' + cur.accessToken })),
     minSwitchIntervalMs: 0,
     lockOptions: { timeoutMs: 15_000, pollMs: 20 },
   });
@@ -3194,6 +3201,96 @@ describe('slots the seat step moves, and an import stopped part-way', () => {
     const report = b.out.join('');
     expect(report).toContain('the global slot switched off x (now reserved) and is on y');
     expect(report).toContain('the import stopped part-way (the disk went away)');
+    expect(b.guardRuns).toBe(1);
+  });
+
+  /**
+   * a is the main login, rule q (which excludes c) runs on b, and the file's one rule p includes a
+   * and b: the global slot is to move a -> c and q's slot b -> d. d's token will not refresh, so q's
+   * slot cannot move and p is not imported. `failing` names the refresh tokens that fail from then
+   * on; `aExpired` gives a a token that has to be refreshed whenever a slot is switched to it.
+   */
+  async function refusedAfterAMove(aExpired: boolean): Promise<{
+    b: Machine;
+    file: string;
+    ids: Record<'a' | 'b' | 'c', string>;
+    p: string;
+    q: string;
+    qSlot: ReturnType<typeof ruleSlotId>;
+    failing: Set<string>;
+  }> {
+    const failing = new Set<string>();
+    const b = await machine(
+      {},
+      {
+        refresh: (cur) =>
+          failing.has(cur.refreshToken)
+            ? Promise.reject(new RefreshError('network error during token refresh'))
+            : Promise.resolve({ ...cur, accessToken: 'NETWORK-' + cur.accessToken }),
+      },
+    );
+    const a = await b.engine.addAccount(
+      'a',
+      bundle('A1', 'u-a', aExpired ? Date.now() - HOUR : undefined),
+    );
+    const bb = await b.engine.addAccount('b', bundle('B1', 'u-b'));
+    const c = await b.engine.addAccount('c', bundle('C1', 'u-c'));
+    await b.engine.addAccount('d', bundle('D1', 'u-d', Date.now() - HOUR));
+    await b.engine.activate(a.id);
+    const q = await folder(b, 'q');
+    const side = await b.engine.excludeInFolder(q, [c.id]);
+    const qSlot = ruleSlotId(side.rule.id);
+    expect(await b.engine.getActiveId(qSlot)).toBe(bb.id);
+    failing.add('r-D1');
+    const p = await folder(b, 'p');
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: [
+          { label: 'a', accountUuid: 'u-a', autoSwitchExcluded: false },
+          { label: 'b', accountUuid: 'u-b', autoSwitchExcluded: false },
+        ],
+        rules: [{ label: 'p', folders: [p], aliases: [], include: ['u-a', 'u-b'], exclude: [] }],
+      }),
+    );
+    b.out.length = 0;
+    expect(await importInto(b, file, { dryRun: true })).toEqual({ failed: 0 });
+    const dry = b.out.join('');
+    expect(dry).toContain('  the global slot moves off a onto c');
+    expect(dry).toContain(`  the folder slot of ${q} moves off b onto d`);
+    b.out.length = 0;
+    return { b, file, ids: { a: a.id, b: bb.id, c: c.id }, p, q, qSlot, failing };
+  }
+
+  it('puts the main login back when the rule it moved it for is not imported', async () => {
+    const { b, file, ids, p, qSlot } = await refusedAfterAMove(false);
+
+    expect(await importInto(b, file)).toEqual({ failed: 1 });
+    const report = b.out.join('');
+    expect(report).toContain(`folder ${p}: not imported - cannot include "b"`);
+    expect(report).toContain('could not be switched to "d"');
+    expect(report).not.toContain('switched off');
+    expect(await b.engine.getActiveId('global')).toBe(ids.a);
+    expect(await b.engine.getActiveId(qSlot)).toBe(ids.b);
+    expect(await b.engine.listRules()).toHaveLength(1);
+    expect(b.guardRuns).toBe(0);
+  });
+
+  it('says the main login stayed moved, and why, when it cannot be put back', async () => {
+    const { b, file, ids, p, qSlot, failing } = await refusedAfterAMove(true);
+    failing.add('r-A1');
+
+    expect(await importInto(b, file)).toEqual({ failed: 1 });
+    const report = b.out.join('');
+    expect(report).toContain(`folder ${p}: not imported - cannot include "b"`);
+    expect(report).toContain(
+      'the global slot switched off a for a rule that was then not imported, and is on c: it ' +
+        'could not be switched back (network error during token refresh)',
+    );
+    expect(report).not.toContain('(now reserved)');
+    expect(await b.engine.getActiveId('global')).toBe(ids.c);
+    expect(await b.engine.getActiveId(qSlot)).toBe(ids.b);
+    expect(await b.engine.listRules()).toHaveLength(1);
     expect(b.guardRuns).toBe(1);
   });
 });

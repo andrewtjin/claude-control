@@ -920,13 +920,17 @@ export function ruleLines(
   }
 }
 
-/** The line a slot the rules move gets: in the plan (`plan`), or as made (`done`). */
+/** The line a slot the rules move gets: in the plan (`plan`), or as made (`done`). A slot the run
+ *  moved for a rule it then did not bring in, and could not switch back, says that instead: the
+ *  account it left is not reserved. */
 export function handOffLine(hand: SlotHandOff, tense: 'plan' | 'done', names: ReportNames): string {
   const slot = safe(names.slotName(hand.slot));
   const from = safe(names.labelOf(hand.from));
   const to = safe(names.labelOf(hand.to));
-  return tense === 'plan'
-    ? `${slot} moves off ${from} onto ${to}`
+  if (tense === 'plan') return `${slot} moves off ${from} onto ${to}`;
+  return hand.stranded !== undefined
+    ? `${slot} switched off ${from} for a rule that was then not imported, and is on ${to}: it ` +
+        `could not be switched back (${safe(hand.stranded)})`
     : `${slot} switched off ${from} (now reserved) and is on ${to}`;
 }
 

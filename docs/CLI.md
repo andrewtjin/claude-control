@@ -176,8 +176,9 @@ changes on this machine between the two runs can make them differ: a session tha
 stops in a folder a rule would leave with no account, a switch left unfinished in a slot (the
 real run settles it first), an account a slot is moved onto that cannot be switched to then (its
 login will not refresh: the real run moves the slot onto the next account that can, or fails the
-rule, and reports every slot it moved), or an account, rule or login changed in between. With
-`--replace`, a quarantined login the file brings tokens for counts as usable in the dry run too,
+rule and switches back any slot it had already moved for that rule; a slot that cannot be
+switched back either is reported as moved for a rule that was not imported), or an account, rule
+or login changed in between. With `--replace`, a quarantined login the file brings tokens for counts as usable in the dry run too,
 since the real run always takes them. Both runs also name every folder slot holding a login that
 seating the rules puts on another account (an account the file newly includes there, one it no
 longer excludes, the account another rule took, or a quarantined login replaced) or on none. A

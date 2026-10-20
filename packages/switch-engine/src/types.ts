@@ -692,6 +692,12 @@ export interface SlotHandOff {
   from: string;
   /** The account the slot now holds. */
   to: string;
+  /**
+   * Set only by an import, for a slot it moved for a rule it then did not bring in (another slot
+   * could not take the account chosen for it) and could not move back: why the switch back failed.
+   * The account the slot left is then not reserved; the move happened all the same.
+   */
+  stranded?: string;
 }
 
 /** What {@link SwitchEngine.includeInFolder} / {@link SwitchEngine.includeInAlias} did — reported so

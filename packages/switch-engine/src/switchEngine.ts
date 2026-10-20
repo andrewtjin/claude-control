@@ -617,6 +617,49 @@ function orderedMoves<M extends { from: { id: string }; to: string }>(
   return out;
 }
 
+/**
+ * The switches that take each slot to where an import's decision puts it, from where the run's
+ * earlier moves left it (`held`: per slot the run moved, the account it held before the run and the
+ * one it holds now). A slot the decision moves goes to its new account, unless it is there already.
+ * A slot the run moved that the decision no longer moves goes back to what it held, unless it could
+ * not be switched back before (`stranded`). A switch that frees an account comes before the one
+ * that takes it.
+ */
+function importMoves(
+  handOffs: ReadonlyArray<{ slotId: SlotId; from: StoredAccount; to: string }>,
+  held: ReadonlyMap<SlotId, { from: string; now: string }>,
+  stranded: ReadonlyMap<SlotId, string>,
+): Array<{ slotId: SlotId; from: { id: string }; to: string; reason?: string }> {
+  const moves: Array<{ slotId: SlotId; from: { id: string }; to: string; reason?: string }> = [];
+  for (const step of handOffs) {
+    const now = held.get(step.slotId)?.now ?? step.from.id;
+    if (now !== step.to) moves.push({ slotId: step.slotId, from: { id: now }, to: step.to });
+  }
+  for (const [slotId, { from, now }] of [...held].reverse()) {
+    if (now === from || stranded.has(slotId) || handOffs.some((s) => s.slotId === slotId)) continue;
+    moves.push({
+      slotId,
+      from: { id: now },
+      to: from,
+      reason: 'putting the slot back: the import no longer needs it moved',
+    });
+  }
+  return orderedMoves(moves) ?? moves;
+}
+
+/** What an import's moves come to, per slot it moved (see importMoves): the account the slot held
+ *  before the run and the one it holds now, for each slot that is not back where it was. */
+function netHandOffs(
+  held: ReadonlyMap<SlotId, { from: string; now: string }>,
+  stranded: ReadonlyMap<SlotId, string>,
+): SlotHandOff[] {
+  return [...held].flatMap(([slot, { from, now }]) => {
+    if (now === from) return [];
+    const why = stranded.get(slot);
+    return [{ slot, from, to: now, ...(why !== undefined ? { stranded: why } : {}) }];
+  });
+}
+
 /** Import specs tried against a draft of the registry (see decideImportLocked): their writes, the
  *  ones the draft refused, the rule each write landed in, and the registry as they leave it. */
 interface TriedBatch {
@@ -1856,8 +1899,11 @@ export class SwitchEngine {
    *      slots together, and the seat step played out on the draft.
    *   2. hand off every slot that holds an account the batch reserves and may not keep it. A slot
    *      that cannot take the account chosen for it (its token will not refresh) stays as it was;
-   *      the decision is then made again from the slots as they are, without that account, and
-   *      every slot that did move is reported.
+   *      the decision is then made again without that account, as from the slots as the run found
+   *      them, and each slot is switched to where the new decision puts it: a slot moved for a spec
+   *      it now refuses goes back, so a rule that does not land moves no slot. Every slot left
+   *      moved is reported, and one that could not be switched back is reported as that
+   *      ({@link SlotHandOff.stranded}).
    *   3. add the scopes a grown rule lacks, then write every exclusion, then every inclusion: an
    *      account a later rule reserves is still shared while the exclusions are written, as it was
    *      on the source when they were made.
@@ -1912,10 +1958,15 @@ export class SwitchEngine {
     await this.settleForAccountsLocked(allIds);
 
     // 1-2. Decide, and hand off. A slot that cannot take the account it was handed (its token will
-    // not refresh, say) stays where it was; the decision is then made again from the slots as they
-    // now are, without that account, and every hand-off made along the way is reported.
+    // not refresh, say) stays where it was, and the decision is made again without that account, as
+    // from the slots as the run found them: a slot already moved for a spec the new decision refuses
+    // goes back to what it held, so a rule that does not land moves nothing. A slot that cannot be
+    // switched back either is reported as left where it is (`stranded`), never as a hand-off.
     const keepOut = new Set(opts.keepOut ?? []);
     const avoid = new Map<string, string>();
+    /** Each slot the run moved: the account it held before the first move, and the one it holds. */
+    const held = new Map<SlotId, { from: string; now: string }>();
+    const stranded = new Map<SlotId, string>();
     let decision: ImportDecision;
     for (;;) {
       renew();
@@ -1925,14 +1976,29 @@ export class SwitchEngine {
         logins: [],
         settle: true,
         avoid,
+        // A stranded slot is decided from where it is: it cannot go back.
+        held: new Map(
+          [...held].flatMap(([slotId, h]) =>
+            stranded.has(slotId) ? [] : [[slotId, h.from] as const],
+          ),
+        ),
       });
-      const moves = await this.executeHandOffLocked(decision.handOffs, renew);
-      moved.handedOff.push(...moves.made);
+      const moves = await this.executeHandOffLocked(
+        importMoves(decision.handOffs, held, stranded),
+        renew,
+      );
+      for (const m of moves.made) {
+        held.set(m.slot, { from: held.get(m.slot)?.from ?? m.from, now: m.to });
+      }
+      moved.handedOff = netHandOffs(held, stranded);
       if (moves.stopped !== undefined) throw moves.stopped;
       if (moves.failed === undefined) break;
-      avoid.set(moves.failed.to, moves.failed.error.message);
+      const { slot, to, error } = moves.failed;
+      avoid.set(to, error.message);
+      // Only a switch back targets the account a slot held before the run.
+      if (held.get(slot)?.from === to) stranded.set(slot, error.message);
       this.log.warn(
-        { accountId: moves.failed.to, reason: errorReason(moves.failed.error) },
+        { slot, accountId: to, reason: errorReason(error) },
         'an import could not move a slot onto an account; deciding again without it',
       );
     }
@@ -2005,8 +2071,9 @@ export class SwitchEngine {
       };
     }
 
-    // 5. The guard snapshot, last, while the lock is still this run's.
-    if (written || moved.handedOff.length > 0) {
+    // 5. The guard snapshot, last, while the lock is still this run's (a slot switched and back
+    // was still switched).
+    if (written || held.size > 0) {
       renew();
       await this.writeSnapshotLocked();
     }
@@ -2048,7 +2115,10 @@ export class SwitchEngine {
    * Who is live in each slot is read from the slots themselves ({@link possibleLiveOwners}), not
    * from what is recorded for them; an account in `pending` or `logins` counts as live where its
    * login runs unrecognized, and an account in `revived` as usable. `avoid` names accounts a slot
-   * could not be switched to in this run, which no slot is moved onto. `settle` says whether a slot
+   * could not be switched to in this run, which no slot is moved onto. `held` names slots this run
+   * has already moved, with the account each held before: the decision is made as if each still
+   * held it, so it is the one the run would have made from the start without the accounts in
+   * `avoid`, and the run moves back a slot it no longer needs moved. `settle` says whether a slot
    * with a switch left unfinished is settled first (the real run), or left to the real run to
    * settle (a plan writes nothing).
    */
@@ -2061,6 +2131,7 @@ export class SwitchEngine {
       settle: boolean;
       revived?: readonly string[];
       avoid?: ReadonlyMap<string, string>;
+      held?: ReadonlyMap<SlotId, string>;
     },
   ): Promise<ImportDecision> {
     const verdicts: Array<ImportRuleVerdict | undefined> = specs.map(() => undefined);
@@ -2095,7 +2166,11 @@ export class SwitchEngine {
       { ...stored, shared: [...stored.shared, ...pendingRows] },
       revived,
     );
-    const states = await this.importStates(stored, [...opts.pending, ...opts.logins]);
+    const states = await this.importStates(
+      stored,
+      [...opts.pending, ...opts.logins],
+      opts.held ?? new Map(),
+    );
     const occupancy = states.owners;
 
     // 2. The rule each spec is, and the scopes no other rule may hold.
@@ -2415,11 +2490,12 @@ export class SwitchEngine {
    * belong to ({@link slotOccupancy}), the account it is recognized as, and whether it holds a login
    * at all. A slot whose live login no stored account is recognized as holds every account of
    * `named` with that login: once the import has stored it (or given it that login), it is the
-   * account live there.
+   * account live there. A slot of `held` holds the account given for it.
    */
   private async importStates(
     picture: RulesPicture,
     named: ReadonlyArray<{ id: string; accountUuid?: string }>,
+    held: ReadonlyMap<SlotId, string>,
   ): Promise<SlotStates> {
     const owners = await this.slotOccupancy(picture);
     const active = new Map<SlotId, string | null>();
@@ -2443,6 +2519,12 @@ export class SwitchEngine {
         }
       }
       active.set(slotId, id);
+    }
+    // A slot the run moved counts as holding what it held before (see decideImportLocked's `held`).
+    for (const [slotId, id] of held) {
+      owners.set(slotId, new Set([id]));
+      active.set(slotId, id);
+      withLogin.add(slotId);
     }
     return { owners, active, withLogin };
   }
@@ -3240,14 +3322,15 @@ export class SwitchEngine {
    * caller reports every slot that moved and decides what to do about the rest. A failure after
    * which nothing more may run (the lock taken over, or a switch that committed and then failed in
    * its bookkeeping) is returned as `stopped`, with every move made, that one included when it
-   * did move the slot. `renew` keeps the lock claimed between moves.
+   * did move the slot. `renew` keeps the lock claimed between moves. A step's `reason` is what the
+   * switch log records for it (by default, freeing the slot for an include).
    */
   private async executeHandOffLocked(
-    plan: ReadonlyArray<{ slotId: SlotId; from: StoredAccount; to: string }>,
+    plan: ReadonlyArray<{ slotId: SlotId; from: { id: string }; to: string; reason?: string }>,
     renew?: () => void,
   ): Promise<{
     made: SlotHandOff[];
-    failed?: { to: string; error: SwitchEngineError };
+    failed?: { slot: SlotId; to: string; error: SwitchEngineError };
     stopped?: Error;
   }> {
     // A slot whose switch is stuck would refuse its move only after the slots before it had moved.
@@ -3261,7 +3344,7 @@ export class SwitchEngine {
         const res = await this.activateInSlot(this.slotRuntime(step.slotId), step.to, {
           force: true,
           origin: 'manual',
-          reason: 'freeing the slot for a folder include',
+          reason: step.reason ?? 'freeing the slot for a folder include',
         });
         made.push({ slot: step.slotId, from: step.from.id, to: res.activeAccountId });
       } catch (err) {
@@ -3275,7 +3358,7 @@ export class SwitchEngine {
           err instanceof SwitchEngineError
             ? err
             : new SwitchEngineError(errorReason(err), 'switch_failed', { cause: err });
-        return { made, failed: { to: step.to, error } };
+        return { made, failed: { slot: step.slotId, to: step.to, error } };
       }
     }
     return { made };
