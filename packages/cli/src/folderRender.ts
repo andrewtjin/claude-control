@@ -43,6 +43,9 @@ export interface PoolEntryView {
   liveElsewhere: string | null;
   /** A dead login: never used until re-logged in. */
   quarantined: boolean;
+  /** A quarantined account that was never logged in here (an import stored it without tokens), as
+   *  opposed to a login that expired. */
+  awaitsLogin?: true;
   /** False for a shared account excluded from auto-switch: usable by hand, never picked unattended. */
   autoTarget: boolean;
 }
@@ -123,8 +126,8 @@ function emptyPoolWords(slot: 'global' | 'rule'): string {
 
 /**
  * Why a slot has no account it can use, from its pool, ending in the fix that applies: a pool that
- * is empty, accounts live in another slot (free that slot), or logins that expired (re-login one).
- * A re-login is suggested only for a login that actually expired.
+ * is empty, accounts live in another slot (free that slot), logins that expired (re-login one), or
+ * accounts never logged in here (log one in). A login is called expired only when it did.
  */
 export function nothingUsableReason(
   pool: readonly PoolEntryView[],
@@ -145,12 +148,20 @@ export function nothingUsableReason(
     );
     parts.push(`${where.join(', ')}; switch that slot to another account to free it`);
   }
-  const dead = pool.filter((e) => e.quarantined);
-  if (dead.length > 0) {
-    const names = dead.map((e) => sanitizeForTerminal(e.label));
+  const expired = pool.filter((e) => e.quarantined && e.awaitsLogin !== true);
+  if (expired.length > 0) {
+    const names = expired.map((e) => sanitizeForTerminal(e.label));
     parts.push(
       `the login of ${names.join(', ')} expired; re-login one: ` +
         `cctl accounts relogin ${shellQuote(names[0]!)}`,
+    );
+  }
+  const waiting = pool.filter((e) => e.quarantined && e.awaitsLogin === true);
+  if (waiting.length > 0) {
+    const names = waiting.map((e) => sanitizeForTerminal(e.label));
+    parts.push(
+      `${names.join(', ')} came without tokens and ${names.length > 1 ? 'are' : 'is'} not ` +
+        `logged in here yet; log one in: cctl accounts relogin ${shellQuote(names[0]!)}`,
     );
   }
   return parts.join('; ');

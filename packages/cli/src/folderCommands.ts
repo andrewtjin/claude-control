@@ -45,7 +45,7 @@ import {
   type SlotId,
   type StoredAccount,
 } from '@claude-control/switch-engine';
-import { defaultPaths } from '@claude-control/switch-engine';
+import { PENDING_LOGIN_REASON, defaultPaths } from '@claude-control/switch-engine';
 import {
   DEFAULT_CONFIRM_TIMEOUT_MS,
   Store,
@@ -348,6 +348,7 @@ export function buildPoolView(
     live: a.id === liveId,
     liveElsewhere: null,
     quarantined: true,
+    ...(a.quarantineReason === PENDING_LOGIN_REASON ? { awaitsLogin: true as const } : {}),
     autoTarget: false,
   });
   const included: PoolEntryView[] = [];

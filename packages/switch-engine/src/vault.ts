@@ -93,6 +93,13 @@ export interface RuleWriter {
     ruleId: string,
     scopes: { folders: readonly string[]; aliases?: readonly StoredAliasScope[] },
   ): Promise<FolderRule>;
+  orderRules(ruleIds: readonly string[]): Promise<unknown>;
+}
+
+/** A {@link Vault.draftRules} draft: the rule writes, and the registry as they leave it. */
+export interface RuleDraft extends RuleWriter {
+  /** Both sides of the registry and the rules as the writes so far leave them. */
+  picture(): RulesPicture;
 }
 
 export interface NewRuleOptions {
@@ -1750,14 +1757,15 @@ export class Vault {
   }
 
   /**
-   * A draft of the registry to try rule writes against, writing nothing: the four rule writes an
-   * import makes, each with exactly the refusals and effects {@link createRule},
-   * {@link includeAccounts}, {@link excludeAccounts} and {@link addScopesToRule} have (the same
-   * code), applied to an in-memory copy read now, with `extraShared` added to its shared side (the
+   * A draft of the registry to try rule writes against, writing nothing: the rule writes an import
+   * makes, each with exactly the refusals and effects {@link createRule}, {@link includeAccounts},
+   * {@link excludeAccounts}, {@link addScopesToRule} and {@link orderRules} have (the same code),
+   * applied to an in-memory copy read now, with `extraShared` added to its shared side (the
    * accounts an import will have stored by the time it writes its rules). Each write sees the ones
-   * before it, so a batch tried here meets every refusal the same batch meets on disk, in order.
+   * before it, so a batch tried here meets every refusal the same batch meets on disk, in order,
+   * and its `picture` is the registry as the batch would leave it.
    */
-  async draftRules(extraShared: readonly StoredAccount[] = []): Promise<RuleWriter> {
+  async draftRules(extraShared: readonly StoredAccount[] = []): Promise<RuleDraft> {
     const st = await this.loadState();
     st.shared = [...st.shared, ...extraShared.map((a) => ({ ...a }))];
     // Each write runs after the ones before it, and its refusal rejects its promise as the
@@ -1779,7 +1787,32 @@ export class Vault {
       excludeAccounts: (ruleId, accountIds) =>
         run(() => this.excludeIn(st, ruleId, accountIds).rule),
       addScopesToRule: (ruleId, scopes) => run(() => this.addScopesIn(st, ruleId, scopes).rule),
+      orderRules: (ruleIds) => run(() => this.orderRulesIn(st, ruleIds)),
+      picture: () => ({ shared: st.shared, reserved: st.reserved, rules: st.rules }),
     };
+  }
+
+  /**
+   * Put the rules `ruleIds` names in that order, among the places they already hold in the file:
+   * an import creates its rules in the order its writes need (every exclusion before any
+   * inclusion), and lists them in the order of the file it read. Writes nothing when they already
+   * are in that order.
+   */
+  async orderRules(ruleIds: readonly string[]): Promise<void> {
+    const st = await this.loadState();
+    if (this.orderRulesIn(st, ruleIds)) await this.saveRules(st);
+  }
+
+  /** {@link orderRules} over `st`; whether anything moved. */
+  private orderRulesIn(st: RegistryState, ruleIds: readonly string[]): boolean {
+    const wanted = [...new Set(ruleIds)].flatMap((id) => st.rules.filter((r) => r.id === id));
+    const places = st.rules.flatMap((r, i) => (wanted.includes(r) ? [i] : []));
+    let moved = false;
+    for (const [k, at] of places.entries()) {
+      if (st.rules[at] !== wanted[k]) moved = true;
+      st.rules[at] = wanted[k]!;
+    }
+    return moved;
   }
 
   /** The scopes {@link addScopesToRule} would add, checked. Pure over `st`. */

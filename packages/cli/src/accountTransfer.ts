@@ -99,6 +99,7 @@ export type TransferEngine = Pick<
   | 'importRules'
   | 'setAutoSwitchExcluded'
   | 'removeAccount'
+  | 'liveSlots'
 >;
 
 /** What writing the export file found out about it. */
@@ -648,8 +649,9 @@ export async function runImport(
 
 /**
  * What to say when nothing is live on this machine's main login after the import: the account to
- * switch it to — a shared, working account auto-switch may use, one this import added first — or,
- * when there is none, that the main login needs one. An account a rule reserves is never named:
+ * switch it to — a shared, working account auto-switch may use that is live in no folder's slot,
+ * one this import added first — or, when there is none, that the main login needs one. An account
+ * a rule reserves is never named:
  * switching to it would only seat it in its rule's slot and leave the main login as it was, and an
  * account kept out of auto-switch (one the file reserves to a rule that was not made) is not named
  * either, so the hint does not spend a client's account on the main login.
@@ -659,8 +661,15 @@ async function mainLoginHint(
   deps: TransferDeps,
 ): Promise<string[]> {
   if ((await deps.engine.getActiveId('global')) !== null) return [];
+  // An account live in a folder's slot is refused by `cctl switch` (an account is live in one slot
+  // at a time), so it is no answer either.
+  const live = new Set((await deps.engine.liveSlots()).values());
   const free = (await deps.engine.listAllAccounts()).filter(
-    (a) => (a.ruleIds ?? []).length === 0 && !a.quarantined && a.autoSwitchExcluded !== true,
+    (a) =>
+      (a.ruleIds ?? []).length === 0 &&
+      !a.quarantined &&
+      a.autoSwitchExcluded !== true &&
+      !live.has(a.id),
   );
   const pick = free.find((a) => accounts.addedIds.includes(a.id)) ?? free[0];
   if (pick !== undefined) {
@@ -681,7 +690,9 @@ async function mainLoginHint(
  * Settle the accounts the plan stored kept out of auto-switch until their rule took them
  * (`awaitsRule`): one a rule here now reserves goes back to auto-switch, as it was on the other
  * machine; one whose rule was not made after all (the engine refused it, or the batch failed)
- * stays kept out, said so, rather than joining the shared pool unannounced.
+ * stays kept out, said so, rather than joining the shared pool unannounced. An account the plan
+ * held back because its rule would not be made (`heldBack`) goes back too, said so, when the real
+ * run made that rule after all (the machine changed between the plan and the run).
  */
 async function settleAwaitingAccounts(
   plan: ImportPlan,
@@ -689,14 +700,18 @@ async function settleAwaitingAccounts(
   engine: TransferEngine,
   report: (line: string, ok: boolean) => void,
 ): Promise<void> {
-  const waiting = plan.accounts.filter((s) => s.kind === 'add' && s.awaitsRule === true);
+  const waiting = plan.accounts.filter(
+    (s) => s.kind === 'add' && (s.awaitsRule === true || s.heldBack === true),
+  );
   if (waiting.length === 0) return;
   const stored = await engine.listAllAccounts();
   for (const step of waiting) {
     const account = stored.find((a) => a.id === localIds.get(step.entry));
     if (account === undefined) continue;
     const include = includeCommand(account.label, plan.platform);
+    const heldBack = step.kind === 'add' && step.heldBack === true;
     if ((account.ruleIds ?? []).length === 0) {
+      if (heldBack) continue;
       report(
         `${safe(account.label)}: kept out of auto-switch (the rule it is reserved to was not ` +
           `made here; ${include} lets auto-switch use it)`,
@@ -706,6 +721,13 @@ async function settleAwaitingAccounts(
     }
     try {
       await engine.setAutoSwitchExcluded(account.id, false);
+      if (heldBack) {
+        report(
+          `${safe(account.label)}: handed back to auto-switch (the rule it is reserved to was ` +
+            'made after all)',
+          true,
+        );
+      }
     } catch (err) {
       if (!(err instanceof SwitchEngineError)) throw err;
       report(
@@ -858,15 +880,17 @@ async function importRules(
       s.kind === 'add' && s.forRule === true ? (localIds.get(s.entry) ?? []) : [],
     );
     try {
+      // A slot is named by its rule as it was when the slot moved (before the batch grew it), as
+      // the dry run names it.
+      const rulesBefore = await engine.listRules();
       const result = await engine.importRules(
         sent.map((s) => s.spec),
         { keepOut },
       );
       const accounts = await engine.listAllAccounts();
-      const rules = await engine.listRules();
       const names: ReportNames = {
         labelOf: (id) => accounts.find((a) => a.id === id)?.label ?? id,
-        slotName: (slot) => slotName(slot, rules),
+        slotName: (slot) => slotName(slot, rulesBefore),
         platform: plan.platform,
       };
       changed = result.handedOff.length > 0;

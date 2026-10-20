@@ -98,7 +98,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
-import { ruleIdOfSlot, ruleSlotId } from './types.js';
+import { PENDING_LOGIN_REASON, ruleIdOfSlot, ruleSlotId } from './types.js';
 import type {
   AccountIdentity,
   AccountView,
@@ -563,7 +563,89 @@ async function writeImportBatch(
       );
     }
   }
+  // The exclusions came first, so a rule with one was made before a rule with only inclusions;
+  // the rules made are then listed in the order of the file.
+  const created = writes.flatMap((w) => (w.ruleId === undefined ? (ruleIds.get(w) ?? []) : []));
+  if (created.length > 1) await writer.orderRules(created);
   return ruleIds;
+}
+
+/** A hand-off plan ({@link SwitchEngine.planHandOffLocked}): the moves, or the slot left with no
+ *  account to move to, the account it is stuck on, and the refusal. */
+type HandOffPlan =
+  | { ok: true; steps: Array<{ slotId: SlotId; from: StoredAccount; to: string }> }
+  | { ok: false; slotId: SlotId; from: StoredAccount; error: RefreshError };
+
+/** Import specs tried against a draft of the registry (see decideImportLocked): their writes, the
+ *  ones the draft refused, the rule each write landed in, and the registry as they leave it. */
+interface TriedBatch {
+  writes: ImportWrite[];
+  refused: Map<number, SwitchEngineError>;
+  ruleIds: Map<ImportWrite, string>;
+  after: RulesPicture;
+}
+
+/** `picture` with the rows of `ids` no longer quarantined: accounts an import gives new tokens
+ *  before it writes its rules, usable by then. */
+function withRevived<P extends RulesPicture>(picture: P, ids: ReadonlySet<string>): P {
+  if (ids.size === 0) return picture;
+  const lift = (rows: readonly StoredAccount[]): StoredAccount[] =>
+    rows.map((a) => (ids.has(a.id) && a.quarantined ? { ...a, quarantined: false } : a));
+  return { ...picture, shared: lift(picture.shared), reserved: lift(picture.reserved) };
+}
+
+/**
+ * The rule cap and the reserved-account cap over the import specs of `indices`, counted in spec
+ * order: each spec that would pass either, with its refusal. Counted afresh for every batch the
+ * decision tries, so a spec refused for another reason never spends room a later one needs.
+ */
+function importCapRefusals(
+  indices: readonly number[],
+  targets: ReadonlyArray<FolderRule | undefined>,
+  members: ReadonlyArray<{ include: readonly string[] }>,
+  stored: RulesPicture,
+  picture: RulesPicture,
+): Map<number, SwitchEngineError> {
+  const refused = new Map<number, SwitchEngineError>();
+  let creates = 0;
+  const reservedByBatch = new Set<string>();
+  for (const i of indices) {
+    const into = targets[i];
+    if (into === undefined && stored.rules.length + creates >= MAX_RULES) {
+      refused.set(i, new VaultError(`cannot create another folder rule (max ${MAX_RULES})`));
+      continue;
+    }
+    const reserving = members[i]!.include.filter(
+      (id) => picture.shared.some((a) => a.id === id) && !reservedByBatch.has(id),
+    );
+    if (stored.reserved.length + reservedByBatch.size + reserving.length > MAX_RESERVED_ACCOUNTS) {
+      refused.set(i, new VaultError(`cannot reserve more than ${MAX_RESERVED_ACCOUNTS} accounts`));
+      continue;
+    }
+    if (into === undefined) creates += 1;
+    for (const id of reserving) reservedByBatch.add(id);
+  }
+  return refused;
+}
+
+/** A slot as a refusal names it: the global slot, or a rule's folder slot by its scopes. */
+function slotPhrase(slotId: SlotId, rules: readonly FolderRule[]): string {
+  const ruleId = ruleIdOfSlot(slotId);
+  if (ruleId === undefined) return 'the global slot';
+  const rule = rules.find((r) => r.id === ruleId);
+  return `the folder slot of ${rule ? describeRule(rule) : slotId}`;
+}
+
+/** Every scope of a rule, as the engine names scopes. */
+function ruleScopeRefs(rule: FolderRule): RuleScopeRef[] {
+  return [
+    ...rule.folders.map((folder): RuleScopeRef => ({ kind: 'folder', folder })),
+    ...(rule.aliases ?? []).map((a): RuleScopeRef => ({
+      kind: 'alias',
+      folder: a.folder,
+      alias: a.alias,
+    })),
+  ];
 }
 
 /** A running Claude Code session as the scope matchers see it: the canonical cwd it runs in (what
@@ -1015,7 +1097,7 @@ export class SwitchEngine {
       const account = await this.vault.addPendingAccount(
         label,
         identity,
-        'imported without tokens - log in with cctl accounts relogin',
+        PENDING_LOGIN_REASON,
         opts,
       );
       await this.refreshSnapshotForAccountsLocked();
@@ -1068,7 +1150,23 @@ export class SwitchEngine {
         stored = await this.readStoredForImport(existing);
         if (stored === undefined) reason = 'missing';
         else if (bundle.claudeAiOauth.expiresAt > stored.claudeAiOauth.expiresAt) reason = 'newer';
-        else return { replaced: false, reason: 'stored_newer', healedLiveLogin: false };
+        else {
+          // The copy here is kept. A row that records no login still learns the one the brought
+          // identity names (the check above proved it is this account), as a replace would have
+          // taught it: a slot running that login is then known to run this account. The stored
+          // tokens are written back unchanged, with the fuller identity.
+          if (existing.accountUuid === undefined) {
+            const identity = importedIdentity(existing, stored.oauthAccount, bundle.oauthAccount);
+            if (identity.accountUuid !== undefined) {
+              await this.vault.writeBundle(existing.id, {
+                claudeAiOauth: stored.claudeAiOauth,
+                oauthAccount: identity,
+              });
+              await this.refreshSnapshotForAccountsLocked();
+            }
+          }
+          return { replaced: false, reason: 'stored_newer', healedLiveLogin: false };
+        }
       }
       const identity = importedIdentity(existing, stored?.oauthAccount, bundle.oauthAccount);
       const { healedLiveLogin } = await this.applyReloginBundle(
@@ -1687,12 +1785,14 @@ export class SwitchEngine {
    * What importing these rules would do (`cctl import --dry-run`), writing nothing: the decision
    * {@link importRules} makes and then carries out, made by the same code under the same lock from
    * the same reads, so a dry run reports what the real run will do. `pending` are the accounts the
-   * import stores before its rules (counted as stored, under the ids the specs name them by), and
-   * `logins` the logins it gives accounts stored here that record none yet.
+   * import stores before its rules (counted as stored, under the ids the specs name them by),
+   * `logins` the logins it gives accounts stored here that record none yet, and `revived` the
+   * quarantined accounts it gives new tokens (usable by the time it writes the rules).
    *
    * What it cannot foresee is what changes between it and the real run, and the run-time state the
    * real run settles first: a session that starts or stops in a slot a rule would empty, a switch
-   * left unfinished in a slot (settled, or refused, only by the real run), and any change to the
+   * left unfinished in a slot (settled, or refused, only by the real run), an account a slot is
+   * moved onto that cannot be switched to then (its token will not refresh), and any change to the
    * accounts, rules or live logins made in between.
    */
   async planImportRules(
@@ -1710,6 +1810,7 @@ export class SwitchEngine {
         pending,
         logins: opts.logins ?? [],
         settle: false,
+        revived: opts.revived ?? [],
       });
       return decision.plan;
     });
@@ -1733,7 +1834,10 @@ export class SwitchEngine {
    *   1. decide ({@link decideImportLocked}, the decision {@link planImportRules} reports): every
    *      refusal, the batch tried against a draft of the registry, and the hand-offs, chosen for
    *      all the slots together.
-   *   2. hand off every slot that holds an account the batch reserves and may not keep it.
+   *   2. hand off every slot that holds an account the batch reserves and may not keep it. A slot
+   *      that cannot take the account chosen for it (its token will not refresh) stays as it was;
+   *      the decision is then made again from the slots as they are, without that account, and
+   *      every slot that did move is reported.
    *   3. add the scopes a grown rule lacks, then write every exclusion, then every inclusion: an
    *      account a later rule reserves is still shared while the exclusions are written, as it was
    *      on the source when they were made.
@@ -1743,7 +1847,9 @@ export class SwitchEngine {
    * Each write is one of the vault's own crash-safe writes, and the batch was tried whole before
    * any of them, so a write fails part-way only when something changed under the lock's holder
    * (another process writing the files by hand) or the process dies; a run that dies part-way
-   * leaves rules the next import grows to completion by their identity.
+   * leaves rules the next import grows to completion by their identity. The lock is renewed between
+   * steps (each move and each seat may refresh a token over the network), so no other process takes
+   * it over while the batch runs.
    *
    * `keepOut` names accounts no slot may be moved to or seated with in steps 2 and 4 unless its own
    * rule includes them (see withoutKeptOut): accounts the import brought for a rule of the machine
@@ -1756,24 +1862,39 @@ export class SwitchEngine {
   ): Promise<ImportRulesResult> {
     this.refuseRuleSlotsOnDarwin();
     await this.vault.readStoredTokens().catch(() => undefined);
-    return this.withCredentialLock(async () => {
+    return this.withCredentialLock(async (renew) => {
       const allIds = memberIdsOf(specs);
       await this.resolveRequested(allIds);
       await this.settleForAccountsLocked(allIds);
 
-      // 1. Decide.
+      // 1-2. Decide, and hand off. A slot that cannot take the account it was handed (its token
+      // will not refresh, say) stays where it was; the decision is then made again from the slots
+      // as they now are, without that account, and every hand-off made along the way is reported.
       const keepOut = new Set(opts.keepOut ?? []);
-      const decision = await this.decideImportLocked(specs, {
-        keepOut,
-        pending: [],
-        logins: [],
-        settle: true,
-      });
-
-      // 2. Hand-offs.
-      const handedOff = await this.executeHandOffLocked(decision.handOffs);
+      const avoid = new Map<string, string>();
+      const handedOff: SlotHandOff[] = [];
+      let decision: ImportDecision;
+      for (;;) {
+        renew();
+        decision = await this.decideImportLocked(specs, {
+          keepOut,
+          pending: [],
+          logins: [],
+          settle: true,
+          avoid,
+        });
+        const moves = await this.executeHandOffLocked(decision.handOffs, renew);
+        handedOff.push(...moves.made);
+        if (moves.failed === undefined) break;
+        avoid.set(moves.failed.to, moves.failed.error.message);
+        this.log.warn(
+          { accountId: moves.failed.to, reason: errorReason(moves.failed.error) },
+          'an import could not move a slot onto an account; deciding again without it',
+        );
+      }
 
       // 3. Scopes, then exclusions, then inclusions.
+      renew();
       const outcomes: Array<ImportRuleOutcome | undefined> = specs.map(() => undefined);
       const ruleIds = await writeImportBatch(
         this.vault,
@@ -1788,7 +1909,8 @@ export class SwitchEngine {
         },
       );
 
-      // 4. Seat each written rule's slot.
+      // 4. Seat each written rule's slot. Only an account the batch includes in a rule is a reason
+      // to move its slot off an account it may keep.
       let written = false;
       for (const write of decision.writes) {
         const ruleId = ruleIds.get(write);
@@ -1797,9 +1919,13 @@ export class SwitchEngine {
         if (outcomes[write.index] !== undefined) continue;
         const rule = await this.vault.getRule(ruleId);
         if (!rule) continue;
+        renew();
         let live: RuleLiveResult | null = null;
         try {
-          live = await this.ensureRuleLiveLocked(rule, { preferIncluded: true, keepOut });
+          live = await this.ensureRuleLiveLocked(rule, {
+            preferIncluded: write.include.length > 0,
+            keepOut,
+          });
         } catch (err) {
           if (!(err instanceof SwitchEngineError)) throw err;
           this.log.warn(
@@ -1829,21 +1955,32 @@ export class SwitchEngine {
    *   1. each spec's scopes, canonicalized as the verbs canonicalize them.
    *   2. the rule it is: the one rule here carrying its identity (two such rules leave none to
    *      grow); any of its scopes held by another rule here, or by an earlier spec, refuses it whole
-   *      (see {@link ImportConflict}).
+   *      (see {@link ImportConflict}), and so does a scope it cannot use here that a rule here
+   *      holds (`absent`).
    *   3. its members as they would land: for a grown rule only the ones it lacks, leaving out one
    *      it holds on the other side, and never an exclusion of an account a rule here reserves
    *      (only a shared account can be excluded). A spec with nothing left to write is unchanged.
-   *   4. the rule cap and the reserved-account cap, counted over the batch in spec order, and an
-   *      exclusion that would empty a slot sessions run in.
+   * Then, until the batch holds (each spec refused below is out for good, and everything after
+   * step 3 is decided again without it):
+   *   4. the rule cap and the reserved-account cap, counted in spec order over the specs still in
+   *      the batch, so room is never spent on a spec refused later.
    *   5. the batch tried against a draft of the registry, in the order it is written; a spec the
-   *      draft refuses is refused, and the batch is tried again without it, so the real batch meets
-   *      no refusal a decision did not.
-   *   6. the hand-offs, chosen for all the slots together; a spec whose reservation would leave a
-   *      slot with nothing is refused, and the choice is made again without it.
+   *      draft refuses is refused, so the real batch meets no refusal the decision did not.
+   *   6. the hand-offs, chosen for all the slots together against the rules as the batch leaves
+   *      them: a slot keeps an account it may still hold then, and moves only onto one it may then
+   *      take (never one the batch excludes from its rule; first one the batch includes in it).
+   *      When some slot is left with nothing, the spec refused is the first, in spec order, whose
+   *      addition leaves it so.
+   *   7. a rule's slot the batch moves off its account (the rule now excludes it) with nothing left
+   *      to seat while sessions run under the rule, judged after the hand-offs, against the rules
+   *      as the batch leaves them, without the accounts kept out, and with the written rules seated
+   *      in turn: the spec growing that rule is refused.
    * Who is live in each slot is read from the slots themselves ({@link possibleLiveOwners}), not
    * from what is recorded for them; an account in `pending` or `logins` counts as live where its
-   * login runs unrecognized. `settle` says whether a slot with a switch left unfinished is settled
-   * first (the real run), or left to the real run to settle (a plan writes nothing).
+   * login runs unrecognized, and an account in `revived` as usable. `avoid` names accounts a slot
+   * could not be switched to in this run, which no slot is moved onto. `settle` says whether a slot
+   * with a switch left unfinished is settled first (the real run), or left to the real run to
+   * settle (a plan writes nothing).
    */
   private async decideImportLocked(
     specs: readonly ImportRuleSpec[],
@@ -1852,6 +1989,8 @@ export class SwitchEngine {
       pending: readonly PendingImportAccount[];
       logins: ReadonlyArray<{ id: string; accountUuid: string }>;
       settle: boolean;
+      revived?: readonly string[];
+      avoid?: ReadonlyMap<string, string>;
     },
   ): Promise<ImportDecision> {
     const verdicts: Array<ImportRuleVerdict | undefined> = specs.map(() => undefined);
@@ -1881,7 +2020,11 @@ export class SwitchEngine {
       createdAtMs: 0,
       updatedAtMs: 0,
     }));
-    const picture: RegistryPicture = { ...stored, shared: [...stored.shared, ...pendingRows] };
+    const revived = new Set(opts.revived ?? []);
+    const picture: RegistryPicture = withRevived(
+      { ...stored, shared: [...stored.shared, ...pendingRows] },
+      revived,
+    );
     const occupancy = await this.importOccupancy(stored, [...opts.pending, ...opts.logins]);
 
     // 2. The rule each spec is, and the scopes no other rule may hold.
@@ -1908,7 +2051,13 @@ export class SwitchEngine {
         refuse(i, new VaultError('the file holds this rule twice; it is imported once'));
         continue;
       }
-      const conflict = this.importConflict(scopes[i]!, into, stored.rules, claimed);
+      const conflict = this.importConflict(
+        scopes[i]!,
+        spec.absent ?? [],
+        into,
+        stored.rules,
+        claimed,
+      );
       if (conflict !== undefined) {
         refuse(i, conflict.error, conflict.conflict);
         continue;
@@ -1962,95 +2111,124 @@ export class SwitchEngine {
       }
     }
 
-    // 4. The caps, in spec order, and a slot an exclusion would empty while sessions run there.
-    let creates = 0;
-    const reservedByBatch = new Set<string>();
-    for (const [i] of specs.entries()) {
-      if (!open(i)) continue;
-      const into = targets[i];
-      const { include, exclude } = members[i]!;
-      try {
-        if (into === undefined && stored.rules.length + creates >= MAX_RULES) {
-          throw new VaultError(`cannot create another folder rule (max ${MAX_RULES})`);
+    // A grown rule's slot is written to: a switch left unfinished there is settled first in the real
+    // run (or refuses the spec), as before any write to it.
+    if (opts.settle) {
+      for (const [i] of specs.entries()) {
+        const into = targets[i];
+        if (!open(i) || into === undefined) continue;
+        try {
+          await this.requireSettledLocked(this.slotRuntime(ruleSlotId(into.id)));
+        } catch (err) {
+          refuse(i, err);
         }
-        const reserving = include.filter(
-          (id) => picture.shared.some((a) => a.id === id) && !reservedByBatch.has(id),
-        );
-        if (
-          stored.reserved.length + reservedByBatch.size + reserving.length >
-          MAX_RESERVED_ACCOUNTS
-        ) {
-          throw new VaultError(`cannot reserve more than ${MAX_RESERVED_ACCOUNTS} accounts`);
-        }
-        if (into !== undefined) {
-          await this.refuseImportEmptyingLocked(into, exclude, picture, occupancy, opts.settle);
-        }
-        if (into === undefined) creates += 1;
-        for (const id of reserving) reservedByBatch.add(id);
-      } catch (err) {
-        refuse(i, err);
       }
     }
 
-    // 5. The batch, tried against a draft until the draft takes all of it.
-    const writesOf = (): ImportWrite[] =>
-      specs.flatMap((spec, i) =>
-        open(i)
-          ? [
-              {
-                index: i,
-                ...(targets[i] !== undefined ? { ruleId: targets[i].id } : {}),
-                scopes: scopes[i]!,
-                gains: members[i]!.gains,
-                include: members[i]!.include,
-                exclude: members[i]!.exclude,
-                ...(spec.label !== undefined ? { label: spec.label } : {}),
-                ...(spec.origin !== undefined ? { origin: spec.origin } : {}),
-              },
-            ]
-          : [],
-      );
-    for (;;) {
+    /** What the import writes for spec `i`. */
+    const writeOf = (i: number): ImportWrite => {
+      const spec = specs[i]!;
+      return {
+        index: i,
+        ...(targets[i] !== undefined ? { ruleId: targets[i].id } : {}),
+        scopes: scopes[i]!,
+        gains: members[i]!.gains,
+        include: members[i]!.include,
+        exclude: members[i]!.exclude,
+        ...(spec.label !== undefined ? { label: spec.label } : {}),
+        ...(spec.origin !== undefined ? { origin: spec.origin } : {}),
+      };
+    };
+    /** The specs of `indices` tried against a draft of the registry, in the order the batch is
+     *  written: the specs the draft refuses, the rule each write landed in, and the registry as the
+     *  batch leaves it (with the quarantine the import lifts lifted). */
+    const tryBatch = async (indices: readonly number[]): Promise<TriedBatch> => {
+      const draft = await this.vault.draftRules(pendingRows);
+      const writes = indices.map(writeOf);
       const refused = new Map<number, SwitchEngineError>();
-      await writeImportBatch(await this.vault.draftRules(pendingRows), writesOf(), (write, err) => {
+      const ruleIds = await writeImportBatch(draft, writes, (write, err) => {
         refused.set(write.index, err);
       });
-      if (refused.size === 0) break;
-      for (const [i, err] of refused) refuse(i, err);
-    }
-
-    // 6. Hand-offs, chosen for the whole batch.
-    const mayKeep = (slotId: SlotId, accountId: string): boolean =>
-      specs.some((_, i) => {
-        const into = targets[i];
-        return (
-          open(i) &&
-          into !== undefined &&
-          ruleSlotId(into.id) === slotId &&
-          (into.include.includes(accountId) || members[i]!.include.includes(accountId))
-        );
-      });
-    let handOffs: Array<{ slotId: SlotId; from: StoredAccount; to: string }> = [];
-    for (;;) {
-      const reservingIds = new Set(specs.flatMap((_, i) => (open(i) ? members[i]!.include : [])));
-      const reserving = picture.shared.filter((a) => reservingIds.has(a.id));
-      const plan = await this.planHandOffLocked(
-        reserving,
+      return { writes, refused, ruleIds, after: withRevived(draft.picture(), revived) };
+    };
+    /** The hand-offs a tried batch needs, judged against the rules as it leaves them: a slot keeps
+     *  an account it may still hold then, and moves only onto one it may. */
+    const handOffsFor = (tried: TriedBatch): Promise<HandOffPlan> => {
+      const reservingIds = new Set(tried.writes.flatMap((w) => w.include));
+      return this.planHandOffLocked(
+        picture.shared.filter((a) => reservingIds.has(a.id)),
         picture,
-        mayKeep,
+        (slotId, accountId) => slotMayHold(slotId, accountId, tried.after),
         opts.keepOut,
         occupancy,
+        { after: tried.after, ...(opts.avoid !== undefined ? { avoid: opts.avoid } : {}) },
       );
-      if (plan.ok) {
-        handOffs = plan.steps;
-        break;
-      }
-      for (const [i] of specs.entries()) {
-        if (open(i) && members[i]!.include.includes(plan.from.id)) refuse(i, plan.error);
-      }
-    }
+    };
 
-    const writes = writesOf();
+    // 4-7, until the batch holds: the caps are counted over the specs still in it, the batch is tried
+    // against a draft, the hand-offs are chosen against the rules as it leaves them, and the slots
+    // it leaves without an account are checked. A spec refused by any of these is out for good and
+    // the whole batch is decided again without it, so a cap is never spent by a spec refused later.
+    let capped = new Map<number, SwitchEngineError>();
+    let handOffs: Array<{ slotId: SlotId; from: StoredAccount; to: string }> = [];
+    let writes: ImportWrite[] = [];
+    for (;;) {
+      // 4. The caps, in spec order.
+      capped = importCapRefusals(
+        specs.flatMap((_, i) => (open(i) ? [i] : [])),
+        targets,
+        members,
+        stored,
+        picture,
+      );
+      const batch = specs.flatMap((_, i) => (open(i) && !capped.has(i) ? [i] : []));
+
+      // 5. The batch, tried against a draft.
+      const tried = await tryBatch(batch);
+      if (tried.refused.size > 0) {
+        for (const [i, err] of tried.refused) refuse(i, err);
+        continue;
+      }
+
+      // 6. The hand-offs, chosen for the whole batch. When some slot is left with nothing, the spec
+      //    refused is the first one, in spec order, whose addition leaves it so.
+      const plan = await handOffsFor(tried);
+      if (!plan.ok) {
+        const culprit = await this.firstSpecLeavingNoHandOff(batch, tryBatch, handOffsFor);
+        const i = culprit?.index ?? batch.at(-1)!;
+        const short = culprit?.plan ?? plan;
+        refuse(
+          i,
+          members[i]!.include.includes(short.from.id)
+            ? short.error
+            : new RefreshError(
+                `it would leave ${slotPhrase(short.slotId, picture.rules)} with no account to ` +
+                  `switch to, once "${short.from.label}" moves off it for another rule of the file`,
+                short.error.code,
+              ),
+        );
+        continue;
+      }
+
+      // 7. A slot the batch moves off its account and leaves with nothing, while sessions run there.
+      const emptied = await this.importEmptyingRefusal(
+        tried,
+        plan.steps,
+        picture,
+        occupancy,
+        targets,
+        opts,
+      );
+      if (emptied !== undefined) {
+        refuse(emptied.index, emptied.error);
+        continue;
+      }
+      handOffs = plan.steps;
+      writes = tried.writes;
+      break;
+    }
+    for (const [i, err] of capped) refuse(i, err);
+
     for (const write of writes) {
       const { include, exclude, leftOut, gains } = members[write.index]!;
       const into = targets[write.index];
@@ -2067,6 +2245,76 @@ export class SwitchEngine {
       writes,
       handOffs,
     };
+  }
+
+  /** The first spec of `batch`, in spec order, whose addition to the ones before it leaves some slot
+   *  with no account to move to, with the hand-off plan that fails there. */
+  private async firstSpecLeavingNoHandOff(
+    batch: readonly number[],
+    tryBatch: (indices: readonly number[]) => Promise<TriedBatch>,
+    handOffsFor: (tried: TriedBatch) => Promise<HandOffPlan>,
+  ): Promise<{ index: number; plan: Extract<HandOffPlan, { ok: false }> } | undefined> {
+    for (let k = 1; k <= batch.length; k += 1) {
+      const plan = await handOffsFor(await tryBatch(batch.slice(0, k)));
+      if (!plan.ok) return { index: batch[k - 1]!, plan };
+    }
+    return undefined;
+  }
+
+  /**
+   * The running-session refusal for a batch: a rule's slot the batch moves off its account (the rule
+   * now excludes it) with nothing left to seat while sessions run under the rule. Judged as the real
+   * run will meet it: after the hand-offs, against the rules as the batch leaves them (so an account
+   * another spec reserves is no replacement), without the accounts kept out, and with the written
+   * rules seated in turn, each taking the first account left for it. The spec refused is the one
+   * growing that rule.
+   */
+  private async importEmptyingRefusal(
+    tried: TriedBatch,
+    handOffs: ReadonlyArray<{ slotId: SlotId; from: StoredAccount; to: string }>,
+    before: RulesPicture,
+    occupancy: Map<SlotId, Set<string>>,
+    targets: ReadonlyArray<FolderRule | undefined>,
+    opts: { keepOut: ReadonlySet<string>; avoid?: ReadonlyMap<string, string> },
+  ): Promise<{ index: number; error: unknown } | undefined> {
+    const live = new Map([...occupancy].map(([slot, owners]) => [slot, new Set(owners)]));
+    for (const step of handOffs) {
+      const owners = live.get(step.slotId);
+      owners?.delete(step.from.id);
+      owners?.add(step.to);
+    }
+    const { after } = tried;
+    for (const write of tried.writes) {
+      const ruleId = tried.ruleIds.get(write);
+      if (ruleId === undefined) continue;
+      const slotId = ruleSlotId(ruleId);
+      const owners = live.get(slotId) ?? new Set<string>();
+      const legit = legitimateOccupancy(live, after);
+      const keeps = [...owners].some(
+        (id) => slotMayHold(slotId, id, after) && liveElsewhere(slotId, id, legit) === null,
+      );
+      if (keeps) continue;
+      const next = availableInOrder(
+        withoutKeptOut(slotPool(slotId, after, live), opts.keepOut),
+      ).filter((a) => opts.avoid?.has(a.id) !== true);
+      if (next.length > 0) {
+        live.set(slotId, new Set([next[0]!.id]));
+        continue;
+      }
+      const into = targets[write.index];
+      const movedOff = [...owners].find(
+        (id) => slotMayHold(slotId, id, before) && !slotMayHold(slotId, id, after),
+      );
+      if (into === undefined || movedOff === undefined) continue;
+      const label =
+        [...before.shared, ...before.reserved].find((a) => a.id === movedOff)?.label ?? movedOff;
+      try {
+        await this.refuseEmptyingWhileRunning(into, [], `excluding "${label}"`, false);
+      } catch (err) {
+        return { index: write.index, error: err };
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -2091,15 +2339,19 @@ export class SwitchEngine {
   /**
    * Why a spec's `scopes` may not land whole here, or undefined: one of them is held by a rule of
    * this machine other than `into` (the rule the spec grows), or by an earlier spec of the batch
-   * (`claimed`). The refusal names the scope and the rule holding it.
+   * (`claimed`). A scope of the spec that cannot be used here (`absent`) counts too when a rule here
+   * holds it: made on the rest, the file's one rule would be split in two. The refusal names the
+   * scope and the rule holding it, with every scope that rule holds.
    */
   private importConflict(
     scopes: readonly RuleScopeRef[],
+    absent: readonly RuleScopeRef[],
     into: FolderRule | undefined,
     rules: readonly FolderRule[],
     claimed: ReadonlySet<string>,
   ): { error: VaultError; conflict: ImportConflict } | undefined {
-    for (const scope of scopes) {
+    const usable = new Set(scopes);
+    for (const scope of [...scopes, ...absent]) {
       const holder =
         scope.kind === 'folder'
           ? exactFolderRule(scope.folder, rules, this.platform)
@@ -2110,10 +2362,13 @@ export class SwitchEngine {
             `${scopePhrase(scope)} already has a rule here ("${holder.label}"), which is not the ` +
               "file's rule; a rule is imported whole or not at all",
           ),
-          conflict: { scope, rule: { id: holder.id, label: holder.label } },
+          conflict: {
+            scope,
+            rule: { id: holder.id, label: holder.label, scopes: ruleScopeRefs(holder) },
+          },
         };
       }
-      if (claimed.has(this.scopeKey(scope))) {
+      if (usable.has(scope) && claimed.has(this.scopeKey(scope))) {
         return {
           error: new VaultError(`${scopePhrase(scope)} is in an earlier rule of the file too`),
           conflict: { scope },
@@ -2121,37 +2376,6 @@ export class SwitchEngine {
       }
     }
     return undefined;
-  }
-
-  /**
-   * The running-session refusal for a grown rule's exclusions: excluding an account live in the
-   * rule's slot moves the slot off it, and when nothing is left for the slot while sessions run
-   * there, the spec is refused. With `settle`, a switch left unfinished in the slot is settled
-   * first (or refuses the spec), as before any write to it.
-   */
-  private async refuseImportEmptyingLocked(
-    rule: FolderRule,
-    exclude: readonly string[],
-    picture: RegistryPicture,
-    occupancy: Map<SlotId, Set<string>>,
-    settle: boolean,
-  ): Promise<void> {
-    const slotId = ruleSlotId(rule.id);
-    if (settle) await this.requireSettledLocked(this.slotRuntime(slotId));
-    const owners = occupancy.get(slotId) ?? new Set<string>();
-    const movedOff = exclude.find((id) => owners.has(id));
-    if (movedOff === undefined) return;
-    const after = withRule(picture, {
-      ...rule,
-      exclude: [...new Set([...rule.exclude, ...exclude])],
-    });
-    const label = picture.shared.find((a) => a.id === movedOff)?.label ?? movedOff;
-    await this.refuseEmptyingWhileRunning(
-      rule,
-      availableInOrder(slotPool(slotId, after, occupancy)),
-      `excluding "${label}"`,
-      false,
-    );
   }
 
   /** A scope's uniqueness key here, as the store compares scopes. */
@@ -2754,27 +2978,30 @@ export class SwitchEngine {
   ): Promise<SlotHandOff[]> {
     const plan = await this.planHandOffLocked(reserving, picture, (slotId) => slotId === ownSlot);
     if (!plan.ok) throw plan.error;
-    return this.executeHandOffLocked(plan.steps);
+    const moves = await this.executeHandOffLocked(plan.steps);
+    if (moves.failed !== undefined) throw moves.failed.error;
+    return moves.made;
   }
 
   /** Choose every hand-off {@link handOffLocked} would make, moving nothing: each slot that holds an
    *  account being reserved and may not keep it (`mayKeep` says which slot may keep which account),
    *  and the account it would move to. When some slot is left with none, says which account it is
    *  stuck on, with the refusal. Who is live where is read from the slots unless the caller passes
-   *  what it already read (`occupancy`). */
+   *  what it already read (`occupancy`). A slot's replacements come from its pool once the accounts
+   *  are reserved, or, for a caller that writes more than the reservations (an import batch), from
+   *  the registry as it will leave it (`after`); `avoid` names accounts a slot could not be moved
+   *  onto just now, and why, which are no replacement. */
   private async planHandOffLocked(
     reserving: readonly StoredAccount[],
     picture: RegistryPicture,
     mayKeep: (slotId: SlotId, accountId: string) => boolean,
     keepOut?: ReadonlySet<string>,
     occupancy?: Map<SlotId, Set<string>>,
-  ): Promise<
-    | { ok: true; steps: Array<{ slotId: SlotId; from: StoredAccount; to: string }> }
-    | { ok: false; from: StoredAccount; error: RefreshError }
-  > {
+    leaves: { after?: RulesPicture; avoid?: ReadonlyMap<string, string> } = {},
+  ): Promise<HandOffPlan> {
     if (reserving.length === 0) return { ok: true, steps: [] };
     const ids = new Set(reserving.map((a) => a.id));
-    const after: RulesPicture = {
+    const after: RulesPicture = leaves.after ?? {
       shared: picture.shared.filter((a) => !ids.has(a.id)),
       reserved: [...picture.reserved, ...reserving],
       rules: picture.rules,
@@ -2787,7 +3014,9 @@ export class SwitchEngine {
       moving.push({
         slotId,
         from,
-        options: availableInOrder(withoutKeptOut(slotPool(slotId, after, live), keepOut)),
+        options: availableInOrder(withoutKeptOut(slotPool(slotId, after, live), keepOut)).filter(
+          (a) => leaves.avoid?.has(a.id) !== true,
+        ),
       });
     }
     const assigned = assignDistinct(moving.map((m) => m.options.map((a) => a.id)));
@@ -2795,8 +3024,9 @@ export class SwitchEngine {
       const short = moving[assigned.unserved]!;
       return {
         ok: false,
+        slotId: short.slotId,
         from: short.from,
-        error: this.noReplacementError(short.slotId, short.from, picture),
+        error: this.noReplacementError(short.slotId, short.from, picture, leaves.avoid),
       };
     }
     return {
@@ -2805,24 +3035,36 @@ export class SwitchEngine {
     };
   }
 
-  /** Make the hand-offs {@link planHandOffLocked} chose. */
+  /**
+   * Make the hand-offs {@link planHandOffLocked} chose, in order. A move that fails (the account's
+   * token will not refresh, say) is undone in its own slot by the switch, and stops the rest: the
+   * moves already made are returned with the one that failed, so the caller reports every slot
+   * that moved and decides what to do about the rest. `renew` keeps the lock claimed between moves.
+   */
   private async executeHandOffLocked(
     plan: ReadonlyArray<{ slotId: SlotId; from: StoredAccount; to: string }>,
-  ): Promise<SlotHandOff[]> {
+    renew?: () => void,
+  ): Promise<{ made: SlotHandOff[]; failed?: { to: string; error: SwitchEngineError } }> {
     // A slot whose switch is stuck would refuse its move only after the slots before it had moved.
     for (const step of plan) await this.requireSettledLocked(this.slotRuntime(step.slotId));
-    const handedOff: SlotHandOff[] = [];
+    const made: SlotHandOff[] = [];
     for (const step of plan) {
-      // A deliberate operator move: forced past the cadence guard (an include should never be blocked
-      // by a recent hop), and the outgoing account's rotation is adopted by the switch itself.
-      const res = await this.activateInSlot(this.slotRuntime(step.slotId), step.to, {
-        force: true,
-        origin: 'manual',
-        reason: 'freeing the slot for a folder include',
-      });
-      handedOff.push({ slot: step.slotId, from: step.from.id, to: res.activeAccountId });
+      renew?.();
+      try {
+        // A deliberate operator move: forced past the cadence guard (an include should never be
+        // blocked by a recent hop), and the outgoing account's rotation is adopted by the switch.
+        const res = await this.activateInSlot(this.slotRuntime(step.slotId), step.to, {
+          force: true,
+          origin: 'manual',
+          reason: 'freeing the slot for a folder include',
+        });
+        made.push({ slot: step.slotId, from: step.from.id, to: res.activeAccountId });
+      } catch (err) {
+        if (!(err instanceof SwitchEngineError) || this.isSimulatedDeath(err)) throw err;
+        return { made, failed: { to: step.to, error: err } };
+      }
     }
-    return handedOff;
+    return { made };
   }
 
   /** The refusal of an include that would leave a slot holding a newly reserved account with no
@@ -2831,19 +3073,26 @@ export class SwitchEngine {
     slotId: SlotId,
     from: StoredAccount,
     picture: RulesPicture,
+    avoid?: ReadonlyMap<string, string>,
   ): RefreshError {
+    // Accounts the slot could have moved to but could not be switched to just now, and why.
+    const labelOf = (id: string): string =>
+      [...picture.shared, ...picture.reserved].find((a) => a.id === id)?.label ?? id;
+    const failed = [...(avoid ?? [])].map(([id, why]) => `"${labelOf(id)}" (${why})`);
+    const note = failed.length > 0 ? `; it could not be switched to ${failed.join(', ')}` : '';
     const ruleId = ruleIdOfSlot(slotId);
     if (ruleId === undefined) {
       return new RefreshError(
         `cannot include "${from.label}": it is the only usable shared account, so reserving it ` +
-          'would leave the global slot with none',
+          `would leave the global slot with none${note}`,
         'no_shared_account_remains',
       );
     }
     const rule = picture.rules.find((r) => r.id === ruleId);
     return new RefreshError(
       `cannot include "${from.label}": it is live in the folder slot of ` +
-        `${rule ? describeRule(rule) : slotId}, and that folder has no other account to switch to`,
+        `${rule ? describeRule(rule) : slotId}, and that folder has no other account to switch to` +
+        note,
       'no_account_remains',
     );
   }
@@ -5897,11 +6146,26 @@ export class SwitchEngine {
    * registry writer — in-process and across separate CLI processes — funnels through one mutex.
    * The lock is NOT reentrant, so only callers that do not already hold it may use this; the
    * switch state machine holds the lock itself and reaches the vault directly instead.
+   *
+   * Another process takes the lock over from a holder older than LOCK_STALE_MS, alive or not, and
+   * each locked network call is sized to fit in that once. Work that makes several such calls under
+   * one hold (an import seating rule after rule) calls `renew` between them: the claim is
+   * restamped, so every step gets the whole window, and a claim already taken over stops the work
+   * there, before it writes over what the new holder does.
    */
-  private async withCredentialLock<T>(mutate: () => Promise<T>): Promise<T> {
+  private async withCredentialLock<T>(mutate: (renew: () => void) => Promise<T>): Promise<T> {
     const lock = await acquireLock(this.lockDir(), this.clock, this.lockOptions);
+    const renew = (): void => {
+      if (!lock.refresh()) {
+        throw new SwitchEngineError(
+          'another cctl process took the credential lock over while this change was running; it ' +
+            'stopped there, and running it again finishes it',
+          'lock_lost',
+        );
+      }
+    };
     try {
-      return await mutate();
+      return await mutate(renew);
     } finally {
       lock.release();
     }

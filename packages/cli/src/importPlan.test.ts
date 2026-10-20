@@ -455,6 +455,11 @@ describe('planImport: rules', () => {
           { kind: 'folder', folder: '/proj' },
           { kind: 'folder', folder: '/other' },
         ],
+        // Nothing is made on these, but a rule here holding one keeps the rule from landing.
+        absent: [
+          { kind: 'folder', folder: '/gone' },
+          { kind: 'folder', folder: '/vault' },
+        ],
         include: [PENDING(0)],
         exclude: [],
         origin: ORIGIN,
@@ -528,6 +533,7 @@ describe('planImport: rules', () => {
         },
       ],
       logins: [],
+      revived: [],
     });
   });
 
@@ -598,6 +604,11 @@ describe('planImport: rules', () => {
   });
 
   it('shows a rule the engine refuses as not imported, and how to merge it by hand', async () => {
+    // The rule here holds the folder and a session alias in it; removing it takes both resets.
+    const held: RuleScopeRef[] = [
+      { kind: 'folder', folder: '/proj' },
+      { kind: 'alias', folder: '/proj', alias: 'a b' },
+    ];
     const refused =
       (scope: RuleScopeRef): PlanRules =>
       () =>
@@ -606,7 +617,7 @@ describe('planImport: rules', () => {
             {
               kind: 'refused',
               message: 'it is held here',
-              conflict: { scope, rule: { id: 'rule-here', label: 'mine' } },
+              conflict: { scope, rule: { id: 'rule-here', label: 'mine', scopes: held } },
             },
           ],
           handOffs: [],
@@ -628,8 +639,8 @@ describe('planImport: rules', () => {
     );
     expect(byFolder).toContain(
       '  folder /proj, session "a b" in /proj: not imported - it is held here; to bring them ' +
-        "together, remove the rule here (cctl folder reset '/proj') and import again, or give " +
-        "it the file's accounts by hand (cctl folder include '/proj' <accounts>)\n",
+        "together, remove the rule here (cctl folder reset '/proj'; cctl session reset 'a b' " +
+        "--cwd '/proj') and import again\n",
     );
     const byAlias = renderImportPlan(
       await planImport(
@@ -640,7 +651,8 @@ describe('planImport: rules', () => {
       ),
     );
     expect(byAlias).toContain("cctl session reset 'a b' --cwd '/proj'");
-    expect(byAlias).toContain("cctl session include 'a b' <accounts> --cwd '/proj'");
+    // Giving the rule here the file's accounts by hand would never let the import land it.
+    expect(byAlias).not.toContain('cctl session include');
   });
 
   it('shows every slot the engine says the rules move, by the names here', async () => {

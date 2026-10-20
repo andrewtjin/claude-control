@@ -2407,10 +2407,23 @@ async function dryThenReal(
   return { dry, real: ruleSection(m.out.join('')), failed };
 }
 
-/** Every line the dry run printed for the rules is the line the real run printed. */
+/** Lines only a real run prints under the rules, about what happened once they were written: a
+ *  slot left with no working account, sessions that keep their account until relaunched, and an
+ *  account the run kept out of, or handed back to, auto-switch. */
+const AFTER_THE_WRITE = [
+  /^ {4}no account is live in its slot yet/,
+  /^ {4}\d+ running session\(s\) under /,
+  /^ {2}\S.*: (?:still )?kept out of auto-switch\b/,
+  /^ {2}\S.*: handed back to auto-switch\b/,
+];
+
+/** The real run printed exactly the rule lines its dry run did, in the past tense and in the same
+ *  order: no verdict, member, scope or slot move more or fewer, beside what only a real run can
+ *  say about the rules it wrote. */
 function expectSameVerdicts(run: { dry: string[]; real: string[] }): void {
   expect(run.dry.length).toBeGreaterThan(0);
-  for (const line of run.dry) expect(run.real).toContain(asDone(line));
+  const real = run.real.filter((line) => !AFTER_THE_WRITE.some((re) => re.test(line)));
+  expect(real).toEqual(run.dry.map(asDone));
 }
 
 /** The credential store over a rule's profile, to plant what a by-hand login there leaves. */
@@ -2701,5 +2714,373 @@ describe('the dry run is the decision the real run makes', () => {
     expect(rules).toHaveLength(2);
     expect(rules.find((r) => r.id !== sideRule.id)!.include).toEqual([client.id]);
     expect(await b.engine.getActiveId(ruleSlotId(sideRule.id))).toBe(work.id);
+  });
+});
+
+describe('what the dry run foresees of the accounts the import stores first', () => {
+  const RULE = '8c8c8c8c-8c8c-4c8c-8c8c-8c8c8c8c8c8c';
+
+  it('decides as the real run does when --replace gives a quarantined login new tokens', async () => {
+    const b = await machine();
+    const client = await b.engine.addAccount('client', bundle('C1', 'u-client'));
+    await b.engine.activate(client.id);
+    const spare = await b.engine.addAccount('spare', bundle('S1', 'u-spare'));
+    await b.vault.quarantine(spare.id, 'invalid_grant');
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: [
+          { label: 'client', accountUuid: 'u-client', autoSwitchExcluded: false },
+          {
+            label: 'spare',
+            accountUuid: 'u-spare',
+            autoSwitchExcluded: false,
+            bundle: bundle('S2', 'u-spare'),
+          },
+          {
+            label: 'fresh',
+            accountUuid: 'u-fresh',
+            autoSwitchExcluded: false,
+            bundle: bundle('F1', 'u-fresh'),
+          },
+        ],
+        rules: [
+          {
+            label: 'r',
+            origin: RULE,
+            folders: [await folder(b, 'proj')],
+            aliases: [],
+            include: ['u-client', 'u-fresh'],
+            exclude: [],
+          },
+        ],
+      }),
+    );
+
+    b.out.length = 0;
+    expect(await importInto(b, file, { dryRun: true, replace: true })).toEqual({ failed: 0 });
+    const dry = ruleSection(b.out.join(''));
+    expect(dry).toContain('  the global slot moves off client onto spare');
+    b.out.length = 0;
+    expect(await importInto(b, file, { replace: true })).toEqual({ failed: 0 });
+    expectSameVerdicts({ dry, real: ruleSection(b.out.join('')) });
+    expect(await b.engine.getActiveId('global')).toBe(spare.id);
+    const fresh = (await b.engine.listAllAccounts()).find((a) => a.label === 'fresh')!;
+    expect(fresh.autoSwitchExcluded).not.toBe(true);
+  });
+
+  it('decides as the real run does when --replace keeps a newer stored copy of a login it records', async () => {
+    const CID = '5e5e5e5e-5e5e-4e5e-8e5e-5e5e5e5e5e5e';
+    const b = await machine();
+    const first = await sealedFile(
+      b,
+      filePayload({
+        accounts: [
+          {
+            label: 'client',
+            id: CID,
+            emailAddress: 'c@x.com',
+            autoSwitchExcluded: false,
+            bundle: {
+              claudeAiOauth: {
+                accessToken: 'C0',
+                refreshToken: 'r-C0',
+                expiresAt: Date.now() + 10 * HOUR,
+              },
+              oauthAccount: { emailAddress: 'c@x.com' },
+            },
+          },
+        ],
+      }),
+      'first.cctl',
+    );
+    expect(await importInto(b, first)).toEqual({ failed: 0 });
+    const other = await b.engine.addAccount('other', bundle('O1', 'u-other'));
+    await b.engine.activate(other.id);
+    const live = new CredentialStore(b.paths);
+    await live.writeLiveCredentials(bundle('C-LIVE', 'u-c').claudeAiOauth);
+    await live.writeOauthAccount({ accountUuid: 'u-c', emailAddress: 'c@x.com' });
+    const second = await sealedFile(
+      b,
+      filePayload({
+        accounts: [
+          {
+            label: 'client',
+            id: CID,
+            accountUuid: 'u-c',
+            emailAddress: 'c@x.com',
+            autoSwitchExcluded: false,
+            // Older than the copy stored here, which the real run keeps.
+            bundle: {
+              claudeAiOauth: {
+                accessToken: 'C-OLD',
+                refreshToken: 'r-C-OLD',
+                expiresAt: Date.now() + HOUR,
+              },
+              oauthAccount: { accountUuid: 'u-c', emailAddress: 'c@x.com' },
+            },
+          },
+        ],
+        rules: [
+          {
+            label: 'r',
+            folders: [await folder(b, 'proj')],
+            aliases: [],
+            include: ['u-c'],
+            exclude: [],
+          },
+        ],
+      }),
+      'second.cctl',
+    );
+
+    b.out.length = 0;
+    await importInto(b, second, { dryRun: true, replace: true });
+    const dry = ruleSection(b.out.join(''));
+    expect(dry).toContain('  the global slot moves off client onto other');
+    b.out.length = 0;
+    expect(await importInto(b, second, { replace: true })).toEqual({ failed: 0 });
+    expectSameVerdicts({ dry, real: ruleSection(b.out.join('')) });
+    expect(await b.engine.getActiveId('global')).toBe(other.id);
+  });
+});
+
+describe('a rule of the file next to a rule of this machine', () => {
+  it('fails whole when a rule here holds a folder of it that is gone from this machine', async () => {
+    const b = await machine();
+    const y = await b.engine.addAccount('y', bundle('Y1', 'u-y'));
+    await b.engine.addAccount('s', bundle('S1', 'u-s'));
+    const old = await folder(b, 'old');
+    await b.vault.createRule({ folders: [old], include: [y.id], label: 'mine' });
+    await rm(old, { recursive: true });
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: [
+          {
+            label: 'x',
+            accountUuid: 'u-x',
+            autoSwitchExcluded: false,
+            bundle: bundle('X1', 'u-x'),
+          },
+        ],
+        rules: [
+          {
+            label: 'theirs',
+            origin: '9d9d9d9d-9d9d-4d9d-8d9d-9d9d9d9d9d9d',
+            folders: [await folder(b, 'app'), old],
+            aliases: [],
+            include: ['u-x'],
+            exclude: [],
+          },
+        ],
+      }),
+    );
+
+    b.out.length = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 1 });
+    expect(b.out.join('')).toContain('already has a rule here ("mine")');
+    expect((await b.engine.listRules()).map((r) => r.label)).toEqual(['mine']);
+  });
+
+  it('names a merge by hand that lets the next import land, for a rule here on several folders', async () => {
+    const b = await machine();
+    const x = await b.engine.addAccount('x', bundle('X1', 'u-x'));
+    const y = await b.engine.addAccount('y', bundle('Y1', 'u-y'));
+    await b.engine.addAccount('s', bundle('S1', 'u-s'));
+    const p = await folder(b, 'p');
+    const q = await folder(b, 'q');
+    await b.vault.createRule({ folders: [p, q], include: [x.id], label: 'mine' });
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: [
+          { label: 'x', accountUuid: 'u-x', autoSwitchExcluded: false },
+          { label: 'y', accountUuid: 'u-y', autoSwitchExcluded: false },
+        ],
+        rules: [
+          {
+            label: 'theirs',
+            origin: '7e7e7e7e-7e7e-4e7e-8e7e-7e7e7e7e7e7e',
+            folders: [p, q],
+            aliases: [],
+            include: ['u-x', 'u-y'],
+            exclude: [],
+          },
+        ],
+      }),
+    );
+
+    b.out.length = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 1 });
+    const report = b.out.join('');
+    for (const f of [p, q]) {
+      expect(report).toContain(`cctl folder reset ${shellQuote(f, process.platform)}`);
+    }
+    expect(report).not.toContain('cctl folder include');
+
+    // Following the hint: every folder of the rule here reset, which removes it.
+    for (const f of [p, q]) await b.engine.resetFolder(f);
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    const rules = await b.engine.listRules();
+    expect(rules).toHaveLength(1);
+    expect(rules[0]!.include.sort()).toEqual([x.id, y.id].sort());
+  });
+});
+
+describe('the lines a real run prints', () => {
+  it("names a moved slot the way its dry run did, when the batch grows that slot's rule", async () => {
+    const b = await machine();
+    const eve = await b.engine.addAccount('eve', bundle('E1', 'u-eve'));
+    const frank = await b.engine.addAccount('frank', bundle('F1', 'u-frank'));
+    const gg = await b.engine.addAccount('gg', bundle('G1', 'u-gg'));
+    await b.engine.activate(gg.id);
+    const p5 = await folder(b, 'p5');
+    const side = await b.engine.excludeInFolder(p5, [gg.id]);
+    expect(await b.engine.getActiveId(ruleSlotId(side.rule.id))).toBe(eve.id);
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: [
+          { label: 'eve', accountUuid: 'u-eve', autoSwitchExcluded: false },
+          { label: 'frank', accountUuid: 'u-frank', autoSwitchExcluded: false },
+          { label: 'gg', accountUuid: 'u-gg', autoSwitchExcluded: false },
+        ],
+        rules: [
+          {
+            label: p5,
+            origin: side.rule.id,
+            folders: [p5, await folder(b, 'q3')],
+            aliases: [],
+            include: [],
+            exclude: ['u-gg'],
+          },
+          {
+            label: 'p1',
+            folders: [await folder(b, 'p1')],
+            aliases: [],
+            include: ['u-eve'],
+            exclude: [],
+          },
+        ],
+      }),
+    );
+
+    const run = await dryThenReal(b, file);
+    expect(run.failed).toBe(0);
+    expect(run.dry).toContain(`  the folder slot of ${p5} moves off eve onto frank`);
+    expectSameVerdicts(run);
+    expect(await b.engine.getActiveId(ruleSlotId(side.rule.id))).toBe(frank.id);
+  });
+
+  it('names an account for the main login that is free to take it', async () => {
+    // The file's exclude-only rule is seated with dave, the first account the import adds; the
+    // main login is left empty, and dave cannot take it while it runs that rule's folder.
+    const b = await machine();
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: ['dave', 'frank', 'eve'].map((label) => ({
+          label,
+          accountUuid: `u-${label}`,
+          autoSwitchExcluded: false,
+          bundle: bundle(label.toUpperCase(), `u-${label}`),
+        })),
+        rules: [
+          {
+            label: 'p1',
+            folders: [await folder(b, 'p1')],
+            aliases: [],
+            include: [],
+            exclude: ['u-eve'],
+          },
+        ],
+      }),
+    );
+
+    b.out.length = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    const rule = (await b.engine.listRules())[0]!;
+    const accounts = await b.engine.listAllAccounts();
+    const dave = accounts.find((a) => a.label === 'dave')!;
+    expect(await b.engine.getActiveId(ruleSlotId(rule.id))).toBe(dave.id);
+    const hint = b.out
+      .join('')
+      .split('\n')
+      .find((l) => l.includes('cctl switch'));
+    expect(hint).toBeDefined();
+    const named = accounts.find((a) => hint!.endsWith(shellQuote(a.label, process.platform)))!;
+    expect(named.label).toBe('frank');
+    await expect(b.engine.activate(named.id)).resolves.toBeDefined();
+  });
+});
+
+describe('the comparison of a dry run with its real run', () => {
+  it('fails a real run that printed a line its dry run did not, or left one out', () => {
+    const dry = ['  folder /p: create, include x'];
+    const created = '  folder /p: created, include x';
+    const moved = '  the global slot switched off x (now reserved) and is on y';
+    expect(() => expectSameVerdicts({ dry, real: [created] })).not.toThrow();
+    expect(() => expectSameVerdicts({ dry, real: [created, moved] })).toThrow();
+    expect(() =>
+      expectSameVerdicts({
+        dry: [...dry, '  the global slot moves off x onto y'],
+        real: [created],
+      }),
+    ).toThrow();
+    // What only a real run can say about a rule it wrote is not a difference.
+    expect(() =>
+      expectSameVerdicts({
+        dry,
+        real: [created, '    no account is live in its slot yet (cctl folders shows why)'],
+      }),
+    ).not.toThrow();
+  });
+});
+
+describe('an account held back for a rule the plan would not make', () => {
+  it('goes back to auto-switch, and says so, when the run makes that rule after all', async () => {
+    const b = await machine();
+    await b.engine.addAccount('other', bundle('O1', 'u-other'));
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: [
+          {
+            label: 'fresh',
+            accountUuid: 'u-fresh',
+            autoSwitchExcluded: false,
+            bundle: bundle('F1', 'u-fresh'),
+          },
+        ],
+        rules: [
+          {
+            label: 'r',
+            folders: [await folder(b, 'proj')],
+            aliases: [],
+            include: ['u-fresh'],
+            exclude: [],
+          },
+        ],
+      }),
+    );
+    // The plan is made before the accounts are stored; here it refuses the rule, as a plan would
+    // that the machine then changed under.
+    b.deps.engine = engineWith(b.engine, {
+      planImportRules: (specs) =>
+        Promise.resolve({
+          rules: specs.map(() => ({ kind: 'refused' as const, message: 'not yet' })),
+          handOffs: [],
+        }),
+    });
+
+    b.out.length = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    const fresh = (await b.engine.listAllAccounts()).find((a) => a.label === 'fresh')!;
+    expect(fresh.ruleIds).toHaveLength(1);
+    expect(fresh.autoSwitchExcluded).not.toBe(true);
+    expect(b.out.join('')).toContain(
+      'fresh: handed back to auto-switch (the rule it is reserved to was made after all)',
+    );
   });
 });

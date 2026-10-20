@@ -103,6 +103,11 @@ export interface StoredAccount {
   updatedAtMs: number;
 }
 
+/** The quarantine reason of an account stored without tokens (an import of a file made with
+ *  `--no-tokens`): it has never been logged in on this machine, which a view says rather than
+ *  calling its login expired. */
+export const PENDING_LOGIN_REASON = 'imported without tokens - log in with cctl accounts relogin';
+
 /** The registry index persisted at `vault/accounts.json`.
  *
  *  Holds only SHARED (global-pool) rows. A reserved account's row is MOVED out of here into
@@ -419,6 +424,10 @@ export interface RemoveAccountOptions {
 export interface ImportRuleSpec {
   /** Every scope of the ONE rule this makes (or grows), as the operator would name them. */
   scopes: RuleScopeRef[];
+  /** Scopes of the same rule that cannot be used here (a folder that does not exist here, a
+   *  network folder), as the file names them. Nothing is made on them, but a rule here that holds
+   *  one still keeps the rule from landing: made on the rest, it would be split in two. */
+  absent?: RuleScopeRef[];
   include: string[];
   exclude: string[];
   /** The display name of a rule this creates. */
@@ -456,6 +465,9 @@ export interface PlanImportRulesOptions extends ImportRulesOptions {
   /** Logins the import gives accounts already stored that record none yet: a slot running such a
    *  login unrecognized holds that account once the import has run. */
   logins?: ReadonlyArray<{ id: string; accountUuid: string }>;
+  /** Accounts stored here quarantined that the import gives new tokens before it writes the rules
+   *  (a replaced login is always taken over a quarantined one): usable once it has run. */
+  revived?: readonly string[];
 }
 
 /** A member of a rule an import leaves out, and why: the rule here it grows excludes (or
@@ -471,7 +483,8 @@ export interface ImportLeftOut {
  *  batch (`rule` absent). */
 export interface ImportConflict {
   scope: RuleScopeRef;
-  rule?: { id: string; label: string };
+  /** The rule here holding it, with every scope it holds (all of which a by-hand merge removes). */
+  rule?: { id: string; label: string; scopes: RuleScopeRef[] };
 }
 
 /**
@@ -546,8 +559,9 @@ export interface ImportBundleResult {
    *    so the stored refresh token is the one that has been spent.
    *  - `quarantined`: the stored login is known dead, so anything is better.
    *  - `missing`: the account has no stored bundle at all here.
-   *  - `stored_newer`: the copy here (after adopting any live rotation) is as new or newer, so it
-   *    was kept and nothing was written. */
+   *  - `stored_newer`: the copy here (after adopting any live rotation) is as new or newer, so its
+   *    tokens were kept. The login the brought identity names is still recorded on a row that
+   *    recorded none, so a slot running that login is known to run this account. */
   reason: 'newer' | 'quarantined' | 'missing' | 'stored_newer';
   /** True when the account was live in a slot here and the brought credentials were written there
    *  too (verified by read-back), as a re-login does. */

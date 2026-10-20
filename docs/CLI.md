@@ -135,23 +135,29 @@ What an import does with each part, printed in full by `--dry-run`:
     or session a rule of this machine holds and that rule. A rule here with another identity,
     or none (made here by hand), is never grown by an import, even on exactly the same
     scopes, whatever accounts it shares with the file's. To bring the two together, remove the
-    rule here (`cctl folder reset <folder>`, or `cctl session reset <alias> --cwd <folder>`) and
-    import again, or give it the file's accounts by hand (`cctl folder include <folder>
-<accounts>`); the failure line names the commands.
+    rule here, every folder and session of it (`cctl folder reset <folder>`, `cctl session reset
+<alias> --cwd <folder>`; resetting its last one removes the rule), and import again, which
+    then makes the file's rule whole; the failure line names the commands. A folder of the file's
+    rule that cannot be used here still counts: a rule here holding it fails the rule too, since
+    making it on the rest would split it.
 
   A scope that cannot be used here is left out, and listed: its folder does not exist here, is
   a network folder (those are never looked up from a file), is a folder of another platform, or
   is one no rule may cover (a drive root, the home folder, cctl's own folders). Once it can be,
-  the next import adds it to the rule the first one made. An exclusion of an account another
+  the next import adds it to the rule the first one made (unless a rule of this machine holds
+  it, see above). An exclusion of an account another
   rule here reserves is left out, and listed (only a shared account can be excluded). A rule is skipped, and listed, when
   none of its scopes is left, none of its accounts came along, none of the accounts it includes
   is in the file or here (with only its exclusions it would open its folders to every account),
   or it names one account both to include and to exclude. A rule fails, saying why, when it
   would pass the 64-rule limit or a limit on one rule (32 accounts included or excluded, 256
   folders, 256 session aliases), the 256 accounts reserved in all, or when reserving an account
-  would leave this machine's main login, or another rule's slot, with no account to run on. A
-  rule that reserves the account live in a slot here moves that slot to another account first,
-  and says so; who is live in a slot is read from the slot itself, not from what cctl recorded
+  would leave this machine's main login, or another rule's slot, with no account to run on, or
+  when an exclusion would leave a folder that sessions run in with no account, counting what the
+  rest of the file reserves; within one file, the rule that fails is the first whose addition
+  causes it. A rule that reserves the account live in a slot here moves that slot to another
+  account first (never onto one the file excludes from that slot's rule), and says so; who is
+  live in a slot is read from the slot itself, not from what cctl recorded
   for it, so a login made by hand inside a folder's profile counts, and so does this machine's
   main login when it runs an account of the file that cctl had not stored yet. Folder rules are
   not created on macOS, nor while a daemon older than this build runs (`cctl daemon restart`).
@@ -168,11 +174,16 @@ What `--dry-run` prints for the rules is the decision the import itself makes, m
 code from the same reads, and the real run prints the same lines (in the past tense). Only what
 changes on this machine between the two runs can make them differ: a session that starts or
 stops in a folder a rule would leave with no account, a switch left unfinished in a slot (the
-real run settles it first), or an account, rule or login changed in between. Which account each
-slot ends up running is decided by the real run.
+real run settles it first), an account a slot is moved onto that cannot be switched to then (its
+login will not refresh: the real run moves the slot onto the next account that can, or fails the
+rule, and reports every slot it moved), or an account, rule or login changed in between. With
+`--replace`, a quarantined login the file brings tokens for counts as usable in the dry run too,
+since the real run always takes them. Which account each slot ends up running is decided by the
+real run.
 
 An import is safe to run twice: everything already in place is reported as such and left
-alone, and a run that stopped part-way is completed by the next one. A wrong passphrase, a file
+alone, and a run that stopped part-way is completed by the next one. A rule that failed because
+a rule of this machine is in its way fails again until that rule is removed. A wrong passphrase, a file
 changed after it was written, one cut short, or one whose rules hold more than 1024 folders and
 session aliases in all is refused before anything is imported.
 `--move` refuses an account that is the live login of this machine's main config (switch to

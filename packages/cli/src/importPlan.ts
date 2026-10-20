@@ -12,8 +12,9 @@
 // So `--dry-run` prints what the real run does, line for line, but for what the dry run cannot know:
 // what changes on this machine between the two runs (a session starting or stopping in a slot a
 // rule would empty, a switch left unfinished in a slot, an account, rule or login changed in
-// between), which account each slot ends up running, and `--replace`'s "is the file's copy newer"
-// (it needs the decrypted stored bundle).
+// between), an account a slot is moved onto that cannot be switched to then (its login will not
+// refresh), which account each slot ends up running, and `--replace`'s "is the file's copy newer"
+// (it needs the decrypted stored bundle; either way the rules are decided alike).
 
 import {
   aliasScopeUniquenessKey,
@@ -484,9 +485,10 @@ function draftRules(input: PlanInput, steps: readonly AccountStep[]): RuleStep[]
 }
 
 /**
- * The spec a rule step asks the engine for: the scopes usable here and the members by `idOf` —
- * the plan's ids for a dry run, the ids the accounts got for the real run — each account once. A
- * member `idOf` has no id for (an account that could not be imported) is left out.
+ * The spec a rule step asks the engine for: the scopes usable here, the ones that are not (nothing
+ * is made on them, but a rule here holding one keeps the rule from landing whole), and the members
+ * by `idOf` — the plan's ids for a dry run, the ids the accounts got for the real run — each account
+ * once. A member `idOf` has no id for (an account that could not be imported) is left out.
  */
 export function ruleSpec(
   step: RuleStep,
@@ -495,8 +497,19 @@ export function ruleSpec(
   const ids = (targets: readonly MemberTarget[]): string[] => [
     ...new Set(targets.flatMap((t) => idOf(t) ?? [])),
   ];
+  const usable = step.scopes.filter((s) => s.skip === undefined).map(scopeRef);
+  // A scope the rule lists twice is the usable one, not one missing here.
+  const same = (a: RuleScopeRef, b: RuleScopeRef): boolean =>
+    a.kind === b.kind &&
+    a.folder === b.folder &&
+    (a.kind === 'folder' || (b.kind === 'alias' && a.alias === b.alias));
+  const absent = step.scopes
+    .filter((s) => s.skip !== undefined)
+    .map((s) => scopeRef({ ...s, folder: s.folder ?? s.sourceFolder }))
+    .filter((ref) => !usable.some((u) => same(u, ref)));
   return {
-    scopes: step.scopes.filter((s) => s.skip === undefined).map(scopeRef),
+    scopes: usable,
+    ...(absent.length > 0 ? { absent } : {}),
     include: ids(step.include),
     exclude: ids(step.exclude),
     ...(step.label !== undefined ? { label: step.label } : {}),
@@ -516,10 +529,9 @@ function fileReserved(input: PlanInput, steps: readonly AccountStep[]): Set<numb
 }
 
 /**
- * The login the import gives a stored row that records none: a replaced row's, which its new tokens
- * prove (the engine lays the brought identity over the stored one). A replace is counted as written:
- * whether the file's copy is the newer one is known only at run time, and assuming it is can make
- * the plan cautious but never promises a rule the real run refuses.
+ * The login the import gives a stored row that records none: a replaced row's, which its tokens
+ * prove. The engine records it whether it takes the file's tokens or keeps the newer copy stored
+ * here (see SwitchEngine.importBundle), so the plan counts it either way, as the real run will.
  */
 function newLoginOf(step: AccountStep, input: PlanInput): string | undefined {
   if (step.kind !== 'replace' || step.existing.accountUuid !== undefined) return undefined;
@@ -566,9 +578,14 @@ async function decideRules(
   const keepOut = steps.flatMap((s) =>
     s.kind === 'add' && forRule.has(s.entry) ? [pendingId(s.entry)] : [],
   );
+  // A quarantined login --replace gives new tokens is always replaced, so it is usable by the time
+  // the rules are written.
+  const revived = steps.flatMap((s) =>
+    s.kind === 'replace' && s.existing.quarantined ? [s.existing.id] : [],
+  );
   const plan = await input.planRules(
     sent.map((r) => ruleSpec(r, (t) => memberKey(t, steps))),
-    { keepOut, pending, logins },
+    { keepOut, pending, logins, revived },
   );
   for (const [k, r] of sent.entries()) r.verdict = plan.rules[k]!;
   return { handOffs: plan.handOffs, labels };
@@ -796,25 +813,29 @@ function describeRuleExtras(step: RuleStep, names: ReportNames): string {
   );
 }
 
-/** How to bring a rule of the file and the rule here in its way together by hand. */
+/** How many of a rule's reset commands a merge hint spells out before it points at the rest. */
+const HINT_RESETS = 4;
+
+/**
+ * How to bring a rule of the file and the rule here in its way together by hand: remove the rule
+ * here, every scope of it (resetting a rule's last scope removes the rule), and import again, which
+ * then makes the file's rule whole. Nothing else lands it: a rule here that the file did not make is
+ * never grown by an import, so giving it the file's accounts by hand would leave the import failing.
+ */
 function mergeHint(conflict: ImportConflict, platform: NodeJS.Platform): string {
   if (conflict.rule === undefined) return '';
   const q = (text: string): string => shellQuoteArg(safe(text), platform);
-  const scope = conflict.scope;
-  const [reset, include] =
+  const resets = conflict.rule.scopes.map((scope) =>
     scope.kind === 'folder'
-      ? [
-          `cctl folder reset ${q(scope.folder)}`,
-          `cctl folder include ${q(scope.folder)} <accounts>`,
-        ]
-      : [
-          `cctl session reset ${q(scope.alias)} --cwd ${q(scope.folder)}`,
-          `cctl session include ${q(scope.alias)} <accounts> --cwd ${q(scope.folder)}`,
-        ];
-  return (
-    `; to bring them together, remove the rule here (${reset}) and import again, or give it the ` +
-    `file's accounts by hand (${include})`
+      ? `cctl folder reset ${q(scope.folder)}`
+      : `cctl session reset ${q(scope.alias)} --cwd ${q(scope.folder)}`,
   );
+  const shown = resets.slice(0, HINT_RESETS).join('; ');
+  const more =
+    resets.length > HINT_RESETS
+      ? `; and ${resets.length - HINT_RESETS} more of its scopes (cctl folders lists them)`
+      : '';
+  return `; to bring them together, remove the rule here (${shown}${more}) and import again`;
 }
 
 /** The verb a rule written by the import gets, in the plan's tense or the report's. */
