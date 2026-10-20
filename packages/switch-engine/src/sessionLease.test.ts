@@ -1360,6 +1360,48 @@ describe('the rest of the engine around a parallel session', () => {
     expect(message).not.toContain('switch that slot');
   });
 
+  it("a refusal names the launch's own rule, never 'there' for the folder the launch is in", async () => {
+    const h = await harness();
+    const { A, B } = await seed(h);
+    // B is live in this folder's slot, and the launch opens a named session of this folder whose
+    // rule has a slot of its own: the folder's slot is not the launch's.
+    const folder = await h.vault.createRule({ folders: ['C:\\research'], exclude: [A.id] });
+    const named = await h.vault.createRule({
+      folders: [],
+      aliases: [{ folder: 'C:\\research', alias: 'auth work' }],
+      exclude: [A.id],
+    });
+    await h.engine.activate(B.id, { force: true, slot: ruleSlotId(folder.id) });
+    const plan = await h.engine.planSessionSlot(B.id, { launchRuleId: named.id });
+    expect(plan).toMatchObject({ kind: 'refused', code: 'live_in_other_rule' });
+    const message = plan.kind === 'refused' ? plan.message : '';
+    expect(message).toContain('is a shared account live in the folder slot of C:\\research');
+    expect(message).toContain(
+      'this launch runs in the slot of session "auth work" in C:\\research',
+    );
+    expect(message).not.toMatch(/\b(here|there)\b/);
+    // With no rule over the launch, it says so.
+    const anywhere = await h.engine.planSessionSlot(B.id, { launchRuleId: null });
+    expect(anywhere.kind === 'refused' && anywhere.message).toContain(
+      'this launch runs under no folder or session rule',
+    );
+  });
+
+  it('a reserved account live in a rule that does not include it is not called a shared one', async () => {
+    const h = await harness();
+    const { A, C } = await seed(h);
+    // Live in another rule's slot while still shared, then reserved: the state until a repair
+    // evicts it.
+    const other = await h.vault.createRule({ folders: ['C:\\other'], exclude: [A.id] });
+    await h.engine.activate(C.id, { force: true, slot: ruleSlotId(other.id) });
+    await h.vault.createRule({ folders: ['C:\\mine'], include: [C.id] });
+    const plan = await h.engine.planSessionSlot(C.id, { launchRuleId: null });
+    expect(plan).toMatchObject({ kind: 'refused', code: 'live_in_other_rule' });
+    const message = plan.kind === 'refused' ? plan.message : '';
+    expect(message).toContain('is reserved to other rules and live in the folder slot of');
+    expect(message).not.toContain('shared account');
+  });
+
   it('renaming a leased account renames its parallel session', async () => {
     const h = await harness();
     const { B } = await seed(h);

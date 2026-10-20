@@ -153,7 +153,9 @@ async function planOf(id: string, ctx: { launchRuleId: string | null }): Promise
     return {
       kind: 'refused',
       code: 'live_in_other_rule',
-      message: `${account?.label ?? id} is a shared account live in the folder slot of ${ruleId}; run claude there`,
+      message:
+        `${account?.label ?? id} is a shared account live in the folder slot of ${ruleId}, ` +
+        `where it serves that slot's sessions. Run claude where that slot applies instead`,
     };
   }
   return {
@@ -1050,7 +1052,7 @@ describe('cctl claude --account of a shared account for a session with an alias 
     expect(launcher.spawnClaude).not.toHaveBeenCalled();
     // The engine was asked with the alias rule as this launch's rule: B serves another rule's slot.
     expect(engine.planSessionSlot).toHaveBeenCalledWith('b', { launchRuleId: 'r2' });
-    expect(r.err).toContain('is a shared account live in the folder slot of r1; run claude there');
+    expect(r.err).toContain('is a shared account live in the folder slot of r1, where it serves');
   });
 
   it('an unnamed launch in the folder still runs on the folder rule slot', async () => {

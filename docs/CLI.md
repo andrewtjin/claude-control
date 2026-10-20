@@ -597,15 +597,20 @@ Where it runs:
 
 - on the global slot when `work` is live there. That session then follows global switches,
   from any terminal or the phone;
-- in this folder's slot when `work` is live there (it then follows the folder's switches);
+- in the slot of the rule this launch runs under when `work` is live there: this folder's
+  rule, or the rule of the named session its arguments open (`--resume <title>`). It then
+  follows that rule's switches;
 - in the slot of a folder or named session `work` is reserved to (a rule that includes it),
   when it is live there, from any folder. The session then follows that rule's switches,
   which can move it off `work`;
-- otherwise in a parallel-session slot of its own.
+- otherwise, when `work` is live in no folder's or named session's slot, in a
+  parallel-session slot of its own.
 
-A shared account live in another folder's slot is refused: run it there, or switch that slot to
-another account first (for a named session's slot, keep `work` out of it with
-`cctl session exclude`).
+Live in the slot of any other rule, `work` is refused: a shared account serving another
+folder's or named session's slot, or a reserved account live in a rule that does not include
+it. That covers this folder's own slot too when the launch opens a named session whose rule has
+a slot of its own. Run claude where that slot applies, or switch that slot to another account
+first (for a named session's slot, keep `work` out of it with `cctl session exclude`).
 
 While a parallel session runs:
 

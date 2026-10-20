@@ -3693,12 +3693,21 @@ export class SwitchEngine {
                 `${shellQuoteArg(label, this.platform)} --cwd ` +
                 `${shellQuoteArg(firstAlias.folder, this.platform)})`
               : 'switch that slot to another account first';
+        // Said by rules, never by "here" and "there": the slot it is live in can be this folder's
+        // while the launch runs under the rule of a named session it opens, which has its own slot.
+        const launchRule = picture.rules.find((r) => r.id === launchRuleId);
+        const launch =
+          launchRule === undefined
+            ? 'this launch runs under no folder or session rule'
+            : `this launch runs in ${slotWordsOf(launchRule)}`;
+        const what = reserved ? 'reserved to other rules and' : 'a shared account';
         return {
           kind: 'refused',
           code: 'live_in_other_rule',
           message:
-            `${label} is a shared account live in ${words(where)} (it serves that slot's sessions ` +
-            `there); run claude there, or ${free}, then run claude --account ${label} here.`,
+            `${label} is ${what} live in ${words(where)}, where it serves that slot's sessions, ` +
+            `and ${launch}. Run claude where that slot applies instead, or ${free}, then run ` +
+            `claude --account ${label} again.`,
         };
       }
     }
