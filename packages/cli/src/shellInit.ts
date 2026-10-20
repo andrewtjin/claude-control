@@ -241,9 +241,24 @@ export function parsePowerShellWrapper(profileText: string): ParsedPowerShellWra
   return undefined;
 }
 
-/** Candidate PowerShell profile locations on Windows — Windows PowerShell 5.1 and PowerShell 7, plus
- *  a OneDrive-redirected Documents (the common case where `$PROFILE` does not live under
- *  `%USERPROFILE%\Documents`). Best-effort; used only by the wrapper check. Pure over `env`. */
+/** The current user's profiles each PowerShell edition loads, per host: every host loads
+ *  `profile.ps1`, then its own. `$PROFILE` names the host's own one, so that is where
+ *  `cctl shell-init powershell | Out-File -Append $PROFILE` puts the wrapper: the console's, VS
+ *  Code's PowerShell extension's (either edition), or the Windows PowerShell ISE's. */
+const POWERSHELL_PROFILE_FILES: Readonly<Record<'WindowsPowerShell' | 'PowerShell', string[]>> = {
+  WindowsPowerShell: [
+    'Microsoft.PowerShell_profile.ps1',
+    'profile.ps1',
+    'Microsoft.VSCode_profile.ps1',
+    'Microsoft.PowerShellISE_profile.ps1',
+  ],
+  PowerShell: ['Microsoft.PowerShell_profile.ps1', 'profile.ps1', 'Microsoft.VSCode_profile.ps1'],
+};
+
+/** Candidate PowerShell profile locations on Windows — Windows PowerShell 5.1 and PowerShell 7, each
+ *  host's own (see POWERSHELL_PROFILE_FILES), plus a OneDrive-redirected Documents (the common case
+ *  where `$PROFILE` does not live under `%USERPROFILE%\Documents`). Best-effort; used only by the
+ *  wrapper checks. Pure over `env`. */
 export function powerShellProfilePaths(env: NodeJS.ProcessEnv = process.env): string[] {
   const home = env.USERPROFILE;
   if (!home || home.length === 0) return [];
@@ -255,12 +270,32 @@ export function powerShellProfilePaths(env: NodeJS.ProcessEnv = process.env): st
   const paths: string[] = [];
   for (const root of docRoots) {
     // Windows PowerShell 5.1 uses the WindowsPowerShell folder; PowerShell 7+ uses PowerShell.
-    for (const dir of ['WindowsPowerShell', 'PowerShell']) {
-      paths.push(join(root, dir, 'Microsoft.PowerShell_profile.ps1'));
-      paths.push(join(root, dir, 'profile.ps1'));
+    for (const dir of ['WindowsPowerShell', 'PowerShell'] as const) {
+      for (const file of POWERSHELL_PROFILE_FILES[dir]) paths.push(join(root, dir, file));
     }
   }
   return paths;
+}
+
+/**
+ * A PowerShell profile's text, decoded the way PowerShell decodes a script: by its byte-order mark
+ * (UTF-16LE, UTF-16BE or UTF-8), and as UTF-8 without one. Windows PowerShell 5.1 writes a profile
+ * that `Out-File -Append` creates in UTF-16LE with a mark, so a plain UTF-8 read of it would never
+ * find the wrapper PowerShell loads from it.
+ */
+export function readPowerShellProfile(path: string): string {
+  const bytes = readFileSync(path);
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return bytes.subarray(2).toString('utf16le');
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+    // Node has no UTF-16BE decoder: swap each pair into little-endian order. A stray odd last byte
+    // is no character in either order, so it is dropped.
+    const le = Buffer.from(bytes.subarray(2, 2 + ((bytes.length - 2) & ~1)));
+    return le.swap16().toString('utf16le');
+  }
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return bytes.subarray(3).toString('utf8');
+  }
+  return bytes.toString('utf8');
 }
 
 /**
@@ -273,7 +308,7 @@ export function powerShellProfilePaths(env: NodeJS.ProcessEnv = process.env): st
  */
 export function readPowerShellWrappers(
   env: NodeJS.ProcessEnv = process.env,
-  read: (path: string) => string = (p) => readFileSync(p, 'utf8'),
+  read: (path: string) => string = readPowerShellProfile,
 ): Array<{ profile: string; wrapper: ParsedPowerShellWrapper }> {
   const out: Array<{ profile: string; wrapper: ParsedPowerShellWrapper }> = [];
   for (const profile of powerShellProfilePaths(env)) {
@@ -299,7 +334,7 @@ export function readPowerShellWrapperProfile(
 ): string | undefined {
   for (const p of powerShellProfilePaths(env)) {
     try {
-      const text = readFileSync(p, 'utf8');
+      const text = readPowerShellProfile(p);
       if (text.includes(POWERSHELL_WRAPPER_MARKER)) return text;
     } catch {
       // Absent or unreadable profile: skip and try the next candidate.

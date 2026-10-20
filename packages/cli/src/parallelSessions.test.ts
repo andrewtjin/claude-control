@@ -21,7 +21,12 @@ import { leaseArgRefusal, startsBackgroundSession } from './backgroundAttach.js'
 import { holdLeaseSignals, leaseInUse, trackChildHolder } from './leaseCli.js';
 import { createLeaseOccupancyProbe } from './leaseProbe.js';
 import { cctlVersionOf, findCctlOnPath, wrapperEntriesOf } from './installLookup.js';
-import { POWERSHELL_WRAPPER_MARKER, readPowerShellWrappers, renderShellInit } from './shellInit.js';
+import {
+  POWERSHELL_WRAPPER_MARKER,
+  readPowerShellWrapperProfile,
+  readPowerShellWrappers,
+  renderShellInit,
+} from './shellInit.js';
 import {
   checkDaemonScopeSupport,
   checkRuleScopes,
@@ -728,6 +733,43 @@ describe("the PowerShell wrappers' installs, read from the profiles", () => {
     ]);
     expect(refusal({ USERPROFILE: root })).toBeUndefined();
     expect(POWERSHELL_WRAPPER_MARKER).toBe('cctl claude wrapper (PowerShell)');
+  });
+
+  it('a profile in UTF-16 is read the way PowerShell reads it, by its byte-order mark', async () => {
+    // `cctl shell-init powershell | Out-File -Append $PROFILE` on Windows PowerShell 5.1 creates
+    // the profile in UTF-16LE with a byte-order mark; PowerShell then loads the wrapper from it.
+    const { root, old } = await setup();
+    const ps5 = join(root, 'Documents', 'WindowsPowerShell', 'Microsoft.PowerShell_profile.ps1');
+    const text = wrapper(old);
+    const le = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, 'utf16le')]);
+    const be = Buffer.from(le);
+    be.swap16();
+    const utf8Bom = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(text, 'utf8')]);
+    for (const bytes of [le, be, utf8Bom]) {
+      await mkdir(join(ps5, '..'), { recursive: true });
+      await writeFile(ps5, bytes);
+      expect(refusal({ USERPROFILE: root })).toContain(
+        `the PowerShell claude wrapper runs the cctl at ${old} (v1.0.0)`,
+      );
+      // The doctor's wrapper check reads the same profile the same way.
+      expect(readPowerShellWrapperProfile({ USERPROFILE: root })).toContain(
+        POWERSHELL_WRAPPER_MARKER,
+      );
+    }
+  });
+
+  it("an editor host's own profile counts: VS Code's, and the Windows PowerShell ISE's", async () => {
+    const { old } = await setup();
+    for (const [dir, file] of [
+      ['PowerShell', 'Microsoft.VSCode_profile.ps1'],
+      ['WindowsPowerShell', 'Microsoft.VSCode_profile.ps1'],
+      ['WindowsPowerShell', 'Microsoft.PowerShellISE_profile.ps1'],
+    ] as const) {
+      const home = await mkdtemp(join(tmpdir(), 'cctl-wrappers-'));
+      dirs.push(home);
+      await profile(join(home, 'Documents', dir, file), wrapper(old));
+      expect(refusal({ USERPROFILE: home })).toContain('(v1.0.0)');
+    }
   });
 });
 
