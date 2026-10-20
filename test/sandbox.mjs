@@ -8,9 +8,13 @@
 //  - Every variable a home or data path is derived from points into a fresh temp folder, and
 //    variables naming real cctl or Claude locations are removed. Paths resolved from the
 //    environment, in this process or in any child spawned with it, stay inside the sandbox.
-//  - liveGuard.mjs then refuses any write that still reaches the real locations, in this process
-//    and (through NODE_OPTIONS) in node children. A refusal fails the test file that caused it,
-//    even when the code under test caught the error.
+//    That includes the macOS Keychain item of the Claude login, which Claude Code names after its
+//    config dir: the sandbox names one, so a test's item is never the real login's.
+//  - liveGuard.mjs then refuses any write that still reaches the real locations: through fs, a
+//    hard link, SQLite, or a child process, in this process, its worker threads and its node
+//    children. It also refuses machine-wide state no folder redirects (the Task Scheduler, launchd
+//    and systemd services, the Keychain, the registry, elevation). A refusal fails the test file
+//    that caused it, even when the code under test caught the error.
 
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
@@ -23,8 +27,31 @@ const TRIP_LOG_ENV = 'CCTL_TEST_GUARD_LOG';
  *  across files) never mistakes the sandbox for the real profile. */
 const SANDBOX_ENV = 'CCTL_TEST_SANDBOX';
 
-/** Variables that name real cctl or Claude state directly; a test that needs one sets its own. */
-const REMOVED_VARS = ['CLAUDE_CONFIG_DIR', 'CCTL_BOT_STATE_DIR', 'CCTL_LOG_FILE'];
+/** Variables that name real cctl or Claude state directly, or let a test reach it; a test that
+ *  needs one sets its own. */
+const REMOVED_VARS = [
+  'CLAUDE_CONFIG_DIR',
+  'CCTL_BOT_STATE_DIR',
+  'CCTL_LOG_FILE',
+  // Name the Keychain item of the Claude login outright, past the sandbox's own name for it.
+  'CLAUDE_CLI_KEYCHAIN_SERVICE',
+  'CLAUDE_CLI_KEYCHAIN_ACCOUNT',
+  // The guard's opt-in for the real Keychain tool, which only the test that needs it sets.
+  'CCTL_TEST_REAL_KEYCHAIN',
+];
+
+/** Where Claude Code reads machine-wide managed settings on this platform (cctl's drop-in goes
+ *  there; see packages/cli/src/managedSettings.ts). */
+function managedSettingsRoot() {
+  switch (process.platform) {
+    case 'win32':
+      return 'C:\\Program Files\\ClaudeCode';
+    case 'darwin':
+      return '/Library/Application Support/ClaudeCode';
+    default:
+      return '/etc/claude-code';
+  }
+}
 
 /**
  * The real locations to guard, read from the account (which ignores the environment) and from the
@@ -58,6 +85,8 @@ function realLocations(env) {
     ...tree(
       env.APPDATA && join(env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup'),
     ),
+    // Claude Code's machine-wide managed settings, which every session on the machine reads.
+    ...tree(managedSettingsRoot()),
   ];
 }
 
@@ -78,6 +107,9 @@ function sandboxEnvironment(env, home) {
     env[name] = value;
   }
   for (const name of REMOVED_VARS) delete env[name];
+  // The config dir the Claude login's Keychain item is named after (macOS); set without creating
+  // it, since tests decide for themselves whether a Claude config dir exists.
+  env.CLAUDE_SECURESTORAGE_CONFIG_DIR = join(home, '.claude');
 }
 
 const env = process.env;
