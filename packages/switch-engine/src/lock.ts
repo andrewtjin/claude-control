@@ -18,7 +18,7 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { ensureDir } from './fsutil.js';
+import { RENAME_RETRY_DELAYS_MS, ensureDir, isTransientRenameError } from './fsutil.js';
 import { LockTimeoutError } from './errors.js';
 
 export interface LockOptions {
@@ -81,8 +81,9 @@ export class Lock {
   /**
    * Restamp the claim's time, so a holder that is alive but holds for long (a move that waits on
    * Claude Code) is never reclaimed as stale by age. The record is replaced by a rename, so a
-   * contender never reads it half-written. Returns false, touching nothing, once the lock is no
-   * longer this claim's.
+   * contender never reads it half-written; a contender reading it at that very instant only delays
+   * the rename (see replaceOwnerRecord). Returns false, touching nothing, once the lock is no
+   * longer this claim's, or when the record cannot be replaced at all.
    */
   refresh(): boolean {
     if (this.released || !this.stillOurs()) return false;
@@ -95,10 +96,11 @@ export class Lock {
     const temp = join(this.dir, `owner.${randomUUID()}.tmp`);
     try {
       writeFileSync(temp, JSON.stringify(record));
-      renameSync(temp, join(this.dir, 'owner.json'));
+      replaceOwnerRecord(temp, join(this.dir, 'owner.json'));
       return true;
     } catch {
-      // Reclaimed between the check and the write: the claim is lost, and the temp file with it.
+      // Reclaimed between the check and the write (the claim is lost, and the temp file with it),
+      // or the record cannot be replaced: the claim is not restamped either way.
       try {
         unlinkSync(temp);
       } catch {
@@ -114,6 +116,28 @@ export class Lock {
     // Remove the lock directory only while it is still this claim's. A holder that outlived the
     // staleness had it reclaimed, and the directory there now is its successor's.
     if (this.stillOurs()) rmSync(this.dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Rename `temp` over a lock's owner record. Every contender waiting on the lock reads that record
+ * on each poll, and on Windows a rename over a file another process has open just then fails
+ * (EPERM or EBUSY) and succeeds a moment later: such a failure is waited out on the same short
+ * ladder every other rename here uses, rather than taken for the claim being lost. Any other
+ * failure, or one that outlasts the ladder, is thrown.
+ */
+function replaceOwnerRecord(temp: string, target: string): void {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      renameSync(temp, target);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? '';
+      const wait = RENAME_RETRY_DELAYS_MS[attempt];
+      if (wait === undefined || !isTransientRenameError(code, process.platform)) throw err;
+      // A refresh is synchronous (its callers restamp between steps), so it waits synchronously.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
+    }
   }
 }
 
