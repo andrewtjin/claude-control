@@ -161,6 +161,101 @@ export function availableInOrder(pool: readonly PoolEntry[]): StoredAccount[] {
 }
 
 /**
+ * `pool` without the accounts of `keepOut` it only inherits from the shared pool: accounts an import
+ * brought for a folder rule of the machine they came from, kept out of auto-switch here until that
+ * rule takes them, which no slot the import moves or seats may run as a last resort either (that
+ * would spend, say, a client's account on unrelated work). An account the slot's own rule includes
+ * stays: that is the rule it is kept for.
+ */
+export function withoutKeptOut(
+  pool: readonly PoolEntry[],
+  keepOut: ReadonlySet<string> | undefined,
+): PoolEntry[] {
+  if (keepOut === undefined || keepOut.size === 0) return [...pool];
+  return pool.filter((e) => e.source === 'include' || !keepOut.has(e.account.id));
+}
+
+/** Who holds a rule's slot as its seat is chosen: the account its live login is recognized as (or
+ *  null), and whether it holds a login at all. */
+export interface SeatOccupant {
+  id: string | null;
+  hasLogin: boolean;
+}
+
+/** What seating a rule's slot does ({@link chooseSeat}): try `candidates` in order, the first that
+ *  goes live taking the slot; with none taken, keep `keeps` (the legitimate occupant), or, when it
+ *  is null, clear whatever login the slot holds. */
+export interface SeatChoice {
+  keeps: string | null;
+  candidates: StoredAccount[];
+}
+
+/**
+ * THE seat choice for a rule's slot. The engine's ensure-live and an import's decision both call
+ * it, so the decision states what the seat step will do rather than guessing at it.
+ *
+ * The occupant is KEPT when the slot may hold it (an included account, or a shared one the rule does
+ * not exclude) and no other slot legitimately holds it. Two cases still move a kept occupant: a
+ * quarantined one (a dead login, though a legitimate one) is replaced by any available account,
+ * and `prefer` moves an inherited occupant onto an available included account: any included one
+ * (`true`), or only those of a set (an import moves a slot only onto an account it newly includes).
+ * Otherwise the slot is seated with the first account available in pool order, the rule's recorded
+ * account first for continuity, and with none it is cleared. `keepOut` (see {@link withoutKeptOut})
+ * and `avoid` (accounts that could not be switched to just now) are never seated as a replacement.
+ */
+export function chooseSeat(
+  slot: SlotId,
+  picture: RulesPicture,
+  occupancy: SlotOccupancy,
+  occupant: SeatOccupant,
+  opts: {
+    prefer?: true | ReadonlySet<string>;
+    keepOut?: ReadonlySet<string>;
+    avoid?: ReadonlySet<string>;
+  } = {},
+): SeatChoice {
+  const usable = (a: StoredAccount): boolean => opts.avoid?.has(a.id) !== true;
+  const pool = slotPool(slot, picture, occupancy);
+  const available = availableInOrder(withoutKeptOut(pool, opts.keepOut)).filter(usable);
+  const live = occupant.id;
+  // Whether the occupant may stay is judged against the other slots' LEGITIMATE copies only: a copy
+  // squatting where its pool does not have it is evicted by that slot's own repair, and must not
+  // cost this slot the account. A new account is still chosen against every copy (`available`).
+  if (
+    live !== null &&
+    occupant.hasLogin &&
+    slotMayHold(slot, live, picture) &&
+    liveElsewhere(slot, live, legitimateOccupancy(occupancy, picture)) === null
+  ) {
+    const entry = pool.find((e) => e.account.id === live);
+    if (entry === undefined) {
+      return { keeps: live, candidates: available.filter((a) => a.id !== live) };
+    }
+    const prefer = opts.prefer;
+    if (prefer === undefined || entry.source !== 'inherited')
+      return { keeps: live, candidates: [] };
+    return {
+      keeps: live,
+      candidates: pool
+        .filter(
+          (e) =>
+            e.source === 'include' &&
+            e.liveElsewhere === null &&
+            (prefer === true || prefer.has(e.account.id)),
+        )
+        .map((e) => e.account)
+        .filter(usable),
+    };
+  }
+  const recordedId = ruleOfSlot(slot, picture.rules)?.activeId;
+  const recorded = available.find((a) => a.id === recordedId);
+  return {
+    keeps: null,
+    candidates: recorded ? [recorded, ...available.filter((a) => a !== recorded)] : available,
+  };
+}
+
+/**
  * Give each of several slots a DIFFERENT account from its own candidates (each list best first), or
  * say which slot cannot have one. Taking each slot's first free candidate in turn is not enough: an
  * earlier slot can take the only account a later one could use while it had another to spare, and

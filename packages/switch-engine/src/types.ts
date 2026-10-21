@@ -103,6 +103,11 @@ export interface StoredAccount {
   updatedAtMs: number;
 }
 
+/** The quarantine reason of an account stored without tokens (an import of a file made with
+ *  `--no-tokens`): it has never been logged in on this machine, which a view says rather than
+ *  calling its login expired. */
+export const PENDING_LOGIN_REASON = 'imported without tokens - log in with cctl accounts relogin';
+
 /** The registry index persisted at `vault/accounts.json`.
  *
  *  Holds only SHARED (global-pool) rows. A reserved account's row is MOVED out of here into
@@ -182,6 +187,12 @@ export interface FolderRule {
   id: string;
   /** Display name. Defaults to the folder the rule was created on. */
   label: string;
+  /** Which rule this one is on the machine an import brought it from: that rule's own origin, else
+   *  its id. Set on a rule an import made. Absent on a rule made here by hand, which an import never
+   *  grows. A later import finds the rule by it whatever changed since on either machine (members,
+   *  folders, name), so a rule brought over part way is grown rather than made again beside itself.
+   *  A lower-case uuid; unlike the id it names nothing on disk. */
+  origin?: string;
   /** Canonical folder paths this rule applies to (see `folderPath.ts`). Unique across all rules.
    *  Empty for a rule that applies only to a session alias. */
   folders: string[];
@@ -359,6 +370,223 @@ export interface ReloginResult {
   healedLiveLogin: boolean;
 }
 
+/** The identity a registry row is known by, as a caller states it (an import, from its file). */
+export type AccountIdentity = Pick<
+  StoredAccount,
+  'accountUuid' | 'emailAddress' | 'organizationUuid'
+>;
+
+/** The plan and billing facts a registry row keeps, copied from a login's bundle. */
+export const ACCOUNT_PLAN_KEYS = [
+  'subscriptionType',
+  'rateLimitTier',
+  'organizationRateLimitTier',
+  'billingType',
+  'subscriptionCreatedAt',
+  'claudeCodeTrialEndsAt',
+] as const;
+
+/** A row's plan and billing facts (see {@link ACCOUNT_PLAN_KEYS}). */
+export type AccountPlanFacts = Pick<StoredAccount, (typeof ACCOUNT_PLAN_KEYS)[number]>;
+
+/** What a caller adding an account knows beyond its bundle (see `Vault.addAccount`). */
+export interface AddAccountOptions {
+  /** Store the account excluded from auto-switch, in the same write that adds it. */
+  autoSwitchExcluded?: boolean;
+  /** The identity to record for each anchor the bundle's identity block does not carry. */
+  identity?: AccountIdentity;
+  /** The id to store the account under: an import keeps the id the account has on the machine it
+   *  came from, so importing it again finds it. A uuid no row here has; absent, one is made. */
+  id?: string;
+}
+
+/** What a caller adding an account that has no login yet knows (see `Vault.addPendingAccount`). */
+export interface AddPendingAccountOptions extends Pick<
+  AddAccountOptions,
+  'autoSwitchExcluded' | 'id'
+> {
+  /** The plan facts the account had where it came from, shown until its first login replaces
+   *  them. */
+  plan?: AccountPlanFacts;
+}
+
+/** What a removal that follows handing an account to another machine checks first (see
+ *  `SwitchEngine.removeAccount`). */
+export interface RemoveAccountOptions {
+  /** Refuse while the account is live on this machine's main login. */
+  refuseIfGloballyLive?: boolean;
+  /** Refuse while the account is live in a folder slot that sessions run in: the removal clears that
+   *  slot's login, which those sessions refresh from, and they would go on spending a token the
+   *  account's new machine now holds. */
+  refuseIfRunning?: boolean;
+  /** Refuse unless the vault still holds this refresh token for the account. */
+  expectRefreshToken?: string;
+}
+
+/** One rule an import asks {@link SwitchEngine.importRules} for: one rule of the machine the file
+ *  came from, applied whole or not at all. */
+export interface ImportRuleSpec {
+  /** Every scope of the ONE rule this makes (or grows), as the operator would name them. */
+  scopes: RuleScopeRef[];
+  /** Scopes of the same rule that cannot be used here (a folder that does not exist here, a
+   *  network folder), as the file names them. Nothing is made on them, but a rule here that holds
+   *  one still keeps the rule from landing: made on the rest, it would be split in two. */
+  absent?: RuleScopeRef[];
+  include: string[];
+  exclude: string[];
+  /** The display name of a rule this creates. */
+  label?: string;
+  /** The rule's identity across machines (see {@link FolderRule.origin}). The rule here carrying it
+   *  (an earlier import of the same rule), or whose own id it is, is grown rather than a second one
+   *  made; a rule this creates stores it. A spec without one can only create. */
+  origin?: string;
+}
+
+/** An account an import has not stored yet, which {@link SwitchEngine.planImportRules} counts as
+ *  stored (shared, under this id) when it decides what the rules would do. It has no tokens here
+ *  yet, so it is live in a slot only when the login it names runs there unrecognized. */
+export interface PendingImportAccount {
+  /** The id rule specs name it by; any string no stored account has. */
+  id: string;
+  label: string;
+  /** Its login, by which a slot already running that login recognizes it once it is stored. */
+  accountUuid?: string;
+  /** Whether it arrives with tokens; without, it is stored quarantined (no slot can move to it). */
+  withTokens: boolean;
+  autoSwitchExcluded?: boolean;
+}
+
+/** What a {@link SwitchEngine.importRules} batch is told beyond its specs. */
+export interface ImportRulesOptions {
+  /** Accounts no slot may be moved to or seated with unless their own rule includes them. */
+  keepOut?: readonly string[];
+}
+
+/** What {@link SwitchEngine.planImportRules} is told about the import around the rules. */
+export interface PlanImportRulesOptions extends ImportRulesOptions {
+  /** The accounts the import stores before it writes the rules. */
+  pending?: readonly PendingImportAccount[];
+  /** Logins the import gives accounts already stored that record none yet: a slot running such a
+   *  login unrecognized holds that account once the import has run. */
+  logins?: ReadonlyArray<{ id: string; accountUuid: string }>;
+  /** Accounts stored here quarantined that the import gives new tokens before it writes the rules
+   *  (a replaced login is always taken over a quarantined one): usable once it has run. */
+  revived?: readonly string[];
+}
+
+/** A member of a rule an import leaves out, and why: the rule here it grows excludes (or
+ *  includes) the account already, or another rule here reserves an account to be excluded (only a
+ *  shared account can be excluded). */
+export interface ImportLeftOut {
+  id: string;
+  why: 'excluded-here' | 'included-here' | 'reserved-here';
+}
+
+/** The scope that keeps a rule of the file from landing whole: held by a rule of this machine (a
+ *  different rule from the file's, or one with no identity), or by an earlier rule of the same
+ *  batch (`rule` absent). */
+export interface ImportConflict {
+  scope: RuleScopeRef;
+  /** The rule here holding it, with every scope it holds (all of which a by-hand merge removes). */
+  rule?: { id: string; label: string; scopes: RuleScopeRef[] };
+}
+
+/**
+ * What an import does with one {@link ImportRuleSpec}, decided before anything is written:
+ * `create` a new rule on every scope, `grow` the rule here that carries its identity (with the
+ * scopes and members it lacks), leave it `unchanged` (the rule here already has all of it), or
+ * `refused` with the engine's own refusal. Never a rule on part of the spec's scopes.
+ */
+export type ImportRuleVerdict =
+  | {
+      kind: 'create';
+      scopes: RuleScopeRef[];
+      include: string[];
+      exclude: string[];
+      leftOut: ImportLeftOut[];
+    }
+  | {
+      kind: 'grow';
+      /** The rule grown, as it stands before the import. */
+      rule: FolderRule;
+      /** The scopes it gains. */
+      scopes: RuleScopeRef[];
+      /** The members it gains. */
+      include: string[];
+      exclude: string[];
+      leftOut: ImportLeftOut[];
+    }
+  | { kind: 'unchanged'; reason: string; rule?: FolderRule; leftOut: ImportLeftOut[] }
+  | { kind: 'refused'; message: string; conflict?: ImportConflict };
+
+/** Everything an import of rules would do: the verdict on each spec, in spec order, every slot it
+ *  would move off an account it reserves, and every rule's slot holding a login that the rules it
+ *  writes would put on another account (or none). */
+export interface ImportRulesPlan {
+  rules: ImportRuleVerdict[];
+  handOffs: SlotHandOff[];
+  seats: SlotSeat[];
+}
+
+/** A rule's slot that held a login and that an import put on another account, or on none: its
+ *  occupant left the rule's pool, another slot took the account, the batch newly includes an
+ *  account there, or a quarantined occupant was replaced. */
+export interface SlotSeat {
+  slot: SlotId;
+  /** The account the slot held, or null for a login no stored account is. */
+  from: string | null;
+  /** The account it holds now, or null when it was cleared. */
+  to: string | null;
+}
+
+/** What {@link SwitchEngine.importRules} did with one spec it wrote (a `create` or `grow`). */
+export type ImportRuleOutcome =
+  | {
+      ok: true;
+      rule: FolderRule;
+      /** True when the rule was created, false when the members were added to an existing one. */
+      created: boolean;
+      /** The outcome of making the rule's slot live, or null when that failed (the rule stands). */
+      live: RuleLiveResult | null;
+      runningSessions: RunningSession[];
+    }
+  | {
+      ok: false;
+      message: string;
+      /** Set when part of the rule was written before the failure. */
+      partial?: FolderRule;
+    };
+
+/** What {@link SwitchEngine.importRules} decided (`plan`, the same decision
+ *  {@link SwitchEngine.planImportRules} reports), what it then did with each spec it wrote
+ *  (`outcomes`, undefined for one it did not write), the slots it moved off accounts its rules now
+ *  reserve, and the rules' slots it put on other accounts (see {@link ImportRulesPlan.seats}). */
+export interface ImportRulesResult {
+  plan: ImportRulesPlan;
+  outcomes: Array<ImportRuleOutcome | undefined>;
+  handedOff: SlotHandOff[];
+  seated: SlotSeat[];
+}
+
+/** What {@link SwitchEngine.importBundle} did with a credential bundle brought from another
+ *  machine for an account already stored here. */
+export interface ImportBundleResult {
+  /** True when the brought bundle was written over the stored one. */
+  replaced: boolean;
+  /** Why it was or was not written:
+   *  - `newer`: the brought grant was minted after the stored one (its access token expires later),
+   *    so the stored refresh token is the one that has been spent.
+   *  - `quarantined`: the stored login is known dead, so anything is better.
+   *  - `missing`: the account has no stored bundle at all here.
+   *  - `stored_newer`: the copy here (after adopting any live rotation) is as new or newer, so its
+   *    tokens were kept. The login the brought identity names is still recorded on a row that
+   *    recorded none, so a slot running that login is known to run this account. */
+  reason: 'newer' | 'quarantined' | 'missing' | 'stored_newer';
+  /** True when the account was live in a slot here and the brought credentials were written there
+   *  too (verified by read-back), as a re-login does. */
+  healedLiveLogin: boolean;
+}
+
 /** Outcome of a startup recovery sweep. `unsettled` (with `recovered: false`): a switch is pending
  *  in some slot that could not be finished or undone yet; `detail` says which and why (every other
  *  slot was recovered regardless). It stays pending, and every operation on that slot retries it
@@ -454,6 +682,11 @@ export interface RuleLiveResult {
    *  repair/doctor report the eviction (an eviction leaves `activated` false, so it would otherwise
    *  be silent). */
   clearedSquatter?: boolean;
+  /** Set by an import's seat step when it left the slot as it was although the slot should have
+   *  moved (a slot holding a login no account here is): sessions run under the rule (this many),
+   *  and the move the import decided on could not be made, so it moved the slot nowhere else and
+   *  cleared nothing. */
+  heldForSessions?: number;
 }
 
 /** A slot moved off an account because the account could no longer be live there (see

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { afterAll, beforeAll, describe, it, expect } from 'vitest';
 import { KeychainProtector } from './keychain.js';
 
 // The repo's only test that talks to a REAL `security(1)`. It runs ONLY on darwin (skipIf) — where
@@ -11,11 +11,21 @@ import { KeychainProtector } from './keychain.js';
 // exercised from a test and stays owner-run on hardware (docs/VERIFICATION.md gate 13).
 //
 // NON-DESTRUCTIVE: it uses the idempotent get-or-create key path, reusing an existing vault-key or
-// creating one exactly as cctl's first run would. It never deletes a key, so running it on a
-// developer's Mac cannot orphan a real vault.
-describe.skipIf(process.platform !== 'darwin')(
+// creating one exactly as cctl's first run would. It never deletes a key.
+//
+// It runs only in CI, where the job makes a throwaway default keychain first. On a developer's Mac
+// the default keychain holds the real vault key, which no test may read, so the test sandbox's
+// guard refuses the Keychain tool unless this test opts in, and it opts in only under CI.
+describe.skipIf(process.platform !== 'darwin' || process.env.CI !== 'true')(
   'KeychainProtector — real security(1) round-trip (darwin)',
   () => {
+    beforeAll(() => {
+      process.env.CCTL_TEST_REAL_KEYCHAIN = '1';
+    });
+    afterAll(() => {
+      delete process.env.CCTL_TEST_REAL_KEYCHAIN;
+    });
+
     it('round-trips AES-GCM through a real login-Keychain-held key', async () => {
       const protector = new KeychainProtector(); // real KeychainKeySource + real defaultExecRunner
       const secret = Buffer.from('cctl real-keychain round-trip check');

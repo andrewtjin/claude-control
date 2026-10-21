@@ -44,7 +44,7 @@ export function isTransientRenameError(code: string, platform: NodeJS.Platform):
  * a process that holds the file open indefinitely, because that is not a race and no amount of
  * waiting resolves it.
  */
-const RENAME_RETRY_DELAYS_MS = [1, 2, 4, 8, 16, 32, 64, 128];
+export const RENAME_RETRY_DELAYS_MS: readonly number[] = [1, 2, 4, 8, 16, 32, 64, 128];
 
 /**
  * Whether the target itself refuses to be written — the half of Windows' EPERM that no amount of

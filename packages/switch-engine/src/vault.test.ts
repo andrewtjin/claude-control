@@ -727,7 +727,7 @@ describe('one name, one login: addAccount refusals', () => {
       oauthAccount: { accountUuid: 'uuid-a', emailAddress: 'a@x.com' },
     };
     await expect(v.addAccount('jina25-again', again)).rejects.toThrow(
-      `this login is account ${first.id} ("jina25"), which is already stored; run \`cctl accounts relogin jina25\``,
+      `this login is account ${first.id} ("jina25"), which is already stored; run \`cctl accounts relogin 'jina25'\``,
     );
     expect(await v.listAccounts()).toHaveLength(1);
   });

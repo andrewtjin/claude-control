@@ -29,7 +29,6 @@ import {
   recordedFolderFor,
   resolveFolderRule,
   resolveSessionRule,
-  ruleIdOfSlot,
   ruleSlotId,
   rulesIncluding,
   type AccountView,
@@ -46,7 +45,7 @@ import {
   type SlotId,
   type StoredAccount,
 } from '@claude-control/switch-engine';
-import { defaultPaths } from '@claude-control/switch-engine';
+import { PENDING_LOGIN_REASON, defaultPaths } from '@claude-control/switch-engine';
 import {
   DEFAULT_CONFIRM_TIMEOUT_MS,
   Store,
@@ -92,6 +91,8 @@ import {
   renderWhere,
   nothingUsableReason,
   resumeCommand,
+  shellQuote,
+  slotName,
   vscodeProfileNames,
   type FolderRuleView,
   type GlobalSlotView,
@@ -155,16 +156,7 @@ function labelsOf(accounts: readonly StoredAccount[], ids: readonly string[]): s
   return ids.map((id) => labelOf(accounts, id)).join(', ');
 }
 
-/** A slot in words: "the global slot", or the folder slot named by its rule's folders (and session
- *  aliases). */
-export function slotName(slot: SlotId, rules: readonly FolderRule[]): string {
-  const ruleId = ruleIdOfSlot(slot);
-  if (ruleId === undefined) return 'the global slot';
-  const rule = rules.find((r) => r.id === ruleId);
-  return rule === undefined
-    ? 'a folder slot whose rule no longer exists'
-    : `the folder slot of ${describeRuleScopes(rule)}`;
-}
+export { slotName };
 
 /** Whether a rule applies to a session alias only (no folder of its own): its reports speak of the
  *  session, not of a folder. */
@@ -356,6 +348,7 @@ export function buildPoolView(
     live: a.id === liveId,
     liveElsewhere: null,
     quarantined: true,
+    ...(a.quarantineReason === PENDING_LOGIN_REASON ? { awaitsLogin: true as const } : {}),
     autoTarget: false,
   });
   const included: PoolEntryView[] = [];
@@ -575,7 +568,7 @@ function liveAndSessionLines(
       live.noWorkingAccount
         ? ctx.palette.red(
             `  live in ${slot}: ${label}, which is quarantined; re-login it: ` +
-              `cctl accounts relogin ${label}`,
+              `cctl accounts relogin ${shellQuote(label)}`,
           )
         : `  live in ${slot}: ${label} (${why})`,
     );

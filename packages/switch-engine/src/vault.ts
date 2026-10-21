@@ -11,12 +11,15 @@
 // a token. Secrets exist only inside the .enc blobs, which are useless off this machine/user.
 
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { ruleSlotId } from './types.js';
+import { ACCOUNT_PLAN_KEYS, ruleSlotId } from './types.js';
 import type {
+  AccountIdentity,
   AccountView,
+  AddAccountOptions,
+  AddPendingAccountOptions,
   CredentialBundle,
   FolderRule,
   OauthAccount,
@@ -33,6 +36,7 @@ import {
   aliasKey,
   aliasScopeUniquenessKey,
   folderUniquenessKey,
+  shellQuoteArg,
 } from './folderPath.js';
 import {
   describeRuleScopes,
@@ -76,6 +80,28 @@ export interface RegistryPicture extends RulesPicture {
 }
 
 /** What a new folder rule is made of ({@link Vault.createRule}). */
+/**
+ * The rule writes an import makes (see `SwitchEngine.importRules`), as the {@link Vault} makes them
+ * on disk or as a {@link Vault.draftRules} draft tries them in memory: one interface, so the batch
+ * that is tried first and the batch that is written are carried out by the same code.
+ */
+export interface RuleWriter {
+  createRule(opts: NewRuleOptions): Promise<FolderRule>;
+  includeAccounts(ruleId: string, accountIds: readonly string[]): Promise<unknown>;
+  excludeAccounts(ruleId: string, accountIds: readonly string[]): Promise<unknown>;
+  addScopesToRule(
+    ruleId: string,
+    scopes: { folders: readonly string[]; aliases?: readonly StoredAliasScope[] },
+  ): Promise<FolderRule>;
+  orderRules(ruleIds: readonly string[]): Promise<unknown>;
+}
+
+/** A {@link Vault.draftRules} draft: the rule writes, and the registry as they leave it. */
+export interface RuleDraft extends RuleWriter {
+  /** Both sides of the registry and the rules as the writes so far leave them. */
+  picture(): RulesPicture;
+}
+
 export interface NewRuleOptions {
   /** Canonical folders the rule applies to (the engine passes exactly one, or none for an alias
    *  rule). */
@@ -89,6 +115,8 @@ export interface NewRuleOptions {
   exclude?: readonly string[];
   /** Display name; defaults to the first folder. */
   label?: string;
+  /** The rule's identity on the machine an import brought it from (see {@link FolderRule.origin}). */
+  origin?: string;
 }
 
 /** The scopes of some rules as a display list, for "reserved to <folders>" messages. */
@@ -115,6 +143,17 @@ function assertLabelFree(rows: StoredAccount[], label: string, exceptId: string 
       `"${label}" already refers to account ${taken.id} ("${taken.label}"); ` +
         'two accounts answering to one name could not be told apart on switch',
     );
+  }
+}
+
+/** Refuse an origin (see {@link FolderRule.origin}) that is not a rule id, or that some rule here
+ *  already answers to, as its origin or its own id: one rule per identity, so an import can never
+ *  find two rules that are both the file's rule. */
+function assertRuleOrigin(st: RegistryState, origin: string): void {
+  if (!ACCOUNT_ID_PATTERN.test(origin)) throw new VaultError('a rule origin must be a rule id');
+  const holder = st.rules.find((r) => r.origin === origin || r.id === origin);
+  if (holder !== undefined) {
+    throw new VaultError(`the rule on ${describeRuleScopes(holder)} is already that rule`);
   }
 }
 
@@ -248,6 +287,10 @@ export const MAX_RULE_ALIASES = 256;
 export const MAX_ALIAS_LENGTH = 512;
 /** The most reserved rows `groups.json` may hold across all rules. */
 export const MAX_RESERVED_ACCOUNTS = 256;
+
+/** What an account id looks like: the lower-case uuid `randomUUID` makes. A caller-supplied id (an
+ *  import) must have this shape, since the id names the account's bundle file. */
+export const ACCOUNT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Property names that, if copied onto an object literal or used as a plain-object map key, reach
  *  through to `Object.prototype` (prototype pollution). Registry files are operator-editable and,
@@ -479,9 +522,16 @@ function validateRulesFile(
     if (activeId !== null && (typeof activeId !== 'string' || activeId === '')) {
       throw new VaultError(`${where} (${r.id}) activeId is not an account id or null`);
     }
+    // A hand-edited origin that is not a uuid could never match a file's; refused like any other
+    // malformed field rather than carried as a key no import could name.
+    const origin = r.origin;
+    if (origin !== undefined && (typeof origin !== 'string' || !ACCOUNT_ID_PATTERN.test(origin))) {
+      throw new VaultError(`${where} (${r.id}) origin is not a rule id`);
+    }
     rules.push({
       id: r.id,
       label: r.label,
+      ...(origin !== undefined ? { origin } : {}),
       folders,
       // Kept only when non-empty, so a rule without alias scopes keeps the older file shape.
       ...(aliases.length > 0 ? { aliases } : {}),
@@ -745,6 +795,7 @@ const ALIAS_SCOPE_KEYS: ReadonlySet<string> = new Set(['folder', 'alias']);
 const RULE_KEYS: ReadonlySet<string> = new Set([
   'id',
   'label',
+  'origin',
   'folders',
   'aliases',
   'include',
@@ -820,13 +871,7 @@ type IdentityKey = 'accountUuid' | 'emailAddress' | 'organizationUuid';
 
 /** Registry fields describing an account's CURRENT plan/billing state — mutable, and meaningful
  *  by their absence. See `setOrDelete`. */
-type PlanKey =
-  | 'subscriptionType'
-  | 'rateLimitTier'
-  | 'organizationRateLimitTier'
-  | 'billingType'
-  | 'subscriptionCreatedAt'
-  | 'claudeCodeTrialEndsAt';
+type PlanKey = (typeof ACCOUNT_PLAN_KEYS)[number];
 
 /** Every field below is copied out of upstream JSON that nothing validates (`oauthAccount` is an
  *  open index-signature block read straight off `~/.claude.json`), so a value of any JSON type
@@ -988,6 +1033,18 @@ interface RegistryState {
 
 /** Every row in the one logical registry — shared rows plus the reserved rows — as a flat list, for
  *  the checks (label uniqueness, login uniqueness) that must see the whole namespace at once. */
+/** The fields of an identity that are set, ready to spread onto a row: an absent field stays
+ *  absent rather than becoming an explicit `undefined` key. */
+function definedIdentity(identity: AccountIdentity): AccountIdentity {
+  return {
+    ...(identity.accountUuid !== undefined ? { accountUuid: identity.accountUuid } : {}),
+    ...(identity.emailAddress !== undefined ? { emailAddress: identity.emailAddress } : {}),
+    ...(identity.organizationUuid !== undefined
+      ? { organizationUuid: identity.organizationUuid }
+      : {}),
+  };
+}
+
 function allRowsOf(st: RegistryState): StoredAccount[] {
   return [...st.shared, ...st.reserved];
 }
@@ -1290,6 +1347,22 @@ export class Vault {
    */
   async createRule(opts: NewRuleOptions): Promise<FolderRule> {
     const st = await this.loadState();
+    const { rule, moved } = this.createRuleIn(st, opts);
+    await this.saveRules(st); // groups.json FIRST
+    if (moved.length > 0) {
+      this.removeSharedRows(st, moved);
+      await this.saveShared(st); // accounts.json SECOND
+    }
+    return rule;
+  }
+
+  /** {@link createRule} on the in-memory state `st`: every refusal, then the new rule and its
+   *  reserved rows added to `st`. Returns the rule and the shared rows it moves, which the caller
+   *  drops from the shared side once groups.json is written. */
+  private createRuleIn(
+    st: RegistryState,
+    opts: NewRuleOptions,
+  ): { rule: FolderRule; moved: StoredAccount[] } {
     const plan = this.planNewRule(st, opts);
     const now = this.clock();
     // Stored terminal-safe, exactly as an account label is (see addAccount): the rule label is
@@ -1306,6 +1379,7 @@ export class Vault {
     const rule: FolderRule = {
       id: randomUUID(),
       label,
+      ...(opts.origin !== undefined ? { origin: opts.origin } : {}),
       folders: plan.folders,
       ...(plan.aliases.length > 0 ? { aliases: plan.aliases } : {}),
       include: plan.include,
@@ -1316,12 +1390,7 @@ export class Vault {
     };
     st.rules.push(rule);
     st.reserved.push(...plan.moved);
-    await this.saveRules(st); // groups.json FIRST
-    if (plan.moved.length > 0) {
-      this.removeSharedRows(st, plan.moved);
-      await this.saveShared(st); // accounts.json SECOND
-    }
-    return rule;
+    return { rule, moved: plan.moved };
   }
 
   /**
@@ -1350,6 +1419,7 @@ export class Vault {
     if (st.rules.length >= MAX_RULES) {
       throw new VaultError(`cannot create another folder rule (max ${MAX_RULES})`);
     }
+    if (opts.origin !== undefined) assertRuleOrigin(st, opts.origin);
     const include = [...new Set(opts.include ?? [])];
     const exclude = [...new Set(opts.exclude ?? [])];
     if (include.length === 0 && exclude.length === 0) {
@@ -1375,20 +1445,33 @@ export class Vault {
     accountIds: readonly string[],
   ): Promise<{ rule: FolderRule; reserved: string[]; unexcluded: string[] }> {
     const st = await this.loadState();
+    const { rule, moved, unexcluded, changed } = this.includeIn(st, ruleId, accountIds);
+    if (!changed) return { rule, reserved: [], unexcluded: [] };
+    await this.saveRules(st); // groups.json FIRST
+    if (moved.length > 0) {
+      this.removeSharedRows(st, moved);
+      await this.saveShared(st); // accounts.json SECOND
+    }
+    return { rule, reserved: moved.map((m) => m.id), unexcluded };
+  }
+
+  /** {@link includeAccounts} on the in-memory state `st`: every refusal, then the rule and the
+   *  reserved side updated. Returns the shared rows it moves (the caller drops them from the shared
+   *  side once groups.json is written) and whether anything changed. */
+  private includeIn(
+    st: RegistryState,
+    ruleId: string,
+    accountIds: readonly string[],
+  ): { rule: FolderRule; moved: StoredAccount[]; unexcluded: string[]; changed: boolean } {
     const rule = this.mustRule(st, ruleId);
     const plan = this.planInclude(st, rule, accountIds);
-    if (plan.added.length === 0) return { rule, reserved: [], unexcluded: [] };
+    if (plan.added.length === 0) return { rule, moved: [], unexcluded: [], changed: false };
     const unexcluded = rule.exclude.filter((id) => plan.added.includes(id));
     rule.exclude = rule.exclude.filter((id) => !plan.added.includes(id));
     rule.include.push(...plan.added);
     rule.updatedAtMs = this.clock();
     st.reserved.push(...plan.moved);
-    await this.saveRules(st); // groups.json FIRST
-    if (plan.moved.length > 0) {
-      this.removeSharedRows(st, plan.moved);
-      await this.saveShared(st); // accounts.json SECOND
-    }
-    return { rule, reserved: plan.moved.map((m) => m.id), unexcluded };
+    return { rule, moved: plan.moved, unexcluded, changed: true };
   }
 
   /** Run every refusal {@link includeAccounts} would make, writing nothing. */
@@ -1434,12 +1517,22 @@ export class Vault {
     accountIds: readonly string[],
   ): Promise<{ rule: FolderRule; added: string[] }> {
     const st = await this.loadState();
+    const result = this.excludeIn(st, ruleId, accountIds);
+    if (result.added.length > 0) await this.saveRules(st);
+    return result;
+  }
+
+  /** {@link excludeAccounts} on the in-memory state `st`: every refusal, then the rule updated. */
+  private excludeIn(
+    st: RegistryState,
+    ruleId: string,
+    accountIds: readonly string[],
+  ): { rule: FolderRule; added: string[] } {
     const rule = this.mustRule(st, ruleId);
     const added = this.checkExcludable(st, rule, accountIds);
     if (added.length === 0) return { rule, added };
     rule.exclude.push(...added);
     rule.updatedAtMs = this.clock();
-    await this.saveRules(st);
     return { rule, added };
   }
 
@@ -1631,6 +1724,137 @@ export class Vault {
     return rule;
   }
 
+  /**
+   * Add scopes to an existing rule: folders and session aliases it does not hold yet, which no other
+   * rule holds either (an import growing the rule an earlier, part-way import of the same rule made,
+   * so the rule stays one slot rather than being split into two). The same checks a new rule's
+   * scopes get, plus the rule's scope caps. One groups.json write, nothing when there is nothing to
+   * add.
+   */
+  async addScopesToRule(
+    ruleId: string,
+    scopes: { folders: readonly string[]; aliases?: readonly StoredAliasScope[] },
+  ): Promise<FolderRule> {
+    const st = await this.loadState();
+    const { rule, changed } = this.addScopesIn(st, ruleId, scopes);
+    if (changed) await this.saveRules(st);
+    return rule;
+  }
+
+  /** {@link addScopesToRule} on the in-memory state `st`: every refusal, then the rule updated. */
+  private addScopesIn(
+    st: RegistryState,
+    ruleId: string,
+    scopes: { folders: readonly string[]; aliases?: readonly StoredAliasScope[] },
+  ): { rule: FolderRule; changed: boolean } {
+    const rule = this.mustRule(st, ruleId);
+    const { folders, aliases } = this.planAddScopes(st, rule, scopes);
+    if (folders.length + aliases.length === 0) return { rule, changed: false };
+    rule.folders = [...rule.folders, ...folders];
+    if (aliases.length > 0) rule.aliases = [...(rule.aliases ?? []), ...aliases];
+    rule.updatedAtMs = this.clock();
+    return { rule, changed: true };
+  }
+
+  /**
+   * A draft of the registry to try rule writes against, writing nothing: the rule writes an import
+   * makes, each with exactly the refusals and effects {@link createRule}, {@link includeAccounts},
+   * {@link excludeAccounts}, {@link addScopesToRule} and {@link orderRules} have (the same code),
+   * applied to an in-memory copy read now, with `extraShared` added to its shared side (the
+   * accounts an import will have stored by the time it writes its rules). Each write sees the ones
+   * before it, so a batch tried here meets every refusal the same batch meets on disk, in order,
+   * and its `picture` is the registry as the batch would leave it.
+   */
+  async draftRules(extraShared: readonly StoredAccount[] = []): Promise<RuleDraft> {
+    const st = await this.loadState();
+    st.shared = [...st.shared, ...extraShared.map((a) => ({ ...a }))];
+    // Each write runs after the ones before it, and its refusal rejects its promise as the
+    // vault's own would.
+    const run = <T>(write: () => T): Promise<T> => Promise.resolve().then(write);
+    return {
+      createRule: (opts) =>
+        run(() => {
+          const { rule, moved } = this.createRuleIn(st, opts);
+          this.removeSharedRows(st, moved);
+          return rule;
+        }),
+      includeAccounts: (ruleId, accountIds) =>
+        run(() => {
+          const { rule, moved } = this.includeIn(st, ruleId, accountIds);
+          this.removeSharedRows(st, moved);
+          return rule;
+        }),
+      excludeAccounts: (ruleId, accountIds) =>
+        run(() => this.excludeIn(st, ruleId, accountIds).rule),
+      addScopesToRule: (ruleId, scopes) => run(() => this.addScopesIn(st, ruleId, scopes).rule),
+      orderRules: (ruleIds) => run(() => this.orderRulesIn(st, ruleIds)),
+      picture: () => ({ shared: st.shared, reserved: st.reserved, rules: st.rules }),
+    };
+  }
+
+  /**
+   * Put the rules `ruleIds` names in that order, among the places they already hold in the file:
+   * an import creates its rules in the order its writes need (every exclusion before any
+   * inclusion), and lists them in the order of the file it read. Writes nothing when they already
+   * are in that order.
+   */
+  async orderRules(ruleIds: readonly string[]): Promise<void> {
+    const st = await this.loadState();
+    if (this.orderRulesIn(st, ruleIds)) await this.saveRules(st);
+  }
+
+  /** {@link orderRules} over `st`; whether anything moved. */
+  private orderRulesIn(st: RegistryState, ruleIds: readonly string[]): boolean {
+    const wanted = [...new Set(ruleIds)].flatMap((id) => st.rules.filter((r) => r.id === id));
+    const places = st.rules.flatMap((r, i) => (wanted.includes(r) ? [i] : []));
+    let moved = false;
+    for (const [k, at] of places.entries()) {
+      if (st.rules[at] !== wanted[k]) moved = true;
+      st.rules[at] = wanted[k]!;
+    }
+    return moved;
+  }
+
+  /** The scopes {@link addScopesToRule} would add, checked. Pure over `st`. */
+  private planAddScopes(
+    st: RegistryState,
+    rule: FolderRule,
+    scopes: { folders: readonly string[]; aliases?: readonly StoredAliasScope[] },
+  ): { folders: string[]; aliases: StoredAliasScope[] } {
+    const folders = this.checkNewFolders(st, scopes.folders, rule.id);
+    const aliases = this.checkNewAliases(st, scopes.aliases ?? []);
+    if (rule.folders.length + folders.length > MAX_RULE_FOLDERS) {
+      throw new VaultError(`a folder rule cannot hold more than ${MAX_RULE_FOLDERS} folders`);
+    }
+    if ((rule.aliases?.length ?? 0) + aliases.length > MAX_RULE_ALIASES) {
+      throw new VaultError(
+        `a folder rule cannot hold more than ${MAX_RULE_ALIASES} session aliases`,
+      );
+    }
+    return { folders, aliases };
+  }
+
+  /** The id a new account row gets: the one asked for (an import keeping the account's id from the
+   *  machine it came from) when it is a uuid no row here has, else a fresh one. The id names the
+   *  account's bundle file, so nothing but a uuid is ever taken from a caller. Nor is one another
+   *  row carries as its label: `resolveAccountRef` would then find two accounts by that one name
+   *  (the mirror of what {@link assertLabelFree} refuses for a label). */
+  private newAccountId(allRows: readonly StoredAccount[], requested: string | undefined): string {
+    if (requested === undefined) return randomUUID();
+    if (!ACCOUNT_ID_PATTERN.test(requested)) {
+      throw new VaultError('an account id must be a lower-case uuid');
+    }
+    const holder = allRows.find((a) => a.id === requested);
+    if (holder !== undefined) {
+      throw new VaultError(`account "${holder.label}" already has the id ${requested}`);
+    }
+    const named = allRows.find((a) => a.label.toLowerCase() === requested);
+    if (named !== undefined) {
+      throw new VaultError(`account "${named.label}" is labelled with the id ${requested}`);
+    }
+    return requested;
+  }
+
   /** Validate a set of NEW folders against the current rules: each must be a non-empty string,
    *  unique within the set, not already held by a DIFFERENT rule, and not already held by the rule
    *  being grown (`ignoreRuleId`). Returns them unchanged.
@@ -1740,8 +1964,19 @@ export class Vault {
    * already reserved, or a label a reserved account carries, is refused here too, or the name
    * resolver could not tell the two apart. A newly added account is always shared — including it in
    * a folder rule is a separate step.
+   *
+   * `opts` is for a caller that knows more than the bundle says (an import): the auto-switch
+   * exclusion lands in this same write, so no crash or lock timeout can leave the account stored
+   * without it; each identity anchor the bundle's block does not carry (all of them, when it has no
+   * block) is taken from the identity the caller states, so the row can be recognized again (a
+   * second import of it is then a no-op, and the login refusal below applies to it); and the account
+   * can keep the id it had where it came from.
    */
-  async addAccount(label: string, bundle: CredentialBundle): Promise<StoredAccount> {
+  async addAccount(
+    label: string,
+    bundle: CredentialBundle,
+    opts: AddAccountOptions = {},
+  ): Promise<StoredAccount> {
     const st = await this.loadState();
     // Strip terminal-interpreted controls (ANSI escapes, newlines, bidi/format controls) before the
     // label is stored — it is later rendered on the CLI, in Discord, and in the enforcement guard's
@@ -1750,22 +1985,27 @@ export class Vault {
     if (next === '') throw new VaultError('a label cannot be empty');
     const allRows = allRowsOf(st);
     assertLabelFree(allRows, next, undefined);
+    const id = this.newAccountId(allRows, opts.id);
     // The same login stored twice is the other way two rows come to answer to one name (and
     // to poll one quota twice). The identity block names the login; when it names a row that
-    // is already here, that row is the one to refresh, never a second copy.
-    const uuid = bundle.oauthAccount?.accountUuid;
+    // is already here, that row is the one to refresh, never a second copy. A block that names
+    // no login (or not as text) leaves the stated one to decide.
+    const blockUuid = bundle.oauthAccount?.accountUuid;
+    const uuid = typeof blockUuid === 'string' ? blockUuid : opts.identity?.accountUuid;
     const stored = uuid !== undefined ? allRows.find((a) => a.accountUuid === uuid) : undefined;
     if (stored) {
       throw new VaultError(
         `this login is account ${stored.id} ("${stored.label}"), which is already stored; run ` +
-          `\`cctl accounts relogin ${stored.label}\` to refresh it instead of adding a duplicate`,
+          `\`cctl accounts relogin ${shellQuoteArg(stored.label, this.platform)}\` to refresh it ` +
+          'instead of adding a duplicate',
       );
     }
     const now = this.clock();
     const account: StoredAccount = {
-      id: randomUUID(),
+      id,
       label: next,
       quarantined: false,
+      ...(opts.autoSwitchExcluded === true ? { autoSwitchExcluded: true } : {}),
       createdAtMs: now,
       updatedAtMs: now,
     };
@@ -1775,9 +2015,72 @@ export class Vault {
     // response missing one degrades to "unknown" in the CLI rather than crashing or forcing a
     // re-login (see planWeight() / `cctl accounts list` for how absence renders).
     applyBundleMetadata(account, bundle, this.log);
+    // Filled per anchor, never all-or-nothing: a partial block (an email and no login) must not
+    // cost the row the login the caller knows, or the row could not be found again.
+    for (const [key, value] of Object.entries(definedIdentity(opts.identity ?? {}))) {
+      const anchor = key as keyof AccountIdentity;
+      if (account[anchor] === undefined) account[anchor] = value;
+    }
     // Writes the blob only — the row is not in the registry yet, so its metadata refresh is a
     // no-op here; `saveShared` below is what persists the row built above.
     await this.writeBundle(account.id, bundle);
+    st.shared.push(account);
+    await this.saveShared(st);
+    return account;
+  }
+
+  /**
+   * Create a SHARED account that has no credentials yet: a registry row carrying the identity it is
+   * known by, and no encrypted bundle. It is stored quarantined with `reason`, which is exactly what
+   * an account without a working login is to every reader: never a switch, refresh, poll or
+   * auto-switch target, listed with its reason, and brought back by a re-login, which writes the
+   * bundle and lifts the quarantine. The identity is what that re-login is checked against, so the
+   * login that fills the row has to be the account it names.
+   *
+   * The same label and login refusals as {@link addAccount} apply, across the whole registry. The
+   * row is stamped with the current metadata revision: there is no bundle to recompute it from, and
+   * the first bundle write replaces the plan fields anyway. `opts.autoSwitchExcluded` is written in
+   * the same write, as {@link addAccount} does; `opts.plan` (the facts the account had where it came
+   * from) is shown until that first write; `opts.id` is {@link addAccount}'s.
+   */
+  async addPendingAccount(
+    label: string,
+    identity: AccountIdentity,
+    reason: string,
+    opts: AddPendingAccountOptions = {},
+  ): Promise<StoredAccount> {
+    const st = await this.loadState();
+    const next = sanitizeTerminalText(label).trim();
+    if (next === '') throw new VaultError('a label cannot be empty');
+    const allRows = allRowsOf(st);
+    assertLabelFree(allRows, next, undefined);
+    const id = this.newAccountId(allRows, opts.id);
+    const uuid = identity.accountUuid;
+    const stored = uuid !== undefined ? allRows.find((a) => a.accountUuid === uuid) : undefined;
+    if (stored) {
+      throw new VaultError(
+        `this login is account ${stored.id} ("${stored.label}"), which is already stored`,
+      );
+    }
+    const now = this.clock();
+    const plan: Partial<Record<PlanKey, string>> = {};
+    for (const key of ACCOUNT_PLAN_KEYS) {
+      const value = opts.plan?.[key];
+      if (typeof value === 'string') plan[key] = value;
+    }
+    const account: StoredAccount = {
+      id,
+      label: next,
+      ...definedIdentity(identity),
+      ...plan,
+      ...(opts.autoSwitchExcluded === true ? { autoSwitchExcluded: true } : {}),
+      metadataRev: ACCOUNT_METADATA_REV,
+      quarantined: true,
+      quarantineReason: reason,
+      quarantinedAtMs: now,
+      createdAtMs: now,
+      updatedAtMs: now,
+    };
     st.shared.push(account);
     await this.saveShared(st);
     return account;
@@ -1967,6 +2270,18 @@ export class Vault {
 
   /** Decrypt and return an account's credential bundle. The token fingerprints of the blob it read
    *  are remembered on the way (see {@link readStoredTokens}), since the decrypt is already paid. */
+  /** Whether an account has an encrypted bundle on disk at all — the one fact about a stored copy
+   *  that does not need it to be readable. */
+  async hasBundle(id: string): Promise<boolean> {
+    try {
+      await stat(this.bundlePath(id));
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw err;
+    }
+  }
+
   async readBundle(id: string): Promise<CredentialBundle> {
     let blob: string;
     try {
@@ -2089,11 +2404,17 @@ export class Vault {
    *
    *  Because of that refresh this method is a registry read-modify-write, so like the other
    *  registry writers it MUST be called with the credential lock held (see the "registry
-   *  mutators" note in switchEngine.ts) or a concurrent writer's update is silently lost. */
-  async writeBundle(id: string, bundle: CredentialBundle): Promise<void> {
+   *  mutators" note in switchEngine.ts) or a concurrent writer's update is silently lost.
+   *
+   *  `onStored` is told as soon as the blob is in place, before the registry write: from then on
+   *  the vault holds the new tokens even if that write fails, and a caller that must undo its own
+   *  writes only while the old tokens are still the stored ones needs to know which side of the
+   *  blob a failure came from. */
+  async writeBundle(id: string, bundle: CredentialBundle, onStored?: () => void): Promise<void> {
     ensureDir(join(this.vaultDir, id));
     const blob = await this.protector.protect(Buffer.from(JSON.stringify(bundle), 'utf8'));
     await atomicWriteFile(this.bundlePath(id), blob);
+    onStored?.();
     this.printsByBlob.set(blobDigest(blob), tokenPrints(bundle.claudeAiOauth));
     await this.syncMetadata(id, bundle);
   }

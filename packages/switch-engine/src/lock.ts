@@ -15,10 +15,18 @@
 // This is a mutex between OUR processes. It cannot lock out the Claude CLI itself — that
 // race is handled separately by reconcile-by-reading in the switch engine.
 
-import { mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { join } from 'node:path';
-import { ensureDir } from './fsutil.js';
+import { basename, dirname, join } from 'node:path';
+import { RENAME_RETRY_DELAYS_MS, ensureDir, isTransientRenameError } from './fsutil.js';
 import { LockTimeoutError } from './errors.js';
 
 export interface LockOptions {
@@ -81,8 +89,9 @@ export class Lock {
   /**
    * Restamp the claim's time, so a holder that is alive but holds for long (a move that waits on
    * Claude Code) is never reclaimed as stale by age. The record is replaced by a rename, so a
-   * contender never reads it half-written. Returns false, touching nothing, once the lock is no
-   * longer this claim's.
+   * contender never reads it half-written; a contender reading it at that very instant only delays
+   * the rename (see replaceOwnerRecord). Returns false, touching nothing, once the lock is no
+   * longer this claim's, or when the record cannot be replaced at all.
    */
   refresh(): boolean {
     if (this.released || !this.stillOurs()) return false;
@@ -95,10 +104,11 @@ export class Lock {
     const temp = join(this.dir, `owner.${randomUUID()}.tmp`);
     try {
       writeFileSync(temp, JSON.stringify(record));
-      renameSync(temp, join(this.dir, 'owner.json'));
+      replaceOwnerRecord(temp, join(this.dir, 'owner.json'));
       return true;
     } catch {
-      // Reclaimed between the check and the write: the claim is lost, and the temp file with it.
+      // Reclaimed between the check and the write (the claim is lost, and the temp file with it),
+      // or the record cannot be replaced: the claim is not restamped either way.
       try {
         unlinkSync(temp);
       } catch {
@@ -117,20 +127,44 @@ export class Lock {
   }
 }
 
+/**
+ * Rename `temp` over a lock's owner record. Every contender waiting on the lock reads that record
+ * on each poll, and on Windows a rename over a file another process has open just then fails
+ * (EPERM or EBUSY) and succeeds a moment later: such a failure is waited out on the same short
+ * ladder every other rename here uses, rather than taken for the claim being lost. Any other
+ * failure, or one that outlasts the ladder, is thrown.
+ */
+function replaceOwnerRecord(temp: string, target: string): void {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      renameSync(temp, target);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? '';
+      const wait = RENAME_RETRY_DELAYS_MS[attempt];
+      if (wait === undefined || !isTransientRenameError(code, process.platform)) throw err;
+      // A refresh is synchronous (its callers restamp between steps), so it waits synchronously.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
+    }
+  }
+}
+
 /** Whether a lock's holder looks dead: not a live process, or older than `staleMs`. */
 function isStale(record: LockRecord, now: number, staleMs: number): boolean {
   if (now - record.startedAtMs > staleMs) return true;
   // A same-host record whose pid no longer exists is definitively stale.
-  if (record.host === hostId()) {
-    try {
-      process.kill(record.pid, 0); // signal 0 = existence check, kills nothing
-      return false; // holder is alive
-    } catch (err) {
-      // ESRCH = no such process → stale. EPERM = exists but not ours → alive.
-      return (err as NodeJS.ErrnoException).code === 'ESRCH';
-    }
+  return record.host === hostId() && !processExists(record.pid);
+}
+
+/** Whether a process of this host runs under `pid`. */
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0); // signal 0 = existence check, kills nothing
+    return true;
+  } catch (err) {
+    // ESRCH = no such process. EPERM = exists but not ours, so it runs.
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
   }
-  return false;
 }
 
 function hostId(): string {
@@ -155,6 +189,10 @@ export async function acquireLock(
   // means two processes — or two attempts — never collide on the staging dir itself.
   const staging = `${lockDir}.staging-${randomUUID()}`;
   const token = randomUUID();
+  // Written once this call starts waiting, so a holder handing the lock over (see yieldLock) knows
+  // someone waits; removed however the wait ends.
+  const waiting = `${lockDir}${WAITER_INFIX}${token}`;
+  let announced = false;
   mkdirSync(staging, { recursive: true });
   try {
     for (;;) {
@@ -178,6 +216,15 @@ export async function acquireLock(
             `could not acquire credential lock at ${lockDir} within ${timeoutMs}ms`,
           );
         }
+        if (!announced) {
+          announced = true;
+          try {
+            writeFileSync(waiting, JSON.stringify({ pid: process.pid, host: hostId() }));
+          } catch {
+            // Unannounced, this call still gets the lock whenever it is free; it is only not
+            // handed it by a holder that would otherwise claim it straight back.
+          }
+        }
         await sleep(pollMs);
       }
     }
@@ -186,7 +233,72 @@ export async function acquireLock(
     // successful rename already consumed it, so `force` makes the now-absent path a no-op. This
     // never touches `lockDir` — only our own staging path.
     rmSync(staging, { recursive: true, force: true });
+    if (announced) rmSync(waiting, { force: true });
   }
+}
+
+/** What a waiting contender's announcement is named by, after the lock's own name. */
+const WAITER_INFIX = '.waiting-';
+
+/** The longest {@link yieldLock} waits for the contenders it found to get the lock: well past any
+ *  contender's poll interval (100 ms by default, 250 ms at most here), so a live one gets its turn
+ *  even on a loaded machine, and short enough that the announcement of a hung process costs little. */
+export const YIELD_MAX_MS = 1_500;
+
+/** How often {@link yieldLock} looks whether the contenders it waits for have got the lock. */
+const YIELD_POLL_MS = 5;
+
+/**
+ * Hand the lock over, between two holds of one long job, to every contender waiting for it now.
+ *
+ * A holder that releases and at once claims again never really lets go: the release and the next
+ * claim run back to back, so a contender gets in only when its poll happens to land in the few
+ * milliseconds between them, and one waiting through a job of many holds times out all the same.
+ * So a waiting contender announces itself (see acquireLock), and the holder, after releasing,
+ * waits here until each contender announced at that moment has got the lock (its announcement is
+ * gone) before claiming again; that claim then waits behind the contender's hold like any other.
+ * The announcement of a process that no longer runs on this host is not waited for, and none is
+ * waited for longer than {@link YIELD_MAX_MS}. With nobody waiting this returns at once.
+ */
+export async function yieldLock(lockDir: string): Promise<void> {
+  let waiting = waitersOf(lockDir);
+  const deadline = Date.now() + YIELD_MAX_MS;
+  while (waiting.size > 0 && Date.now() < deadline) {
+    await sleep(YIELD_POLL_MS);
+    const now = waitersOf(lockDir);
+    waiting = new Set([...waiting].filter((name) => now.has(name)));
+  }
+}
+
+/** The announcements of contenders waiting for the lock at `lockDir`, leaving out those of a
+ *  process on this host that no longer runs. */
+function waitersOf(lockDir: string): Set<string> {
+  const parent = dirname(lockDir);
+  const prefix = `${basename(lockDir)}${WAITER_INFIX}`;
+  let names: string[];
+  try {
+    names = readdirSync(parent).filter((name) => name.startsWith(prefix));
+  } catch {
+    return new Set();
+  }
+  return new Set(
+    names.filter((name) => {
+      let text: string;
+      try {
+        text = readFileSync(join(parent, name), 'utf8');
+      } catch {
+        // Gone since the listing: its contender got the lock, or stopped waiting.
+        return false;
+      }
+      try {
+        const { pid, host } = JSON.parse(text) as { pid: number; host: string };
+        return host !== hostId() || processExists(pid);
+      } catch {
+        // Being written just now: its contender waits.
+        return true;
+      }
+    }),
+  );
 }
 
 /**

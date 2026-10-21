@@ -71,6 +71,10 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
   sessions started on the global account move onto the folder's own account between turns.
   `cctl session include <alias> <account>` gives one named session (its `/rename` title) a
   rule of its own, ahead of its folder's. Windows and Linux; see `docs/CLI.md`.
+- **Take your accounts to a new machine.** `cctl export <file>` seals every account, its
+  folder rules and your settings under a passphrase; `cctl import <file>` on the other machine
+  adds them (`--dry-run` shows what it would do first). `--move` removes them here once the
+  file is written, since a login works on one machine at a time.
 
 ## Local-only (no Discord)
 

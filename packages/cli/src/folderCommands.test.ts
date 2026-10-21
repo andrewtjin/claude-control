@@ -11,13 +11,22 @@ import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  FileCredentialChannel,
+  InsecurePassthroughProtector,
+  SwitchEngine,
   sandboxPaths,
   type AccountView,
   type FolderRule,
   type Paths,
 } from '@claude-control/switch-engine';
 import { BIND_GUARD_MARKER, Store, bindGuardPath, isMoveTarget } from '@claude-control/daemon';
-import { lastUsageOf, reconcileFolderGuard, relaxationBannerLine } from './folderCommands.js';
+import {
+  buildPoolView,
+  lastUsageOf,
+  reconcileFolderGuard,
+  relaxationBannerLine,
+} from './folderCommands.js';
+import { describeSlotLive } from './folderRender.js';
 
 /** A minimal stand-in for the switch engine: `reconcileFolderGuard` only asks it how many folder
  *  rules exist. `count` is what `listRules` reports — the one input that decides install vs. remove. */
@@ -173,5 +182,34 @@ describe('lastUsageOf', () => {
     // With no record at all it counts as able.
     const none = lastUsageOf(E, join(root, 'none.db'));
     expect(isMoveTarget(['e'], 'e', none, Date.now())).toBe(true);
+  });
+});
+
+describe('why a slot has no usable account', () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'cctl-pending-'));
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('says an account an import stored without tokens is not logged in yet, not that it expired', async () => {
+    const engine = new SwitchEngine({
+      paths: sandboxPaths(root),
+      protector: new InsecurePassthroughProtector(),
+      liveCredentialChannel: new FileCredentialChannel(join(root, 'claude', '.credentials.json')),
+    });
+    await engine.addPendingAccount('alice', { accountUuid: 'u-alice' });
+    const view = buildPoolView(
+      undefined,
+      await engine.slotPool('global'),
+      null,
+      await engine.listAllAccounts(),
+      [],
+    );
+    const line = describeSlotLive(null, view, 'global');
+    expect(line).not.toContain('expired');
+    expect(line).toContain("not logged in here yet; log one in: cctl accounts relogin 'alice'");
   });
 });

@@ -1,6 +1,8 @@
 // Typed errors so callers can branch on failure mode rather than string-matching.
 // Each carries a stable `code` for logs and protocol mapping.
 
+import type { ImportRuleOutcome, ImportRulesPlan, SlotHandOff, SlotSeat } from './types.js';
+
 export class SwitchEngineError extends Error {
   constructor(
     message: string,
@@ -138,5 +140,44 @@ export class UnknownAccountError extends SwitchEngineError {
 export class ProfileError extends SwitchEngineError {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, 'profile_error', options);
+  }
+}
+
+/**
+ * An import of rules that stopped part-way, after it had started writing: what it got done is
+ * carried here, because the caller has to report it and bring the guard up to date even though the
+ * batch did not finish. `plan` is the decision it was carrying out; `outcomes` what each rule it
+ * wrote and seated came to (undefined for the rest); `allWritten` whether every write of the batch
+ * had landed (each rule the plan creates or grows is then in place, seated or not); `handedOff` and
+ * `seated` the slots it moved. `cause` is what stopped it (the lock taken over, a file that could
+ * not be read).
+ */
+export class ImportInterruptedError extends SwitchEngineError {
+  readonly plan: ImportRulesPlan;
+  readonly outcomes: ReadonlyArray<ImportRuleOutcome | undefined>;
+  readonly allWritten: boolean;
+  readonly handedOff: readonly SlotHandOff[];
+  readonly seated: readonly SlotSeat[];
+
+  constructor(
+    done: {
+      plan: ImportRulesPlan;
+      outcomes: ReadonlyArray<ImportRuleOutcome | undefined>;
+      allWritten: boolean;
+      handedOff: readonly SlotHandOff[];
+      seated: readonly SlotSeat[];
+    },
+    cause: unknown,
+  ) {
+    super(
+      `the import stopped part-way (${cause instanceof Error ? cause.message : String(cause)})`,
+      'import_interrupted',
+      { cause },
+    );
+    this.plan = done.plan;
+    this.outcomes = done.outcomes;
+    this.allWritten = done.allWritten;
+    this.handedOff = done.handedOff;
+    this.seated = done.seated;
   }
 }
