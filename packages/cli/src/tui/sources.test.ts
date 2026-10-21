@@ -2,7 +2,7 @@
 // so one unreadable file never blanks a pane whose data lives somewhere else.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
@@ -17,7 +17,9 @@ import {
   type LeaseHolder,
 } from '@claude-control/switch-engine';
 import { Store } from '@claude-control/daemon';
+import { AccountActionError } from '../accountActions.js';
 import { createTuiSources } from './sources.js';
+import type { TuiAccount } from './types.js';
 
 // The data dir (vault, daemon.db) is moved into a temp root for every test.
 const pathsIo = vi.hoisted(() => ({ dataRoot: '' }));
@@ -31,6 +33,17 @@ vi.mock('@claude-control/switch-engine', async (importOriginal) => {
     }),
   };
 });
+
+// Whether a parallel session's processes still run is a process query, which these tests do not
+// make: the check an action runs before a session can refuse it is recorded instead.
+const leaseIo = vi.hoisted(() => ({ swept: [] as string[] }));
+vi.mock('../leaseCli.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../leaseCli.js')>()),
+  sweepBeforeLeaseRefusal: (_engine: unknown, _paths: unknown, accountId: string) => {
+    leaseIo.swept.push(accountId);
+    return Promise.resolve();
+  },
+}));
 
 /** A login far from expiry. */
 function login(name: string): CredentialBundle {
@@ -161,38 +174,37 @@ describe('createTuiSources: each pane degrades on its own', () => {
 
 describe('createTuiSources: an account a parallel session holds', () => {
   let root: string;
+  let paths: ReturnType<typeof defaultPaths>;
+  let engine: SwitchEngine;
+  let work: { id: string };
+  let sources: ReturnType<typeof createTuiSources>;
+
+  /** Two terminals on a parallel session, as `cctl claude --account` records them. */
+  const launcher = (pid: number): LeaseHolder => ({
+    pid,
+    start: 0,
+    host: 'box',
+    platform: 'win32',
+    role: 'launcher',
+  });
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), 'cctl-tui-lease-'));
     pathsIo.dataRoot = root;
+    leaseIo.swept = [];
     vi.stubEnv('CLAUDE_CONFIG_DIR', join(root, 'claude'));
     await mkdir(join(root, 'claude'), { recursive: true });
-  });
-  afterEach(async () => {
-    vi.unstubAllEnvs();
-    pathsIo.dataRoot = '';
-    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-  });
-
-  it('is tagged as a parallel session, never as a folder, beside a folder rule named by its label', async () => {
-    const paths = defaultPaths();
+    paths = defaultPaths();
     const protector = new InsecurePassthroughProtector();
-    const engine = new SwitchEngine({ paths, protector, logger: noopLogger });
-    const work = await engine.addAccount('work', login('work'));
+    engine = new SwitchEngine({ paths, protector, logger: noopLogger });
+    work = await engine.addAccount('work', login('work'));
     const home = await engine.addAccount('home', login('home'));
     const spare = await engine.addAccount('spare', login('spare'));
     await engine.addAccount('extra', login('extra'));
     const repo = join(root, 'repo');
     await mkdir(repo, { recursive: true });
     await engine.includeInFolder(repo, [home.id], { label: 'Client' });
-    // Two terminals on work's parallel session, its slot seated as the claim seats it.
-    const launcher = (pid: number): LeaseHolder => ({
-      pid,
-      start: 0,
-      host: 'box',
-      platform: 'win32',
-      role: 'launcher',
-    });
+    // work's parallel session, its slot seated as the claim seats it.
     await new Vault(paths.vaultDir, protector).createRule({
       folders: [],
       include: [work.id],
@@ -203,33 +215,92 @@ describe('createTuiSources: an account a parallel session holds', () => {
     const other = join(root, 'other');
     await mkdir(other, { recursive: true });
     await engine.excludeInFolder(other, [spare.id], { label: 'Other' });
-
     const dataDir = dirname(paths.vaultDir);
-    const sources = createTuiSources({
+    sources = createTuiSources({
       engine,
       readOutages: () =>
         Promise.resolve({ episodes: [], open: [], logPath: join(dataDir, 'exhaustion.jsonl') }),
     });
-    try {
-      const snapshot = await sources.load(Date.now());
-      expect(snapshot.accounts.ok).toBe(true);
-      if (!snapshot.accounts.ok) return;
-      const row = (label: string) =>
-        snapshot.accounts.ok && snapshot.accounts.value.find((a) => a.label === label);
-      expect(row('work')).toMatchObject({
-        folders: [],
-        extraTags: [{ text: 'parallel session x2', tone: 'info' }],
-      });
-      expect(row('home')).toMatchObject({ folders: ['Client'], extraTags: [] });
-      // A shared account live in a folder's slot is named by that rule's label, not its slot id.
-      expect(row('extra')).toMatchObject({ folders: ['Other'], extraTags: [] });
-      // The folders pane lists the operator's rules only.
-      expect(snapshot.folders.ok && snapshot.folders.value.rules.map((r) => r.label)).toEqual([
-        'Client',
-        'Other',
-      ]);
-    } finally {
-      sources.close?.();
-    }
+  });
+  afterEach(async () => {
+    sources.close?.();
+    vi.unstubAllEnvs();
+    pathsIo.dataRoot = '';
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  });
+
+  /** The account rows of a fresh read, by label. */
+  async function rows(): Promise<Map<string, TuiAccount>> {
+    const snapshot = await sources.load(Date.now());
+    expect(snapshot.accounts.ok).toBe(true);
+    return new Map((snapshot.accounts.ok ? snapshot.accounts.value : []).map((a) => [a.label, a]));
+  }
+
+  /** work's parallel session is as it was started: both holders, its slot on work, and the rules
+   *  file at the schema a parallel session needs. */
+  async function sessionIntact(): Promise<void> {
+    const rule = (await engine.listRules()).find((r) => r.id === leaseRuleId(work.id));
+    expect(rule?.lease?.holders).toEqual([launcher(4101), launcher(4102)]);
+    expect(await engine.getActiveId(ruleSlotId(leaseRuleId(work.id)))).toBe(work.id);
+    const file = JSON.parse(await readFile(join(paths.vaultDir, 'groups.json'), 'utf8')) as {
+      schemaVersion: number;
+    };
+    expect(file.schemaVersion).toBe(4);
+  }
+
+  it('is tagged as a parallel session, never as a folder, beside a folder rule named by its label', async () => {
+    const byLabel = await rows();
+    expect(byLabel.get('work')).toMatchObject({
+      folders: [],
+      extraTags: [{ text: 'parallel session x2', tone: 'info' }],
+    });
+    expect(byLabel.get('home')).toMatchObject({ folders: ['Client'], extraTags: [] });
+    // A shared account live in a folder's slot is named by that rule's label, not its slot id.
+    expect(byLabel.get('extra')).toMatchObject({ folders: ['Other'], extraTags: [] });
+    // The folders pane lists the operator's rules only.
+    const snapshot = await sources.load(Date.now());
+    expect(snapshot.folders.ok && snapshot.folders.value.rules.map((r) => r.label)).toEqual([
+      'Client',
+      'Other',
+    ]);
+  });
+
+  it("refuses a switch to it and its removal in the engine's words, and changes nothing", async () => {
+    const global = await engine.getActiveId('global');
+    const switched = await sources.switchAccount(work.id).catch((err: unknown) => err);
+    expect(switched).toBeInstanceOf(AccountActionError);
+    expect((switched as AccountActionError).code).toBe('slot_refused');
+    expect((switched as AccountActionError).message).toMatch(
+      /^account "work" is in use by a parallel session on 2 terminals .*; it rejoins the pool when the last of them exits$/,
+    );
+    const removed = await sources.removeAccount(work.id, 'work').catch((err: unknown) => err);
+    expect(removed).toBeInstanceOf(AccountActionError);
+    expect((removed as AccountActionError).code).toBe('leased');
+    expect((removed as AccountActionError).message).toMatch(
+      /^account "work" is in use by a parallel session .*; exit them first$/,
+    );
+    // Each first checked whether the session's processes still run.
+    expect(leaseIo.swept).toEqual([work.id, work.id]);
+    expect(await engine.getActiveId('global')).toBe(global);
+    expect((await engine.listAllAccounts()).map((a) => a.label).sort()).toEqual([
+      'extra',
+      'home',
+      'spare',
+      'work',
+    ]);
+    await sessionIntact();
+  });
+
+  it('renames it and bars it from auto-switch with the session left whole', async () => {
+    expect((await sources.renameAccount(work.id, 'job')).message).toContain('Renamed work to job');
+    expect((await sources.setExcluded(work.id, true)).message).toBe(
+      'Excluded job from auto-switch (manual switches still work).',
+    );
+    await sessionIntact();
+    expect((await rows()).get('job')).toMatchObject({
+      excluded: true,
+      folders: [],
+      extraTags: [{ text: 'parallel session x2', tone: 'info' }],
+    });
   });
 });
