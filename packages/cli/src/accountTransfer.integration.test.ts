@@ -2,7 +2,7 @@
 // and main config dir, with a real engine over a pass-through protector), a sealed file between
 // them, and the registry, rules and settings compared on both sides.
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtemp, mkdir, open, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -394,6 +394,28 @@ describe('collisions', () => {
     expect(report).toContain("newer: tokens replaced (the file's were newer)");
     expect(report).toContain('older: kept - the tokens stored here are as new');
     expect(report).toContain('fixme: tokens replaced (the stored login was quarantined)');
+  });
+
+  it('says the tokens arrived when a step after storing them fails', async () => {
+    const a = await machine();
+    const now = Date.now();
+    await a.engine.addAccount('newer', bundle('A-new', 'u-1', now + 9 * HOUR));
+    const file = join(a.root, 'f.cctl');
+    await runExport(file, exportAll, a.deps);
+    const b = await machine();
+    const row = await b.engine.addAccount('newer', bundle('B-new', 'u-1', now + 2 * HOUR));
+
+    const lift = vi
+      .spyOn(Vault.prototype, 'clearQuarantine')
+      .mockRejectedValueOnce(new VaultError('the registry could not be written'));
+    await runImport(file, { dryRun: false, replace: true }, b.deps).finally(() =>
+      lift.mockRestore(),
+    );
+    expect((await b.vault.readBundle(row.id)).claudeAiOauth.accessToken).toBe('A-new');
+    const report = b.out.join('');
+    expect(report).toContain('newer: the tokens were replaced, but the rest of');
+    expect(report).not.toContain('newer: not imported');
+    expect(report).toContain(ONE_MACHINE_WARNING);
   });
 });
 

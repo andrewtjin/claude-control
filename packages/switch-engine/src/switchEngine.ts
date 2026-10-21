@@ -1427,6 +1427,7 @@ export class SwitchEngine {
             )
           : undefined;
       let healedLiveLogin: boolean;
+      let bundleStored = false;
       try {
         ({ healedLiveLogin } = await this.applyReloginBundle(
           existing,
@@ -1435,10 +1436,23 @@ export class SwitchEngine {
           liveSlot,
           bundle.oauthAccount,
           named !== null && named !== accountId,
+          () => {
+            bundleStored = true;
+          },
         ));
       } catch (err) {
-        await putBack?.();
-        throw err;
+        // Until the vault holds the new tokens, the slot written first goes back to its old copy.
+        // Once it does, the slot keeps the new ones: they are what the account is now known by, so
+        // the old copy put back would run there known as no account, and a later step of the
+        // import could put the account live in a second slot. What is left undone is said.
+        if (!bundleStored) await putBack?.();
+        if (!bundleStored || this.isSimulatedDeath(err)) throw err;
+        throw new SwitchEngineError(
+          `the tokens were replaced, but the rest of this account's import failed ` +
+            `(${errorReason(err)}); run the import again to finish it`,
+          'import_unfinished',
+          { cause: err },
+        );
       }
       await this.refreshSnapshotForAccountsLocked();
       return { replaced: true, reason, healedLiveLogin: healedLiveLogin || putBack !== undefined };
@@ -5943,6 +5957,8 @@ export class SwitchEngine {
    *
    * `keepLiveIdentity` heals only the credentials of `liveSlot`, for a slot whose identity block
    * names another account: the slot stays torn as it was, so whoever reads it still counts both.
+   * `onStored` is told once the vault holds the new bundle, so a caller that wrote a slot first
+   * knows whether a later failure may still undo that write (see {@link importBundle}).
    */
   private async applyReloginBundle(
     existing: StoredAccount,
@@ -5951,6 +5967,7 @@ export class SwitchEngine {
     liveSlot: SlotId | undefined,
     reportedIdentity: OauthAccount | undefined,
     keepLiveIdentity = false,
+    onStored?: () => void,
   ): Promise<ReloginResult> {
     // Attribution guard — a refusal is fatal, not a warning: writing a different account's
     // tokens under this id would corrupt the very history this verb exists to protect. It runs
@@ -5974,6 +5991,7 @@ export class SwitchEngine {
     // (re-login is also a legitimate way to rotate a still-valid login) and bumps updatedAtMs,
     // so the registry reflects the re-login.
     await this.vault.writeBundle(existing.id, bundle);
+    onStored?.();
     await this.vault.clearQuarantine(existing.id);
 
     // Live heal (see the method comment). Writing credentials before identity mirrors

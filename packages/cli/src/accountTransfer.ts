@@ -830,7 +830,10 @@ async function importAccounts(
       }
     } catch (err) {
       if (!(err instanceof SwitchEngineError)) throw err;
-      report(`${name}: not imported - ${safe(err.message)}`, false);
+      // Tokens stored before a later step failed did arrive: the line says so, not "not imported".
+      const stored = err.code === 'import_unfinished';
+      if (stored) tokensArrived = true;
+      report(`${name}: ${stored ? '' : 'not imported - '}${safe(err.message)}`, false);
     }
   }
   if (plan.accounts.length === 0) report('(none in the file)', true);
