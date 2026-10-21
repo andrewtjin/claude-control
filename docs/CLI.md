@@ -198,10 +198,18 @@ and open the folder in it:
    ```json
    {
      "claudeCode.environmentVariables": [
-       { "name": "CLAUDE_CONFIG_DIR", "value": "<the profile dir cctl where prints>" }
+       { "name": "CLAUDE_CONFIG_DIR", "value": "<the profile dir cctl where prints>" },
+       {
+         "name": "CLAUDE_CODE_REMOTE_MEMORY_DIR",
+         "value": "<the main config dir cctl where prints>"
+       }
      ]
    }
    ```
+
+   The second entry lets Claude Code save its auto memory without asking: the profile reaches
+   its memory through a link, and Claude Code asks before every memory write on such a path.
+   `cctl claude` sets it for you.
 
 3. Open the folder with the same `code --profile ...` command from then on. Windows in any
    other profile keep the global slot.

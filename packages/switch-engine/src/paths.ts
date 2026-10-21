@@ -142,15 +142,8 @@ export function mainConfigDirForProfile(
   platform: NodeJS.Platform = process.platform,
   deps: Pick<DefaultPathsDeps, 'readlink' | 'readFile'> = REAL_PATH_DEPS,
 ): string | undefined {
-  const p = pathFor(platform);
-  try {
-    // A junction's target may come back with the `\\?\` long-path prefix or a trailing separator.
-    const raw = deps.readlink(p.join(profileDir, 'projects')).replace(/^\\\\\?\\/, '');
-    const target = p.resolve(profileDir, raw);
-    if (p.basename(target).toLowerCase() === 'projects') return p.dirname(target);
-  } catch {
-    // Not a link (or unreadable): try the snapshot.
-  }
+  const linked = mainDirFromProjectsLink(profileDir, platform, deps);
+  if (linked !== undefined) return linked;
   try {
     const snapshot = JSON.parse(deps.readFile(folderBindingsPath(vaultDir))) as {
       mainConfigDir?: unknown;
@@ -162,6 +155,76 @@ export function mainConfigDirForProfile(
     // No usable snapshot.
   }
   return undefined;
+}
+
+/** The main config dir a profile's `projects` link points into (the link's target is that dir's
+ *  `projects`), or undefined when `projects` is not a link or cannot be read. Never throws. */
+function mainDirFromProjectsLink(
+  profileDir: string,
+  platform: NodeJS.Platform,
+  deps: Pick<DefaultPathsDeps, 'readlink'>,
+): string | undefined {
+  const p = pathFor(platform);
+  try {
+    // A junction's target may come back with the `\\?\` long-path prefix or a trailing separator.
+    const raw = deps.readlink(p.join(profileDir, 'projects')).replace(/^\\\\\?\\/, '');
+    const target = p.resolve(profileDir, raw);
+    if (p.basename(target).toLowerCase() === 'projects') return p.dirname(target);
+  } catch {
+    // Not a link, or unreadable.
+  }
+  return undefined;
+}
+
+/** The variable Claude Code reads as the base of its auto-memory dir: memory then lives at
+ *  `<base>/projects/<project>/memory` instead of under the config dir. */
+export const MEMORY_BASE_ENV = 'CLAUDE_CODE_REMOTE_MEMORY_DIR';
+
+/**
+ * The environment for a session, with its auto memory moved off its profile's `projects` link.
+ *
+ * Why: Claude Code lets Write/Edit save `.md` files in the session's own memory dir without asking,
+ * but not when that path resolves through a link ("resolves through a symlink to …, which is
+ * outside the allowed working directories"). A group profile's `projects` IS a link to the main
+ * dir's, so in a folder-bound session every memory write fell to the sensitive-file check and asked
+ * for approval, and permission rules cannot allow it. Naming the main dir — where the link lands —
+ * as the memory base gives the same auto-memory files a path with no link in it. Claude Code also
+ * keeps subagent memory under that base, so a profile session's subagent memory moves with it.
+ *
+ * This owns the variable: it is set exactly when CLAUDE_CONFIG_DIR is a group profile under `root`
+ * (cctl's profiles root, {@link profilesRoot}) with a linked `projects`, and removed otherwise.
+ * Every process inherits it, so a value left over from a profile session must not follow a session
+ * on any other config dir — it would put that session's memory in the main dir, sandbox or not.
+ * An env with nothing to change is returned as given. Never throws.
+ */
+export function withProfileMemoryBase(
+  env: NodeJS.ProcessEnv,
+  root: string,
+  platform: NodeJS.Platform = process.platform,
+  deps: Pick<DefaultPathsDeps, 'readlink'> = REAL_PATH_DEPS,
+): NodeJS.ProcessEnv {
+  const mainDir = profileMemoryBase(env.CLAUDE_CONFIG_DIR, root, platform, deps);
+  if (mainDir !== undefined) return { ...env, [MEMORY_BASE_ENV]: mainDir };
+  if (env[MEMORY_BASE_ENV] === undefined) return env;
+  const without = { ...env };
+  delete without[MEMORY_BASE_ENV];
+  return without;
+}
+
+/** The memory base a session on `configDir` needs: the main dir when `configDir` is a group
+ *  profile under `root` whose `projects` is a link, else undefined. */
+function profileMemoryBase(
+  configDir: string | undefined,
+  root: string,
+  platform: NodeJS.Platform,
+  deps: Pick<DefaultPathsDeps, 'readlink'>,
+): string | undefined {
+  const dir = configDir?.trim();
+  if (dir === undefined || dir === '') return undefined;
+  const profileDir = profileDirContaining(dir, root, platform);
+  // Only the profile dir itself: Claude Code keys memory on the config dir, not on a dir inside it.
+  if (profileDir === undefined || !samePath(profileDir, dir, platform)) return undefined;
+  return mainDirFromProjectsLink(profileDir, platform, deps);
 }
 
 /** Where the POSIX file-key protector (fileKey.ts) keeps the vault key: a SIBLING of

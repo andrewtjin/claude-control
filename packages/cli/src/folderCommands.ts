@@ -38,7 +38,11 @@ import {
   type SlotId,
   type StoredAccount,
 } from '@claude-control/switch-engine';
-import { defaultPaths } from '@claude-control/switch-engine';
+import {
+  MEMORY_BASE_ENV,
+  defaultPaths,
+  withProfileMemoryBase,
+} from '@claude-control/switch-engine';
 import {
   DEFAULT_CONFIRM_TIMEOUT_MS,
   Store,
@@ -368,6 +372,18 @@ async function buildRuleView(
     pool: await rulePoolView(engine, rule, picture),
     profileDir: ruleProfilePath(defaultPaths().vaultDir, rule.id),
   };
+}
+
+/** The memory base a session on this profile is given (see withProfileMemoryBase), for the env
+ *  lines `where` prints; none when the profile needs none. */
+function memoryBaseOf(profileDir: string): { memoryBase?: string } {
+  const env = withProfileMemoryBase(
+    { CLAUDE_CONFIG_DIR: profileDir },
+    profilesRoot(defaultPaths().vaultDir),
+    process.platform,
+  );
+  const base = env[MEMORY_BASE_ENV];
+  return base === undefined ? {} : { memoryBase: base };
 }
 
 /** The global slot's view: its live account and the shared pool. */
@@ -934,11 +950,15 @@ export function buildFolderCommands(program: Command): void {
       const rule =
         match === null
           ? null
-          : {
-              ...(await buildRuleView(engine, match.rule, picture)),
-              matchedFolder: match.folder,
-              ...profileOf(vscodeProfileNames(picture.rules).get(match.rule.id)),
-            };
+          : await (async () => {
+              const view = await buildRuleView(engine, match.rule, picture);
+              return {
+                ...view,
+                matchedFolder: match.folder,
+                ...profileOf(vscodeProfileNames(picture.rules).get(match.rule.id)),
+                ...memoryBaseOf(view.profileDir),
+              };
+            })();
       process.stdout.write(
         renderWhere({ folder: canonical, rule, global }, detectPalette()) + '\n',
       );
@@ -1328,7 +1348,7 @@ async function runClaude(opts: {
     // Interrupted while a move ran (any other refusal has ended the command already).
     if (decision.kind === 'refuse') return;
     if (decision.kind === 'open') {
-      await launchRouted(routing!.ctx, decision);
+      await launchRouted(routing!.ctx, decision, profRoot);
       return;
     }
   }
@@ -1452,7 +1472,7 @@ async function runClaude(opts: {
     });
     if (decision.kind === 'refuse') return;
     if (decision.kind === 'open') {
-      await launchRouted(routing!.ctx, decision);
+      await launchRouted(routing!.ctx, decision, profRoot);
       return;
     }
   }
@@ -1509,11 +1529,19 @@ function dropsInheritedConfigDir(slot: LaunchSlot, profRoot: string): boolean {
 async function launchRouted(
   ctx: RouteContext,
   decision: Extract<RouteDecision, { kind: 'open' }>,
+  profRoot: string,
 ): Promise<void> {
   await runHolding(ctx.host, decision.hold, async (spawned) => {
     const target = claudeLaunchTarget(process.platform);
     const slot = await slotOfConfig(ctx, decision.configDir);
-    const env = buildLaunchEnv({ baseEnv: process.env, slot, dropInheritedConfigDir: true });
+    const env = buildLaunchEnv({
+      baseEnv: process.env,
+      slot,
+      dropInheritedConfigDir: true,
+      profilesRoot: profRoot,
+    });
+    // The slot is the one this config dir holds, so naming the dir as the routing named it keeps
+    // the memory base buildLaunchEnv gave the slot.
     const named = ctx.host.configEnv(decision.configDir);
     if (named !== undefined) env.CLAUDE_CONFIG_DIR = named;
     process.stderr.write(
@@ -1582,6 +1610,7 @@ async function launchOnSlot(input: {
     ...(explicitToken !== undefined ? { explicitToken } : {}),
     ...(overrideToken !== undefined ? { overrideToken } : {}),
     dropInheritedConfigDir,
+    profilesRoot: profRoot,
   });
 
   // One-line banner on stderr (stdout belongs to the child's TUI).

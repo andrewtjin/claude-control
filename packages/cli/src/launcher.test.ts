@@ -164,6 +164,9 @@ describe('findClaudeOnPath', () => {
   });
 });
 
+/** A profiles root holding no real profile: these launches read no `projects` link. */
+const PROFILES_ROOT = 'C:\\profiles';
+
 describe('buildLaunchEnv', () => {
   const groupSlot: LaunchSlot = {
     kind: 'group',
@@ -182,6 +185,7 @@ describe('buildLaunchEnv', () => {
       explicitToken: EXPLICIT_TOKEN,
       overrideToken: OVERRIDE_TOKEN,
       dropInheritedConfigDir: false,
+      profilesRoot: PROFILES_ROOT,
     });
     expect(env.CLAUDE_CONFIG_DIR).toBe('C:\\profiles\\g1');
     // The knobs carry the per-launch token, not a bare "1" the guard could not distinguish from
@@ -196,6 +200,7 @@ describe('buildLaunchEnv', () => {
       baseEnv: {},
       slot: groupSlot,
       dropInheritedConfigDir: false,
+      profilesRoot: PROFILES_ROOT,
     });
     expect(env.CCTL_LAUNCH_EXPLICIT).toBeUndefined();
     expect(env.CCTL_BIND_OVERRIDE).toBeUndefined();
@@ -206,6 +211,7 @@ describe('buildLaunchEnv', () => {
       baseEnv: { CCTL_LAUNCH_EXPLICIT: '1', CCTL_BIND_OVERRIDE: '1', CCTL_BIND_ENFORCE: 'off' },
       slot: { kind: 'global', label: 'main', context: 'global' },
       dropInheritedConfigDir: false,
+      profilesRoot: PROFILES_ROOT,
     });
     expect(env.CCTL_LAUNCH_EXPLICIT).toBeUndefined();
     expect(env.CCTL_BIND_OVERRIDE).toBeUndefined();
@@ -218,6 +224,7 @@ describe('buildLaunchEnv', () => {
       baseEnv: { CLAUDE_CONFIG_DIR: 'C:\\profiles\\g1' },
       slot: { kind: 'global', label: 'main', context: 'global' },
       dropInheritedConfigDir: true,
+      profilesRoot: PROFILES_ROOT,
     });
     expect(dropped.CLAUDE_CONFIG_DIR).toBeUndefined();
 
@@ -225,6 +232,7 @@ describe('buildLaunchEnv', () => {
       baseEnv: { CLAUDE_CONFIG_DIR: 'C:\\some\\other' },
       slot: { kind: 'global', label: 'main', context: 'global' },
       dropInheritedConfigDir: false,
+      profilesRoot: PROFILES_ROOT,
     });
     expect(kept.CLAUDE_CONFIG_DIR).toBe('C:\\some\\other');
   });
@@ -328,6 +336,7 @@ describe('spawnClaude (real spawn via a fake claude)', () => {
       slot: { kind: 'group', profileDir: 'C:\\profiles\\g1', label: 'work', context: 'binding' },
       explicitToken: token,
       dropInheritedConfigDir: false,
+      profilesRoot: PROFILES_ROOT,
     });
     const { out } = await runFake([], env);
     expect(out.env.CLAUDE_CONFIG_DIR).toBe('C:\\profiles\\g1');
