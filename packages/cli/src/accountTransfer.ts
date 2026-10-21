@@ -619,7 +619,8 @@ export async function runImport(
     deps.out(header + renderImportPlan(plan) + 'Nothing was changed (dry run).\n');
     return { failed: 0 };
   }
-  const lines: string[] = [header.trimEnd()];
+  // The notes head the report as they head the dry run's plan, so the two print the same lines.
+  const lines: string[] = [header.trimEnd(), ...plan.notes.map(safe)];
   let failed = 0;
   const report = (line: string, ok: boolean): void => {
     lines.push(`  ${line}`);

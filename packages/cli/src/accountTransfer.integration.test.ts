@@ -295,6 +295,25 @@ describe('export then import', () => {
     expect(b.out.join('')).toContain('skipped - the folder does not exist on this machine');
   });
 
+  it('prints the notes above its plan in the real run as in the dry run', async () => {
+    const a = await machine();
+    await seedSource(a);
+    const file = join(a.root, 'fleet.cctl');
+    await runExport(file, exportAll, a.deps);
+    // A file from another platform carries a note about its folders.
+    const elsewhere = process.platform === 'win32' ? 'linux' : 'win32';
+    const b = await machine({
+      platform: elsewhere,
+      resolveFolder: (f) => resolveFolderHere(f, elsewhere),
+    });
+    const note = `The file was written on ${process.platform};`;
+    await importInto(b, file, { dryRun: true });
+    expect(b.out.join('')).toContain(note);
+    b.out.length = 0;
+    await importInto(b, file);
+    expect(b.out.join('')).toContain(note);
+  });
+
   it('exports only the named accounts, with their rule memberships', async () => {
     const a = await machine();
     await seedSource(a);
