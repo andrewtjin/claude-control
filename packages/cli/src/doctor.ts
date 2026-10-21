@@ -632,7 +632,7 @@ export function checkSessionLeases(
     problems.push(
       `the parallel session of ${label} is held only by ` +
         `${one ? 'an exited process' : 'exited processes'} (${pidWords(pids)}${reusedWords}). ` +
-        'The running daemon frees it within one poll; with no daemon running, the next ' +
+        'The running daemon frees it at its next check; with no daemon running, the next ' +
         `cctl switch ${label} or cctl claude --account ${label} checks ` +
         `${one ? 'that process' : 'those processes'} and frees it.`,
     );

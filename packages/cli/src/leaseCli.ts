@@ -1,7 +1,7 @@
 // The CLI side of parallel sessions outside `cctl claude`: the checks a command runs before a
 // parallel session may block it, and how a session's terminals are counted for display.
 //
-// A parallel session whose processes are gone is ended by the daemon within one poll. With no daemon
+// A parallel session whose processes are gone is ended by the daemon at its next check. With no daemon
 // running, nothing else would end it, so every command a parallel session can refuse (`cctl switch`,
 // `cctl accounts remove`, `cctl folder exclude`, `cctl session exclude`, a join by `cctl claude
 // --account`) first runs the full check on that one session: the user is already blocked there, so

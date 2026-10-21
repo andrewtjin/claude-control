@@ -85,7 +85,7 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
   until that slot switches away. Live in none, it gets a slot of its own, and while it
   runs `work` is out of every pool; when the terminal exits (and any
   Claude Code it started on that account), its refreshed login returns and `work` rejoins
-  the pool. Windows and Linux;
+  the pool. Windows and Linux; not yet macOS;
   see "Parallel sessions" in `docs/CLI.md`.
 
 ## Local-only (no Discord)

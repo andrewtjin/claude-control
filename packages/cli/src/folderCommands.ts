@@ -1244,9 +1244,10 @@ export function buildFolderCommands(program: Command): void {
     .description('launch Claude Code on the account for the current folder (or --account)')
     .option(
       '--account <ref>',
-      'run a specific account in this terminal: on the slot where it is live (the global slot, or ' +
-        "a folder's slot it is reserved to), else in a parallel session of its own (out of the " +
-        'pool and never auto-switched until this terminal exits)',
+      'run a specific account in this terminal: on the slot where it is live (the global slot, ' +
+        "the slot of the rule this launch runs under or of a named session it opens, or a folder's " +
+        "slot it is reserved to), following that slot's switches; else in a parallel session of " +
+        'its own (out of the pool and never auto-switched until this terminal exits)',
     )
     .option('--override', 'allow this session in a folder whose rule runs on a DIFFERENT slot')
     .helpOption(false)
