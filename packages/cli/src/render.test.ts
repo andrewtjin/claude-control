@@ -449,6 +449,59 @@ describe('renderPacingLine', () => {
     expect(renderPacingLine([], { nowMs: NOW })).toBe('Pacing: no usage data yet.');
   });
 
+  describe('accounts reserved to folder rules', () => {
+    const plain = pacingStyle(PLAIN_PALETTE);
+    const research = { ...input('research', 6, 6), weight: 5 };
+
+    it('shows what they hold on a row of its own, outside the runway', () => {
+      const line = renderPacingLine([input('a', 50, 3)], { nowMs: NOW }, plain, [research]);
+      expect(line).toBe(
+        [
+          'Pacing  [--] burn rate not measured yet',
+          '  left     10u of 20u (50%)',
+          '  folders  +4.7u of 5u in research (folder-only)',
+          '  1u = one Pro account-week (a Max 20x counts 20)',
+        ].join('\n'),
+      );
+    });
+
+    it('still shows that row when no shared account has data', () => {
+      expect(renderPacingLine([], { nowMs: NOW }, plain, [research])).toBe(
+        [
+          'Pacing: no usage data yet.',
+          '  folders  +4.7u of 5u in research (folder-only)',
+          '  1u = one Pro account-week (a Max 20x counts 20)',
+        ].join('\n'),
+      );
+    });
+
+    it('states the 1u fallback when one of their plan tiers is unknown', () => {
+      const untiered: AccountUsageInput = { ...research };
+      delete untiered.weight;
+      const line = renderPacingLine([input('a', 50, 3)], { nowMs: NOW }, plain, [untiered]);
+      expect(line).toContain('  folders  +0.9u of 1u in research (folder-only)');
+      expect(line).toContain('plan tiers unknown, so every account counts 1u');
+    });
+
+    it('prints no row when none of them contributes', () => {
+      const locked = { ...research, quarantined: true };
+      expect(renderPacingLine([input('a', 50, 3)], { nowMs: NOW }, plain, [locked])).toBe(
+        renderPacingLine([input('a', 50, 3)], { nowMs: NOW }),
+      );
+    });
+
+    it('colors the row without changing its text', () => {
+      const opts = { nowMs: NOW };
+      const colored = renderPacingLine([input('a', 50, 3)], opts, pacingStyle(ANSI_PALETTE), [
+        research,
+      ]);
+      expect(colored).toContain(ANSI_PALETTE.bold('folders'));
+      expect(stripAnsi(colored)).toBe(
+        renderPacingLine([input('a', 50, 3)], opts, plain, [research]),
+      );
+    });
+  });
+
   it('tells a wholly quarantined fleet to re-login instead of claiming there is no data', () => {
     const locked = [input('a', 50, 3), input('b', 10, 5)].map((i) => ({ ...i, quarantined: true }));
     const line = renderPacingLine(locked, { nowMs: NOW, burnUnitsPerDay: 1 });

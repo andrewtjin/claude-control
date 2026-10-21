@@ -632,6 +632,10 @@ const ROW_LABEL_WIDTH = 7;
  * own per-account rows (quarantine included), but `cctl usage` prints nothing of the sort, so on
  * that surface this block is the only pacing signal there is: anything that stops the fleet from
  * being measurable at all has to survive compaction here, or the operator is told nothing.
+ *
+ * `folders` is the pacing of the accounts reserved to folder rules, computed apart from `pacing`:
+ * only their folders can spend what they hold, so it gets its own row (see `folderRow`) and never
+ * enters the totals the verdict is judged on.
  */
 export function renderPacingSummary(
   pacing: Pick<
@@ -650,11 +654,19 @@ export function renderPacingSummary(
   >,
   nowMs: number,
   style: PacingStyle = PLAIN_PACING_STYLE,
+  folders?: FolderReserve,
 ): string {
+  // Built where it prints, like every other segment: the style hooks run in display order.
+  const legend = (): string =>
+    `  ${style.dim(unitLegend(pacing.tiersUnknown || (folders?.tiersUnknown ?? false)))}`;
   // No contributing account, so there are no totals to print — but "no data" and "the data is
   // fine and every account is locked out" are opposite situations with opposite fixes, and only
-  // the accounts themselves say which one this is.
-  if (pacing.capacityUnits <= 0) return renderNoCapacity(pacing.accounts, style);
+  // the accounts themselves say which one this is. What the folders hold is still worth a row.
+  if (pacing.capacityUnits <= 0) {
+    const none = renderNoCapacity(pacing.accounts, style);
+    const reserve = folderRow(folders, style);
+    return reserve !== undefined ? [none, reserve, legend()].join('\n') : none;
+  }
 
   const pct = Math.round((pacing.availableUnits / pacing.capacityUnits) * 100);
   const marker =
@@ -691,9 +703,37 @@ export function renderPacingSummary(
     const expiring = renderExpiring(pacing.waste, pacing.wastedUnits, pacing.horizonDays, nowMs);
     if (expiring !== undefined) rows.push(row('expires', style.waste(expiring), style));
   }
-  rows.push(`  ${style.dim(unitLegend(pacing.tiersUnknown))}`);
+  const reserve = folderRow(folders, style);
+  if (reserve !== undefined) rows.push(reserve);
+  rows.push(legend());
 
   return [head, ...rows].join('\n');
+}
+
+/** The pacing of the accounts reserved to folder rules, as `renderPacingSummary` takes it. */
+export type FolderReserve = Pick<
+  Pacing,
+  'availableUnits' | 'capacityUnits' | 'accounts' | 'tiersUnknown'
+>;
+
+/** "folders  +4.7u of 5u in research (folder-only)": what the accounts reserved to folder rules
+ *  still hold, named, so a reader sees that capacity exists and why the runway above leaves it
+ *  out. Undefined when none of them contributes. */
+function folderRow(folders: FolderReserve | undefined, style: PacingStyle): string | undefined {
+  if (folders === undefined || folders.capacityUnits <= 0) return undefined;
+  const holders = folders.accounts.filter((a) => a.contributing);
+  const named = holders
+    .slice(0, MAX_NAMED_ACCOUNTS)
+    .map((a) => a.label)
+    .join(', ');
+  const rest = holders.length - MAX_NAMED_ACCOUNTS;
+  const pct = Math.round((folders.availableUnits / folders.capacityUnits) * 100);
+  const held = `+${units(folders.availableUnits)} of ${units(folders.capacityUnits)}`;
+  return row(
+    'folders',
+    `${style.percent(held, 100 - pct)} in ${named}${rest > 0 ? ` +${rest}` : ''} (folder-only)`,
+    style,
+  );
 }
 
 /** One labelled row, padded on the PLAIN label so the value columns align regardless of style. */

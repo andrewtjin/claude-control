@@ -482,9 +482,12 @@ Where folder rules exist, both end with a section per rule: its folders, the acc
 slot, and its pool in order (`cctl folders` has the full picture).
 
 An account reserved to a folder rule is listed with the others, labeled `<label> (folder)`: its
-usage, 5-hour windows and resets show like any other account's, and it counts toward the pacing
-line, as it does on the phone. The `*` still marks the account live in the global slot, and the
-plan is the global slot's, so it never names a reserved account as somewhere to switch.
+usage, 5-hour windows and resets show like any other account's. The `*` still marks the account
+live in the global slot, and the plan is the global slot's, so it never names a reserved account
+as somewhere to switch. Pacing works the same way: its runway (`left`, the burn and when it runs
+dry) is the shared accounts', since no global session can spend what a reserved account holds,
+and a `folders` row says what the reserved accounts still have (`+4.7u of 5u in research
+(folder-only)`). The phone's pacing still counts the whole fleet in one runway.
 
 ## When every account is out of usage
 
