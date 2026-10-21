@@ -477,6 +477,9 @@ export interface RemoveAccountOptions {
   refuseIfRunning?: boolean;
   /** Refuse unless the vault still holds this refresh token for the account. */
   expectRefreshToken?: string;
+  /** The label a person typed to confirm the removal; refused when the account is called something
+   *  else by the time the lock is held. */
+  expectedLabel?: string;
 }
 
 /** One rule an import asks {@link SwitchEngine.importRules} for: one rule of the machine the file

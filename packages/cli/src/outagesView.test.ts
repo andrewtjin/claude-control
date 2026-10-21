@@ -20,6 +20,7 @@ import {
   renderOutageBanner,
   renderOutages,
 } from './outagesView.js';
+import { displayWidth } from './textWidth.js';
 
 // Built from LOCAL components, so the expected strings hold in whatever zone the suite runs.
 const local = (month: number, day: number, hour: number, minute: number, year = 2026): number =>
@@ -137,6 +138,22 @@ describe('renderOutages', () => {
         'Log: C:\\data\\exhaustion-log.jsonl',
       ].join('\n'),
     );
+  });
+
+  it("spells an auto-switch reason's dashes in ASCII, whose width every terminal agrees on", () => {
+    const s = start(local(10, 1, 14, 0), {
+      switches: [
+        {
+          at: local(10, 1, 13, 0),
+          from: 'work1',
+          to: 'w2',
+          origin: 'auto',
+          reason: 'work1 is at 96% weekly \u2014 w2 has the soonest weekly reset',
+        },
+      ],
+    });
+    const out = renderOutages([{ start: s }], { now: NOW, logPath: 'x', open: [] });
+    expect(out).toContain('auto: work1 is at 96% weekly - w2 has the soonest weekly reset');
   });
 
   it('names every limit holding an account out, and the reset of the last', () => {
@@ -510,5 +527,23 @@ describe('scopes in the views', () => {
       "No account in C:\\research's pool can take work. First back: inc1 in 2h. " +
         'cctl outages lists every time this happened.',
     );
+  });
+});
+
+describe('renderOutages column widths', () => {
+  it('lines account lines up by terminal width, CJK labels included', () => {
+    const s = start(local(10, 1, 14, 0), {
+      accounts: [
+        { accountId: 'a1', label: '仕事', reason: 'quarantined', spent: [] },
+        { accountId: 'a2', label: 'work', reason: 'quarantined', spent: [] },
+      ],
+    });
+    const lines = renderOutages([{ start: s }], { now: NOW, logPath: 'x' }).split('\n');
+    const at = (label: string): number => {
+      const line = lines.find((l) => l.startsWith(`  ${label}`))!;
+      const rest = line.slice(2 + label.length).search(/\S/);
+      return displayWidth(label) + rest;
+    };
+    expect(at('仕事')).toBe(at('work'));
   });
 });

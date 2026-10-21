@@ -14,14 +14,7 @@ import { hostname } from 'node:os';
 import { createInterface } from 'node:readline';
 import { dirname, join } from 'node:path';
 import {
-  CadenceError,
-  QuarantineError,
-  SharedTokenError,
-  SlotError,
   SwitchEngineError,
-  SwitchFailedError,
-  UnknownAccountError,
-  UnsettledSwitchError,
   VaultError,
   buildAuthorizeUrl,
   defaultPaths,
@@ -29,7 +22,6 @@ import {
   generatePkce,
   generateState,
   canonicalizeFolder,
-  isOverloadCode,
   parsePastedCode,
   resolveAccountRef,
   isLeaseRule,
@@ -38,7 +30,7 @@ import {
   type LeaseView,
   type StoredAccount,
 } from '@claude-control/switch-engine';
-import { cliLeaseProbe, leaseInUse, sweepBeforeLeaseRefusal } from './leaseCli.js';
+import { cliLeaseProbe, leaseInUse } from './leaseCli.js';
 import { olderInstallReason } from './folderRulesSupport.js';
 import {
   ControlPlaneClient,
@@ -54,7 +46,6 @@ import {
   resumeOpenEpisodes,
   scopeKey,
   scopeOf,
-  readFleetHistory,
   readHeartbeat,
   readTranscriptTurns,
   slotBySessionMap,
@@ -62,14 +53,11 @@ import {
   type OpenEpisode,
   type OutageJudgement,
   type ScopeView,
-  type SessionRow,
 } from '@claude-control/daemon';
-import type { AccountUsage } from '@claude-control/shared-protocol';
 import { DEFAULT_STATS_DAYS } from '@claude-control/shared-protocol';
 import {
   computeOutlook,
   computePlan,
-  planWeight,
   renderOutlook,
   renderPlanSummary,
   timelineInputFromWire,
@@ -86,6 +74,21 @@ import {
 } from './outagesView.js';
 import { buildEngine, daemonDbPath, fail, paintErrorLine } from './context.js';
 import { buildTransferCommands } from './accountTransfer.js';
+import {
+  AccountActionError,
+  NO_LIVE_LOGIN,
+  addAccount,
+  removeAccount,
+  renameAccount,
+  runAccountAction,
+  setExcluded,
+  switchAccount,
+} from './accountActions.js';
+import { readUsageState, resolvedWeight, type UsageState } from './usageState.js';
+import { fullScreenBlocker, isInteractiveTerminal } from './terminalSupport.js';
+import { StatusLog, runTui } from './tui/run.js';
+import { createTuiSources } from './tui/sources.js';
+import type { OutagesView } from './tui/types.js';
 import { runSessionAliases, runSessionShow, type SessionAliasDeps } from './sessionAliases.js';
 import { runSessionExclude, runSessionInclude, runSessionReset } from './sessionRules.js';
 import { withCaptureDir } from './captureDir.js';
@@ -140,13 +143,8 @@ import {
 } from './ansi.js';
 import {
   buildFolderCommands,
-  describeSlotRefusal,
-  describeSwitchedGroup,
   renderFolderRulesAppendix,
   renderReservedAppendix,
-  refuseOnOlderDaemon,
-  switchSlotForFolder,
-  switchSlotOf,
 } from './folderCommands.js';
 import {
   renderAccountHeal,
@@ -159,6 +157,7 @@ import {
 } from './render.js';
 import {
   renderSessionStatus,
+  sessionRowFromStore,
   weeklyResetHeader,
   type SessionStatusHeader,
   type SessionStatusRow,
@@ -324,78 +323,7 @@ export function buildProgram(): Command {
       "put the account in that folder's slot (the slot of the folder rule it runs under)",
     )
     .action(async (ref: string, opts: { force?: boolean; folder?: string }) => {
-      const engine = buildEngine();
-      // Resolve across the WHOLE registry (shared pool + reserved accounts) so `cctl switch <ref>`
-      // reaches an account a folder rule includes; activate() routes it to that rule's slot.
-      let fleet = await engine.listAllAccounts();
-      const resolved = resolveAccountRef(fleet, ref);
-      if (!resolved.ok) fail(resolved.message);
-      // A parallel session holding the account refuses the switch while it runs. Whether its
-      // processes still run is checked first (with no daemon, nothing else would end one whose
-      // terminal was closed), and the fleet re-read if that ended it.
-      const before = fleet.find((a) => a.id === resolved.account.id)?.ruleIds;
-      await sweepBeforeLeaseRefusal(engine, defaultPaths(), resolved.account.id);
-      if (before !== undefined) fleet = await engine.listAllAccounts();
-      // --folder names the slot outright: the folder's rule slot (a rule slot may also take a shared
-      // account it does not exclude), or the global slot where no rule applies. Without it, the
-      // slot the account belonged to when it was resolved — asserted on the switch, so a rule change
-      // landing in between fails this command instead of switching a slot it never named. An account
-      // several rules include has no single slot: the engine picks the one it is live in, or refuses
-      // and says to name the folder.
-      const target =
-        opts.folder !== undefined ? await switchSlotForFolder(engine, opts.folder) : undefined;
-      const slot = target?.slot ?? switchSlotOf(fleet.find((a) => a.id === resolved.account.id));
-      // A shared account switched into a folder slot is one a daemon that predates folder rules
-      // could put live in the global slot as well.
-      const shared = (fleet.find((a) => a.id === resolved.account.id)?.ruleIds ?? []).length === 0;
-      if (slot !== undefined && slot !== 'global' && shared) await refuseOnOlderDaemon();
-      try {
-        const result = await engine.activate(resolved.account.id, {
-          force: Boolean(opts.force),
-          origin: 'manual',
-          ...(slot !== undefined ? { slot } : {}),
-        });
-        const bits = [
-          result.wroteCredentials ? 'credentials written' : 'no change',
-          result.refreshed ? 'token refreshed' : null,
-          result.adoptedPreviousRotation ? 'adopted previous rotation' : null,
-        ].filter(Boolean);
-        // A switch into a folder rule's slot moves that slot, not the global one — say which.
-        const group = await describeSwitchedGroup(engine, resolved.account.id);
-        const where = group
-          ? ` in the folder slot of ${sanitizeForTerminal(group.scopes)}`
-          : target !== undefined
-            ? ` in the global slot (no folder rule applies to ${sanitizeForTerminal(opts.folder ?? '')})`
-            : '';
-        process.stdout.write(
-          `Activated ${sanitizeForTerminal(resolved.account.label)}${where} (${bits.join(', ')}).\n`,
-        );
-      } catch (err) {
-        if (err instanceof QuarantineError)
-          fail(`${resolved.account.label} is quarantined; re-login required.`);
-        if (err instanceof CadenceError) fail(`${err.message}. Use --force to override.`);
-        if (err instanceof UnknownAccountError) fail(err.message);
-        if (err instanceof SlotError) fail(describeSlotRefusal(err, resolved.account.label));
-        // A switch that failed after it began writing the live login, one an earlier switch still
-        // blocks, or a login stored under two accounts: the engine's message already says what the
-        // live login is now and what to do, in words — it is the whole error line.
-        if (
-          err instanceof SwitchFailedError ||
-          err instanceof UnsettledSwitchError ||
-          err instanceof SharedTokenError
-        ) {
-          fail(err.message);
-        }
-        // The token endpoint shedding load is an outage, not a broken account: the engine has
-        // already spent its retry budget and checked the status page, so its message is the
-        // whole story and this switch simply did not happen. Printed as the CLI's own refusal
-        // (one error line, exit 1) so it reads like every other refusal here instead of
-        // escaping as an unhandled failure.
-        if (err instanceof SwitchEngineError && isOverloadCode(err.code)) {
-          fail(`${err.message}. Nothing was changed - try again shortly.`);
-        }
-        throw err;
-      }
+      await runAccountAction(() => switchAccount(ref, opts));
     });
 
   program
@@ -1122,9 +1050,29 @@ export function buildProgram(): Command {
       ),
     );
 
-  // Bare `cctl` (no subcommand): a short status summary once there are accounts, otherwise a
-  // single nudge to run setup — never Commander's raw usage dump. `--help`/`--version` are
-  // handled by Commander before this ever runs.
+  program
+    .command('tui')
+    .description('full-screen view: accounts and usage, sessions, folders, outages (keys inside)')
+    .action(async () => {
+      // The view draws on the terminal and reads keys from it; with either end redirected there
+      // is no one to draw for, and raw input from a pipe would hang waiting for keys.
+      if (!isInteractiveTerminal()) {
+        fail(
+          'cctl tui needs an interactive terminal (neither input nor output redirected). ' +
+            'For plain output use: cctl usage',
+        );
+      }
+      const blocker = await fullScreenBlocker();
+      if (blocker !== undefined)
+        fail(`cctl tui cannot run here: ${blocker}. For plain output use: cctl usage`);
+      await openTui();
+    });
+
+  // Bare `cctl` (no subcommand): on an interactive terminal (input AND output), the full-screen
+  // view once there are accounts; anywhere else a short status summary, byte for byte what it
+  // has always printed, so pipes, scripts and `cctl > file` see no change. With no accounts, a
+  // single nudge to run setup either way — never Commander's raw usage dump. `--help`/`--version`
+  // are handled by Commander before this ever runs.
   //
   // Having an action of its own makes Commander read an unmatched first word as an argument to
   // bare `cctl` and refuse it as "too many arguments", never naming it as an unknown command. So
@@ -1145,6 +1093,17 @@ export function buildProgram(): Command {
         { code: 'commander.unknownCommand' },
       );
     }
+    // A terminal that cannot draw the view (TERM=dumb, the legacy Windows console) gets the
+    // summary, as a pipe does. The console is only asked when both ends are a terminal.
+    if (isInteractiveTerminal() && (await fullScreenBlocker()) === undefined) {
+      // "Set up" means what the summary's own check means: an account in the shared pool.
+      if ((await buildEngine().listAccounts()).length === 0) {
+        process.stdout.write('Not set up yet. Run: cctl setup\n');
+        return;
+      }
+      await openTui();
+      return;
+    }
     const summary = await readStatusSummary();
     if (summary.accounts.length === 0) {
       process.stdout.write('Not set up yet. Run: cctl setup\n');
@@ -1157,6 +1116,34 @@ export function buildProgram(): Command {
   });
 
   return program;
+}
+
+/**
+ * Open the full-screen view on this terminal (composition root: the real engine, data dir and
+ * streams). The engine logs to the view's status line rather than stderr, which would scribble
+ * over the drawn screen; anything else written to stderr while the screen is up is diverted the
+ * same way. A signal that ended the view becomes the exit code it asks for.
+ */
+async function openTui(): Promise<void> {
+  const log = new StatusLog(process.stderr);
+  const engine = buildEngine(defaultPaths(), log);
+  const sources = createTuiSources({
+    engine,
+    readOutages: (nowMs, usage) => readOutagesView(nowMs, engine, usage),
+  });
+  try {
+    const exit = await runTui({
+      stdin: process.stdin,
+      stdout: process.stdout,
+      sources,
+      palette: detectPalette(),
+      log,
+      stderr: process.stderr,
+    });
+    if (exit.code !== 0) process.exitCode = exit.code;
+  } finally {
+    sources.close?.();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1273,7 +1260,8 @@ function buildSetupDeps(io: WizardIo, relayFlag?: string): SetupDeps {
     isLoggedIn: async () => (await checkLiveLogin(paths)).ok,
     listAccounts: () => engine.listAccounts(),
     captureCurrentLogin: (label) => engine.captureCurrentLogin(label),
-    addFreshAccount: (label) => addFreshAccount(label),
+    addFreshAccount: (label) =>
+      runAccountAction((announce) => addAccount(label, { fresh: true, onAdded: announce })),
     hooksInstalled: () => hooksInstalledAt(settingsPath),
     hooksProfilePath: settingsPath,
     channelEnabled: async () => {
@@ -1350,63 +1338,6 @@ async function readStatusSummary(): Promise<SetupSummary> {
     daemonAlive: heartbeat.state === 'alive',
     paired: identity !== undefined,
   };
-}
-
-/** What `usage` and `timeline` read before rendering: the registry, the daemon's latest
- *  persisted snapshot per account, and the two history-derived measurements the pure advisor
- *  cannot make for itself (each account's predicted weekly reset and the fleet's burn rate).
- *  Works whether or not the daemon is currently running (it shows the last poll), and opening
- *  a not-yet-created db just yields an empty one. A corrupt snapshot row is skipped, never
- *  fatal. */
-interface UsageState {
-  accounts: StoredAccount[];
-  activeId: string | null;
-  usageFor: (accountId: string) => AccountUsage | undefined;
-  /** Next weekly reset predicted from stored history, for accounts the endpoint has stopped
-   *  publishing one for. Absent when the account has no observed reset in history at all. */
-  predictedResetFor: (accountId: string) => number | undefined;
-  /** Fleet burn in Pro-equivalent units/day, or undefined when history cannot measure one. */
-  burnUnitsPerDay: number | undefined;
-}
-
-/** The usage view's state: the shared accounts, the global live account and each account's latest
- *  snapshot. `only` names the accounts to read instead (the outage judgement reads the whole fleet,
- *  reserved accounts included). */
-async function readUsageState(nowMs: number, only?: StoredAccount[]): Promise<UsageState> {
-  const engine = buildEngine();
-  const [accounts, activeId] = await Promise.all([
-    only !== undefined ? Promise.resolve(only) : engine.listAccounts(),
-    engine.getActiveId(),
-  ]);
-  const store = new Store(daemonDbPath());
-  try {
-    const byId = new Map<string, AccountUsage>();
-    for (const a of accounts) {
-      const row = store.latestUsageSnapshot(a.id);
-      if (!row) continue;
-      try {
-        byId.set(a.id, JSON.parse(row.json) as AccountUsage);
-      } catch {
-        // a corrupt row must not crash the whole view
-      }
-    }
-    // The same measurement the daemon makes each poll cycle, over the same store and the one
-    // implementation — so a number the CLI prints can never disagree with the one the phone got.
-    const history = readFleetHistory(
-      store,
-      accounts.map((a) => ({ accountId: a.id, ...resolvedWeight(a) })),
-      nowMs,
-    );
-    return {
-      accounts,
-      activeId,
-      usageFor: (accountId) => byId.get(accountId),
-      predictedResetFor: (accountId) => history.predictedResetByAccount.get(accountId),
-      burnUnitsPerDay: history.burnUnitsPerDay,
-    };
-  } finally {
-    store.close();
-  }
 }
 
 /** The rows `cctl usage` shows for these accounts. The prediction is measured here, from the same
@@ -1518,15 +1449,36 @@ async function globalSlotAccountsNow(): Promise<Set<string>> {
  *  `outageScopes`), with the latest numbers for the whole fleet, reserved accounts included. */
 async function readOutageScopes(
   nowMs: number,
+  engine: ReturnType<typeof buildEngine> = buildEngine(),
+  usage?: UsageState,
 ): Promise<{ inputs: AccountUsageInput[]; scopes: ScopeView[] }> {
-  const engine = buildEngine();
   const [accounts, rules, liveSlots] = await Promise.all([
     engine.listAllAccounts(),
     engine.listRules(),
     engine.liveSlots(),
   ]);
-  const inputs = buildAdvisorInputs(await readUsageState(nowMs, accounts));
+  // A caller that has just read the whole fleet's usage (the full-screen view, every couple of
+  // seconds) hands it over rather than have it read, and the history measured, a second time.
+  const inputs = buildAdvisorInputs(usage ?? (await readUsageState(nowMs, accounts, engine)));
   return { inputs, scopes: outageScopes({ accounts, rules, liveSlots }) };
+}
+
+/** Everything `cctl outages` prints with no filter: the log's episodes, where each open one stands,
+ *  and the log's path. The full-screen view reads it through its own engine, so nothing it reads
+ *  writes a diagnostic over the screen. */
+async function readOutagesView(
+  nowMs: number,
+  engine: ReturnType<typeof buildEngine>,
+  usage?: UsageState,
+): Promise<OutagesView> {
+  const log = exhaustionLog();
+  const records = await log.read();
+  const open = await openOutageStatuses(resumeOpenEpisodes(records), nowMs, engine, usage);
+  return {
+    episodes: episodesInWindow(episodesOf(records), nowMs, undefined, open),
+    open,
+    logPath: log.path,
+  };
 }
 
 /**
@@ -1539,12 +1491,14 @@ async function readOutageScopes(
 async function openOutageStatuses(
   opens: Map<string, OpenEpisode>,
   nowMs: number,
+  engine?: ReturnType<typeof buildEngine>,
+  usage?: UsageState,
 ): Promise<OutageStatus[]> {
   if (opens.size === 0) return [];
   let current: { inputs: AccountUsageInput[]; scopes: ScopeView[] } | undefined;
   let policy: AutoSwitchPolicy = {};
   try {
-    current = await readOutageScopes(nowMs);
+    current = await readOutageScopes(nowMs, engine, usage);
     policy = await cliAutoSwitchPolicy();
   } catch {
     current = undefined;
@@ -1609,66 +1563,11 @@ async function exhaustionBanner(
   }
 }
 
-/** `{ weight }` when the account's plan tier resolves, `{}` when it does not — the same
- *  present-or-absent contract `timelineInputFromWire` relies on to tell a real 1x Pro account
- *  from one whose tier nothing could read. */
-function resolvedWeight(account: StoredAccount): { weight?: number } {
-  const result = planWeight(account);
-  return result.known ? { weight: result.weight } : {};
-}
-
 /** Spread the measured burn into `PacingOptions` only when there IS one. `exactOptionalPropertyTypes`
  *  forbids passing an explicit `undefined`, and the distinction is load-bearing: an absent burn
  *  rate means "not measurable", which pacing reports rather than treating as zero. */
 function burnOption(state: UsageState): { burnUnitsPerDay?: number } {
   return state.burnUnitsPerDay !== undefined ? { burnUnitsPerDay: state.burnUnitsPerDay } : {};
-}
-
-/**
- * The `--fresh` capture flow: run an interactive `claude` inside a
- * throwaway `CLAUDE_CONFIG_DIR`, let the user /login as the NEW account there, then vault
- * what landed. The live login is never touched. The transient dir holds real tokens, so it
- * is deleted no matter how the flow ends.
- */
-async function addFreshAccount(label: string): Promise<void> {
-  const paths = defaultPaths();
-  // Failures are RETURNED, not `fail()`ed, so the dir is deleted before the process exits —
-  // `fail()` is `process.exit`, which skips `finally`. See captureDir.ts.
-  const failure = await withCaptureDir(dirname(paths.vaultDir), 'capture', async (captureDir) => {
-    // Darwin: the CLI writes every login to its single Keychain item regardless of
-    // CLAUDE_CONFIG_DIR, so the capture must diff the Keychain around the window instead of
-    // reading files from the transient dir — and restore the pre-window login afterwards.
-    // See SwitchEngine.captureFromKeychainDelta.
-    const engine = buildEngine();
-    const prior = process.platform === 'darwin' ? await engine.readLiveOauth() : undefined;
-    process.stdout.write(
-      'Opening a throwaway Claude window. In it:\n' +
-        '  1. /login - pick the NEW account in the browser (it may preselect the current one).\n' +
-        '  2. Send one short message so the login completes.\n' +
-        '  3. /exit\n\n',
-    );
-    const run = spawnSync('claude', [], {
-      stdio: 'inherit',
-      env: { ...process.env, CLAUDE_CONFIG_DIR: captureDir },
-      shell: process.platform === 'win32', // `claude` is a .cmd shim on Windows; a real PATH exe on mac/linux
-    });
-    if (run.error) return `could not launch \`claude\`: ${run.error.message}`;
-    try {
-      const account =
-        process.platform === 'darwin'
-          ? await engine.captureFromKeychainDelta(label, captureDir, prior)
-          : await engine.captureFromConfigDir(label, captureDir);
-      process.stdout.write(
-        `Added ${account.label} (${account.id}). Your current login was not touched - ` +
-          `\`cctl switch ${account.label}\` to use it.\n`,
-      );
-    } catch (err) {
-      if (err instanceof SwitchEngineError && err.code === 'no_capture_login') return err.message;
-      throw err;
-    }
-    return undefined;
-  });
-  if (failure) fail(failure);
 }
 
 /**
@@ -1688,10 +1587,11 @@ async function reloginAccount(ref: string): Promise<void> {
   const account = resolved.account;
 
   const paths = defaultPaths();
-  // Same return-don't-fail contract as addFreshAccount: cleanup has to outlive every failure
+  // Same return-don't-fail contract as the fresh add (accountActions.ts): cleanup has to outlive every failure
   // path, and `fail()` (process.exit) would skip it. See captureDir.ts.
   const failure = await withCaptureDir(dirname(paths.vaultDir), 'relogin', async (captureDir) => {
-    // Same darwin Keychain-diff-and-restore as addFreshAccount — see that flow's comment.
+    // Same darwin Keychain-diff-and-restore as the fresh add (accountActions.ts) — see that flow's
+    // comment.
     const prior = process.platform === 'darwin' ? await engine.readLiveOauth() : undefined;
     process.stdout.write(
       `Re-logging in "${account.label}" (${account.id}). A throwaway Claude window will open.\n` +
@@ -1818,36 +1718,6 @@ async function reauthAccount(ref: string): Promise<void> {
   }
 }
 
-/**
- * The shared body of `accounts exclude` / `accounts include`. Reports what the registry now says
- * rather than what the command asked for: running either verb on an account already in that
- * state is a no-op, and printing "Excluded X" there would claim a change that did not happen.
- */
-async function setExclusion(ref: string, excluded: boolean): Promise<void> {
-  const engine = buildEngine();
-  // Resolve against the WHOLE fleet, reserved (folder-bound) members included: a row-level mutation
-  // must reach exactly the accounts binding reserves, whose ids/labels live in the group registry, not
-  // the shared-only pool. The engine routes the write to the file that holds the row (groups.json for a
-  // reserved member). Same resolution as relogin/reauth.
-  const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
-  if (!resolved.ok) fail(resolved.message);
-  const already = resolved.account.autoSwitchExcluded === true;
-  if (already === excluded) {
-    process.stdout.write(
-      excluded
-        ? `${resolved.account.label} is already excluded from auto-switch.\n`
-        : `${resolved.account.label} is already available to auto-switch.\n`,
-    );
-    return;
-  }
-  await engine.setAutoSwitchExcluded(resolved.account.id, excluded);
-  process.stdout.write(
-    excluded
-      ? `Excluded ${resolved.account.label} from auto-switch (manual switches still work).\n`
-      : `${resolved.account.label} is available to auto-switch again.\n`,
-  );
-}
-
 function buildAccountCommands(program: Command): void {
   const accounts = program.command('accounts').description('manage stored accounts');
 
@@ -1886,27 +1756,21 @@ function buildAccountCommands(program: Command): void {
       'log in as a NEW account in a throwaway window, without touching the live login',
     )
     .action(async (label: string, opts: { fresh?: boolean }) => {
-      if (opts.fresh) {
-        await addFreshAccount(label);
-        return;
-      }
-      try {
-        const account = await buildEngine().captureCurrentLogin(label);
-        process.stdout.write(`Added ${account.label} (${account.id}) and set it active.\n`);
-      } catch (err) {
-        // A refused duplicate (label or login already stored) is the vault's own message.
-        if (err instanceof VaultError) fail(err.message);
-        // Run inside a group profile, capture reads a folder-bound account's live seat — never a
-        // fresh login to store. Surface the engine's own guidance instead of the no-login message.
-        if (err instanceof SwitchEngineError && err.code === 'capture_in_profile') {
-          fail(
-            `${err.message}. Onboard a new account from a normal (non-folder-bound) shell, ` +
-              `or use: cctl accounts add <label> --fresh.`,
-          );
+      await runAccountAction(async (announce) => {
+        try {
+          return await addAccount(label, { ...opts, onAdded: announce });
+        } catch (err) {
+          // This command answers every failed capture of the current login with the no-login
+          // line, faults included — except a vault fault, which it has always printed in the
+          // vault's own words (that line is what a malformed registry needs read). The action
+          // lets those faults escape as themselves so a caller that can show more does; the
+          // command keeps its own words for them.
+          if (opts.fresh || err instanceof AccountActionError || err instanceof VaultError) {
+            throw err;
+          }
+          throw new AccountActionError('no_live_login', NO_LIVE_LOGIN, { cause: err });
         }
-        // Anything else is the capture finding no login to store.
-        fail('no live login to capture. Run `claude` and log in first, then retry.');
-      }
+      });
     });
 
   accounts
@@ -1930,14 +1794,14 @@ function buildAccountCommands(program: Command): void {
     .command('exclude <ref>')
     .description('stop auto-switch from ever hopping TO this account (manual switches still work)')
     .action(async (ref: string) => {
-      await setExclusion(ref, true);
+      await runAccountAction(() => setExcluded(ref, true));
     });
 
   accounts
     .command('include <ref>')
     .description('let auto-switch consider this account again')
     .action(async (ref: string) => {
-      await setExclusion(ref, false);
+      await runAccountAction(() => setExcluded(ref, false));
     });
 
   accounts
@@ -1945,21 +1809,7 @@ function buildAccountCommands(program: Command): void {
     .alias('rm')
     .description('remove a stored account by id or label')
     .action(async (ref: string) => {
-      const engine = buildEngine();
-      // Resolve across the WHOLE fleet so a reserved (folder-bound) member is reachable by id or
-      // label; removeAccount drops it from its group (dissolving a group left memberless).
-      const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
-      if (!resolved.ok) fail(resolved.message);
-      // A parallel session holding it refuses the removal; one whose processes are gone is ended
-      // first (see cctl switch).
-      await sweepBeforeLeaseRefusal(engine, defaultPaths(), resolved.account.id);
-      try {
-        await engine.removeAccount(resolved.account.id);
-      } catch (err) {
-        if (err instanceof SlotError && err.code === 'leased') fail(err.message);
-        throw err;
-      }
-      process.stdout.write(`Removed ${resolved.account.label}.\n`);
+      await runAccountAction(() => removeAccount(ref));
     });
 
   accounts
@@ -1967,28 +1817,7 @@ function buildAccountCommands(program: Command): void {
     .alias('mv')
     .description('give a stored account a new label (its id and usage history are unchanged)')
     .action(async (ref: string, newLabel: string) => {
-      const engine = buildEngine();
-      // Resolve across the WHOLE fleet so a reserved (folder-bound) member is reachable by id or
-      // label; renameAccount asserts label uniqueness across all rows and writes the file holding it.
-      const resolved = resolveAccountRef(await engine.listAllAccounts(), ref);
-      if (!resolved.ok) fail(resolved.message);
-      // Answered here rather than written: nothing would change, so nothing should be saved or
-      // reported as a rename.
-      if (newLabel.trim() === resolved.account.label) {
-        process.stdout.write(`${resolved.account.label} already has that label.\n`);
-        return;
-      }
-      try {
-        const updated = await engine.renameAccount(resolved.account.id, newLabel);
-        process.stdout.write(
-          `Renamed ${resolved.account.label} to ${updated.label} (${updated.id}).\n`,
-        );
-      } catch (err) {
-        // A collision or an empty label is a user mistake carrying its own explanation; anything
-        // else is a real fault and propagates.
-        if (err instanceof VaultError) fail(err.message);
-        throw err;
-      }
+      await runAccountAction(() => renameAccount(ref, newLabel));
     });
 }
 
@@ -2319,24 +2148,6 @@ function sessionAliasDeps(): SessionAliasDeps {
       if (process.stderr.isTTY) process.stderr.write(text + '\n');
     },
   };
-}
-
-/** Turn one Store `sessions` row into a display row, resolving the account id to a label and
- *  tolerating a corrupt/foreign `json` blob (fields simply stay absent). */
-function sessionRowFromStore(row: SessionRow, labelById: Map<string, string>): SessionStatusRow {
-  let parsed: Record<string, unknown> = {};
-  try {
-    parsed = JSON.parse(row.json) as Record<string, unknown>;
-  } catch {
-    // keep the empty object — the row's top-level columns still render
-  }
-  const accountId =
-    row.accountId ?? (typeof parsed.accountId === 'string' ? parsed.accountId : undefined);
-  const out: SessionStatusRow = { id: row.id, kind: row.kind, state: row.state };
-  if (typeof parsed.label === 'string') out.label = parsed.label;
-  if (typeof parsed.watch === 'boolean') out.watch = parsed.watch;
-  if (accountId !== undefined) out.accountLabel = labelById.get(accountId) ?? accountId;
-  return out;
 }
 
 /** Shared driver for register/label/watch: resolve the session id, POST to the daemon with a

@@ -99,11 +99,57 @@ export class SharedTokenError extends SwitchEngineError {
   }
 }
 
-/** DPAPI protect/unprotect failed, or the vault is structurally corrupt. */
-export class VaultError extends SwitchEngineError {
-  constructor(message: string, options?: { cause?: unknown }) {
-    super(message, 'vault_error', options);
+/** A removal confirmed by the account's label found, once it held the credential lock, that the
+ *  account no longer has that label (`currentLabel`), or is gone (`null`): another process renamed
+ *  or removed it while the removal waited. Nothing was removed, since the person confirmed a name
+ *  the account no longer answers to. */
+export class AccountLabelChangedError extends SwitchEngineError {
+  constructor(
+    readonly accountId: string,
+    readonly expectedLabel: string,
+    readonly currentLabel: string | null,
+  ) {
+    super(
+      currentLabel === null
+        ? `account ${accountId} (${expectedLabel}) is no longer stored`
+        : `account ${accountId} is now called ${currentLabel}, not ${expectedLabel}`,
+      'label_changed',
+    );
   }
+}
+
+/** Why the vault refused an account write that was asked of it in error, as opposed to a vault
+ *  that could not do its job:
+ *  - `label_empty`: the label is empty once stripped;
+ *  - `label_taken`: another account already answers to the label (or the label spells an id);
+ *  - `login_stored`: the login being added is already stored under an account. */
+export type VaultRefusalCode = 'label_empty' | 'label_taken' | 'login_stored';
+
+/** DPAPI protect/unprotect failed, or the vault is structurally corrupt — code `vault_error`. Or,
+ *  with one of the {@link VaultRefusalCode}s, the vault refused a write the caller should not have
+ *  asked for; {@link isVaultRefusal} tells the two apart. One class for both, so every existing
+ *  `instanceof VaultError` keeps catching what it always caught. */
+export class VaultError extends SwitchEngineError {
+  constructor(message: string, options?: { cause?: unknown; code?: VaultRefusalCode }) {
+    super(
+      message,
+      options?.code ?? 'vault_error',
+      options && 'cause' in options ? { cause: options.cause } : undefined,
+    );
+  }
+}
+
+const VAULT_REFUSAL_CODES: ReadonlySet<string> = new Set<VaultRefusalCode>([
+  'label_empty',
+  'label_taken',
+  'login_stored',
+]);
+
+/** True for a vault refusal of a mistaken request (a label taken or empty, a login stored
+ *  already): words for the person who asked. False for every vault fault (a registry it cannot
+ *  read or parse, a key it cannot unwrap), which callers must let escape as itself. */
+export function isVaultRefusal(err: unknown): err is VaultError & { code: VaultRefusalCode } {
+  return err instanceof VaultError && VAULT_REFUSAL_CODES.has(err.code);
 }
 
 /** Why an activation was refused for its slot (see {@link SlotError}):

@@ -185,6 +185,79 @@ describe('UsagePoller', () => {
     expect(snapshot.results[0]?.outcome).toBe('live');
   });
 
+  it('pollReadiness: an account never polled is due', () => {
+    const poller = new UsagePoller({
+      fetch: vi.fn(() => Promise.resolve(jsonResponse(200, liveBody(5)))),
+      getToken: () => Promise.resolve('tok'),
+      getCachedUsage: () => Promise.resolve(cachedBody(0)),
+      clock: () => 1000,
+    });
+    expect(poller.pollReadiness('never-seen')).toEqual({ due: true });
+  });
+
+  it('pollReadiness: the floor holds a just-polled account until it is due, then releases it', async () => {
+    let now = 0;
+    const fetchFn = vi.fn(() => Promise.resolve(jsonResponse(200, liveBody(5))));
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: () => Promise.resolve('tok'),
+      getCachedUsage: () => Promise.resolve(cachedBody(0)),
+      clock: () => now,
+      random: () => 0,
+    });
+    await poller.pollAll([account]);
+    now = 1;
+    expect(poller.pollReadiness(account.accountId)).toEqual({
+      due: false,
+      reason: 'floor',
+      dueAtMs: POLL_FLOOR_MS,
+    });
+    // Asking is read-only: the cycle that follows still skips the account.
+    expect((await poller.pollAll([account])).results[0]?.outcome).toBe('skipped');
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+
+    now = POLL_FLOOR_MS;
+    expect(poller.pollReadiness(account.accountId)).toEqual({ due: true });
+    expect((await poller.pollAll([account])).results[0]?.outcome).toBe('live');
+  });
+
+  it('pollReadiness: a 429 is reported as backoff, for as long as the backoff runs', async () => {
+    let now = 0;
+    const fetchFn = vi.fn(() => Promise.resolve(jsonResponse(429, {})));
+    const poller = new UsagePoller({
+      fetch: fetchFn,
+      getToken: () => Promise.resolve('tok'),
+      getCachedUsage: () => Promise.resolve(cachedBody(10)),
+      clock: () => now,
+      random: () => 0,
+    });
+    // Enough consecutive 429s that the backoff outgrows the floor: each wait is reported as the
+    // backoff's and ends exactly where the poller will next poll, never sooner.
+    for (let n = 1; n <= 4; n += 1) {
+      const polledAt = now;
+      await poller.pollAll([account]);
+      const waitMs = Math.max(
+        POLL_FLOOR_MS,
+        Math.min(BACKOFF_BASE_MS * 2 ** (n - 1), BACKOFF_CAP_MS),
+      );
+      expect(poller.pollReadiness(account.accountId)).toEqual({
+        due: false,
+        reason: 'backoff',
+        dueAtMs: polledAt + waitMs,
+      });
+      // One millisecond short of it, a cycle still does not poll.
+      now = polledAt + waitMs - 1;
+      await poller.pollAll([account]);
+      expect(fetchFn).toHaveBeenCalledTimes(n);
+      now = polledAt + waitMs;
+    }
+    expect(BACKOFF_BASE_MS * 2 ** 3).toBeGreaterThan(POLL_FLOOR_MS);
+    // A success clears it: the next wait is the floor's again.
+    fetchFn.mockImplementation(() => Promise.resolve(jsonResponse(200, liveBody(5))));
+    await poller.pollAll([account]);
+    expect(poller.pollReadiness(account.accountId)).toMatchObject({ due: false, reason: 'floor' });
+  });
+
   it('429 triggers cached fallback; the floor is a hard minimum wait even under backoff', async () => {
     let now = 0;
     const fetchFn: FetchLike = vi.fn(() => Promise.resolve(jsonResponse(429, {})));

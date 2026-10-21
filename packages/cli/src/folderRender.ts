@@ -278,7 +278,9 @@ function aliasScopeLines(view: Pick<FolderRuleView, 'aliases'>, palette: Palette
         ? ''
         : '  ' +
           palette.yellow(
-            `(never matches: no session title can carry it — longer than ` +
+            // ASCII only: a dash or dot outside ASCII is ambiguous width, two columns on a
+            // terminal set up for CJK text, and the full-screen view draws this line.
+            `(never matches: no session title can carry it - longer than ` +
               `${CLAUDE_CODE_TITLE_MAX_LENGTH} characters, or not well-formed text; reset it)`,
           )),
   );
@@ -349,11 +351,15 @@ export const ADD_FOLDER_RULE_HINT =
   '          or: cctl folder exclude <folder> <account>[,<account>...]\n' +
   'For one named session: cctl session include <alias> <account>[,<account>...]';
 
+/** Everything the full `cctl folders` view renders. */
+export interface FoldersView {
+  rules: FolderRuleView[];
+  global: GlobalSlotView;
+  footer: FolderGuardFooterView;
+}
+
 /** The full `cctl folders` view: every rule, the global slot, then the guard footer. */
-export function renderFolders(
-  input: { rules: FolderRuleView[]; global: GlobalSlotView; footer: FolderGuardFooterView },
-  palette: Palette = PLAIN_PALETTE,
-): string {
+export function renderFolders(input: FoldersView, palette: Palette = PLAIN_PALETTE): string {
   if (input.rules.length === 0) {
     return (
       'No folder rules: every folder uses the global slot and the shared pool.\n' +

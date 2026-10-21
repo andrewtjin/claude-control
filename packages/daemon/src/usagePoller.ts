@@ -179,6 +179,11 @@ interface AccountPollState {
   lastResult?: ParsedUsage;
 }
 
+/** What {@link UsagePoller.pollReadiness} says about one account: polled on the next cycle, or
+ *  held by the floor or a 429 backoff until `dueAtMs`. */
+export type PollReadiness =
+  { due: true } | { due: false; reason: 'floor' | 'backoff'; dueAtMs: number };
+
 export interface AccountPollResult {
   accountId: string;
   usage: ParsedUsage;
@@ -310,11 +315,40 @@ export class UsagePoller {
     if (state) state.nextDueAtMs = 0;
   }
 
+  /**
+   * Whether the next `pollAll()` would actually poll this account, and if not, what holds it back
+   * and until when. Read-only: it never moves an account's timing.
+   *
+   * This is the question an on-demand refresh has to ask before it starts a cycle early. Unlike
+   * {@link repollNow}, a person asking for fresh numbers is not a one-off event that changed what
+   * the endpoint would say, and asking again and again must not turn into a loop around the floor
+   * or the 429 backoff — so a held account is reported held, never released.
+   */
+  pollReadiness(accountId: string): PollReadiness {
+    const state = this.state.get(accountId);
+    if (state === undefined || !this.isHeld(state, this.clock())) return { due: true };
+    return {
+      due: false,
+      // A wait set by a 429 is the backoff's, even when the floor would have held it as long:
+      // the endpoint asked us to back off, and that is the reason worth showing.
+      reason: state.consecutive429s > 0 ? 'backoff' : 'floor',
+      dueAtMs: state.nextDueAtMs,
+    };
+  }
+
+  /** Whether a poll right now would be skipped for this account: not due yet, and holding a
+   *  real result to serve in its place. An account with no result yet always polls. One
+   *  predicate for both `pollOne` and {@link pollReadiness}, so what a refresh reports can never
+   *  disagree with what the cycle then does. */
+  private isHeld(state: AccountPollState, now: number): boolean {
+    return !this.isDue(state, now) && state.lastResult !== undefined;
+  }
+
   private async pollOne(account: PollAccount): Promise<AccountPollResult> {
     const now = this.clock();
     const state = this.state.get(account.accountId);
 
-    if (state && !this.isDue(state, now) && state.lastResult) {
+    if (state && this.isHeld(state, now) && state.lastResult) {
       // Not due yet: return the retained last real result with its POLLED DATA unchanged
       // (original fetchedAtMs + source), tagged 'skipped' so callers can tell "we
       // deliberately didn't poll" apart from "we polled and got nothing new". Deliberately

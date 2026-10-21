@@ -115,6 +115,7 @@ import {
   type PollAccount,
   type RegistryFacts,
 } from './usagePoller.js';
+import { planUsageRepoll, type UsageRepollResult } from './usageRepoll.js';
 import { readFleetHistory, RESET_LOOKBACK_MS } from './usageHistory.js';
 import type { AttributionJournal } from './attributionJournal.js';
 import type { TranscriptScan } from './transcriptTokens.js';
@@ -976,6 +977,14 @@ export class Daemon {
    *  duplicate snapshot pushes to the phone, and a last-write-wins race on
    *  {@link latestAdvisorInputs} decided by whichever cycle happened to finish second. */
   private pollCycleInFlight = false;
+  /** Accounts a usage refresh scheduled while a cycle was already running. When that cycle ends,
+   *  any of them it did not poll (one added after it loaded the fleet) gets one more cycle; the
+   *  rest it already served (see {@link runPollCycle}). */
+  private readonly refreshesPending = new Set<string>();
+  /** Whether the last poll cycle failed. A cycle that dies before it polls leaves no poll state,
+   *  so the floor cannot hold anything back; this is what keeps a refresh from starting a cycle
+   *  per request while cycles keep failing. Cleared by the next cycle that completes. */
+  private lastPollCycleFailed = false;
   private started = false;
 
   constructor(options: DaemonOptions) {
@@ -1126,6 +1135,8 @@ export class Daemon {
     // …and for live channels: the receiver owns the sockets and the held polls, this class owns
     // the queue and where a reply is routed.
     this.hookReceiver.setChannelHandlers(this.channelHandlers());
+    // …and for an on-demand usage refresh: the receiver owns the route, this class owns the poller.
+    this.hookReceiver.setUsageHandlers({ repollUsage: (ids) => this.repollUsage(ids) });
 
     const hookPort = await this.hookReceiver.listen(0);
 
@@ -1408,11 +1419,71 @@ export class Daemon {
       return;
     }
     this.pollCycleInFlight = true;
+    let failed = true;
     try {
       await this.pollCycle();
+      failed = false;
     } finally {
       this.pollCycleInFlight = false;
+      this.lastPollCycleFailed = failed;
+      this.followUpPendingRefreshes();
     }
+  }
+
+  /**
+   * After a cycle, start one more for the refreshes that arrived while it ran, but only if it
+   * left one of their accounts unpolled. Usually it polled them all (a refresh finds an account
+   * due only before the cycle's poll reaches it), and a cycle that polls nothing would still
+   * re-run every per-cycle side effect and spend retry budgets that are counted in cycles. Never
+   * after a failed cycle, which the next one would most likely repeat (the regular tick retries),
+   * and never after stop().
+   */
+  private followUpPendingRefreshes(): void {
+    const pending = [...this.refreshesPending];
+    this.refreshesPending.clear();
+    if (this.lastPollCycleFailed || !this.started) return;
+    if (pending.some((id) => this.poller.pollReadiness(id).due)) this.startPollCycleNow();
+  }
+
+  /** Start a poll cycle outside the interval, for a usage refresh. Not awaited: the caller is
+   *  answering a request (or finishing a cycle), and the cycle reports its own failure. */
+  private startPollCycleNow(): void {
+    this.runPollCycle().catch((err: unknown) => {
+      this.logger.error({ err }, 'requested poll cycle failed');
+    });
+  }
+
+  /**
+   * Refresh usage for these accounts (every stored account when `ids` is absent) as soon as the
+   * poller allows, and say per account what will happen.
+   *
+   * Each account's floor and 429 backoff are honored, never released: an account they hold is
+   * reported skipped with the time it is next due. When at least one account is due, a cycle is
+   * started now rather than at the next tick, or, when one is already running, the account is
+   * polled by it or by one more right after it. While cycles are failing, a due account is
+   * reported as such instead, and the regular tick alone retries.
+   *
+   * A daemon that is stopping answers `'stopping'` and starts nothing: the receiver is still
+   * serving while stop() drains sessions, and a cycle started then would run slot maintenance
+   * and auto-switch during teardown and write to a store about to close. Checked again after the
+   * fleet is read, since stop() can begin while that read is in flight.
+   */
+  private async repollUsage(ids: string[] | undefined): Promise<UsageRepollResult | 'stopping'> {
+    if (!this.started) return 'stopping';
+    const { accounts } = await this.loadFleet();
+    if (!this.started) return 'stopping';
+    const results = planUsageRepoll(
+      ids,
+      accounts.map((a) => a.id),
+      (id) => this.poller.pollReadiness(id),
+      { cyclesFailing: this.lastPollCycleFailed },
+    );
+    const scheduled = results.filter((r) => r.outcome === 'scheduled').map((r) => r.id);
+    if (scheduled.length > 0) {
+      if (this.pollCycleInFlight) for (const id of scheduled) this.refreshesPending.add(id);
+      else this.startPollCycleNow();
+    }
+    return { ok: true, results };
   }
 
   /** One poll cycle's actual work — see {@link runPollCycle}, which owns the one-at-a-time

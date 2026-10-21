@@ -2,9 +2,13 @@
 
 `cctl` runs local, one-shot commands over the switch engine and the daemon's data, plus
 the guided first-run wizard and the background daemon itself. Bare `cctl` (no
-subcommand) prints `Not set up yet. Run: cctl setup` before setup, or a short status
-summary afterward — it never dumps raw command-tree usage. `cctl --help` lists every
-command; this page adds the detail and the unhappy paths.
+subcommand) prints `Not set up yet. Run: cctl setup` before setup. Afterward it opens the
+full-screen view (see [Full-screen view](#full-screen-view)) when both its input and its
+output are a terminal that can draw it, and prints a short status summary otherwise, so a
+pipe, a script or `cctl > file` gets the same plain text it always did. A terminal that
+cannot move the cursor (`TERM=dumb`, as in an Emacs shell buffer) or the legacy Windows
+console gets the summary too. It never dumps raw command-tree usage.
+`cctl --help` lists every command; this page adds the detail and the unhappy paths.
 
 ## First run
 
@@ -803,6 +807,85 @@ macOS: not available yet, except for an account that is already live in the glob
 Folder rules are **not supported on macOS yet** — `cctl folder include|exclude` refuse
 there. The isolation relies on a per-slot credential store, and on macOS each store would
 prompt the Keychain. See `docs/PLATFORM.md`. Parallel sessions likewise.
+
+## Full-screen view
+
+```
+cctl            # on a terminal, once set up
+cctl tui        # the same view, by name; works before setup too
+```
+
+One screen with four panes, refreshed every 2 seconds (a timed refresh is skipped while an action runs or a read is still in
+flight, and a read follows the action) and after every action: **Accounts**
+(each account's plan, its 5-hour and weekly usage with reset times, any per-model weekly
+windows, its folder rules, whether it is excluded or quarantined, and how old the reading is),
+**Sessions** (what `cctl session status` shows), **Folders** (`cctl folders`) and **Outages**
+(`cctl outages`). The header says whether the daemon is running, whether auto-switch is on, and
+when it last polled (the newest usage reading of any account, or "no poll yet"). The auto-switch
+part only shows while the daemon is running. Colour is used when the output is a terminal and
+`NO_COLOR` is unset. Everything is read locally from the vault and the daemon's database, the
+same places the commands read; nothing in the view calls Anthropic. A reset marked `~` is
+predicted from history rather than reported.
+
+| Key                 | What it does                                                                                                                                                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| up/down or k/j      | move the selection (Accounts) or scroll (other panes)                                                                                                                                                                                 |
+| PgUp/PgDn, Home/End | move or scroll further                                                                                                                                                                                                                |
+| Tab / Shift-Tab     | next / previous pane                                                                                                                                                                                                                  |
+| Enter               | switch to the selected account (same as `cctl switch`)                                                                                                                                                                                |
+| e                   | exclude the selected account from auto-switch, or include it again                                                                                                                                                                    |
+| r                   | rename the selected account                                                                                                                                                                                                           |
+| a                   | add an account: the screen steps aside for a Claude login window (as `cctl accounts add --fresh`), then comes back                                                                                                                    |
+| d                   | remove the selected account; you type its label to confirm                                                                                                                                                                            |
+| u                   | ask the running daemon to refresh usage now; it still honors each account's poll floor and any rate-limit backoff, and says which accounts it held back and until when. Unavailable, with the reason, while the daemon is not running |
+| l                   | show the command that runs Claude as the selected account, to paste in another terminal                                                                                                                                               |
+| m                   | show the last message in full (a long one is cut on the status line)                                                                                                                                                                  |
+| ?                   | the key list                                                                                                                                                                                                                          |
+| q or Esc            | quit                                                                                                                                                                                                                                  |
+
+Enter, e, r, d and l act on the selected account, so they work only in the Accounts pane;
+elsewhere the status line tells you to Tab to it. a, u, ?, m and q work in every pane.
+
+q and Esc quit from the list. In a prompt, Esc cancels it and q is just typed; in the help,
+message and launch overlays, q and Esc close the overlay. While an action is running q and Esc
+do nothing; Ctrl-C always works. It quits the view as soon as the action finishes; a second
+Ctrl-C gives the screen back at once, and cctl exits when the action has finished (it is never
+cut off part way). Either way, how the action ended is printed on the normal screen, and a
+refused action makes the exit code non-zero. A signal exits with 128 plus its number (SIGHUP 129,
+SIGINT 130, SIGTERM 143); one that arrives during an action waits for it and prints "Still
+finishing the running action...". While a login window is up, Ctrl-C and Ctrl+Break belong to
+that window and the view ignores them.
+
+The help and message overlays scroll with the movement keys, including Home/End and
+PgUp/PgDn, in a short terminal. They and the
+launch line close on Esc or any other key except Enter, so a doubled Enter never reaches the
+account list. A prompt takes Backspace, filters out control characters and caps its input at 200
+characters. A rename, add or remove prompt whose Enter does not go through (an empty label, a
+label another account already has, a mistyped confirmation) stays open and says why, and a rename
+or remove the vault refuses opens its prompt again with the reason; Esc then leaves the reason on
+the status line, where m shows all of it. A removal is checked against the label you typed once
+more when it runs, so an account renamed elsewhere in the meantime is not removed. A prompt whose
+account is removed elsewhere while it is open takes nothing more and closes on Esc. When the
+selected account is removed, here or elsewhere, no account is selected until j/k picks one, so no
+key lands on an account you did not pick. Pasted text only ever goes into a prompt; in the list it does nothing. Keys typed while the
+screen is stepped aside for a login window are dropped when it comes back, for as long as they
+keep arriving.
+
+As the terminal narrows, columns give way in a fixed order: per-model windows first, then reset
+times, then the plan; after that the label column narrows and the tags are cut, and the key-hint line
+drops its least important hints first. Below 40 columns (or 6 rows) the view shows a notice instead, and only q,
+Esc and Ctrl-C do anything until it is larger. A long message wraps onto up to three status
+rows, never taking the selected account's row; one longer than that keeps its start and its end,
+and m shows all of it. cctl's own messages are drawn with plain ASCII punctuation, so they are as
+wide on a terminal set up for CJK text as anywhere else. Diagnostics that
+would normally go to stderr appear on the status line, so they never draw over the screen; every
+one logged while an action ran is shown with that action's result (and printed after an error
+ends the view). Quitting, a signal, a closed terminal and an error all give the terminal back as
+it was. `cctl tui` refuses to start when its input or output is redirected, or on a terminal that
+cannot draw it (`TERM=dumb`, or a Windows console that does not answer a cursor-position query,
+as the legacy console does not), and points at `cctl usage` for plain output; bare `cctl` prints
+the summary there instead. The legacy console setting only applies to windows opened after it is
+changed.
 
 ## Switching and recovery
 

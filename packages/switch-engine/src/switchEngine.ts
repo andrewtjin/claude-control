@@ -25,6 +25,7 @@ import { CredentialStore, type LiveCredentialChannel } from './credentialStore.j
 import { type Protector } from './dpapi.js';
 import { defaultLiveCredentialChannel, defaultProtector } from './protector.js';
 import {
+  AccountLabelChangedError,
   CadenceError,
   ImportInterruptedError,
   LeaseHolderCapError,
@@ -1725,9 +1726,21 @@ export class SwitchEngine {
    * the vault, after adopting every rotation a rule slot holds, still has the refresh token that was
    * handed over — a refresh since then (the daemon's poller refreshes idle accounts) spent that
    * token, and the copy here is now the only working one.
+   *
+   * `opts.expectedLabel` is the label a person typed to confirm the removal. It is compared here,
+   * under the lock, against the registry the lock protects: compared before the lock is taken, a
+   * rename another process commits while this removal waits for the lock would go unseen, and the
+   * account would be removed under a name nobody confirmed. A mismatch (or an account already gone)
+   * throws {@link AccountLabelChangedError} before anything is touched.
    */
   removeAccount(id: string, opts: RemoveAccountOptions = {}): Promise<void> {
     return this.withCredentialLock(async () => {
+      if (opts.expectedLabel !== undefined) {
+        const current = (await this.vault.listAllAccounts()).find((a) => a.id === id);
+        if (current?.label !== opts.expectedLabel) {
+          throw new AccountLabelChangedError(id, opts.expectedLabel, current?.label ?? null);
+        }
+      }
       // An account a parallel session holds runs in a terminal right now; removing it would pull the
       // login out from under that session. (The CLI checks those processes first, so what is left
       // here is a session that still runs, or one nothing can tell is gone.)
@@ -7091,10 +7104,12 @@ export class SwitchEngine {
    * Anything else (no live token, no bundle, an unreadable one) is simply not proof and answers
    * false — this corroborates an override, it does not gate one.
    *
-   * Deliberately asked ONLY from `getActiveId()`'s disagreement branch: it decrypts a bundle,
-   * which on Windows is a PowerShell spawn (see dpapi.ts), and the agreeing case is every normal
-   * call. The disagreement branch means the live login is out of step with the last committed
-   * switch, which a switch heals. The other-holder check runs only once the bundle matched.
+   * Answered from the stored tokens' fingerprints (see tokenPrints.ts), not by decrypting the
+   * bundle: a decrypt is a PowerShell spawn on Windows (see dpapi.ts), and the disagreement branch
+   * that asks this can last indefinitely (a `/login` in Claude Code as an account never stored
+   * here), with a live view asking it every couple of seconds. The fingerprints are kept in memory
+   * and on disk keyed by each encrypted blob, so a bundle is decrypted at most once until it
+   * changes. Asked only from `getActiveId()`'s disagreement branch.
    */
   private async liveTokenBelongsTo(
     accountId: string,
@@ -7102,13 +7117,9 @@ export class SwitchEngine {
   ): Promise<boolean> {
     const live = await credStore.readLiveCredentials().catch(() => undefined);
     if (!live) return false;
-    const bundle = await this.vault.readBundle(accountId).catch(() => undefined);
-    if (bundle?.claudeAiOauth.refreshToken !== live.refreshToken) return false;
-    const holders = await this.vault.readStoredTokens().then(
-      (stored) => stored.holdersOf(live),
-      () => undefined,
-    );
-    return holders !== undefined && holders.every((id) => id === accountId);
+    const stored = await this.vault.readStoredTokens().catch(() => undefined);
+    if (stored === undefined || !stored.holdsRefresh(accountId, live)) return false;
+    return stored.holdersOf(live).every((id) => id === accountId);
   }
 
   /**
@@ -7149,6 +7160,7 @@ export class SwitchEngine {
         throw new VaultError(
           `this login is account ${holder} ("${row?.label ?? holder}"), which is already stored; ` +
             `switch to it with \`cctl switch ${row?.label ?? holder}\` instead of adding it again`,
+          { code: 'login_stored' },
         );
       }
       if (holders.length > 1) {
@@ -7156,6 +7168,7 @@ export class SwitchEngine {
         throw new VaultError(
           `this login's token is already stored under ` +
             `${quotedLabels(holders, await this.vault.listAllAccounts())}; ${SHARED_TOKEN_REMEDY}`,
+          { code: 'login_stored' },
         );
       }
       const oauthAccount = await this.credStore.readOauthAccount();

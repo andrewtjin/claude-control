@@ -16,6 +16,8 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { SwitchEngine, type BindFs } from './switchEngine.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
+import { AccountLabelChangedError } from './errors.js';
+import { acquireLock } from './lock.js';
 import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
 import { Vault } from './vault.js';
 import { groupProfileDir, profilesRoot, sandboxPaths, type Paths } from './paths.js';
@@ -326,5 +328,53 @@ describe('a profile no rule owns', () => {
     await e.resetFolder(h.repo);
 
     expect(await e.checkSlots()).toEqual([]);
+  });
+});
+
+describe('removing an account confirmed by its label', () => {
+  /** Another process's hold on the credential lock, for as long as the test keeps it. */
+  const holdLock = (h: Harness) =>
+    acquireLock(join(h.paths.vaultDir, '.lock'), () => NOW, { timeoutMs: 5000, pollMs: 5 });
+
+  it('removes nothing when another process renames it while the removal waits for the lock', async () => {
+    const h = await harness();
+    const e = h.mk();
+    const A = await e.addAccount('alpha', bundle('A'));
+    await e.addAccount('bravo', bundle('B'));
+    const held = await holdLock(h);
+    let settled = false;
+    const removal = e.removeAccount(A.id, { expectedLabel: 'alpha' }).finally(() => {
+      settled = true;
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(settled).toBe(false);
+    // The other process commits a rename under its hold, then lets go.
+    await h.vault.renameAccount(A.id, 'renamed');
+    held.release();
+    const err = await removal.then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(AccountLabelChangedError);
+    expect(err).toMatchObject({ expectedLabel: 'alpha', currentLabel: 'renamed' });
+    expect((await e.listAccounts()).map((a) => a.label).sort()).toEqual(['bravo', 'renamed']);
+  });
+
+  it('removes nothing when the account is gone by the time it holds the lock', async () => {
+    const h = await harness();
+    const e = h.mk();
+    const A = await e.addAccount('alpha', bundle('A'));
+    await h.vault.removeAccount(A.id);
+    await expect(e.removeAccount(A.id, { expectedLabel: 'alpha' })).rejects.toMatchObject({
+      currentLabel: null,
+    });
+  });
+
+  it('removes it when the label still matches', async () => {
+    const h = await harness();
+    const e = h.mk();
+    const A = await e.addAccount('alpha', bundle('A'));
+    await e.removeAccount(A.id, { expectedLabel: 'alpha' });
+    expect(await e.listAccounts()).toEqual([]);
   });
 });
