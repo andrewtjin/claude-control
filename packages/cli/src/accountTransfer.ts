@@ -193,7 +193,8 @@ export const ONE_MACHINE_WARNING =
  */
 export function passphraseFromFile(bytes: Buffer, path: string): string {
   const text = decodeExportText(bytes);
-  if (text.includes('\u0000') || text.includes('\ufffd')) {
+  // A NUL, or the replacement character a decode leaves for bytes that are not text.
+  if (text.includes('\u0000') || /\ufffd/.test(text)) {
     fail(
       `the passphrase file ${path} is not plain text; save it as UTF-8 (or UTF-16 with its ` +
         'byte-order mark)',
