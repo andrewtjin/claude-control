@@ -152,7 +152,12 @@ export function computePlan(
 
   return {
     recommendedAccountId: recommended?.input.accountId ?? null,
-    reason: buildReason(recommended, inSlot, burns, dropped, greedy, now),
+    // Accounts exist but the slot can hold none of them (all reserved to folders, or live in a
+    // folder's slot): say so, rather than that no account is configured.
+    reason:
+      inSlot.length === 0 && analyses.length > 0
+        ? 'No account the global slot can switch to: every account is reserved to a folder rule or live in a folder slot.'
+        : buildReason(recommended, inSlot, burns, dropped, greedy, now),
     ranking,
     advisories,
     generatedAtMs: now,
