@@ -2238,7 +2238,10 @@ describe('cctl claude --account: where it runs', () => {
 
   it("the help says where --account runs, a parallel session's slot included", async () => {
     const r = await runCli(['help', 'claude']);
-    expect(r.out + r.err).toContain('else in a parallel session of its own');
+    // The help wraps long lines, so compare with the whitespace collapsed.
+    const help = (r.out + r.err).replace(/\s+/g, ' ');
+    expect(help).toContain("of a named session it opens, or a folder's slot it is reserved to)");
+    expect(help).toContain("following that slot's switches; else in a parallel session of its own");
   });
 });
 

@@ -456,7 +456,7 @@ describe('doctor and parallel sessions', () => {
     expect(c.ok).toBe(false);
     expect(c.detail).toBe(
       'the parallel session of W is held only by exited processes (pids 4120, 4188; pid 4120 is ' +
-        'now used by another program). The running daemon frees it within one poll; with no daemon ' +
+        'now used by another program). The running daemon frees it at its next check; with no daemon ' +
         'running, the next cctl switch W or cctl claude --account W checks those processes and ' +
         'frees it.',
     );
@@ -545,7 +545,7 @@ describe('doctor and parallel sessions', () => {
       new Map([['session-w', { unstoredLogin: true }]]),
     );
     expect(login.detail).toContain('Log in again with cctl accounts relogin W');
-    expect(login.detail).not.toContain('frees it within one poll');
+    expect(login.detail).not.toContain('frees it at its next check');
   });
 });
 

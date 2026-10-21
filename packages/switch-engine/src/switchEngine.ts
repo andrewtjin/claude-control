@@ -3975,8 +3975,9 @@ export class SwitchEngine {
       if (rule.activeId !== null) await this.vault.setRuleActive(rule.id, null);
     }
     actions.push(
-      `a parallel session of ${rule.label} was logged in as ${otherLabel}; that login was moved ` +
-        `back to ${otherLabel}`,
+      `a parallel session of ${rule.label} was logged in as ${otherLabel}; that login's latest ` +
+        `token was saved to ${otherLabel}` +
+        (elsewhere ? ' and cleared from the session' : ' (the login stays in the session)'),
     );
   }
 

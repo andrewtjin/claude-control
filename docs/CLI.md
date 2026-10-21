@@ -301,15 +301,17 @@ A rule only takes effect for a session that launches on the folder's slot. That 
 ```
 cctl claude                        # launch Claude Code on the folder's slot (or the global
                                     # slot when no rule applies here)
-cctl claude --account <id|label>   # run on that account in this terminal only (see "Parallel sessions")
+cctl claude --account <id|label>   # run on that account in this terminal only: on the slot where it is
+                                    # live, following that slot's switches (global, this launch's rule,
+                                    # a named session's), else in a slot of its own (see "Parallel sessions")
 cctl claude --override             # launch here on the global account, on purpose (see below)
 cctl claude -- <claude args...>    # everything after -- is passed through to claude
 cctl claude attach <id|name>       # open a background session on its folder's account (see
 cctl claude --resume <id|title>    # "Opening a background session" below)
 ```
 
-`cctl claude` resolves which slot to use (an explicit `--account`, which outranks any rule;
-else the folder's rule; else global), makes sure an account is live there, prints a one-line banner naming
+`cctl claude` resolves which slot to use (an explicit `--account`, which outranks a rule that
+would otherwise decide, within the limits under Parallel sessions; else the folder's rule; else global), makes sure an account is live there, prints a one-line banner naming
 the account and the rule, and hands off to the real `claude` executable. Its exit code is
 yours; Ctrl+C reaches Claude Code, not the wrapper.
 
@@ -581,8 +583,8 @@ so the daemon cannot move the session in between. With `--account` or `--overrid
 session is never moved, but it is still opened where it runs rather than taken from there.
 
 To run in a ruled folder on the global account _on purpose_ for one session, launch it
-with `cctl claude --override`; `--account` runs the account you name here whatever rule
-applies (see Parallel sessions). Both are honored by the guard for that session only.
+with `cctl claude --override`; `--account` runs the account you name here instead of the
+rule's (refused in some cases: see Parallel sessions). Both are honored by the guard for that session only.
 `--override` relaxes a session on the global slot only: from a shell whose
 `CLAUDE_CONFIG_DIR` names a config dir cctl does not manage, the session runs there and is
 refused as above.
@@ -608,7 +610,9 @@ Where it runs:
 
 Live in the slot of any other rule, `work` is refused: a shared account serving another
 folder's or named session's slot, or a reserved account live in a rule that does not include
-it. That covers this folder's own slot too when the launch opens a named session whose rule has
+it. It is also refused when it is live in two slots, when it is quarantined (fix:
+`cctl accounts relogin work`; joining a parallel session already running on it is allowed), and
+when the rules registry is full (64 rules, parallel sessions included). That covers this folder's own slot too when the launch opens a named session whose rule has
 a slot of its own. Run claude where that slot applies, or switch that slot to another account
 first (for a named session's slot, keep `work` out of it with `cctl session exclude`).
 
@@ -619,17 +623,36 @@ While a parallel session runs:
 - The slot never auto-switches. At a usage limit the session stops, as at any limit.
 - Two terminals on `work` share one slot.
 
-Do not run `/login` inside a parallel session: it would put another account in that slot, and
-cctl moves that login back to its own account.
+Do not run `/login` inside a parallel session: it would put another account in that slot. The
+daemon notices that on a later check (nothing happens without it): the other account's refreshed
+login is saved with that account, and the copy in the slot is cleared only when that account
+could be live in another slot too; otherwise it stays, since no other slot can take it meanwhile.
+The session's own account is not changed.
 
 When the last terminal on `work` exits, its refreshed login returns to cctl and `work` rejoins
-the pool. A closed window or a killed process is cleaned up by the daemon within one poll, or,
-with no daemon, by the next `cctl claude --account work` or `cctl switch work`.
+the pool. A closed window or a killed process is cleaned up by the daemon at its next check
+(a busy Windows machine can take longer; a check that cannot decide is retried), or, with no
+daemon, by the next `cctl switch`, `accounts remove`, `folder exclude`, `session exclude` or
+`cctl claude --account`, which first end every session whose processes are gone.
 
 A Claude Code the session started that outlives it on its profile (a backgrounded `claude -p`)
 keeps `work` reserved until it exits: it may still use the login. The terminal names its pid
 when it exits, and `cctl doctor` names it too. Anything else the session started (a dev server,
 an editor) does not hold `work`: it never reads the login.
+
+On Windows the last terminal out may pause while the process list is read (up to 60 s). From
+the claim until the release, Ctrl-C, Ctrl-Break and closing the console are ignored in the
+wrapper, so a stray one cannot cut the release short; a terminal that is not the last reads
+nothing on the way out. A session holds at most 32 processes.
+
+When the release cannot finish, the terminal says so: `could not return <label> to the pool yet
+(<reason>)` (a roster, process list or slot that could not be read or settled; the daemon or the
+next command above retries), or `<label> stays reserved ...` (a Claude Code process or a
+background-service session started from it still runs on its profile; it rejoins when that
+exits). For an unsaved login the fix is `cctl accounts relogin <label>`. The session shows in
+`cctl status`, `accounts list`, `usage`, `timeline` and `folder list` as in use. `cctl folder
+include` of an account a session holds waits until it ends, and `cctl accounts remove` is
+refused. `--override` with a parallel session relaxes nothing.
 
 History is shared, as in folder profiles: `--resume` and `--continue` see every conversation.
 
@@ -654,8 +677,9 @@ prompt the Keychain. See `docs/PLATFORM.md`. Parallel sessions likewise.
 
 ```
 cctl switch <id|label>       # activate an account (a reserved account switches its folder's slot;
-                             # refused while the account runs a parallel session; it first
-                             # checks whether that session's processes are still running)
+                             # refused while the account runs a parallel session; a session
+                             # whose processes are gone is ended first, as `accounts remove`,
+                             # `folder exclude` and `session exclude` also do)
 cctl switch <id|label> --force   # bypass the switch-cadence guard
 cctl recover                 # recover from an interrupted switch (safe to run anytime);
                              # exits 1 with the reason when it cannot be settled yet

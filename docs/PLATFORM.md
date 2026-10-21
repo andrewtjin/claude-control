@@ -63,6 +63,12 @@
 - **Parallel sessions** (`cctl claude --account`, one account per terminal) need a
   per-config-dir Keychain item for the same reason, and are refused on macOS except for an
   account that is already live in the global slot.
+  A session is held by processes, each identified by pid and start time: on Linux the boot id
+  and start ticks read from `/proc` (no process is spawned), on Windows the creation time from a
+  process query. Holders recorded in another WSL distro, a container or the host read as foreign
+  and are freed only after those processes exit, `wsl --shutdown` or a reboot. `cctl doctor`'s
+  parallel-sessions check reports holders that all exited, foreign holders, an unreadable
+  roster, an unsettled slot and an unsaved login.
 
 Everything else — the daemon, the bot, the CLI, usage polling, remote/managed
 sessions — is portable Node ≥ 22.5.

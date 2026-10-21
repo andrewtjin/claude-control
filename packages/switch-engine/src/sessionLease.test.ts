@@ -653,7 +653,7 @@ describe('nothing else touches a parallel session', () => {
     );
     const res = await h.engine.repairSlots();
     expect(res.actions.join('\n')).toContain(
-      'a parallel session of B was logged in as A; that login was moved back to A',
+      "a parallel session of B was logged in as A; that login's latest token was saved to A",
     );
     expect(await leaseStore(h.paths, B.id).readLiveCredentials()).toBeUndefined();
     expect((await h.vault.readBundle(A.id)).claudeAiOauth.refreshToken).toBe('r-A2');
