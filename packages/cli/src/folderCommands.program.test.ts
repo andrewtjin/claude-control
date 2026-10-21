@@ -18,10 +18,10 @@ import {
   type FolderRule,
   type PoolEntry,
 } from '@claude-control/switch-engine';
-import { BIND_GUARD_MARKER } from '@claude-control/daemon';
+import { BIND_GUARD_MARKER, Store } from '@claude-control/daemon';
 import { backgroundHostOptions, createClaudeBackgroundHost } from './backgroundHost.js';
 import { buildProgram } from './program.js';
-import { CliFailure, reportFatal } from './context.js';
+import { CliFailure, daemonDbPath, reportFatal } from './context.js';
 import type { SettingsReport } from './settings.js';
 
 // Every path the commands resolve (vault, profiles, the guard's settings.json, daemon.db) lands in a
@@ -682,6 +682,108 @@ describe('cctl timeline plan', () => {
     expect(r.exited).toBe(false);
     expect(r.out).not.toContain('F has the most available headroom');
     expect(r.out).toContain('G has the most available headroom');
+  });
+});
+
+describe('cctl usage and timeline: an account reserved to a folder rule', () => {
+  const HOUR = 3_600_000;
+  type Limit = { kind: 'session' | 'weekly_all'; percent: number; resetsAt: number };
+
+  /** One live snapshot per account in the sandbox's daemon.db, the way the daemon's poll writes it. */
+  function seedUsage(rows: Array<{ id: string; label: string; limits: Limit[] }>): void {
+    const store = new Store(daemonDbPath());
+    try {
+      for (const r of rows) {
+        const json = {
+          accountId: r.id,
+          label: r.label,
+          active: false,
+          source: 'live',
+          fetchedAtMs: Date.now(),
+          limits: r.limits.map((l) => ({
+            kind: l.kind,
+            percent: l.percent,
+            resetsAt: new Date(l.resetsAt).toISOString(),
+            isActive: true,
+          })),
+        };
+        store.insertUsageSnapshot({
+          accountId: r.id,
+          fetchedAtMs: Date.now(),
+          source: 'live',
+          json: JSON.stringify(json),
+        });
+      }
+    } finally {
+      store.close();
+    }
+  }
+
+  // A live globally (40% of its week gone), E reserved to the research folder and live in its slot.
+  beforeEach(() => {
+    const now = Date.now();
+    engine.listAllAccounts.mockResolvedValue([A, E]);
+    engine.getActiveId.mockResolvedValue('a');
+    engine.listRules.mockResolvedValue([ruleOn(research, { include: ['e'], activeId: 'e' })]);
+    engine.liveSlots.mockResolvedValue(
+      new Map([
+        ['global', 'a'],
+        ['group:r1', 'e'],
+      ]),
+    );
+    seedUsage([
+      {
+        id: 'a',
+        label: 'A',
+        limits: [{ kind: 'weekly_all', percent: 40, resetsAt: now + 50 * HOUR }],
+      },
+      {
+        id: 'e',
+        label: 'E',
+        limits: [
+          { kind: 'session', percent: 6, resetsAt: now + 4 * HOUR },
+          { kind: 'weekly_all', percent: 6, resetsAt: now + 140 * HOUR },
+        ],
+      },
+    ]);
+  });
+
+  it('usage lists it with its own numbers, labeled (folder), and never marks it live globally', async () => {
+    const r = await runCli(['usage']);
+    expect(r.exited).toBe(false);
+    const lines = r.out.split('\n');
+    const e = lines.find((l) => l.includes('E (folder)'));
+    expect(e).toBeDefined();
+    expect(e).toContain('5h 6%');
+    expect(e).toContain('week 6%');
+    expect(e?.startsWith(' ')).toBe(true);
+    expect(lines.find((l) => l.includes('A  ('))?.startsWith('*')).toBe(true);
+  });
+
+  it('timeline gives it a budget line, a track and its resets, labeled (folder)', async () => {
+    const r = await runCli(['timeline']);
+    expect(r.exited).toBe(false);
+    expect(r.out).toMatch(/ E \(folder\)\s+window open \(6% used, resets in /);
+    expect(r.out).toMatch(/ E \(folder\)\s+\|/);
+    expect(r.out).toMatch(/in [^\n]+ E \(folder\)\s+5h window resets \(6% used clears\)/);
+  });
+
+  it('timeline never plans the global slot onto it, though it has the most headroom', async () => {
+    const r = await runCli(['timeline']);
+    expect(r.out).toContain('A has the most available headroom');
+    expect(r.out).not.toMatch(/E \(folder\) has the most available headroom/);
+  });
+
+  it('counts its plan capacity in the pacing line, as the phone does', async () => {
+    engine.listAllAccounts.mockResolvedValue([
+      { ...A, rateLimitTier: 'default_claude_max_20x' },
+      { ...E, rateLimitTier: 'default_claude_max_5x' },
+    ]);
+    for (const cmd of ['usage', 'timeline']) {
+      const r = await runCli([cmd]);
+      // 20u for A plus 5u for E; without E the fleet reads 20u.
+      expect(r.out).toMatch(/of 25u/);
+    }
   });
 });
 

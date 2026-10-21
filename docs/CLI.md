@@ -113,7 +113,8 @@ global live account when that is one it excludes.
 live in its slot (and whether that one is included or inherited), and the whole pool in
 order, with what limits each account: live elsewhere, quarantined, or not an auto-switch
 target. It ends with the global slot and the guard's state. `cctl usage` and `cctl timeline`
-end with a short per-folder section (the live account and the pool on one line), and
+list each reserved account among the others, labeled `(folder)`, and end with a short
+per-folder section (the live account and the pool on one line), and
 `cctl accounts list` shows the reserved accounts in their own table, each with its email, plan
 and billing (as the shared table shows them) and the folders that include it.
 
@@ -479,6 +480,11 @@ out (see below).
 
 Where folder rules exist, both end with a section per rule: its folders, the account live in its
 slot, and its pool in order (`cctl folders` has the full picture).
+
+An account reserved to a folder rule is listed with the others, labeled `<label> (folder)`: its
+usage, 5-hour windows and resets show like any other account's, and it counts toward the pacing
+line, as it does on the phone. The `*` still marks the account live in the global slot, and the
+plan is the global slot's, so it never names a reserved account as somewhere to switch.
 
 ## When every account is out of usage
 
