@@ -21,6 +21,7 @@ import {
   SwitchEngineError,
   canonicalizeFolder,
   defaultPaths,
+  isLeaseRule,
   isWellFormedText,
   sanitizeTerminalText,
   type AccountView,
@@ -35,6 +36,7 @@ import {
   type SwitchEngine,
 } from '@claude-control/switch-engine';
 import { buildEngine, fail } from './context.js';
+import { sweepBeforeLeaseRefusal } from './leaseCli.js';
 import {
   ExportFileError,
   MAX_EXPORT_FILE_BYTES,
@@ -139,6 +141,9 @@ export interface TransferDeps {
   confirm: (question: string) => Promise<boolean>;
   /** Install or refresh the enforcement guard after rules changed. */
   reconcileGuard: () => Promise<void>;
+  /** End this account's parallel session when none of its processes runs any more (see
+   *  sweepBeforeLeaseRefusal), before a command it would block refuses. */
+  sweepParallelSession: (accountId: string) => Promise<void>;
   /** Why rules cannot be written right now (an older daemon runs), by scope kind. */
   rulesBlocked: () => Promise<{ folder?: string; alias?: string }>;
   /** A folder from a file as canonically spelled here, or why it cannot be used here. */
@@ -366,7 +371,9 @@ async function sealPayload(
  * `cctl export <file|->`. Refuses before anything is read or written when it cannot finish: an
  * existing file (never overwritten), `--move` to standard output (nothing to read back), `--move`
  * of the account live on this machine's main login (removing it would leave its login live here),
- * or `--move` with nobody to answer its question and no `--yes`.
+ * `--move` of an account a parallel session runs on (removing it would sign that session out, and
+ * the session would go on refreshing the login the file carries), or `--move` with nobody to
+ * answer its question and no `--yes`.
  *
  * The credentials of each account are read one call at a time, each the freshest copy (a live
  * rotation is adopted first). A quarantined account travels without them.
@@ -405,6 +412,14 @@ export async function runExport(
         `"${safe(liveHere.label)}" is the live account of this machine's main login, and removing ` +
           'it would leave that login live here; switch to another account first ' +
           '(cctl switch <account>) or leave it out with --accounts',
+      );
+    }
+    const leased = await heldByParallelSession(selected, deps);
+    if (leased !== undefined) {
+      fail(
+        `"${safe(leased.label)}" is in use by a parallel session here (cctl claude --account), and ` +
+          'removing it would pull its login out from under that session; exit the session ' +
+          'first, or leave it out with --accounts',
       );
     }
     if (!opts.yes && !deps.interactive) {
@@ -468,6 +483,23 @@ export async function runExport(
   if (bundles.size > 0) lines.push(ONE_MACHINE_WARNING);
   deps.out(lines.join('\n') + '\n');
   return { failed };
+}
+
+/** The first of `accounts` a parallel session holds, once the sessions among theirs whose processes
+ *  are all gone have been ended, or undefined. Such an account is in use in a terminal here, on the
+ *  very login an export carries. */
+async function heldByParallelSession(
+  accounts: readonly AccountView[],
+  deps: TransferDeps,
+): Promise<AccountView | undefined> {
+  const held = async (): Promise<Set<string>> =>
+    new Set((await deps.engine.listRules()).filter(isLeaseRule).map((r) => r.include[0]!));
+  const before = await held();
+  const leased = accounts.filter((a) => before.has(a.id));
+  if (leased.length === 0) return undefined;
+  for (const account of leased) await deps.sweepParallelSession(account.id);
+  const after = await held();
+  return leased.find((a) => after.has(a.id));
 }
 
 /** `--move`'s second half: check the file, ask, and remove each account it can (see runExport).
@@ -1392,6 +1424,7 @@ function processDeps(reportToStderr: boolean): TransferDeps {
     promptHidden: promptHiddenTty,
     confirm: confirmTty,
     reconcileGuard: () => reconcileFolderGuard(engine, paths),
+    sweepParallelSession: (accountId) => sweepBeforeLeaseRefusal(engine, paths, accountId),
     rulesBlocked: rulesBlockedHere,
     resolveFolder: (folder) => resolveFolderHere(folder, process.platform),
     afterSettings: async (changed) => {

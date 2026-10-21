@@ -21,10 +21,12 @@ import {
   acquireLock,
   folderBindingsPath,
   groupProfileDir,
+  leaseRuleId,
   ruleSlotId,
   sandboxPaths,
   type ClaudeOauth,
   type CredentialBundle,
+  type LeaseHolder,
   type Paths,
 } from '@claude-control/switch-engine';
 import { CliFailure } from './context.js';
@@ -121,6 +123,7 @@ async function machine(
       return Promise.resolve();
     },
     rulesBlocked: () => Promise.resolve({}),
+    sweepParallelSession: () => Promise.resolve(),
     resolveFolder: (folder) => resolveFolderHere(folder, process.platform),
     afterSettings: () => Promise.resolve(),
     platform: process.platform,
@@ -3394,5 +3397,156 @@ describe('slots the seat step moves, and an import stopped part-way', () => {
     const n = (await b.engine.listAllAccounts()).find((acc) => acc.label === 'n')!;
     expect(n.quarantined).toBeFalsy();
     expect((await b.vault.readBundle(n.id)).claudeAiOauth.refreshToken).toBe('r-N-LIVE');
+  });
+});
+
+describe.skipIf(process.platform === 'darwin')('a parallel session on this machine', () => {
+  /** Start a parallel session on `accountId`, as `cctl claude --account` in another terminal
+   *  leaves it: its rule with one launcher, and its slot seated. */
+  async function startSession(m: Machine, accountId: string): Promise<LeaseHolder> {
+    const holder: LeaseHolder = {
+      pid: 4120,
+      start: 0,
+      host: 'box',
+      platform: process.platform === 'win32' ? 'win32' : 'linux',
+      role: 'launcher',
+    };
+    await m.vault.createRule({
+      folders: [],
+      include: [accountId],
+      lease: { holders: [holder], startedAtMs: Date.now() },
+    });
+    await m.engine.activate(accountId, { slot: ruleSlotId(leaseRuleId(accountId)), lease: true });
+    return holder;
+  }
+
+  /** The live files of an account's parallel-session slot. */
+  function sessionLogin(m: Machine, accountId: string): CredentialStore {
+    const dir = groupProfileDir(m.paths.vaultDir, leaseRuleId(accountId));
+    return new CredentialStore({
+      claudeDir: dir,
+      credentialsPath: join(dir, '.credentials.json'),
+      claudeJsonPath: join(dir, '.claude.json'),
+      vaultDir: m.paths.vaultDir,
+    });
+  }
+
+  /** The session is as it was started: its rule and holder, its account live in its slot, and the
+   *  rules file at the schema a parallel session needs. */
+  async function sessionIntact(m: Machine, accountId: string, holder: LeaseHolder): Promise<void> {
+    const rule = (await m.engine.listRules()).find((r) => r.id === leaseRuleId(accountId));
+    expect(rule?.lease?.holders).toEqual([holder]);
+    expect(await m.engine.getActiveId(ruleSlotId(leaseRuleId(accountId)))).toBe(accountId);
+    const file = JSON.parse(await readFile(join(m.paths.vaultDir, 'groups.json'), 'utf8')) as {
+      schemaVersion: number;
+    };
+    expect(file.schemaVersion).toBe(4);
+  }
+
+  it('is never written to the file, and its account travels with the login the session refreshed', async () => {
+    const a = await machine();
+    const work = await a.engine.addAccount('work', bundle('W1', 'u-work'));
+    const home = await a.engine.addAccount('home', bundle('H1', 'u-home'));
+    await a.engine.activate(work.id);
+    await a.engine.excludeInFolder(await folder(a, 'proj'), [home.id], { label: 'Client' });
+    const holder = await startSession(a, home.id);
+    // The session's Claude Code refreshed the login since the claim seated it.
+    await sessionLogin(a, home.id).writeLiveCredentials({
+      accessToken: 'H2',
+      refreshToken: 'r-H2',
+      expiresAt: Date.now() + 20 * HOUR,
+    });
+
+    const file = join(a.root, 'f');
+    await runExport(file, exportAll, a.deps);
+    expect(a.out.join('')).toContain('Exported 2 accounts (2 with tokens), 1 rule ');
+    await sessionIntact(a, home.id, holder);
+
+    const b = await machine();
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    const rules = await b.engine.listRules();
+    expect(rules.map((r) => r.label)).toEqual(['Client']);
+    const brought = (await b.engine.listAllAccounts()).find((acc) => acc.label === 'home')!;
+    expect(brought.ruleIds ?? []).toEqual([]);
+    expect((await b.vault.readBundle(brought.id)).claudeAiOauth.refreshToken).toBe('r-H2');
+  });
+
+  it('refuses export --move of its account before writing or removing anything', async () => {
+    const swept: string[] = [];
+    const a = await machine({
+      sweepParallelSession: (id) => {
+        swept.push(id);
+        return Promise.resolve();
+      },
+    });
+    const work = await a.engine.addAccount('work', bundle('W1', 'u-work'));
+    const home = await a.engine.addAccount('home', bundle('H1', 'u-home'));
+    await a.engine.activate(work.id);
+    const holder = await startSession(a, home.id);
+    const file = join(a.root, 'm');
+
+    const msg = await refusal(
+      runExport(file, { ...exportAll, accounts: 'home', move: true, yes: true }, a.deps),
+    );
+    expect(msg).toContain('"home" is in use by a parallel session here');
+    expect(msg).toContain('leave it out with --accounts');
+    // Whether its processes still run was checked first.
+    expect(swept).toEqual([home.id]);
+    expect(existsSync(file)).toBe(false);
+    expect((await a.engine.listAllAccounts()).map((acc) => acc.label).sort()).toEqual([
+      'home',
+      'work',
+    ]);
+    await sessionIntact(a, home.id, holder);
+  });
+
+  it('lets export --move go ahead once that check finds the session ended', async () => {
+    const a = await machine();
+    const work = await a.engine.addAccount('work', bundle('W1', 'u-work'));
+    const home = await a.engine.addAccount('home', bundle('H1', 'u-home'));
+    await a.engine.activate(work.id);
+    await startSession(a, home.id);
+    // The check finds none of the session's processes running, and ends it.
+    a.deps.sweepParallelSession = async (id) => {
+      await a.vault.removeRule(leaseRuleId(id));
+    };
+    const file = join(a.root, 'm');
+    await runExport(file, { ...exportAll, accounts: 'home', move: true, yes: true }, a.deps);
+    expect(existsSync(file)).toBe(true);
+    expect((await a.engine.listAllAccounts()).map((acc) => acc.label)).toEqual(['work']);
+  });
+
+  it('is left whole by an import, whose dry run and report say alike why an exclusion waits', async () => {
+    const a = await machine();
+    const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
+    const y = await a.engine.addAccount('y', bundle('Y1', 'u-y'));
+    await a.engine.activate(x.id);
+    await a.engine.includeInFolder(await folder(a, 'proj'), [y.id], { label: 'Client' });
+    await a.engine.excludeInFolder(await folder(a, 'other'), [x.id], { label: 'Other' });
+    const file = join(a.root, 'f');
+    await runExport(file, exportAll, a.deps);
+
+    const b = await machine();
+    const g = await b.engine.addAccount('g', bundle('G1', 'u-g'));
+    // x is stored here with a later login than the file's, and a parallel session runs on it.
+    const bx = await b.engine.addAccount('x', bundle('XB', 'u-x', Date.now() + 20 * HOUR));
+    await b.engine.activate(g.id);
+    const holder = await startSession(b, bx.id);
+
+    expect(await importInto(b, file, { dryRun: true })).toEqual({ failed: 0 });
+    const planned = b.out.join('');
+    b.out.length = 0;
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    const report = b.out.join('');
+    for (const text of [planned, report]) {
+      expect(text).toContain('a parallel session runs on every account it excludes');
+    }
+
+    await sessionIntact(b, bx.id, holder);
+    expect((await sessionLogin(b, bx.id).readLiveCredentials())?.accessToken).toBe('XB');
+    const rules = await b.engine.listRules();
+    expect(rules.filter((r) => r.lease === undefined).map((r) => r.label)).toEqual(['Client']);
+    const client = rules.find((r) => r.label === 'Client')!;
+    expect(await b.engine.getActiveId(ruleSlotId(client.id))).not.toBe(bx.id);
   });
 });

@@ -201,8 +201,9 @@ a rule of this machine is in its way fails again until that rule is removed. A w
 changed after it was written, one cut short, or one whose rules hold more than 1024 folders and
 session aliases in all is refused before anything is imported.
 `--move` refuses an account that is the live login of this machine's main config (switch to
-another account first: `cctl switch <account>`), that is live in a folder's slot while
-sessions run there, or whose removal would dissolve a rule (one naming only that account) whose
+another account first: `cctl switch <account>`), that a parallel session runs on (exit it
+first; checked before anything is written, as `cctl switch` checks it), that is live in a
+folder's slot while sessions run there, or whose removal would dissolve a rule (one naming only that account) whose
 folder's slot sessions are running on (exit them first), and removes nothing unless the written file is
 on the disk and reads back, opening with the same passphrase. It keeps an account whose tokens
 did not travel (a quarantined one), and one whose tokens changed or that became the main login
