@@ -12,6 +12,7 @@ import {
   shellQuoteArg,
 } from '@claude-control/switch-engine';
 import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
+import { MEMORY_BASE_ENV } from '@claude-control/switch-engine';
 
 /** Where an account of a folder's pool comes from: the rule's own included accounts, or the shared
  *  pool every folder inherits. */
@@ -440,8 +441,11 @@ export interface WhereView {
   folder: string;
   /** The rule it resolves to and the rule folder that matched, or null for the global slot, with
    *  the VS Code profile it gets among every rule (see {@link vscodeProfileNames}; absent, the
-   *  name its label alone gives). */
-  rule: (FolderRuleView & { matchedFolder: string; vscodeProfile?: string }) | null;
+   *  name its label alone gives), and the memory base its sessions get (see withProfileMemoryBase;
+   *  absent when the profile needs none). */
+  rule:
+    | (FolderRuleView & { matchedFolder: string; vscodeProfile?: string; memoryBase?: string })
+    | null;
   global: GlobalSlotView;
   /** Named sessions with a rule of their own in EXACTLY this folder: they outrank the folder's rule
    *  above. */
@@ -640,11 +644,13 @@ export function renderWhere(
   // workspace's .vscode/settings.json (it only greys the line out), and reads it from user settings
   // only. Per-folder routing therefore needs a VS Code profile whose user settings carry it — one
   // profile per folder rule, opened on its folder.
-  const vscodeSnippet = JSON.stringify(
-    { 'claudeCode.environmentVariables': [{ name: 'CLAUDE_CONFIG_DIR', value: r.profileDir }] },
-    null,
-    2,
-  );
+  // The memory base rides along so the extension's sessions save memory without asking, as
+  // `cctl claude` sessions do.
+  const env = [
+    { name: 'CLAUDE_CONFIG_DIR', value: r.profileDir },
+    ...(r.memoryBase !== undefined ? [{ name: MEMORY_BASE_ENV, value: r.memoryBase }] : []),
+  ];
+  const vscodeSnippet = JSON.stringify({ 'claudeCode.environmentVariables': env }, null, 2);
   const profileName = r.vscodeProfile ?? vscodeProfileName(r.label);
   const openCommand = `code --profile ${shellQuote(profileName, platform)} ${quoted}`;
   return [
@@ -653,6 +659,9 @@ export function renderWhere(
     `  matched:  ${sanitizeForTerminal(r.matchedFolder)} (the longest matching rule wins; rules do not merge)`,
     ...ruleBodyLines(r, palette),
     `  env:      CLAUDE_CONFIG_DIR=${profile}`,
+    ...(r.memoryBase !== undefined
+      ? [`            ${MEMORY_BASE_ENV}=${sanitizeForTerminal(r.memoryBase)}`]
+      : []),
     `  global:   ${globalSlotHere(r)}`,
     '',
     'Start Claude Code here with the right account using: cctl claude',
