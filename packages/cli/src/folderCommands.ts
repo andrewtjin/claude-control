@@ -35,6 +35,7 @@ import {
   operatorRules,
   selfHolder,
   shellQuoteArg,
+  slotWordsOf,
   type AccountView,
   type ExcludeResult,
   type FolderRule,
@@ -1025,16 +1026,22 @@ export function describeSlotRefusal(err: SlotError, accountLabel: string): strin
   }
 }
 
-/** Also used by `cctl switch`: the folder rule whose slot a just-switched account is now live in, or
- *  null when it went to the global slot. */
+/** Also used by `cctl switch`: the rule whose slot a just-switched account is now live in, with
+ *  that slot in words (a parallel session's slot is not a folder's), or null when it went to the
+ *  global slot. */
 export async function describeSwitchedGroup(
   engine: Engine,
   accountId: string,
-): Promise<{ label: string; folders: string[]; scopes: string } | null> {
+): Promise<{ label: string; folders: string[]; scopes: string; slot: string } | null> {
   const [rules, live] = await Promise.all([engine.listRules(), engine.liveSlots()]);
   const rule = rules.find((r) => live.get(ruleSlotId(r.id)) === accountId);
   return rule
-    ? { label: rule.label, folders: rule.folders, scopes: describeRuleScopes(rule) }
+    ? {
+        label: rule.label,
+        folders: rule.folders,
+        scopes: describeRuleScopes(rule),
+        slot: slotWordsOf(rule),
+      }
     : null;
 }
 

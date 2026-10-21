@@ -224,10 +224,10 @@ export async function switchAccount(
     activation.refreshed ? 'token refreshed' : null,
     activation.adoptedPreviousRotation ? 'adopted previous rotation' : null,
   ].filter(Boolean);
-  // A switch into a folder rule's slot moves that slot, not the global one — say which.
+  // A switch into a rule's slot moves that slot, not the global one — say which.
   const folderRule = await describeSwitchedGroup(engine, account.id);
   const where = folderRule
-    ? ` in the folder slot of ${sanitizeForTerminal(folderRule.scopes)}`
+    ? ` in ${sanitizeForTerminal(folderRule.slot)}`
     : target !== undefined
       ? ` in the global slot (no folder rule applies to ${sanitizeForTerminal(folder ?? '')})`
       : '';

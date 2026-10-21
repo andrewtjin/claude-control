@@ -235,6 +235,24 @@ describe('switchAccount', () => {
     expect(folderIo.refuseOnOlderDaemon).not.toHaveBeenCalled();
   });
 
+  it("names a parallel session's slot as one, not as a folder slot", async () => {
+    engine.liveSlots.mockResolvedValue(new Map([['group:session-id-9', 'id-1']]));
+    // The rules read before the switch show no parallel session (so no sweep runs); the one read
+    // after it finds the account live in another account's parallel-session slot.
+    engine.listRules.mockResolvedValueOnce([]).mockResolvedValue([
+      {
+        id: 'session-id-9',
+        label: 'Other',
+        include: ['id-9'],
+        exclude: [],
+        folders: [],
+        lease: { holders: [], startedAtMs: 0 },
+      },
+    ]);
+    const out = await switchAccount('Work', {}, ctx);
+    expect(out.message).toMatch(/^Activated Work in the parallel-session slot of Other \(/);
+  });
+
   it('asserts no slot for an account several rules include', async () => {
     engine.listAllAccounts.mockResolvedValue([{ ...work, ruleIds: ['g1', 'g2'] }]);
     await switchAccount('Work', {}, ctx);

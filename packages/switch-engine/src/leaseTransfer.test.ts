@@ -444,6 +444,8 @@ describe.skipIf(process.platform === 'darwin')(
         .removeAccount(y, { refuseIfGloballyLive: true, refuseIfRunning: true })
         .catch((e: unknown) => e);
       expect((err as { code?: string }).code).toBe('sessions_running');
+      // The refusal names the slot it is live in as a parallel session's, not a folder's.
+      expect((err as Error).message).toMatch(/^it is live in the parallel-session slot of x, /);
       expect((await h.engine.listAllAccounts()).map((a) => a.label).sort()).toEqual([
         'g',
         'x',

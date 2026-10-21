@@ -1014,7 +1014,9 @@ describe('--move hands over only what it can', () => {
       a.deps,
     );
     expect(res.failed).toBe(1);
-    expect(a.out.join('')).toContain(`Could not remove x: removing it dissolves the rule on ${p}`);
+    expect(a.out.join('')).toContain(
+      `Could not remove x: removing it dissolves the rule of the folder slot of ${p}`,
+    );
     expect(await a.engine.getActiveId(slot)).toBe(z.id);
     expect(await a.engine.listRules()).toHaveLength(1);
   });

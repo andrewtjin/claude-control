@@ -1821,13 +1821,13 @@ export class SwitchEngine {
         const sessions = await this.runningSessionsInRule(rule);
         if (sessions.length === 0) continue;
         const using = `${sessions.length} running session(s) are using it${unidentifiedNote(sessions)}`;
+        // The slot is named as every message names it: a parallel session's slot is not a folder's.
         throw new RefreshError(
           !live
-            ? `removing it dissolves the rule on ${describeRule(rule)}, which signs its folder ` +
-                `slot out, and ${using}; exit them, then remove it with cctl accounts remove`
-            : `it is live in the folder slot of ${describeRule(rule)}, and ${using}, which would ` +
-                'go on using a login the other machine now holds; exit them, then remove it with ' +
-                'cctl accounts remove',
+            ? `removing it dissolves the rule of ${slotWordsOf(rule)}, which signs that slot out, ` +
+                `and ${using}; exit them, then remove it with cctl accounts remove`
+            : `it is live in ${slotWordsOf(rule)}, and ${using}, which would go on using a login ` +
+                'the other machine now holds; exit them, then remove it with cctl accounts remove',
           'sessions_running',
         );
       }
@@ -2052,7 +2052,7 @@ export class SwitchEngine {
     }
     throw new SlotError(
       `account "${target.label}" is included by several folder rules ` +
-        `(${including.map(describeRule).join('; ')}); name the folder slot to switch it in`,
+        `(${including.map(slotWordsOf).join('; ')}); name the folder slot to switch it in`,
       'slot_ambiguous',
     );
   }

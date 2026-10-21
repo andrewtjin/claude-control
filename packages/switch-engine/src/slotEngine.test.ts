@@ -228,7 +228,10 @@ describe('activate — an account several rules include', () => {
 
     await expect(h.engine.activate(A.id)).rejects.toMatchObject({
       code: 'slot_ambiguous',
-      message: expect.stringMatching(/name the folder slot/) as unknown,
+      // Each candidate is named as its slot, the way every other message names one.
+      message: expect.stringMatching(
+        /several folder rules \(the folder slot of [^;]+; the folder slot of [^;]*client\); name the folder slot/,
+      ) as unknown,
     });
     // Nothing was picked for the caller: both rule slots and the global slot are untouched.
     expect(await ruleStore(h.paths, rule.id).readLiveCredentials()).toBeUndefined();
