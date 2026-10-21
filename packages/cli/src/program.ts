@@ -32,6 +32,7 @@ import {
   isOverloadCode,
   parsePastedCode,
   resolveAccountRef,
+  type AccountView,
   type StoredAccount,
 } from '@claude-control/switch-engine';
 import {
@@ -404,7 +405,7 @@ export function buildProgram(): Command {
     .action(async () => {
       await healAccounts(buildEngine());
       const nowMs = Date.now();
-      const state = await readUsageState(nowMs);
+      const state = withFolderTags(await readUsageState(nowMs));
       const rows: UsageRow[] = state.accounts.map((a) => {
         // The prediction is measured here, from the same history the pacing line below reads,
         // and handed to the row: an account whose endpoint reset has already passed has no
@@ -439,7 +440,7 @@ export function buildProgram(): Command {
     .action(async () => {
       await healAccounts(buildEngine());
       const nowMs = Date.now();
-      const state = await readUsageState(nowMs);
+      const state = withFolderTags(await readUsageState(nowMs));
       const inputs = buildAdvisorInputs(state);
       const outlook = computeOutlook(inputs, nowMs);
       const autoSwitchPolicy = await cliAutoSwitchPolicy();
@@ -1319,7 +1320,7 @@ async function readStatusSummary(): Promise<SetupSummary> {
  *  a not-yet-created db just yields an empty one. A corrupt snapshot row is skipped, never
  *  fatal. */
 interface UsageState {
-  accounts: StoredAccount[];
+  accounts: AccountView[];
   activeId: string | null;
   usageFor: (accountId: string) => AccountUsage | undefined;
   /** Next weekly reset predicted from stored history, for accounts the endpoint has stopped
@@ -1329,13 +1330,14 @@ interface UsageState {
   burnUnitsPerDay: number | undefined;
 }
 
-/** The usage view's state: the shared accounts, the global live account and each account's latest
- *  snapshot. `only` names the accounts to read instead (the outage judgement reads the whole fleet,
- *  reserved accounts included). */
-async function readUsageState(nowMs: number, only?: StoredAccount[]): Promise<UsageState> {
+/** The usage view's state: the whole fleet (shared accounts and those reserved to folder rules,
+ *  the set the daemon polls and measures, so the numbers here match the phone's), the global live
+ *  account and each account's latest snapshot. `fleet` is the registry's accounts when the caller
+ *  has already read them. */
+async function readUsageState(nowMs: number, fleet?: AccountView[]): Promise<UsageState> {
   const engine = buildEngine();
   const [accounts, activeId] = await Promise.all([
-    only !== undefined ? Promise.resolve(only) : engine.listAccounts(),
+    fleet !== undefined ? Promise.resolve(fleet) : engine.listAllAccounts(),
     engine.getActiveId(),
   ]);
   const store = new Store(daemonDbPath());
@@ -1367,6 +1369,18 @@ async function readUsageState(nowMs: number, only?: StoredAccount[]): Promise<Us
   } finally {
     store.close();
   }
+}
+
+/** `usage` and `timeline`'s copy of the state, with every account reserved to a folder rule
+ *  labeled "<label> (folder)": it counts in the fleet like any other account, but only the folders
+ *  that include it can use it, and the global plan never sends the global slot there. */
+function withFolderTags(state: UsageState): UsageState {
+  return {
+    ...state,
+    accounts: state.accounts.map((a) =>
+      (a.ruleIds ?? []).length > 0 ? { ...a, label: `${a.label} (folder)` } : a,
+    ),
+  };
 }
 
 /** Build the advisor's `AccountUsageInput` view shared by `timeline`'s outlook/plan and both
