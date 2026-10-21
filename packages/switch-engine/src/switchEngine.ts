@@ -515,17 +515,26 @@ interface ImportProgress {
   seated: SlotSeat[];
 }
 
-/** What the batch of an import (steps 1 to 4 of {@link SwitchEngine.importRules}) leaves its seat
- *  step: the decision, the rule each write landed in, the rules as they stood before the writes,
- *  the accounts no seat may take (`keepOut`, and `avoided`: found unable to go live), and whether
- *  anything was written or moved. */
+/** What the batch of an import (steps 1 to 3 of {@link SwitchEngine.importRules}) leaves its moves
+ *  and its seat step, the state carried from one hold of the lock to the next: the decision, the
+ *  rule each write landed in, the registry as it stood before the writes, the slots of the rules
+ *  that did not land (`notLanded`), the moves still to be made, and the accounts no seat may take
+ *  (`keepOut`, and `avoided`: found unable to go live, added to by a move that fails). */
 interface ImportBatch {
   decision: ImportDecision;
   ruleIds: ReadonlyMap<ImportWrite, string>;
-  rulesBefore: readonly FolderRule[];
+  before: RulesPicture;
+  notLanded: () => Set<SlotId>;
+  moves: readonly ImportMove[];
   keepOut: ReadonlySet<string>;
-  avoided: ReadonlySet<string>;
-  changed: boolean;
+  avoided: Set<string>;
+}
+
+/** A slot an import's move switched: the account it held and the one it holds now (null: none). */
+interface MadeMove {
+  slot: SlotId;
+  from: string | null;
+  to: string | null;
 }
 
 /** The import decision ({@link SwitchEngine.importRules}): the plan as reported, the writes that
@@ -2218,17 +2227,19 @@ export class SwitchEngine {
    *      refusal, the batch tried against a draft of the registry, every slot it moves, chosen for
    *      all the slots together, and the seat step played out on the draft.
    *   2. make sure every account the decision puts live can go live ({@link readyImportTargets}):
-   *      its stored tokens read, and refreshed now when near their end. One that cannot is left out
-   *      and the decision made again without it. Nothing is written or moved until every account
-   *      of the decision is ready, so an account that fails never leaves a slot moved for a rule
-   *      that then does not land.
+   *      its stored tokens read, and refreshed now when near their end, each such refresh under a
+   *      hold of the lock of its own, after which the batch is decided again. One that cannot is
+   *      left out and the decision made again without it. Nothing is written or moved until every
+   *      account of the decision is ready, so an account that fails never leaves a slot moved for a
+   *      rule that then does not land.
    *   3. add the scopes a grown rule lacks, then write every exclusion, then every inclusion: an
    *      account a later rule reserves is still shared while the exclusions are written, as it was
    *      on the source when they were made.
    *   4. make the moves, now that every rule they are for is written (so a slot may take an account
    *      the batch newly includes in its rule): each slot holding an account a rule now reserves,
    *      and each written rule's slot the decision puts elsewhere, in an order that frees each
-   *      account before the slot taking it.
+   *      account before the slot taking it. Each move is made under a hold of the lock of its own,
+   *      as each seat is below (see makeImportMoves).
    *   5. seat each written rule's slot that is still to be seated (an empty slot), each under a
    *      hold of the lock of its own: once the rules are written and the moves made, each seat is
    *      independent of the others, so a switch or a daemon waiting on the lock is handed it
@@ -2240,10 +2251,13 @@ export class SwitchEngine {
    * any of them, so a write fails part-way only when something changed under the lock's holder
    * (another process writing the files by hand) or the process dies; a run that dies part-way
    * leaves rules the next import grows to completion by their identity, and slots the daemon's
-   * repair settles. The lock is renewed between steps 1 to 4 (each account readied may refresh a
-   * token over the network), so no other process takes it over while the batch runs. A run stopped
-   * part-way once it has started writing (the lock taken over all the same, a file that cannot be
-   * read) throws {@link ImportInterruptedError} carrying what it got done, so it is still reported.
+   * repair settles. Past the batch's local reads and writes, a hold makes one network refresh or
+   * one switch (the batch refreshes only a token that ran short again since its own hold), so a
+   * command or the daemon waiting for the lock gets it within what it waits, however large the
+   * import; within each hold the lock is renewed, so no other process
+   * takes it over mid-hold. A run stopped part-way once it has started writing (the lock taken over
+   * all the same, a file that cannot be read) throws {@link ImportInterruptedError} carrying what
+   * it got done, so it is still reported.
    *
    * `keepOut` names accounts no slot may be moved to or seated with unless its own rule includes
    * them (see withoutKeptOut): accounts the import brought for a rule of the machine they came
@@ -2263,10 +2277,43 @@ export class SwitchEngine {
       seated: [],
     };
     try {
-      const batch = await this.withCredentialLock((renew) =>
-        this.importBatchLocked(specs, opts, renew, done),
-      );
-      // 5. Each seat under its own hold, the lock handed first to whoever waits for it.
+      // 1-3. The batch, under one hold. An account it would put live whose token must first be
+      // refreshed over the network sends it back: each such account is refreshed under a hold of
+      // its own, the lock handed first to whoever waits for it, and the batch decided again (see
+      // importBatchLocked). Accounts that cannot go live (`avoid`) and the ones refreshed so
+      // (`readied`) carry from one try of the batch to the next.
+      const avoid = new Map<string, string>();
+      const readied = new Set<string>();
+      let batch: ImportBatch;
+      for (;;) {
+        const step = await this.withCredentialLock((renew) =>
+          this.importBatchLocked(specs, opts, renew, done, { avoid, readied }),
+        );
+        if (!('stale' in step)) {
+          batch = step;
+          break;
+        }
+        for (const id of step.stale) {
+          await yieldLock(this.lockDir());
+          const failed = await this.withCredentialLock(async (renew) => {
+            await this.settleForAccountsLocked([id]);
+            const ready = await this.readyImportTargets([id], step.moves, renew);
+            // A refresh that outlasted the lock's claim, another process taking it over meanwhile,
+            // stops the import here, before anything is written, as it would in the batch.
+            renew();
+            return ready.failed;
+          });
+          readied.add(id);
+          // The decision made without it may need none of the other refreshes.
+          if (failed !== undefined) {
+            this.noteUnready(avoid, failed);
+            break;
+          }
+        }
+      }
+      // 4. Each move under its own hold, the lock handed first to whoever waits for it.
+      const moved = await this.makeImportMoves(batch, done);
+      // 5. Each seat the same way.
       for (const write of batch.decision.writes) {
         await yieldLock(this.lockDir());
         await this.withCredentialLock((renew) =>
@@ -2274,7 +2321,7 @@ export class SwitchEngine {
         );
       }
       // 6. The guard snapshot, last.
-      if (batch.changed) {
+      if (batch.ruleIds.size > 0 || moved > 0) {
         await yieldLock(this.lockDir());
         await this.withCredentialLock(() => this.writeSnapshotLocked());
       }
@@ -2290,15 +2337,25 @@ export class SwitchEngine {
     }
   }
 
-  /** Steps 1 to 4 of {@link importRules}, under one hold of its lock: the decision, the writes and
-   *  the moves. What it gets done goes into `done` as it goes (`plan` once it starts writing), so a
-   *  run that stops part-way still reports it. */
+  /**
+   * Steps 1 to 3 of {@link importRules}, under one hold of its lock: the decision and the writes.
+   * What it gets done goes into `done` as it goes (`plan` once it starts writing), so a run that
+   * stops part-way still reports it.
+   *
+   * A refresh over the network takes as long as the token endpoint does, and an export imported
+   * after its tokens lapsed needs one for every account it puts live: done here, one after another,
+   * they would keep the lock past what `cctl switch` and the daemon wait for it. So an account
+   * whose token needs one sends the batch back before anything is written (`stale`, with the moves
+   * that readying goes by), unless it was already refreshed under a hold of its own (`readied`),
+   * which is then done here (a token that ran short again in between).
+   */
   private async importBatchLocked(
     specs: readonly ImportRuleSpec[],
     opts: ImportRulesOptions,
     renew: () => void,
     done: ImportProgress,
-  ): Promise<ImportBatch> {
+    tried: { avoid: Map<string, string>; readied: ReadonlySet<string> },
+  ): Promise<ImportBatch | { stale: string[]; moves: readonly ImportMove[] }> {
     const allIds = memberIdsOf(specs);
     await this.resolveRequested(allIds);
     await this.settleForAccountsLocked(allIds);
@@ -2307,7 +2364,7 @@ export class SwitchEngine {
     // (its token will not refresh, its stored tokens cannot be read) is left out, and the decision
     // made again without it: nothing has been written or moved yet.
     const keepOut = new Set(opts.keepOut ?? []);
-    const avoid = new Map<string, string>();
+    const { avoid, readied } = tried;
     let decision: ImportDecision;
     for (;;) {
       renew();
@@ -2318,20 +2375,25 @@ export class SwitchEngine {
         settle: true,
         avoid,
       });
-      const failed = await this.readyImportTargets(decision.targets, decision.moves, renew);
-      if (failed === undefined) break;
-      avoid.set(failed.id, failed.error.message);
-      this.log.warn(
-        { accountId: failed.id, reason: errorReason(failed.error) },
-        'an import cannot make an account live; deciding again without it',
-      );
+      const ready = await this.readyImportTargets(decision.targets, decision.moves, renew, readied);
+      if (ready.failed !== undefined) {
+        this.noteUnready(avoid, ready.failed);
+        continue;
+      }
+      if (ready.stale.length > 0) return { stale: ready.stale, moves: decision.moves };
+      break;
+    }
+
+    // A slot whose switch is stuck would refuse its move only once the rules are written and the
+    // moves before it made, so it refuses the import now, before anything is written.
+    for (const move of decision.moves) {
+      await this.requireSettledLocked(this.slotRuntime(move.slotId));
     }
 
     // 3. Scopes, then exclusions, then inclusions. The rules as they stand before, for whose
     // sessions run on each grown rule's slot now (a scope it gains ran on another slot).
     renew();
     const before = await this.vault.readPicture();
-    const rulesBefore = before.rules;
     done.plan = decision.plan;
     const outcomes = done.outcomes;
     const ruleIds = await writeImportBatch(this.vault, decision.writes, async (write, err, at) => {
@@ -2344,12 +2406,8 @@ export class SwitchEngine {
     });
     done.allWritten = true;
 
-    // 4. The moves, each reported as it is made. A write that failed leaves a move made for it
-    // pointless, so such moves are not made (see movesStillNeeded). A move that fails puts back
-    // every rule the slots, as they then stand, would run against (see putBackViolatedWrites), and
-    // the moves still needed for the rules that stay are made; a move that stops the run puts back
-    // the same way, and no move is made after it.
-    const avoided = new Set(avoid.keys());
+    // A write that failed leaves a move made for it pointless, so such moves are not made (see
+    // movesStillNeeded).
     const notLanded = (): Set<SlotId> =>
       new Set(
         decision.writes.flatMap((w) => {
@@ -2357,61 +2415,63 @@ export class SwitchEngine {
           return id !== undefined && outcomes[w.index] !== undefined ? [ruleSlotId(id)] : [];
         }),
       );
-    let pending = decision.writes.some((w) => outcomes[w.index] !== undefined)
+    const moves = decision.writes.some((w) => outcomes[w.index] !== undefined)
       ? await this.movesStillNeeded(decision.moves, notLanded())
       : decision.moves;
-    const made: Array<{ slot: SlotId; from: string | null; to: string | null }> = [];
+    return {
+      decision,
+      ruleIds,
+      before,
+      notLanded,
+      moves,
+      keepOut,
+      avoided: new Set(avoid.keys()),
+    };
+  }
+
+  /** Leave an account the import found unable to go live out of its decision from now on. */
+  private noteUnready(
+    avoid: Map<string, string>,
+    failed: { id: string; error: SwitchEngineError },
+  ): void {
+    avoid.set(failed.id, failed.error.message);
+    this.log.warn(
+      { accountId: failed.id, reason: errorReason(failed.error) },
+      'an import cannot make an account live; deciding again without it',
+    );
+  }
+
+  /**
+   * Step 4 of {@link importRules}: the moves, each under a hold of the lock of its own, the lock
+   * handed first to whoever waits for it (see yieldLock). One hold across every move would keep
+   * `cctl switch` and the daemon waiting for as long as all the switches take, past what they wait.
+   * The written rules and the moves still to be made are all that passes from one hold to the next;
+   * each hold reads the slots again (see importMoveLocked). A move that fails puts back every rule
+   * the slots, as they then stand, would run against (see putBackViolatedWrites), and the moves
+   * still needed for the rules that stay are made; a move that stops the run puts back the same
+   * way, and no move is made after it. Every slot moved is reported, as the net move it was, even
+   * when the run then stops. Returns how many moves were made.
+   */
+  private async makeImportMoves(batch: ImportBatch, done: ImportProgress): Promise<number> {
+    const made: MadeMove[] = [];
     let stopped: Error | undefined;
-    const occupancy = await this.slotOccupancy(await this.vault.readPicture());
-    const batchOf = { writes: decision.writes, ruleIds, outcomes, before, notLanded };
-    for (;;) {
-      const run = await this.executeHandOffLocked(pending, renew, occupancy);
-      made.push(...run.made);
-      if (run.stopped !== undefined) {
-        stopped = run.stopped;
-        // No move after this one is made, but the lock is still this run's unless it was taken
-        // over: the rules the slots, as they then stand, would run against are put back as for a
-        // move that failed, so nothing (the daemon's repair, a launch) moves a running slot later
-        // for a rule whose move this run never made.
-        if (!(stopped instanceof SwitchEngineError && stopped.code === 'lock_lost')) {
-          const why =
-            `the import stopped before the move this rule needs was made (${stopped.message}); ` +
-            'it was left as it was before the import';
-          await this.putBackViolatedWrites([], batchOf, why, renew).catch((err: unknown) => {
-            if (this.isSimulatedDeath(err)) throw err;
-            this.log.warn(
-              { reason: errorReason(err) },
-              'a stopped import could not put rules back',
-            );
-          });
-        }
-        break;
+    try {
+      let pending = batch.moves;
+      while (pending.length > 0) {
+        const left = pending;
+        await yieldLock(this.lockDir());
+        pending = await this.withCredentialLock((renew) =>
+          this.importMoveLocked(left, batch, done, renew, made),
+        );
       }
-      if (run.failed === undefined) break;
-      const { slot, to, error } = run.failed;
-      if (to !== null) avoided.add(to);
-      const why =
-        `${slotPhrase(slot, rulesBefore)} could not be ` +
-        (to === null
-          ? 'signed out'
-          : `switched to "${(await this.vault.getAccount(to))?.label ?? to}"`) +
-        ` (${error.message}), which this rule needs; it was left as it was before the import`;
-      const rest = await this.putBackViolatedWrites(
-        pending.slice(run.made.length + 1),
-        batchOf,
-        why,
-        renew,
-      );
-      if (rest === undefined) {
-        stopped = error;
-        break;
-      }
-      pending = rest;
+    } catch (err) {
+      if (this.isSimulatedDeath(err)) throw err;
+      stopped = err instanceof Error ? err : new Error(String(err));
     }
     // A slot moved off an account that a rule put back no longer reserves is reported as the seat it
     // is, never as "now reserved".
     const kindOf = (slotId: SlotId): ImportMove['kind'] =>
-      decision.moves.find((move) => move.slotId === slotId)?.kind ?? 'seat';
+      batch.decision.moves.find((move) => move.slotId === slotId)?.kind ?? 'seat';
     const net = netMoves(made.map((m) => ({ ...m, kind: kindOf(m.slot) })));
     const now = await this.vault.readPicture();
     for (const hand of net.handOffs) {
@@ -2420,15 +2480,87 @@ export class SwitchEngine {
     }
     done.seated.push(...net.seats);
     if (stopped !== undefined) throw stopped;
+    return made.length;
+  }
 
-    return {
-      decision,
-      ruleIds,
-      rulesBefore,
-      keepOut,
-      avoided,
-      changed: ruleIds.size > 0 || made.length > 0,
+  /**
+   * One move of {@link makeImportMoves} (the first of `pending`), under its own hold of the lock;
+   * returns the moves still to be made after it, and adds the slot it moves to `made`. Another
+   * process may have had the lock since the plan was made, so the move goes by the slots as this
+   * hold reads them: a slot that already holds the account the move puts there needs nothing more,
+   * and a slot that no longer holds what the move takes it off is not switched on a premise that
+   * has gone, which counts as the move failing. The account it puts there is checked by the switch
+   * itself (live in no other slot, one the slot may hold, its token usable).
+   */
+  private async importMoveLocked(
+    pending: readonly ImportMove[],
+    batch: ImportBatch,
+    done: ImportProgress,
+    renew: () => void,
+    made: MadeMove[],
+  ): Promise<ImportMove[]> {
+    const [move, ...rest] = pending as [ImportMove, ...ImportMove[]];
+    const putBack = {
+      writes: batch.decision.writes,
+      ruleIds: batch.ruleIds,
+      outcomes: done.outcomes,
+      before: batch.before,
+      notLanded: batch.notLanded,
     };
+    const occupancy = await this.slotOccupancy(await this.vault.readPicture());
+    const owners = occupancy.get(move.slotId) ?? new Set<string>();
+    if (move.to !== null && owners.has(move.to)) return rest;
+    // What the slot should hold now: what the plan found there, or, for a slot this run already
+    // moved (one cleared to break a trade, then given its account), where this run left it.
+    const mine = made.findLast((m) => m.slot === move.slotId);
+    const holds = mine === undefined ? move.from.id : mine.to;
+    const switchedSince = holds === null ? owners.size > 0 : !owners.has(holds);
+    let failed: { slot: SlotId; to: string | null; error: SwitchEngineError } | undefined;
+    if (switchedSince) {
+      const error = new SlotError(
+        'another command switched it while the import ran',
+        'slot_mismatch',
+      );
+      failed = { slot: move.slotId, to: move.to, error };
+    } else {
+      const step = { slotId: move.slotId, from: { id: holds }, to: move.to };
+      const run = await this.executeHandOffLocked([step], renew, occupancy);
+      made.push(...run.made);
+      if (run.stopped !== undefined) {
+        // No move after this one is made, but the lock is still this run's unless it was taken
+        // over: the rules the slots, as they then stand, would run against are put back as for a
+        // move that failed, so nothing (the daemon's repair, a launch) moves a running slot later
+        // for a rule whose move this run never made.
+        const stopped = run.stopped;
+        if (!(stopped instanceof SwitchEngineError && stopped.code === 'lock_lost')) {
+          const why =
+            `the import stopped before the move this rule needs was made (${stopped.message}); ` +
+            'it was left as it was before the import';
+          await this.putBackViolatedWrites([], putBack, why, renew).catch((err: unknown) => {
+            if (this.isSimulatedDeath(err)) throw err;
+            this.log.warn(
+              { reason: errorReason(err) },
+              'a stopped import could not put rules back',
+            );
+          });
+        }
+        throw stopped;
+      }
+      failed = run.failed;
+    }
+    if (failed === undefined) return rest;
+    const { slot, to, error } = failed;
+    // An account is blamed only for a switch onto it that was tried.
+    if (to !== null && !switchedSince) batch.avoided.add(to);
+    const why =
+      `${slotPhrase(slot, batch.before.rules)} could not be ` +
+      (to === null
+        ? 'signed out'
+        : `switched to "${(await this.vault.getAccount(to))?.label ?? to}"`) +
+      ` (${error.message}), which this rule needs; it was left as it was before the import`;
+    const left = await this.putBackViolatedWrites(rest, putBack, why, renew);
+    if (left === undefined) throw error;
+    return left;
   }
 
   /**
@@ -2465,7 +2597,7 @@ export class SwitchEngine {
         occupancy: await this.slotOccupancy(await this.vault.readPicture()),
         guard: {
           move: batch.decision.seats.find((s) => s.slot === slotId),
-          rule: batch.rulesBefore.find((r) => r.id === ruleId) ?? rule,
+          rule: batch.before.rules.find((r) => r.id === ruleId) ?? rule,
         },
       });
     } catch (err) {
@@ -2497,14 +2629,20 @@ export class SwitchEngine {
    * being live nowhere: the switch onto it would take that slot's rotation, so it is adopted first,
    * and a refresh it then needs writes the new tokens into that slot too, so the slot runs on them
    * until it moves rather than on a spent token. A token any other slot holds live is never
-   * refreshed. The first account that cannot go live is returned with why. A lock taken over, or a
-   * process that died, stops the import instead.
+   * refreshed. The first account that cannot go live is returned with why (`failed`). A lock taken
+   * over, or a process that died, stops the import instead.
+   *
+   * `refreshHere`, when given, names the accounts whose refresh is made here; any other account
+   * that needs one is returned in `stale` instead, unrefreshed, for its caller to refresh under a
+   * hold of the lock of its own (see importBatchLocked).
    */
   private async readyImportTargets(
     ids: readonly string[],
     moves: readonly ImportMove[],
     renew: () => void,
-  ): Promise<{ id: string; error: SwitchEngineError } | undefined> {
+    refreshHere?: ReadonlySet<string>,
+  ): Promise<{ failed?: { id: string; error: SwitchEngineError }; stale: string[] }> {
+    const stale: string[] = [];
     // Read once for every account: a refresh below gives one account a token of its own, which
     // shares nothing with another's. Which slot runs each token is read once too, and again only
     // after a slot is written here (a switch settled there, refreshed tokens written into it), so
@@ -2526,10 +2664,16 @@ export class SwitchEngine {
         const expiring = bundle.claudeAiOauth.expiresAt - this.clock() < this.refreshSkewMs;
         holders ??= expiring ? await this.liveRefreshTokens() : undefined;
         const holder = expiring ? holders?.get(bundle.claudeAiOauth.refreshToken) : undefined;
-        if (expiring && holder === undefined) await this.refreshAndPersist(id, bundle);
-        else if (expiring && left !== undefined && holder === leaving) {
-          const next = await this.refreshAndPersist(id, bundle);
-          await left.credStore.writeLiveCredentials(next.claudeAiOauth);
+        // Refreshed when no slot runs the token, or only the slot it is leaving (which then runs on
+        // the new tokens until it moves); never when another slot runs it.
+        if (!expiring || (holder !== undefined && holder !== leaving)) continue;
+        if (refreshHere !== undefined && !refreshHere.has(id)) {
+          stale.push(id);
+          continue;
+        }
+        const next = await this.refreshAndPersist(id, bundle);
+        if (holder !== undefined) {
+          await left!.credStore.writeLiveCredentials(next.claudeAiOauth);
           holders = undefined;
         }
       } catch (err) {
@@ -2539,10 +2683,10 @@ export class SwitchEngine {
           err instanceof SwitchEngineError
             ? err
             : new SwitchEngineError(errorReason(err), 'switch_failed', { cause: err });
-        return { id, error };
+        return { failed: { id, error }, stale };
       }
     }
-    return undefined;
+    return { stale };
   }
 
   /**

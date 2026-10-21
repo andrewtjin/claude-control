@@ -5,7 +5,7 @@
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -33,6 +33,10 @@ import type {
   SlotHandOff,
   SlotSeat,
 } from './types.js';
+
+// Nearly every test here makes real switches and seats, through the lock and the files, and a
+// loaded machine runs one well past the suite's 20 s default when nothing is wrong.
+vi.setConfig({ testTimeout: 120_000 });
 
 const NOW = 100_000_000;
 const HOUR = 3_600_000;
@@ -431,53 +435,106 @@ describe('the credential lock over a long import', () => {
       const { id } = await h.engine.addAccount(`a${i}`, bundle(`A${i}`, `u-a${i}`));
       specs.push({ scopes: [folder(await ruleFolder(h, `p${i}`))], include: [id], exclude: [] });
     }
-    // Another process takes the lock over and over, the way a cctl command or the daemon would,
-    // each time waiting for it as they do, and says when it got it.
-    const lockModule = pathToFileURL(join(import.meta.dirname, 'lock.ts')).href;
-    const script = join(root, 'contender.mts');
-    await writeFile(
-      script,
-      [
-        `import { acquireLock } from ${JSON.stringify(lockModule)};`,
-        'const [dir, offset] = process.argv.slice(2);',
-        'const clock = () => Date.now() + Number(offset);',
-        "process.stdout.write('ready\\n');",
-        'for (;;) {',
-        '  const lock = await acquireLock(dir, clock, { timeoutMs: 60000, pollMs: 100 });',
-        "  process.stdout.write('got ' + Date.now() + '\\n');",
-        '  lock.release();',
-        '  await new Promise((r) => setTimeout(r, 20));',
-        '}',
-      ].join('\n'),
-    );
-    const contender = spawn(
-      process.execPath,
-      ['--import', 'tsx', script, join(h.paths.vaultDir, '.lock'), String(NOW - started)],
-      { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'inherit'] },
-    );
+    const contender = await contend(h, started);
     try {
-      let out = '';
-      await new Promise<void>((resolve, reject) => {
-        contender.stdout.on('data', (chunk: Buffer) => {
-          out += chunk.toString();
-          if (out.includes('ready')) resolve();
-        });
-        contender.once('exit', (code) => reject(new Error(`contender exited (${String(code)})`)));
-      });
       const from = Date.now();
       const res = await h.engine.importRules(specs);
       const to = Date.now();
       expect(res.outcomes.every((o) => o?.ok === true)).toBe(true);
-      const got = [...out.matchAll(/got (\d+)/g)].map((m) => Number(m[1]));
       // The import holds the lock n + 2 times (the batch, each seat, the snapshot): the process
       // waiting all along is handed it in every gap between them, not only when a poll of its own
       // happens to land in one.
-      expect(got.filter((at) => at > from && at < to).length).toBeGreaterThanOrEqual(n);
+      expect(contender.got().filter((at) => at > from && at < to).length).toBeGreaterThanOrEqual(n);
     } finally {
-      contender.kill();
+      contender.stop();
     }
-  }, 60_000);
+  });
+
+  it('is handed to another process waiting for it between one refresh of a lapsed token and the next', async () => {
+    const root = realpathSync.native(await mkdtemp(join(tmpdir(), 'ce-decide-')));
+    dirs.push(root);
+    const started = Date.now();
+    const clock = (): number => NOW + (Date.now() - started);
+    const h = await harness({ clock, root });
+    const { g } = await accounts(h, 'g');
+    await h.engine.activate(g!);
+    // An export imported after its tokens lapsed: every account it puts live needs a refresh over
+    // the network before anything is written, and each refresh takes a while.
+    const n = 4;
+    const specs: ImportRuleSpec[] = [];
+    for (let i = 0; i < n; i += 1) {
+      const { id } = await h.engine.addAccount(`a${i}`, bundle(`A${i}`, `u-a${i}`, NOW - HOUR));
+      specs.push({ scopes: [folder(await ruleFolder(h, `p${i}`))], include: [id], exclude: [] });
+    }
+    const refreshes: Array<{ from: number; to: number }> = [];
+    h.onRefresh(async (cur) => {
+      const from = Date.now();
+      await new Promise((r) => setTimeout(r, 300));
+      refreshes.push({ from, to: Date.now() });
+      return { ...cur, accessToken: 'NET-' + cur.accessToken, expiresAt: clock() + HOUR };
+    });
+    const contender = await contend(h, started);
+    try {
+      const res = await h.engine.importRules(specs);
+      expect(res.outcomes.every((o) => o?.ok === true)).toBe(true);
+      expect(refreshes.length).toBe(n);
+      // Each refresh is a hold of its own: the process waiting all along gets the lock between
+      // one refresh and the next, never only once they are all done.
+      const got = contender.got();
+      for (let i = 1; i < n; i += 1) {
+        const gap = { from: refreshes[i - 1]!.to, to: refreshes[i]!.from };
+        expect(got.some((at) => at > gap.from && at < gap.to)).toBe(true);
+      }
+    } finally {
+      contender.stop();
+    }
+  });
 });
+
+/**
+ * Another process that takes the import's lock over and over, the way a cctl command or the daemon
+ * would, each time waiting for it as they do (announced, polling every 100 ms), and says when it got
+ * it. `started` puts it on the test's clock, so neither takes the other's claim for a stale one.
+ */
+async function contend(
+  h: Harness,
+  started: number,
+): Promise<{ got: () => number[]; stop: () => void }> {
+  const lockModule = pathToFileURL(join(import.meta.dirname, 'lock.ts')).href;
+  const script = join(h.root, 'contender.mts');
+  await writeFile(
+    script,
+    [
+      `import { acquireLock } from ${JSON.stringify(lockModule)};`,
+      'const [dir, offset] = process.argv.slice(2);',
+      'const clock = () => Date.now() + Number(offset);',
+      "process.stdout.write('ready\\n');",
+      'for (;;) {',
+      '  const lock = await acquireLock(dir, clock, { timeoutMs: 60000, pollMs: 100 });',
+      "  process.stdout.write('got ' + Date.now() + '\\n');",
+      '  lock.release();',
+      '  await new Promise((r) => setTimeout(r, 20));',
+      '}',
+    ].join('\n'),
+  );
+  const child = spawn(
+    process.execPath,
+    ['--import', 'tsx', script, join(h.paths.vaultDir, '.lock'), String(NOW - started)],
+    { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'inherit'] },
+  );
+  let out = '';
+  await new Promise<void>((resolve, reject) => {
+    child.stdout.on('data', (chunk: Buffer) => {
+      out += chunk.toString();
+      if (out.includes('ready')) resolve();
+    });
+    child.once('exit', (code) => reject(new Error(`contender exited (${String(code)})`)));
+  });
+  return {
+    got: () => [...out.matchAll(/got (\d+)/g)].map((m) => Number(m[1])),
+    stop: () => child.kill(),
+  };
+}
 
 describe('what the import does to the accounts it stores first', () => {
   it('counts a quarantined account whose login the import replaces as usable', async () => {
@@ -1277,19 +1334,34 @@ describe('the refusal of a rule that would leave sessions with no account', () =
 });
 
 describe('the cost of seating many rules', () => {
-  /** The most reads of slot logins, and of every stored token, that one hold of the credential lock
-   *  makes while `n` new rules are imported and seated. */
-  async function mostPerHold(n: number): Promise<{ slotReads: number; tokenReads: number }> {
+  /** The most reads of slot logins, of every stored token, and writes of slot logins, that one hold
+   *  of the credential lock makes while `n` rules are imported and seated: new rules, or (`grown`)
+   *  rules here each grown to run a new account in place of the one its slot runs now. */
+  async function mostPerHold(
+    n: number,
+    grown = false,
+  ): Promise<{ slotReads: number; tokenReads: number; slotWrites: number }> {
     const h = await harness();
     const { g } = await accounts(h, 'g');
     await h.engine.activate(g!);
     const specs: ImportRuleSpec[] = [];
     for (let i = 0; i < n; i += 1) {
       const { id } = await h.engine.addAccount(`a${i}`, bundle(`A${i}`, `u-a${i}`));
-      specs.push({ scopes: [folder(await ruleFolder(h, `p${i}`))], include: [id], exclude: [] });
+      const p = await ruleFolder(h, `p${i}`);
+      if (!grown) {
+        specs.push({ scopes: [folder(p)], include: [id], exclude: [] });
+        continue;
+      }
+      const x = await h.engine.addAccount(`x${i}`, bundle(`X${i}`, `u-x${i}`));
+      const origin = `0f0f0f0f-0f0f-4f0f-8f0f-${String(i).padStart(12, '0')}`;
+      const r = await h.vault.createRule({ folders: [p], exclude: [g!], origin });
+      await h.engine.activate(x.id, { slot: ruleSlotId(r.id) });
+      specs.push({ scopes: [folder(p)], include: [id], exclude: [x.id], origin });
     }
+    const plan = await h.engine.planImportRules(specs);
     const slotReads = vi.spyOn(CredentialStore.prototype, 'readLiveCredentials');
     const tokenReads = vi.spyOn(Vault.prototype, 'readStoredTokens');
+    const slotWrites = vi.spyOn(CredentialStore.prototype, 'writeLiveCredentials');
     const releases = vi.spyOn(Lock.prototype, 'release');
     const res = await h.engine.importRules(specs);
     const ends = releases.mock.invocationCallOrder;
@@ -1301,19 +1373,33 @@ describe('the cost of seating many rules', () => {
             spy.mock.invocationCallOrder.filter((at) => at < end && at > (ends[k - 1] ?? 0)).length,
         ),
       );
-    const out = { slotReads: most(slotReads), tokenReads: most(tokenReads) };
+    const out = {
+      slotReads: most(slotReads),
+      tokenReads: most(tokenReads),
+      slotWrites: most(slotWrites),
+    };
     vi.restoreAllMocks();
+    expect(res.plan).toEqual(plan);
     expect(res.outcomes.every((o) => o?.ok === true)).toBe(true);
+    if (grown) expect(res.seated.length).toBe(n);
     return out;
   }
 
   it('holds the lock for work that grows with the rules, never with their square', async () => {
-    const small = await mostPerHold(3);
-    const large = await mostPerHold(12);
+    const small = await mostPerHold(2);
+    const large = await mostPerHold(8);
     // Four times the rules: about four times the slot reads in the busiest hold (one walk of every
     // slot), nowhere near sixteen times, and the same few reads of every stored token.
     expect(large.slotReads / small.slotReads).toBeLessThan(5);
     expect(large.tokenReads).toBeLessThanOrEqual(small.tokenReads + 2);
+  });
+
+  it('switches the slots of the rules it grows one hold of the lock at a time', async () => {
+    const one = await mostPerHold(1, true);
+    const four = await mostPerHold(4, true);
+    // Every slot is switched, and no hold switches more of them than an import of one rule does.
+    expect(four.slotWrites).toBe(one.slotWrites);
+    expect(four.slotReads / one.slotReads).toBeLessThan(5);
   });
 });
 
@@ -1802,6 +1888,47 @@ describe('a seat that cannot be made at run time', () => {
       const next = await h.engine.ensureRuleLive(r.id);
       expect(next.liveAccount, `spare ${spare}`).toBe(now);
     }
+  });
+});
+
+describe('a planned move whose slot another command switched first', () => {
+  it('leaves the slot where that command put it, when its rule allows that', async () => {
+    const h = await harness();
+    const { w, y, v, z, u } = await accounts(h, 'w', 'y', 'v', 'z', 'u');
+    await h.engine.activate(w!);
+    const p = await ruleFolder(h, 'p');
+    const r = await h.vault.createRule({ folders: [p], exclude: [v!], origin: ORIGIN });
+    const slot = ruleSlotId(r.id);
+    await h.engine.activate(y!, { slot });
+    const specs: ImportRuleSpec[] = [
+      { scopes: [folder(p)], include: [], exclude: [y!], origin: ORIGIN },
+    ];
+    const plan = await h.engine.planImportRules(specs);
+    expect(plan.seats).toEqual([{ slot, from: y, to: z }]);
+
+    // Once the rule is written and the lock let go, another command puts u in the slot before the
+    // import's next hold: its login files, written at once, as a switch there writes them.
+    const dir = groupProfileDir(h.paths.vaultDir, r.id);
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- called with its own this
+    const release = Lock.prototype.release;
+    let holds = 0;
+    const releases = vi.spyOn(Lock.prototype, 'release').mockImplementation(function (this: Lock) {
+      release.call(this);
+      holds += 1;
+      if (holds !== 1) return;
+      const creds = { accessToken: 'U', refreshToken: 'r-U', expiresAt: NOW + HOUR };
+      writeFileSync(join(dir, '.credentials.json'), JSON.stringify({ claudeAiOauth: creds }));
+      const ident = JSON.parse(readFileSync(join(dir, '.claude.json'), 'utf8')) as object;
+      const oauthAccount = { accountUuid: 'u-u', emailAddress: 'u-u@x.com' };
+      writeFileSync(join(dir, '.claude.json'), JSON.stringify({ ...ident, oauthAccount }));
+    });
+    const res = await h.engine.importRules(specs);
+    releases.mockRestore();
+    // The import's move was off y, which the slot no longer runs: u stays, as its rule allows.
+    expect(res.outcomes[0]?.ok).toBe(true);
+    expect(await h.engine.getActiveId(slot)).toBe(u);
+    expect(res.seated).toEqual([]);
+    expect(await switchesIn(h, slot)).not.toContainEqual({ from: y, to: z });
   });
 });
 

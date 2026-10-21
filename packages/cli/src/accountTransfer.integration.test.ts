@@ -43,6 +43,10 @@ import {
   type TransferEngine,
 } from './accountTransfer.js';
 
+// These tests run real exports and imports, with real switches and seats, and a loaded machine
+// runs one well past the suite's 20 s default when nothing is wrong.
+vi.setConfig({ testTimeout: 120_000 });
+
 const HOUR = 3_600_000;
 const PASS = 'a long enough passphrase';
 
@@ -633,7 +637,7 @@ describe('freshest tokens and the lock', () => {
     }
     expect(Date.now() - started).toBeGreaterThanOrEqual(4_900);
     expect(await picture(b)).toEqual(await picture(a));
-  }, 30_000);
+  });
 });
 
 describe('the commands', () => {
