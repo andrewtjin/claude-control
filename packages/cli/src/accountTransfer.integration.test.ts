@@ -943,6 +943,34 @@ describe('--move hands over only what it can', () => {
     ]);
   });
 
+  it('keeps an account whose removal would dissolve a rule sessions run under', async () => {
+    const a = await machine();
+    const u = await a.engine.addAccount('u', bundle('U1', 'u-u'));
+    const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
+    const z = await a.engine.addAccount('z', bundle('Z1', 'u-z'));
+    await a.engine.activate(u.id);
+    const p = await folder(a, 'p');
+    // The rule names x and nothing else, and its slot runs z.
+    const made = await a.engine.excludeInFolder(p, [x.id]);
+    const slot = ruleSlotId(made.rule.id);
+    expect(await a.engine.getActiveId(slot)).toBe(z.id);
+    await mkdir(join(a.paths.claudeDir, 'sessions'), { recursive: true });
+    await writeFile(
+      join(a.paths.claudeDir, 'sessions', 'running.json'),
+      JSON.stringify({ pid: process.pid, cwd: p }),
+    );
+
+    const res = await runExport(
+      join(a.root, 'm'),
+      { ...exportAll, move: true, yes: true, accounts: 'x' },
+      a.deps,
+    );
+    expect(res.failed).toBe(1);
+    expect(a.out.join('')).toContain(`Could not remove x: removing it dissolves the rule on ${p}`);
+    expect(await a.engine.getActiveId(slot)).toBe(z.id);
+    expect(await a.engine.listRules()).toHaveLength(1);
+  });
+
   it('keeps a quarantined account, whose tokens did not travel', async () => {
     const a = await machine();
     const dead = await a.engine.addAccount('dead', bundle('D1', 'u-dead'));
