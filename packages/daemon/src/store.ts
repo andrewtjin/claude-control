@@ -264,6 +264,17 @@ export interface StoreOptions {
  */
 const WAL_SIZE_LIMIT_BYTES = 4 * 1024 * 1024;
 
+/**
+ * How long a write on this connection waits for another connection's write lock before it
+ * throws `database is locked`. The daemon, the background checkpointer and every CLI command
+ * open their own connections to one file, and a migration that adds a table is a write: without
+ * a wait, the first command a new build runs against an older build's database fails outright
+ * whenever it lands on one of the daemon's commits. Ten seconds is far past any commit here; a
+ * lock held longer than that (a stuck disk, an outside tool holding a transaction) still fails,
+ * after the wait instead of at once.
+ */
+const BUSY_TIMEOUT_MS = 10_000;
+
 export class Store {
   private readonly db: DatabaseSync;
   private checkpointer: WalCheckpointer | undefined;
@@ -342,6 +353,7 @@ export class Store {
     // WAL — a power loss can lose the last commit, never corrupt, and every table here is a
     // cache/mirror/outbox that tolerates exactly that.
     this.db.exec(`
+      PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS};
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = NORMAL;
     `);

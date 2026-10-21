@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -754,6 +755,41 @@ describe('Store migration', () => {
       expect(store.recordSessionSlot('s1', 'group:g1', 2000)).toBe(true);
     } finally {
       store.close();
+    }
+  });
+
+  it('waits out another process holding the write lock instead of failing that migration', async () => {
+    const dbPath = join(dir, 'daemon.db');
+    new Store(dbPath).close();
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec('DROP TABLE session_slot_spans');
+    legacy.close();
+    // Another process (the running daemon, in production) is mid-commit when this build's first
+    // open has a table to add.
+    const holder = spawn(process.execPath, [
+      '--no-warnings',
+      '-e',
+      `const { DatabaseSync } = require('node:sqlite');
+       const db = new DatabaseSync(${JSON.stringify(dbPath)});
+       db.exec('BEGIN IMMEDIATE');
+       console.log('locked');
+       setTimeout(() => { db.exec('COMMIT'); db.close(); }, 1500);`,
+    ]);
+    const exited = new Promise((resolve) => holder.once('exit', resolve));
+    await new Promise<void>((resolve, reject) => {
+      holder.stdout.once('data', () => resolve());
+      holder.once('error', reject);
+      void exited.then((code) => reject(new Error(`lock holder exited first (${String(code)})`)));
+    });
+    const t0 = Date.now();
+    const store = new Store(dbPath);
+    try {
+      // It waited for the commit rather than throwing `database is locked`, then migrated.
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(500);
+      expect(store.listSessionSlotSpans()).toEqual([]);
+    } finally {
+      store.close();
+      await exited;
     }
   });
 
