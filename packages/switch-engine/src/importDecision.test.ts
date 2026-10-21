@@ -1668,48 +1668,76 @@ describe('a reserved account whose login runs in the main login', () => {
     expect(main.claudeAiOauth.refreshToken).toBe('r-A');
   });
 
-  it('keeps the slot running it on the new tokens once they are stored, though the import then fails', async () => {
-    const h = await harness();
-    const { a, x } = await accounts(h, 'a', 'x');
-    await h.engine.activate(a!);
-    const r1f = await ruleFolder(h, 'r1');
-    const r1 = await h.vault.createRule({ folders: [r1f], include: [a!] });
-    await h.engine.activate(x!, { slot: ruleSlotId(r1.id) });
-    await runSession(h, r1f, 4242);
-    // The main login runs a's token under no identity block, so only that token says it is a.
-    const ident = JSON.parse(await readFile(h.paths.claudeJsonPath, 'utf8')) as {
-      oauthAccount?: unknown;
-    };
-    delete ident.oauthAccount;
-    await writeFile(h.paths.claudeJsonPath, JSON.stringify(ident));
-    const specs: ImportRuleSpec[] = [
-      { scopes: [folder(await ruleFolder(h, 'q'))], include: [x!], exclude: [] },
-    ];
+  // The new tokens are stored once their blob is written: a failure in the registry write that
+  // follows it inside the same store call counts as after, just as one in the step after the call.
+  it.each([
+    [
+      'the step after storing them',
+      () =>
+        vi
+          .spyOn(Vault.prototype, 'clearQuarantine')
+          .mockRejectedValueOnce(new VaultError('the registry could not be written')),
+    ],
+    [
+      'the registry write of the store itself',
+      () => {
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- called with its own this
+        const sync = Vault.prototype.syncMetadata;
+        let failed = false;
+        return vi.spyOn(Vault.prototype, 'syncMetadata').mockImplementation(function (
+          this: Vault,
+          id: string,
+          b: CredentialBundle,
+        ) {
+          if (failed || b.claudeAiOauth.refreshToken !== 'r-A2') return sync.call(this, id, b);
+          failed = true;
+          return Promise.reject(new VaultError('the registry could not be written'));
+        });
+      },
+    ],
+  ])(
+    'keeps the slot running it on the new tokens once they are stored, though %s fails',
+    async (_, fail) => {
+      const h = await harness();
+      const { a, x } = await accounts(h, 'a', 'x');
+      await h.engine.activate(a!);
+      const r1f = await ruleFolder(h, 'r1');
+      const r1 = await h.vault.createRule({ folders: [r1f], include: [a!] });
+      await h.engine.activate(x!, { slot: ruleSlotId(r1.id) });
+      await runSession(h, r1f, 4242);
+      // The main login runs a's token under no identity block, so only that token says it is a.
+      const ident = JSON.parse(await readFile(h.paths.claudeJsonPath, 'utf8')) as {
+        oauthAccount?: unknown;
+      };
+      delete ident.oauthAccount;
+      await writeFile(h.paths.claudeJsonPath, JSON.stringify(ident));
+      const specs: ImportRuleSpec[] = [
+        { scopes: [folder(await ruleFolder(h, 'q'))], include: [x!], exclude: [] },
+      ];
 
-    const plan = await h.engine.planImportRules(specs);
-    // The file's tokens are newer; they are stored, and the step after that fails.
-    const lift = vi
-      .spyOn(Vault.prototype, 'clearQuarantine')
-      .mockRejectedValueOnce(new VaultError('the registry could not be written'));
-    const replaced = await h.engine.importBundle(a!, bundle('A2', 'u-a', NOW + 2 * HOUR)).then(
-      () => undefined,
-      (e: unknown) => e,
-    );
-    lift.mockRestore();
-    expect(replaced).toBeInstanceOf(SwitchEngineError);
-    expect((replaced as SwitchEngineError).code).toBe('import_unfinished');
-    expect((await h.vault.readBundle(a!)).claudeAiOauth.refreshToken).toBe('r-A2');
-    // The main login runs what is stored, so it is still known as a, and the real run is the plan.
-    const main = JSON.parse(await readFile(h.paths.credentialsPath, 'utf8')) as {
-      claudeAiOauth: ClaudeOauth;
-    };
-    expect(main.claudeAiOauth.refreshToken).toBe('r-A2');
-    const res = await h.engine.importRules(specs);
-    expect(res.plan).toEqual(plan);
-    expect((await h.engine.checkSlots()).map((v) => v.kind)).not.toContain(
-      'account_in_multiple_slots',
-    );
-  }, 60_000);
+      const plan = await h.engine.planImportRules(specs);
+      // The file's tokens are newer; they are stored, and something after that fails.
+      const lift = fail();
+      const replaced = await h.engine.importBundle(a!, bundle('A2', 'u-a', NOW + 2 * HOUR)).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      lift.mockRestore();
+      expect(replaced).toBeInstanceOf(SwitchEngineError);
+      expect((replaced as SwitchEngineError).code).toBe('import_unfinished');
+      expect((await h.vault.readBundle(a!)).claudeAiOauth.refreshToken).toBe('r-A2');
+      // The main login runs what is stored, so it is still known as a, and the real run is the plan.
+      const main = JSON.parse(await readFile(h.paths.credentialsPath, 'utf8')) as {
+        claudeAiOauth: ClaudeOauth;
+      };
+      expect(main.claudeAiOauth.refreshToken).toBe('r-A2');
+      const res = await h.engine.importRules(specs);
+      expect(res.plan).toEqual(plan);
+      expect((await h.engine.checkSlots()).map((v) => v.kind)).not.toContain(
+        'account_in_multiple_slots',
+      );
+    },
+  );
 
   it('counts as live there when the file teaches this machine the login it runs', async () => {
     const h = await harness();

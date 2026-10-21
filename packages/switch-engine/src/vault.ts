@@ -2404,11 +2404,17 @@ export class Vault {
    *
    *  Because of that refresh this method is a registry read-modify-write, so like the other
    *  registry writers it MUST be called with the credential lock held (see the "registry
-   *  mutators" note in switchEngine.ts) or a concurrent writer's update is silently lost. */
-  async writeBundle(id: string, bundle: CredentialBundle): Promise<void> {
+   *  mutators" note in switchEngine.ts) or a concurrent writer's update is silently lost.
+   *
+   *  `onStored` is told as soon as the blob is in place, before the registry write: from then on
+   *  the vault holds the new tokens even if that write fails, and a caller that must undo its own
+   *  writes only while the old tokens are still the stored ones needs to know which side of the
+   *  blob a failure came from. */
+  async writeBundle(id: string, bundle: CredentialBundle, onStored?: () => void): Promise<void> {
     ensureDir(join(this.vaultDir, id));
     const blob = await this.protector.protect(Buffer.from(JSON.stringify(bundle), 'utf8'));
     await atomicWriteFile(this.bundlePath(id), blob);
+    onStored?.();
     this.printsByBlob.set(blobDigest(blob), tokenPrints(bundle.claudeAiOauth));
     await this.syncMetadata(id, bundle);
   }

@@ -5957,8 +5957,9 @@ export class SwitchEngine {
    *
    * `keepLiveIdentity` heals only the credentials of `liveSlot`, for a slot whose identity block
    * names another account: the slot stays torn as it was, so whoever reads it still counts both.
-   * `onStored` is told once the vault holds the new bundle, so a caller that wrote a slot first
-   * knows whether a later failure may still undo that write (see {@link importBundle}).
+   * `onStored` is told once the vault holds the new bundle (its blob written, even when the registry
+   * write after it then fails), so a caller that wrote a slot first knows whether a later failure
+   * may still undo that write (see {@link importBundle}).
    */
   private async applyReloginBundle(
     existing: StoredAccount,
@@ -5990,8 +5991,7 @@ export class SwitchEngine {
     // authenticate again. `clearQuarantine` is a no-op flag-wise if it was never quarantined
     // (re-login is also a legitimate way to rotate a still-valid login) and bumps updatedAtMs,
     // so the registry reflects the re-login.
-    await this.vault.writeBundle(existing.id, bundle);
-    onStored?.();
+    await this.vault.writeBundle(existing.id, bundle, onStored);
     await this.vault.clearQuarantine(existing.id);
 
     // Live heal (see the method comment). Writing credentials before identity mirrors
