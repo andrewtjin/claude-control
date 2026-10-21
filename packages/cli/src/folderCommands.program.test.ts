@@ -787,6 +787,44 @@ describe('cctl usage and timeline: an account reserved to a folder rule', () => 
   });
 });
 
+describe('cctl stats: a folder session on a reserved account', () => {
+  it("bills the session's turns to the account live in its rule's slot, by its recorded slot", async () => {
+    const t0 = Date.now() - 3_600_000;
+    const session = 'sess-research';
+    const paths = sandboxPaths(sandbox.root);
+    const dir = join(paths.claudeDir, 'projects', 'C--repos-research');
+    mkdirSync(dir, { recursive: true });
+    const turn = {
+      type: 'assistant',
+      timestamp: new Date(t0 + 60_000).toISOString(),
+      message: {
+        id: 'msg-1',
+        model: 'claude-opus-5-5',
+        usage: { input_tokens: 10, output_tokens: 20 },
+      },
+    };
+    writeFileSync(join(dir, `${session}.jsonl`), JSON.stringify(turn) + '\n');
+    const store = new Store(daemonDbPath());
+    try {
+      store.replaceActivationIntervals([
+        { accountId: 'a', startedAtMs: t0, endedAtMs: null, origin: null, slot: 'global' },
+        { accountId: 'e', startedAtMs: t0, endedAtMs: null, origin: null, slot: 'group:r1' },
+      ]);
+      store.recordSessionSlot(session, 'group:r1', t0);
+    } finally {
+      store.close();
+    }
+    engine.listAllAccounts.mockResolvedValue([A, E]);
+
+    const r = await runCli(['stats', '--days', '1']);
+    expect(r.exited).toBe(false);
+    const byAccount = r.out.split('By model')[0] ?? '';
+    // Labeled by name (the reserved row is in the label map), and not billed to the global A.
+    expect(byAccount).toMatch(/\nE\s+1\s/);
+    expect(byAccount).not.toMatch(/\nA\s/);
+  });
+});
+
 describe('cctl doctor', () => {
   it('flags a running daemon that predates folder rules', { timeout: 60_000 }, async () => {
     await daemonRunning(olderReport);

@@ -560,7 +560,9 @@ export function buildProgram(): Command {
         process.stderr.write(`Reading transcripts under ${paths.claudeDir} ...\n`);
       }
       const [accounts, scan] = await Promise.all([
-        buildEngine(paths).listAccounts(),
+        // Every account, reserved ones included: a reserved account's turns must be labeled
+        // with its name, not its raw id.
+        buildEngine(paths).listAllAccounts(),
         readTranscriptTurns({ claudeDir: paths.claudeDir, sinceMs: windowStartMs }),
       ]);
 
@@ -570,10 +572,12 @@ export function buildProgram(): Command {
       const store = new Store(daemonDbPath(paths));
       let intervals;
       let slotBySession;
+      let slotSpans;
       try {
         intervals = store.listActivationIntervals();
         // Folder-bound sessions attribute against their group slot's timeline, not the global one.
         slotBySession = slotBySessionMap(store.listSessions());
+        slotSpans = store.listSessionSlotSpans();
       } finally {
         store.close();
       }
@@ -585,6 +589,7 @@ export function buildProgram(): Command {
         windowEndMs,
         labelById: new Map(accounts.map((a) => [a.id, a.label] as const)),
         slotBySession,
+        slotSpans,
       });
       process.stdout.write(renderTokenStats(stats, detectPalette()) + '\n');
     });

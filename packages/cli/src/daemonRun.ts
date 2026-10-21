@@ -39,6 +39,7 @@ import {
   exhaustionLogPath,
   HeartbeatWriter,
   HookReceiver,
+  SessionSlotRecorder,
   Store,
   UsagePoller,
   bindGuardPath,
@@ -475,6 +476,13 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // built after the receiver, so the route gets a slot the sequence is dropped into once it
   // exists — which happens in this same synchronous pass, before the receiver ever listens.
   let requestStop: () => void = () => {};
+  // Every hook event reports its session's config dir; recording the slot it maps to is what lets
+  // stats bill a hand-started ruled folder's session to the right account.
+  const sessionSlotRecorder = new SessionSlotRecorder({
+    store,
+    slotForConfigDir: (configDir) => engine.slotForConfigDir(configDir),
+    logger,
+  });
   const hookReceiver = new HookReceiver({
     store,
     secret: hookSecret,
@@ -492,6 +500,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     // report (persisted as the record's resume anchor on session_init).
     isManagedSession: (sessionId) =>
       sessionManager.list().some((r) => r.id === sessionId || r.resumeId === sessionId),
+    onSessionSeen: (sighting) => sessionSlotRecorder.observe(sighting),
     ...(config.values.permissionHoldMs !== undefined
       ? { permissionHoldMs: config.values.permissionHoldMs }
       : {}),

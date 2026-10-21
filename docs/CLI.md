@@ -590,6 +590,11 @@ timestamp against the daemon's switch journal to decide which account was live a
 time. Input, output, cache-write and cache-read tokens are reported separately — cache
 reads usually dominate, so one combined number would hide everything interesting.
 
+A session in a folder with a folder rule is billed to the account live in that rule's slot,
+reserved accounts included. The daemon learns each session's slot from the session's hook
+events, so a turn of such a session from before the daemon first heard from it counts against
+the global slot's account.
+
 No network call is made and no daemon needs to be running. The same numbers reach the
 phone as `/stats`, pushed by the daemon every 15 minutes.
 
