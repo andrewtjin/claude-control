@@ -311,6 +311,18 @@ describe('regressions: what the frame must never do', () => {
   const s = stateWith(snapshotOf(everyStateAccounts()));
   const BEL = String.fromCharCode(7);
 
+  it('leaves a header part off whole rather than cutting it mid-phrase', () => {
+    for (const color of [false, true]) {
+      const full = stripAnsi(frame(s, 200, ROWS, color)[0]!);
+      expect(full.split(' | ').length).toBeGreaterThan(2);
+      for (let cols = MIN_COLS; cols <= full.length; cols++) {
+        const header = stripAnsi(frame(s, cols, ROWS, color)[0]!);
+        expect(full.startsWith(header)).toBe(true);
+        if (header !== full) expect(full.slice(header.length)).toMatch(/^ \| /);
+      }
+    }
+  });
+
   it('passes no escape but color through, whatever a pane renderer was handed', () => {
     const hostile = `x${ESC}[?1049l${ESC}[?25h${ESC}]52;c;aGk=${BEL}y${ESC}[2J`;
     const st = stateWith(

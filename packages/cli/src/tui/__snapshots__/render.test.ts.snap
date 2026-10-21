@@ -1,7 +1,7 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
 exports[`renderFrame snapshots > a failed read under the last picture at 40 cols 1`] = `
-"cctl  daemon up | auto-switch on | last 
+"cctl  daemon up | auto-switch on
 [Accounts]  Sessions   Folders   Outages
    ACC.. 5H         7D         TAGS  AGE
 >* work  ##...  45% ####.  72%       2m 
@@ -18,7 +18,7 @@ Enter switch | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > a failed read under the last picture at 40 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mlast <E>[0m
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages<E>[0m
 <E>[2m   ACC.. 5H         7D         TAGS  AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork <E>[0m <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m       <E>[2m2m <E>[0m
@@ -137,7 +137,7 @@ exports[`renderFrame snapshots > a failed read under the last picture at 200 col
 `;
 
 exports[`renderFrame snapshots > accounts unreadable at 40 cols 1`] = `
-"cctl  daemon up | auto-switch on | no po
+"cctl  daemon up | auto-switch on
 [Accounts]  Sessions   Folders   Outages
 Could not read the accounts: the account
 registry at x is malformed
@@ -154,7 +154,7 @@ Enter switch | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > accounts unreadable at 40 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mno po<E>[0m
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages<E>[0m
 <E>[31mCould not read the accounts: the account<E>[0m
 <E>[31mregistry at x is malformed<E>[0m
@@ -273,7 +273,7 @@ exports[`renderFrame snapshots > accounts unreadable at 200 cols, color 1`] = `
 `;
 
 exports[`renderFrame snapshots > daemon down at 40 cols 1`] = `
-"cctl  daemon stopped | last poll just no
+"cctl  daemon stopped
 [Accounts]  Sessions   Folders   Outages
    ACC.. 5H         7D         TAGS  AGE
 >* work  ##...  45% ####.  72%       2m 
@@ -290,7 +290,7 @@ Enter switch | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > daemon down at 40 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[33mdaemon stopped<E>[0m<E>[2m | <E>[0mlast poll just no<E>[0m
+"<E>[1mcctl<E>[0m  <E>[33mdaemon stopped<E>[0m
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages<E>[0m
 <E>[2m   ACC.. 5H         7D         TAGS  AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork <E>[0m <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m       <E>[2m2m <E>[0m
@@ -409,7 +409,7 @@ exports[`renderFrame snapshots > daemon down at 200 cols, color 1`] = `
 `;
 
 exports[`renderFrame snapshots > empty vault at 40 cols 1`] = `
-"cctl  daemon up | auto-switch on | no po
+"cctl  daemon up | auto-switch on
 [Accounts]  Sessions   Folders   Outages
 No accounts yet.
 Press a to log one in, or run \`cctl setu
@@ -426,7 +426,7 @@ Enter switch | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > empty vault at 40 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mno po<E>[0m
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages<E>[0m
 No accounts yet.
 Press a to log one in, or run \`cctl setu
@@ -545,7 +545,7 @@ Press a to log one in, or run \`cctl setup\` for the guided first run.
 `;
 
 exports[`renderFrame snapshots > every tag and state at 40 cols 1`] = `
-"cctl  daemon up | auto-switch on | last 
+"cctl  daemon up | auto-switch on
 [Accounts]  Sessions   Folders   Outages
    ACC.. 5H         7D         TAGS  AGE
 >* work  ##...  45% ####.  72%       2m 
@@ -562,7 +562,7 @@ Enter switch | ? help | q quit"
 `;
 
 exports[`renderFrame snapshots > every tag and state at 40 cols, color 1`] = `
-"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on<E>[2m | <E>[0mlast <E>[0m
+"<E>[1mcctl<E>[0m  <E>[32mdaemon up<E>[0m<E>[2m | <E>[0mauto-switch on
 <E>[1m[Accounts]<E>[0m <E>[2m Sessions <E>[0m <E>[2m Folders <E>[0m <E>[2m Outages<E>[0m
 <E>[2m   ACC.. 5H         7D         TAGS  AGE<E>[0m
 <E>[1m><E>[0m<E>[32m*<E>[0m <E>[1mwork <E>[0m <E>[32m##<E>[0m<E>[2m...<E>[0m <E>[32m 45%<E>[0m <E>[33m####<E>[0m<E>[2m.<E>[0m <E>[33m 72%<E>[0m       <E>[2m2m <E>[0m

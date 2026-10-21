@@ -454,7 +454,7 @@ export function isFrameTooSmall(cols: number, rows: number): boolean {
 // ---------------------------------------------------------------------------
 
 /** "cctl  daemon up | auto-switch on | last poll 2m ago". */
-function headerLine(state: TuiState, palette: Palette): string {
+function headerLine(state: TuiState, palette: Palette, cols: number): string {
   const parts: string[] = [];
   const daemon = state.snapshot?.daemon;
   const heartbeat = daemon?.heartbeat;
@@ -476,7 +476,15 @@ function headerLine(state: TuiState, palette: Palette): string {
         : 'no poll yet',
     );
   }
-  return `${palette.bold('cctl')}  ${parts.join(palette.dim(SEP))}`;
+  // On a narrow terminal the later parts are left off whole, the way columns drop, rather than
+  // cut mid-phrase. The daemon's state, first, always shows.
+  let line = `${palette.bold('cctl')}  ${parts[0]!}`;
+  for (const part of parts.slice(1)) {
+    const next = line + palette.dim(SEP) + part;
+    if (visibleWidth(next) > cols) break;
+    line = next;
+  }
+  return line;
 }
 
 /** "2m ago" / "just now" for the header. */
@@ -750,7 +758,7 @@ export function renderFrame(
   const padded = [...body.slice(0, bodyRows)];
   while (padded.length < bodyRows) padded.push('');
   return [
-    headerLine(state, palette),
+    headerLine(state, palette, cols),
     tabsLine(state, palette),
     ...padded,
     ...status.lines,
