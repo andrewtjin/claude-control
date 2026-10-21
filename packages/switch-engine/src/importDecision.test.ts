@@ -6,8 +6,10 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync, realpathSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { SwitchEngine } from './switchEngine.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
@@ -413,6 +415,68 @@ describe('the credential lock over a long import', () => {
     expect(res.outcomes.map((o) => o?.ok)).toEqual([true, true]);
     expect(daemonOutcome).toBeInstanceOf(LockTimeoutError);
   });
+
+  it('is handed to another process waiting for it between one seat and the next', async () => {
+    const root = realpathSync.native(await mkdtemp(join(tmpdir(), 'ce-decide-')));
+    dirs.push(root);
+    // One clock for both processes, so neither takes the other's claim for a stale one.
+    const started = Date.now();
+    const clock = (): number => NOW + (Date.now() - started);
+    const h = await harness({ clock, root });
+    const { g } = await accounts(h, 'g');
+    await h.engine.activate(g!);
+    const n = 8;
+    const specs: ImportRuleSpec[] = [];
+    for (let i = 0; i < n; i += 1) {
+      const { id } = await h.engine.addAccount(`a${i}`, bundle(`A${i}`, `u-a${i}`));
+      specs.push({ scopes: [folder(await ruleFolder(h, `p${i}`))], include: [id], exclude: [] });
+    }
+    // Another process takes the lock over and over, the way a cctl command or the daemon would,
+    // each time waiting for it as they do, and says when it got it.
+    const lockModule = pathToFileURL(join(import.meta.dirname, 'lock.ts')).href;
+    const script = join(root, 'contender.mts');
+    await writeFile(
+      script,
+      [
+        `import { acquireLock } from ${JSON.stringify(lockModule)};`,
+        'const [dir, offset] = process.argv.slice(2);',
+        'const clock = () => Date.now() + Number(offset);',
+        "process.stdout.write('ready\\n');",
+        'for (;;) {',
+        '  const lock = await acquireLock(dir, clock, { timeoutMs: 60000, pollMs: 100 });',
+        "  process.stdout.write('got ' + Date.now() + '\\n');",
+        '  lock.release();',
+        '  await new Promise((r) => setTimeout(r, 20));',
+        '}',
+      ].join('\n'),
+    );
+    const contender = spawn(
+      process.execPath,
+      ['--import', 'tsx', script, join(h.paths.vaultDir, '.lock'), String(NOW - started)],
+      { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'inherit'] },
+    );
+    try {
+      let out = '';
+      await new Promise<void>((resolve, reject) => {
+        contender.stdout.on('data', (chunk: Buffer) => {
+          out += chunk.toString();
+          if (out.includes('ready')) resolve();
+        });
+        contender.once('exit', (code) => reject(new Error(`contender exited (${String(code)})`)));
+      });
+      const from = Date.now();
+      const res = await h.engine.importRules(specs);
+      const to = Date.now();
+      expect(res.outcomes.every((o) => o?.ok === true)).toBe(true);
+      const got = [...out.matchAll(/got (\d+)/g)].map((m) => Number(m[1]));
+      // The import holds the lock n + 2 times (the batch, each seat, the snapshot): the process
+      // waiting all along is handed it in every gap between them, not only when a poll of its own
+      // happens to land in one.
+      expect(got.filter((at) => at > from && at < to).length).toBeGreaterThanOrEqual(n);
+    } finally {
+      contender.kill();
+    }
+  }, 60_000);
 });
 
 describe('what the import does to the accounts it stores first', () => {
@@ -1388,6 +1452,45 @@ describe('moves planned with the seats they make room for', () => {
     }
   });
 
+  it('refuses no rule for an account a later rule frees, when more than one rule cannot land', async () => {
+    const h = await harness();
+    const { g, f, p, q, x } = await accounts(h, 'g', 'f', 'p', 'q', 'x');
+    await h.engine.activate(g!);
+    const ff = await ruleFolder(h, 'F');
+    const F = await h.vault.createRule({ folders: [ff], exclude: [g!], origin: ORIGIN });
+    await h.engine.activate(f!, { slot: ruleSlotId(F.id) });
+    // Three busy slots, each on the one account its rule leaves it.
+    const busy = [
+      { name: 'P', exclude: [g!, f!, q!], live: p! },
+      { name: 'Q', exclude: [g!, f!, p!], live: q! },
+      { name: 'X', exclude: [g!, f!, p!, q!], live: x! },
+    ];
+    for (const [k, { name, exclude, live }] of busy.entries()) {
+      const dir = await ruleFolder(h, name);
+      const rule = await h.vault.createRule({ folders: [dir], exclude });
+      await h.engine.activate(live, { slot: ruleSlotId(rule.id) });
+      await runSession(h, dir, 4001 + k);
+    }
+    // The second and third cannot land whatever else does; the first needs the main login to move
+    // onto f, which the last frees by taking F's slot off it.
+    const specs: ImportRuleSpec[] = [
+      { scopes: [folder(await ruleFolder(h, 'c0'))], include: [g!], exclude: [] },
+      { scopes: [folder(await ruleFolder(h, 'c1'))], include: [p!], exclude: [] },
+      { scopes: [folder(await ruleFolder(h, 'c2'))], include: [q!], exclude: [] },
+      { scopes: [folder(ff)], include: [], exclude: [f!], origin: ORIGIN },
+    ];
+
+    const plan = await h.engine.planImportRules(specs);
+    expect(plan.rules.map((v) => v.kind)).toEqual(['create', 'refused', 'refused', 'grow']);
+    expect(plan.handOffs).toContainEqual({ slot: 'global', from: g, to: f });
+    const res = await h.engine.importRules(specs);
+    expect(res.plan).toEqual(plan);
+    const again = await h.engine.planImportRules(specs);
+    for (const [i, verdict] of again.rules.entries()) {
+      expect(verdict.kind, `spec ${i}: ${refusalOf(plan.rules[i])}`).not.toMatch(/create|grow/);
+    }
+  });
+
   it("moves a grown rule's slot onto an account the batch includes there that another rule reserves", async () => {
     for (const spare of [false, true]) {
       const h = await harness();
@@ -1520,6 +1623,51 @@ describe('a reserved account whose login runs in the main login', () => {
     }
   });
 
+  it('keeps its stored tokens when the slot running it by its token alone cannot take the new ones', async () => {
+    const h = await harness();
+    const { a, x } = await accounts(h, 'g', 'a', 'x');
+    await h.engine.activate(a!);
+    const r1f = await ruleFolder(h, 'r1');
+    const r1 = await h.vault.createRule({ folders: [r1f], include: [a!] });
+    await h.engine.activate(x!, { slot: ruleSlotId(r1.id) });
+    await h.vault.quarantine(a!, 'dead');
+    await runSession(h, r1f, 4242);
+    // The main login runs a's token under no identity block, and its credentials cannot be written.
+    const ident = JSON.parse(await readFile(h.paths.claudeJsonPath, 'utf8')) as {
+      oauthAccount?: unknown;
+    };
+    delete ident.oauthAccount;
+    await writeFile(h.paths.claudeJsonPath, JSON.stringify(ident));
+    const specs: ImportRuleSpec[] = [
+      { scopes: [folder(await ruleFolder(h, 'q'))], include: [x!], exclude: [] },
+    ];
+
+    const write = vi
+      .spyOn(CredentialStore.prototype, 'writeLiveCredentials')
+      .mockRejectedValueOnce(new Error('EPERM: operation not permitted'));
+    const replaced = await h.engine.importBundle(a!, bundle('A2', 'u-a', NOW + 2 * HOUR)).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    write.mockRestore();
+    // Replacing the stored tokens would leave the main login on the old copy, known as a by
+    // nothing any more, so they are kept, and the main login still counts as a.
+    expect(replaced).toBeInstanceOf(SwitchEngineError);
+    expect((replaced as Error).message).toContain('not replaced');
+    expect((await h.vault.readBundle(a!)).claudeAiOauth.refreshToken).toBe('r-A');
+    // So the rule's slot, moved off x, is never handed onto a while a's login runs in the main one.
+    const res = await h.engine.importRules(specs);
+    expect(res.handedOff.map((m) => m.to)).not.toContain(a);
+    const r1Live = JSON.parse(
+      await readFile(join(groupProfileDir(h.paths.vaultDir, r1.id), '.credentials.json'), 'utf8'),
+    ) as { claudeAiOauth: ClaudeOauth };
+    expect(r1Live.claudeAiOauth.refreshToken).not.toMatch(/^r-A/);
+    const main = JSON.parse(await readFile(h.paths.credentialsPath, 'utf8')) as {
+      claudeAiOauth: ClaudeOauth;
+    };
+    expect(main.claudeAiOauth.refreshToken).toBe('r-A');
+  });
+
   it('counts as live there when the file teaches this machine the login it runs', async () => {
     const h = await harness();
     const client = await h.engine.addAccount('client', {
@@ -1647,6 +1795,64 @@ describe('a planned move that fails once the rules are written', () => {
     expect(await h.engine.getActiveId(ruleSlotId(pr.id))).toBe(b);
     expect((await h.engine.checkSlots()).map((x) => x.kind)).toEqual(violations);
   });
+
+  it('that stops the run puts back the rules of the slots it never moved', async () => {
+    const h = await harness();
+    const { w, y1, y2, v } = await accounts(h, 'w', 'y1', 'y2', 'v', 'z1', 'z2');
+    await h.engine.activate(w!);
+    const p1 = await ruleFolder(h, 'p1');
+    const p2 = await ruleFolder(h, 'p2');
+    const r1 = await h.vault.createRule({ folders: [p1], exclude: [v!], origin: ORIGIN });
+    const r2 = await h.vault.createRule({ folders: [p2], exclude: [v!], origin: ORIGIN2 });
+    await h.engine.activate(y1!, { slot: ruleSlotId(r1.id) });
+    await h.engine.activate(y2!, { slot: ruleSlotId(r2.id) });
+    await runSession(h, p1, 4241);
+    await runSession(h, p2, 4242);
+    // Each rule now excludes the account its running slot is on, so both slots move.
+    const specs: ImportRuleSpec[] = [
+      { scopes: [folder(p1)], include: [], exclude: [y1!], origin: ORIGIN },
+      { scopes: [folder(p2)], include: [], exclude: [y2!], origin: ORIGIN2 },
+    ];
+    const plan = await h.engine.planImportRules(specs);
+    expect(plan.seats).toHaveLength(2);
+
+    // The first move switches its slot, and then its bookkeeping cannot be written: the run stops.
+    const bookkeeping = vi
+      .spyOn(
+        SwitchEngine.prototype as unknown as { writeLastSwitchAtMs: () => Promise<void> },
+        'writeLastSwitchAtMs',
+      )
+      .mockRejectedValueOnce(new VaultError('the switch time could not be written'));
+    const err = await h.engine.importRules(specs).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    bookkeeping.mockRestore();
+    expect(err).toBeInstanceOf(ImportInterruptedError);
+    const stopped = err as ImportInterruptedError;
+    const rules = [
+      { rule: r1, was: y1!, at: 0 },
+      { rule: r2, was: y2!, at: 1 },
+    ];
+    const moved = rules.filter(({ rule }) =>
+      stopped.seated.some((s) => s.slot === ruleSlotId(rule.id)),
+    );
+    expect(moved).toHaveLength(1);
+    for (const { rule, was, at } of rules) {
+      const slot = ruleSlotId(rule.id);
+      const now = await h.engine.getActiveId(slot);
+      if (moved.some((m) => m.rule === rule)) {
+        expect((await h.engine.getRule(rule.id))?.exclude).toEqual([v, was]);
+      } else {
+        // The slot it never moved keeps its account, and the rule that would forbid it is put back.
+        expect(now).toBe(was);
+        expect((await h.engine.getRule(rule.id))?.exclude).toEqual([v]);
+        expect(stopped.outcomes[at]).toMatchObject({ ok: false });
+      }
+      // What the daemon runs next leaves every running slot where the import left it.
+      expect((await h.engine.ensureRuleLive(rule.id)).liveAccount).toBe(now);
+    }
+  });
 });
 
 describe('removing an account handed to another machine', () => {
@@ -1729,6 +1935,34 @@ describe('two slots that trade accounts', () => {
     expect(await h.engine.getActiveId(ruleSlotId(p.id))).toBe(a0);
     const again = await h.engine.planImportRules(specs);
     expect(again.rules.map((v) => v.kind)).toEqual(['unchanged', 'unchanged']);
+  });
+
+  it('are given other accounts that free each in turn when neither may stand empty', async () => {
+    const h = await harness();
+    const { g, a0, a3, a5 } = await accounts(h, 'g', 'a0', 'a3', 'a5');
+    await h.engine.activate(g!);
+    const pf = await ruleFolder(h, 'p');
+    const qf = await ruleFolder(h, 'q');
+    const p = await h.vault.createRule({ folders: [pf], exclude: [g!], origin: ORIGIN });
+    const q = await h.vault.createRule({ folders: [qf], exclude: [g!], origin: ORIGIN2 });
+    await h.engine.activate(a0!, { slot: ruleSlotId(p.id) });
+    await h.engine.activate(a3!, { slot: ruleSlotId(q.id) });
+    await runSession(h, pf, 4241);
+    await runSession(h, qf, 4242);
+    // p must move onto a3, so q must move off it: the first account q could take is the a0 p
+    // leaves, a trade no order makes with sessions in both, but q can take a5 instead.
+    const specs: ImportRuleSpec[] = [
+      { scopes: [folder(pf)], include: [a3!], exclude: [a0!], origin: ORIGIN },
+    ];
+
+    const plan = await h.engine.planImportRules(specs);
+    expect(plan.rules.map((v) => v.kind)).toEqual(['grow']);
+    expect(plan.handOffs).toEqual([{ slot: ruleSlotId(q.id), from: a3, to: a5 }]);
+    expect(plan.seats).toEqual([{ slot: ruleSlotId(p.id), from: a0, to: a3 }]);
+    const res = await h.engine.importRules(specs);
+    expect(res.plan).toEqual(plan);
+    expect(await h.engine.getActiveId(ruleSlotId(p.id))).toBe(a3);
+    expect(await h.engine.getActiveId(ruleSlotId(q.id))).toBe(a5);
   });
 });
 
