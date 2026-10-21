@@ -73,6 +73,7 @@ import {
   SHORT_OPTIONS,
   type ClaudeBackgroundHost,
 } from './backgroundHost.js';
+import { parseClaudeSessionArgs } from './launcher.js';
 
 /** Claude Code's own rule for a job id given to `attach` and its kin: one to eight lowercase hex
  *  digits are always a prefix of a job id, never a name. */
@@ -588,6 +589,9 @@ export interface ConfigView {
   slot: string;
   /** The profile of a folder rule since removed: no login, so every prompt there fails. */
   removed?: boolean;
+  /** A parallel session's slot (`cctl claude --account`): its account was chosen for that session,
+   *  so nothing moves a background session onto or off it. */
+  parallel?: boolean;
 }
 
 export interface RouteContext {
@@ -1282,7 +1286,10 @@ async function decide(
     let final = false;
     /** Where a move that failed put it back, when that is where it is opened. */
     let putBack: Extract<SessionWhere, { kind: 'bg' }> | undefined;
-    if (tree !== undefined) {
+    if (runsOn.parallel === true) {
+      why = "it runs on a parallel session's slot, whose account was chosen for that session";
+      final = true;
+    } else if (tree !== undefined) {
       why = 'it works in a git worktree Claude Code made for it, which a move would delete';
       final = true;
     } else if (home.unusable !== undefined) {
@@ -1426,12 +1433,15 @@ async function decide(
     message: `could not start ${label(target)} on ${onWhat(await ctx.view(configDir))}: ${why}.`,
   });
   // Opened under one config dir: every other row it has goes first, while it runs nowhere, so no
-  // row is left elsewhere to reach it once it runs. One recording a worktree stays.
+  // row is left elsewhere to reach it once it runs. One recording a worktree stays, and so does one
+  // on a parallel session's slot: that account was chosen for the session, and only the operator
+  // naming a slot (which never reaches here) takes a session off it.
   const keepOnly = async (configDir: string | null): Promise<void> => {
     for (const r of rows) {
       if (sameConfigDir(r.configDir, configDir, platform) || r.row.worktreePath !== undefined) {
         continue;
       }
+      if ((await ctx.view(r.configDir)).parallel === true) continue;
       await ctx.host
         .removeRow(r.configDir, r.row.short)
         .catch((err: unknown) =>
@@ -1464,12 +1474,23 @@ async function decide(
             'worktree Claude Code made for it, which a move would delete. Opening it there.',
     );
   }
+  const latest = rows[0]!;
+  // Its latest row is on a parallel session's slot: the account was chosen for that session, and
+  // opening it anywhere else (even where an older row of it sits) would take the session off it.
+  // It is opened where that row is.
+  const latestOn = await ctx.view(latest.configDir);
+  if (latestOn.parallel === true) {
+    return openRow(
+      latest,
+      `cctl: background session ${label(target)} stays on ${onWhat(latestOn)}: its account was ` +
+        'chosen for that parallel session. Opening it there.',
+    );
+  }
   if (home.unusable !== undefined) return { kind: 'refuse', message: home.unusable };
   const here = rows.find((r) => sameConfigDir(r.configDir, home.configDir, platform));
   if (here !== undefined) return openRow(here);
   // The slot it belongs to holds no row: start it there from its latest row, on the terms a move
   // carries options over on (its rows elsewhere go, so it is left one only there).
-  const latest = rows[0]!;
   let hint: string | undefined;
   const started = await ctx.shield(
     (hold) =>
@@ -1563,4 +1584,54 @@ export async function runHolding<T>(
     release();
     await watch;
   }
+}
+
+/**
+ * Whether these arguments start a NEW background session: `--bg` or `--background` with no
+ * background-session verb run first (Claude Code's own reading; see {@link BACKGROUND_STARTS}).
+ * Such a session outlives the terminal that started it.
+ */
+export function startsBackgroundSession(args: readonly string[]): boolean {
+  const words = args[0] === '--' ? args.slice(1) : args;
+  return words.some((w) => BACKGROUND_STARTS.has(w)) && claudeCodeVerbAt(args, true) === -1;
+}
+
+/**
+ * Why these arguments cannot run in a parallel session (`cctl claude --account`, which lasts as long
+ * as its terminal), or undefined when they can. Read by token, as Claude Code reads them, never from
+ * an uncertain parse: an unrecognized option before a session option is a launch like any other.
+ *   - a new background session (`--bg`, `--background`): it would outlive the session's terminal;
+ *   - `attach`, `stop`, `kill`, `rm`, `respawn`: they reach a session its own service runs;
+ *   - any other subcommand (`auth login`, `setup-token`, `mcp`, `update`...): not a session, and a
+ *     login would overwrite the session's own in its profile.
+ * A resume, a continue, the picker, a prompt or a print run are sessions, and run.
+ */
+export function leaseArgRefusal(args: readonly string[], label: string): string | undefined {
+  const request = parseBackgroundRequest(args);
+  if (request?.verb === 'attach' || request?.verb === 'control') {
+    // The verb itself, found where the parser found it: flags may stand between it and the
+    // session it names (`kill --force abc12345`).
+    const verbAt =
+      request.verb === 'attach'
+        ? request.args.indexOf('attach')
+        : request.args.findIndex((w) => CONTROL.has(w));
+    const verb = request.args[verbAt] ?? request.verb;
+    // attach opens a session; stop, kill, rm and respawn act on one. Either way it is a session
+    // its service runs, on the account that service holds.
+    const what = request.verb === 'attach' ? 'opens' : 'acts on';
+    return (
+      `"${verb}" ${what} a background session, which runs on the account its service holds; ` +
+      '--account cannot choose one for it. Run it without --account.'
+    );
+  }
+  if (startsBackgroundSession(args)) {
+    return (
+      `${label} would run here as a parallel session, which lasts only as long as this terminal, ` +
+      'and "--bg" starts a background session that outlives it. To give a named session its own ' +
+      `account, run: cctl session include <name> ${label}`
+    );
+  }
+  const sub = parseClaudeSessionArgs(args).subcommand;
+  if (sub !== undefined) return `"claude ${sub}" is not a session; run it without --account.`;
+  return undefined;
 }

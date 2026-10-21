@@ -36,6 +36,8 @@ import type { ClaudeBackgroundHost } from './backgroundHost.js';
 const MAIN = null;
 const X = 'C:/data/profiles/rule-x';
 const Q = 'C:/data/profiles/rule-q';
+/** The profile of W's parallel session (`cctl claude --account W`). */
+const P = 'C:/data/profiles/session-w';
 const SID = 'c5f2097e-d500-42a0-9ddf-8a33f4f9a886';
 const SHORT = 'c5f2097e';
 const SID2 = '0dff6248-faa1-48a3-ba02-a3ac6c888819';
@@ -208,8 +210,10 @@ class FakeClaude implements ClaudeBackgroundHost {
     };
   }
 
+  /** Config dirs beyond the usual three, for a case that needs one (a parallel session's). */
+  extraDirs: Config[] = [];
   configDirs(): Promise<Config[]> {
-    return Promise.resolve([MAIN, X, Q]);
+    return Promise.resolve([MAIN, X, Q, ...this.extraDirs]);
   }
   liveSessions(): Promise<LiveSession[]> {
     this.beforeRegistry?.(++this.registryReads);
@@ -264,6 +268,10 @@ class FakeClaude implements ClaudeBackgroundHost {
     this.beforeList?.(c);
     const reused = opts?.verified === true ? [] : (this.reusedPids.get(key(c)) ?? []);
     return Promise.resolve([...(this.hosted.get(key(c)) ?? []), ...reused]);
+  }
+  /** Parallel sessions are not what these cases drive: no service hosts a worker for one. */
+  hostedWorkerProcesses(): Promise<Array<{ pid: number; procStart?: string }>> {
+    return Promise.resolve([]);
   }
   activity(c: Config): Promise<Map<string, SessionActivity>> {
     this.calls.push(`agents ${key(c)}`);
@@ -446,10 +454,14 @@ function world(
   const lines: string[] = [];
   const shields = { n: 0, held: 0, hints: [] as string[] };
   const homeX: SessionHome = { configDir: X, movable: true, ...home };
-  const views: Record<string, { account?: string; slot: string; removed?: boolean }> = {
+  const views: Record<
+    string,
+    { account?: string; slot: string; removed?: boolean; parallel?: boolean }
+  > = {
     main: { account: 'Shared', slot: 'the global slot' },
     [X]: { account: 'Inc', slot: 'the folder slot of C:/work' },
     [Q]: { slot: 'the profile of a folder rule since removed', removed: true },
+    [P]: { account: 'W', slot: 'the parallel-session slot of W', parallel: true },
   };
   const ruled = (cwd: string): boolean => cwd.toLowerCase().startsWith('c:/work');
   const ctx: RouteContext = {
@@ -1374,6 +1386,51 @@ describe('routeBackgroundLaunch — the session runs on another account', () => 
       expect(w.host.hosted.get(X)).toEqual([{ short: '7a7a7a7a', sessionId: NEW, cwd: WORK }]);
       expect(w.host.rowsOf(NEW)).toEqual([X]);
     }
+  });
+});
+
+describe("routeBackgroundLaunch — a session on a parallel session's slot", () => {
+  it('idle there and working in a ruled folder: opened where it runs, never moved onto the folder', async () => {
+    const w = world();
+    w.host.extraDirs.push(P);
+    w.host.runs(P, SID, { name: 'bg eval', saved: { kind: 'replayable', options: [] } });
+    const d = await decideIn(w, attach(SHORT));
+    expect(d).toMatchObject(openUnder(P));
+    expect(w.host.hostOf()).toEqual([P]);
+    expect(w.host.calls.some((c) => c.startsWith('stop') || c.startsWith('rm'))).toBe(false);
+    expect(w.lines.join(' ')).not.toContain('moving');
+  });
+
+  it('runs nowhere, its only row there: opened there, never started on the folder', async () => {
+    const w = world();
+    w.host.extraDirs.push(P);
+    w.host.row(P, 'stopped');
+    const d = await decideIn(w, attach(SHORT));
+    expect(d).toMatchObject(openUnder(P));
+    expect(w.host.rowsOf()).toEqual([P]);
+  });
+
+  it('runs nowhere, its latest row there and an older one on the folder slot: opened there, never moved', async () => {
+    const w = world();
+    w.host.extraDirs.push(P);
+    w.host.row(X, 'stopped', SID, { updatedAt: '2026-10-09T20:00:00Z' });
+    w.host.row(P, 'stopped', SID, { updatedAt: '2026-10-09T23:00:00Z' });
+    const d = await decideIn(w, attach(SHORT));
+    expect(d).toMatchObject(openUnder(P));
+    // Only the folder slot's older row goes, as for any session opened where it last ran.
+    expect(w.host.calls).toEqual([`rm ${X} ${SHORT}`]);
+    expect(w.host.rowsOf()).toEqual([P]);
+  });
+
+  it('runs nowhere, its latest row on the folder slot and an older one there: the parallel row is kept', async () => {
+    const w = world();
+    w.host.extraDirs.push(P);
+    w.host.row(P, 'stopped', SID, { updatedAt: '2026-10-09T20:00:00Z' });
+    w.host.row(X, 'stopped', SID, { updatedAt: '2026-10-09T23:00:00Z' });
+    const d = await decideIn(w, attach(SHORT));
+    expect(d).toMatchObject(openUnder(X));
+    expect(w.host.calls.some((c) => c.startsWith(`rm ${P}`))).toBe(false);
+    expect(w.host.rowsOf()).toContain(P);
   });
 });
 

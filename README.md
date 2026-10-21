@@ -75,6 +75,16 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
   folder rules and your settings under a passphrase; `cctl import <file>` on the other machine
   adds them (`--dry-run` shows what it would do first). `--move` removes them here once the
   file is written, since a login works on one machine at a time.
+- **Run one account in one terminal.** `claude --account work` (through the shell wrapper)
+  runs Claude Code on `work` in that terminal only, without switching any other session.
+  Where `work` is already live in the global slot, the slot of the rule this launch runs
+  under, or that of a folder or named session it is reserved to, it runs there and follows
+  that slot's switches. Live in any other folder's or named session's slot, it is refused
+  until that slot switches away. Live in none, it gets a slot of its own, and while it
+  runs `work` is out of every pool; when the terminal exits (and any
+  Claude Code it started on that account), its refreshed login returns and `work` rejoins
+  the pool. Windows and Linux;
+  see "Parallel sessions" in `docs/CLI.md`.
 
 ## Local-only (no Discord)
 

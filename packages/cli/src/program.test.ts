@@ -1718,6 +1718,50 @@ describe('the banner and the plan agree with the running daemon', () => {
     ];
   };
 
+  it('usage and timeline show the account a parallel session holds, apart from the pool', async () => {
+    const now = Date.now();
+    const vee = { id: 'v1', label: 'vee', quarantined: false, createdAtMs: 0, updatedAtMs: 0 };
+    engine.listAllAccounts.mockImplementation(async () => [...(await engine.listAccounts()), vee]);
+    engine.listRules.mockImplementation(() =>
+      Promise.resolve([
+        {
+          id: 'session-v1',
+          label: 'vee',
+          folders: [],
+          include: ['v1'],
+          exclude: [],
+          activeId: 'v1',
+          createdAtMs: 0,
+          updatedAtMs: 0,
+          lease: {
+            holders: [{ pid: 1, start: 1, host: 'h', platform: 'win32', role: 'launcher' }],
+            startedAtMs: 0,
+          },
+        },
+      ]),
+    );
+    try {
+      await seedUsage([
+        {
+          id: 'v1',
+          label: 'vee',
+          limits: [{ kind: 'session', percent: 85, resetsAt: now + 2 * H }],
+        },
+      ]);
+      const usage = await runCli(['usage']);
+      const at = usage.out.indexOf('In use by a parallel session (out of the pool until it ends');
+      expect(at).toBeGreaterThan(0);
+      expect(usage.out.slice(at)).toContain('vee');
+      const timeline = await runCli(['timeline']);
+      expect(timeline.out).toContain(
+        'In use by a parallel session (out of the pool until it ends): vee',
+      );
+    } finally {
+      engine.listAllAccounts.mockImplementation(() => engine.listAccounts());
+      engine.listRules.mockImplementation(() => Promise.resolve([]));
+    }
+  });
+
   it('a Fable-cap opt-out saved since the daemon started does not hide its outage', async () => {
     // The running daemon counts the cap (its report), and has an outage open on it.
     await seedHeartbeat('alive');

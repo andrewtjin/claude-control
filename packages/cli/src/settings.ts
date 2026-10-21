@@ -50,6 +50,7 @@ import {
   FOLDER_RULES_REPORT_ROW,
   FOLDER_RULES_SUPPORTED,
   SESSION_ALIAS_RULES_REPORT_ROW,
+  SESSION_LEASES_REPORT_ROW,
 } from './folderRulesSupport.js';
 
 export type { SettingRow } from '@claude-control/shared-protocol';
@@ -770,6 +771,15 @@ export function resolveDaemonConfig(
       value: FOLDER_RULES_SUPPORTED,
       source: 'default',
       detail: 'cctl session include / exclude: account pools for a named session',
+    },
+    {
+      // A capability too: a daemon whose report carries this row reads a rules file holding a
+      // parallel session (`cctl claude --account`). The CLI refuses to start one while a running
+      // daemon's report lacks it, since that daemon would stop maintaining every slot.
+      name: SESSION_LEASES_REPORT_ROW,
+      value: FOLDER_RULES_SUPPORTED,
+      source: 'default',
+      detail: 'cctl claude --account: one account per terminal',
     },
     {
       name: 'auto-switch',

@@ -238,6 +238,15 @@ export interface DaemonUnitQuery {
   /** systemd's UnitFileState (`enabled`, `disabled`, …) when the manager answered — whether
    *  the unit is linked into `default.target` and will therefore start at the next login. */
   enabled?: string;
+  /** The cctl shim the unit's `ExecStart=` runs, read back out of the unit file. */
+  execute?: string;
+}
+
+/** The shim a unit body runs: the first word of `ExecStart=`, unquoted as {@link unitQuote} quoted
+ *  it (a backslash and a double quote each escaped by a backslash). */
+export function unitShimOf(unit: string): string | undefined {
+  const m = /^ExecStart="((?:[^"\\]|\\.)*)"/m.exec(unit);
+  return m === null ? undefined : m[1]!.replace(/\\(.)/g, '$1');
 }
 
 /**
@@ -256,7 +265,9 @@ export function queryDaemonUnit(options: DaemonUnitOptions = {}): DaemonUnitQuer
   const run = options.run ?? defaultSystemctlRunner;
   const fs = options.fs ?? defaultTextFileStore;
   const unitPath = options.unitPath ?? daemonUnitPath();
-  if (fs.read(unitPath) === undefined) return { registered: false };
+  const unit = fs.read(unitPath);
+  if (unit === undefined) return { registered: false };
+  const execute = unitShimOf(unit);
   let state: string | undefined;
   try {
     state = run(['show', '-p', 'ActiveState', '--value', DAEMON_UNIT_NAME]) || undefined;
@@ -268,6 +279,7 @@ export function queryDaemonUnit(options: DaemonUnitOptions = {}): DaemonUnitQuer
     registered: !saysNotEnabled(enabled),
     ...(state !== undefined ? { state } : {}),
     ...(enabled !== undefined ? { enabled } : {}),
+    ...(execute !== undefined ? { execute } : {}),
   };
 }
 

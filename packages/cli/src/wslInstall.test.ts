@@ -144,7 +144,8 @@ describe('WSL task lifecycle', () => {
     installWslDaemonTask({ host, shimPath, run });
     expect(queryWslDaemonTask({ host, run })).toMatchObject({
       registered: true,
-      execute: 'wsl.exe',
+      // The cctl the task runs inside the distro, not the wsl.exe every WSL task runs.
+      execute: shimPath,
     });
     startWslDaemonTaskNow({ host, run });
     expect(startCalls()).toBe(1);

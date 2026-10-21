@@ -26,7 +26,7 @@ import type {
 import { createHash } from 'node:crypto';
 import { atomicWriteFile, readJsonIfExists } from './fsutil.js';
 import { VaultError } from './errors.js';
-import { scopedRuleOf } from './folderRules.js';
+import { isLeaseRule, scopedRuleOf } from './folderRules.js';
 
 /** Schema tag for `folder-bindings.json`. The guard treats an unknown value as "fail open"; this
  *  trusted reader treats it as a corrupt file and refuses it by name. */
@@ -122,6 +122,8 @@ export function buildFolderBindingSnapshot(input: BuildSnapshotInput): FolderBin
         .filter((a): a is StoredAccount => a !== undefined)
         .map(identityOf),
       ...(aliases.length > 0 ? { aliases } : {}),
+      // A parallel-session slot: the guard lets its sessions run wherever they were started.
+      ...(isLeaseRule(r) ? { kind: 'lease' as const } : {}),
     };
   });
   const accounts: FolderBindingSnapshotAccount[] = [...input.shared, ...input.reserved].map(
@@ -179,6 +181,7 @@ function guardRelevantKey(s: FolderBindingSnapshot): string {
         g.excluded?.map((e) => [e.label, e.accountKey ?? null, e.organizationKey ?? null]) ?? null,
       // A snapshot written before alias rules existed has no field; it means "none".
       aliases: g.aliases?.map((a) => [a.folder, a.aliasKey, a.alias ?? null]) ?? [],
+      kind: g.kind ?? null,
     })),
   });
 }

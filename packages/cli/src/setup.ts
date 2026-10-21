@@ -11,7 +11,7 @@
 
 import type { StoredAccount } from '@claude-control/switch-engine';
 import { renderDoctor, summarize, type DoctorCheck, type RelayProbe } from './doctor.js';
-import { PLAIN_PALETTE, type Palette } from './ansi.js';
+import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
 import { BOT_INVITE_URL, BOT_USER_INSTALL_URL } from './settings.js';
 import { MANUAL_START_HINT, type AutostartResult, type AutostartState } from './autostart.js';
 
@@ -210,6 +210,9 @@ export async function connectWithTimeout(
 
 export interface SetupSummary {
   accounts: { label: string; active: boolean }[];
+  /** Each parallel session (`cctl claude --account`): what it is in use by now, and whether any of
+   *  its processes runs. Absent when there is none. */
+  parallelSessions?: { label: string; inUse: string; running: boolean }[];
   hooksInstalled: boolean;
   hooksProfilePath: string;
   relayUrl: string;
@@ -266,8 +269,29 @@ export function renderSetupSummary(
     ? ok('discord: paired')
     : warn('discord: local-only (not paired) — pair later: cctl setup --reconfigure');
 
+  // An account a parallel session holds is out of the pool until that session ends; say so beside
+  // the accounts, since no switch reaches it meanwhile. One whose processes all exited is a warning:
+  // it still holds the account until a check ends it.
+  const sessions = s.parallelSessions ?? [];
+  const sessionText = sessions
+    .map((p) =>
+      p.running
+        ? `${sanitizeForTerminal(p.label)} (in use by ${sanitizeForTerminal(p.inUse)})`
+        : `${sanitizeForTerminal(p.label)} (${sanitizeForTerminal(p.inUse)})`,
+    )
+    .join(', ');
+  const sessionsLine =
+    sessions.length === 0
+      ? []
+      : [
+          sessions.every((p) => p.running)
+            ? ok(`parallel sessions: ${sessionText}`)
+            : warn(`parallel sessions: ${sessionText}`),
+        ];
+
   const lines = [
     accountsLine,
+    ...sessionsLine,
     hooksLine,
     `${palette.dim('relay:')} ${s.relayUrl}`,
     daemonLine,

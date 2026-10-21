@@ -3,7 +3,7 @@
 // a rule's name in words. Shared by the per-slot auto-switch and the per-scope outage log, so the
 // two can never disagree about which accounts a slot draws from or what a folder is called.
 
-import { describeRuleScopes, slotMayHold } from '@claude-control/switch-engine';
+import { describeRuleScopes, isLeaseRule, slotMayHold } from '@claude-control/switch-engine';
 import type { AccountView, FolderRule, RulesPicture, SlotId } from '@claude-control/switch-engine';
 
 /** The registry picture the engine's pool functions (`slotMembers`, `slotMayHold`) read, from the
@@ -42,7 +42,10 @@ export function globalSlotAccountIds(
 
 /** A rule in words: its folders and session aliases, joined (what the operator acts on), or its
  *  label when it somehow has none recorded. The label alone would not do: it defaults to the folder,
- *  but can be anything. */
-export function folderNameOf(rule: Pick<FolderRule, 'folders' | 'aliases' | 'label'>): string {
+ *  but can be anything. A parallel session is named by its account. */
+export function folderNameOf(
+  rule: Pick<FolderRule, 'folders' | 'aliases' | 'label' | 'lease'>,
+): string {
+  if (isLeaseRule(rule as FolderRule)) return `a parallel session of ${rule.label}`;
   return describeRuleScopes(rule as FolderRule);
 }
