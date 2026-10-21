@@ -52,7 +52,7 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
   session or the phone connection.
 - **Every limit in one view.** 5-hour, weekly, and per-model limits across all
   accounts at once, with the reset clocks that make them actionable. Run `cctl` on its own
-  for a live full-screen view: switch, rename, add or exclude accounts and refresh usage
+  in a terminal for a live full-screen view: switch, rename, add or exclude accounts and refresh usage
   with single keys.
 - **A record of every time you ran out.** When every account is spent, the daemon logs
   when, why each account was out, and the switches that led there, then how long it

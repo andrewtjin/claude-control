@@ -604,12 +604,15 @@ cctl            # on a terminal, once set up
 cctl tui        # the same view, by name; works before setup too
 ```
 
-One screen with four panes, refreshed every 2 seconds and after every action: **Accounts**
+One screen with four panes, refreshed every 2 seconds (a timed refresh is skipped while an action runs or a read is still in
+flight, and a read follows the action) and after every action: **Accounts**
 (each account's plan, its 5-hour and weekly usage with reset times, any per-model weekly
 windows, its folder rules, whether it is excluded or quarantined, and how old the reading is),
 **Sessions** (what `cctl session status` shows), **Folders** (`cctl folders`) and **Outages**
 (`cctl outages`). The header says whether the daemon is running, whether auto-switch is on, and
-when it last polled. Everything is read locally from the vault and the daemon's database, the
+when it last polled (the newest usage reading of any account, or "no poll yet"). The auto-switch
+part only shows while the daemon is running. Colour is used when the output is a terminal and
+`NO_COLOR` is unset. Everything is read locally from the vault and the daemon's database, the
 same places the commands read; nothing in the view calls Anthropic. A reset marked `~` is
 predicted from history rather than reported.
 
@@ -629,14 +632,24 @@ predicted from history rather than reported.
 | ?                   | the key list                                                                                                                                                                                                                          |
 | q or Esc            | quit                                                                                                                                                                                                                                  |
 
-Ctrl-C also quits. If an action is running, the view quits as soon as it finishes; a second
+Enter, e, r, d and l act on the selected account, so they work only in the Accounts pane;
+elsewhere the status line tells you to Tab to it. a, u, ?, m and q work in every pane.
+
+q and Esc quit from the list. In a prompt, Esc cancels it and q is just typed; in the help,
+message and launch overlays, q and Esc close the overlay. While an action is running q and Esc
+do nothing; Ctrl-C always works. It quits the view as soon as the action finishes; a second
 Ctrl-C gives the screen back at once, and cctl exits when the action has finished (it is never
 cut off part way). Either way, how the action ended is printed on the normal screen, and a
-refused action makes the exit code non-zero.
+refused action makes the exit code non-zero. A signal exits with 128 plus its number (SIGHUP 129,
+SIGINT 130, SIGTERM 143); one that arrives during an action waits for it and prints "Still
+finishing the running action...". While a login window is up, Ctrl-C and Ctrl+Break belong to
+that window and the view ignores them.
 
-The help and message overlays scroll with the movement keys in a short terminal. They and the
+The help and message overlays scroll with the movement keys, including Home/End and
+PgUp/PgDn, in a short terminal. They and the
 launch line close on Esc or any other key except Enter, so a doubled Enter never reaches the
-account list. A rename, add or remove prompt whose Enter does not go through (an empty label, a
+account list. A prompt takes Backspace, filters out control characters and caps its input at 200
+characters. A rename, add or remove prompt whose Enter does not go through (an empty label, a
 label another account already has, a mistyped confirmation) stays open and says why, and a rename
 or remove the vault refuses opens its prompt again with the reason; Esc then leaves the reason on
 the status line, where m shows all of it. A removal is checked against the label you typed once
@@ -648,7 +661,8 @@ screen is stepped aside for a login window are dropped when it comes back, for a
 keep arriving.
 
 As the terminal narrows, columns give way in a fixed order: per-model windows first, then reset
-times, then the plan. Below 40 columns (or 6 rows) the view shows a notice instead, and only q,
+times, then the plan; after that the label column narrows and the tags are cut, and the key-hint line
+drops its least important hints first. Below 40 columns (or 6 rows) the view shows a notice instead, and only q,
 Esc and Ctrl-C do anything until it is larger. A long message wraps onto up to three status
 rows, never taking the selected account's row; one longer than that keeps its start and its end,
 and m shows all of it. cctl's own messages are drawn with plain ASCII punctuation, so they are as
