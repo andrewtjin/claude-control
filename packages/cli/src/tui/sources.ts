@@ -14,6 +14,13 @@
 // held open for the view's lifetime (see UsageReader): it is read every couple of seconds.
 
 import { readHeartbeat, type UsageRepollResult } from '@claude-control/daemon';
+import {
+  isLeaseRule,
+  leaseOccupants,
+  occupantCount,
+  ruleIdOfSlot,
+  type SessionLease,
+} from '@claude-control/switch-engine';
 import { planLabel } from '@claude-control/usage-advisor';
 import {
   addAccount,
@@ -38,6 +45,7 @@ import type {
   TuiSessions,
   TuiSnapshot,
   TuiSources,
+  TuiTag,
 } from './types.js';
 
 type Engine = ReturnType<typeof buildEngine>;
@@ -114,17 +122,32 @@ async function readRegistry(
   }
 }
 
-/** The accounts, with usage, plan, folder memberships and live markers. */
+/** The tag of an account a parallel session (`cctl claude --account`) holds, with how many
+ *  terminals and other processes it records when more than one. */
+function parallelSessionTag(lease: SessionLease): TuiTag {
+  const count = occupantCount(leaseOccupants(lease.holders));
+  return { text: count > 1 ? `parallel session x${count}` : 'parallel session', tone: 'info' };
+}
+
+/** The accounts, with usage, plan, folder memberships, parallel sessions and live markers. */
 function accountsOf(picture: RegistryPicture): TuiAccount[] {
   const { usage, rules, live } = picture;
-  const ruleLabel = new Map(rules.map((r) => [r.id, r.label] as const));
+  const ruleById = new Map(rules.map((r) => [r.id, r] as const));
   return usage.accounts.map((a): TuiAccount => {
     // A rule names the account by inclusion, or holds it live in its slot (an inherited shared
-    // account): either way the account answers to that folder now.
-    const folders = new Set<string>();
-    for (const id of picture.ruleIdsOf.get(a.id) ?? []) folders.add(ruleLabel.get(id) ?? id);
+    // account): either way the account answers to that folder now. A parallel session is a rule
+    // too, but no folder: it is tagged as what it is.
+    const ruleIds = new Set(picture.ruleIdsOf.get(a.id) ?? []);
     for (const [slot, liveId] of live) {
-      if (slot !== 'global' && liveId === a.id) folders.add(ruleLabel.get(slot) ?? slot);
+      const ruleId = ruleIdOfSlot(slot);
+      if (ruleId !== undefined && liveId === a.id) ruleIds.add(ruleId);
+    }
+    const folders = new Set<string>();
+    const extraTags: TuiTag[] = [];
+    for (const id of ruleIds) {
+      const rule = ruleById.get(id);
+      if (rule !== undefined && isLeaseRule(rule)) extraTags.push(parallelSessionTag(rule.lease));
+      else folders.add(rule?.label ?? id);
     }
     const snapshot = usage.usageFor(a.id);
     const predicted = usage.predictedResetFor(a.id);
@@ -138,7 +161,7 @@ function accountsOf(picture: RegistryPicture): TuiAccount[] {
       ...(snapshot !== undefined ? { usage: snapshot } : {}),
       ...(predicted !== undefined ? { predictedResetAt: predicted } : {}),
       folders: [...folders],
-      extraTags: [],
+      extraTags,
     };
   });
 }

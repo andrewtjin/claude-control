@@ -8,9 +8,13 @@ import { dirname, join } from 'node:path';
 import {
   InsecurePassthroughProtector,
   SwitchEngine,
+  Vault,
   defaultPaths,
+  leaseRuleId,
   noopLogger,
+  ruleSlotId,
   type CredentialBundle,
+  type LeaseHolder,
 } from '@claude-control/switch-engine';
 import { Store } from '@claude-control/daemon';
 import { createTuiSources } from './sources.js';
@@ -149,6 +153,81 @@ describe('createTuiSources: each pane degrades on its own', () => {
         raw.exec('ROLLBACK');
         holder.close();
       }
+    } finally {
+      sources.close?.();
+    }
+  });
+});
+
+describe('createTuiSources: an account a parallel session holds', () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'cctl-tui-lease-'));
+    pathsIo.dataRoot = root;
+    vi.stubEnv('CLAUDE_CONFIG_DIR', join(root, 'claude'));
+    await mkdir(join(root, 'claude'), { recursive: true });
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    pathsIo.dataRoot = '';
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  });
+
+  it('is tagged as a parallel session, never as a folder, beside a folder rule named by its label', async () => {
+    const paths = defaultPaths();
+    const protector = new InsecurePassthroughProtector();
+    const engine = new SwitchEngine({ paths, protector, logger: noopLogger });
+    const work = await engine.addAccount('work', login('work'));
+    const home = await engine.addAccount('home', login('home'));
+    const spare = await engine.addAccount('spare', login('spare'));
+    await engine.addAccount('extra', login('extra'));
+    const repo = join(root, 'repo');
+    await mkdir(repo, { recursive: true });
+    await engine.includeInFolder(repo, [home.id], { label: 'Client' });
+    // Two terminals on work's parallel session, its slot seated as the claim seats it.
+    const launcher = (pid: number): LeaseHolder => ({
+      pid,
+      start: 0,
+      host: 'box',
+      platform: 'win32',
+      role: 'launcher',
+    });
+    await new Vault(paths.vaultDir, protector).createRule({
+      folders: [],
+      include: [work.id],
+      lease: { holders: [launcher(4101), launcher(4102)], startedAtMs: Date.now() },
+    });
+    await engine.activate(work.id, { slot: ruleSlotId(leaseRuleId(work.id)), lease: true });
+    // A folder that only excludes spare: its slot inherits the one shared account free for it.
+    const other = join(root, 'other');
+    await mkdir(other, { recursive: true });
+    await engine.excludeInFolder(other, [spare.id], { label: 'Other' });
+
+    const dataDir = dirname(paths.vaultDir);
+    const sources = createTuiSources({
+      engine,
+      readOutages: () =>
+        Promise.resolve({ episodes: [], open: [], logPath: join(dataDir, 'exhaustion.jsonl') }),
+    });
+    try {
+      const snapshot = await sources.load(Date.now());
+      expect(snapshot.accounts.ok).toBe(true);
+      if (!snapshot.accounts.ok) return;
+      const row = (label: string) =>
+        snapshot.accounts.ok && snapshot.accounts.value.find((a) => a.label === label);
+      expect(row('work')).toMatchObject({
+        folders: [],
+        extraTags: [{ text: 'parallel session x2', tone: 'info' }],
+      });
+      expect(row('home')).toMatchObject({ folders: ['Client'], extraTags: [] });
+      // A shared account live in a folder's slot is named by that rule's label, not its slot id.
+      expect(row('extra')).toMatchObject({ folders: ['Other'], extraTags: [] });
+      // The folders pane lists the operator's rules only.
+      expect(snapshot.folders.ok && snapshot.folders.value.rules.map((r) => r.label)).toEqual([
+        'Client',
+        'Other',
+      ]);
     } finally {
       sources.close?.();
     }
