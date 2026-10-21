@@ -2,7 +2,7 @@
 // whether a recorded holder still runs. Everything here is pure or reads an injected fixture, so a
 // Windows box tests the Linux rules and the other way round.
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -23,6 +23,7 @@ import {
   windowsStartMs,
   type HolderEvidence,
   type ProcFsIo,
+  type QueryRunner,
 } from './processStarts.js';
 import type { LeaseHolder, ProcFs } from './types.js';
 
@@ -428,6 +429,33 @@ describe('a process query that does not finish', () => {
     await expect(readProcessTable(partial)).rejects.toThrow();
     const whole = () => Promise.resolve({ lines: ['4 1 133000000000000000'], complete: true });
     expect(await readProcessTable(whole)).toHaveLength(1);
+  });
+
+  it('a process table that takes 20 s, as on a loaded box, is waited for', async () => {
+    // A runner that behaves as runQuery does: it answers after the query's own time, or abandons
+    // the query at the budget it was given, whichever comes first.
+    vi.useFakeTimers();
+    try {
+      const slow: QueryRunner = (_command, _args, _env, _detached, timeoutMs) =>
+        new Promise((resolve) => {
+          const done = setTimeout(
+            () => resolve({ lines: ['4 1 133000000000000000'], complete: true }),
+            20_000,
+          );
+          setTimeout(() => {
+            clearTimeout(done);
+            resolve({ lines: [], complete: false });
+          }, timeoutMs ?? 0);
+        });
+      const read = readProcessTable(slow).then(
+        (rows) => rows.length,
+        () => 'abandoned',
+      );
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(await read).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

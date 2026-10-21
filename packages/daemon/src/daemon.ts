@@ -783,6 +783,8 @@ export class Daemon {
   private readonly leaseOccupancyProbe: LeaseOccupancyProbe | undefined;
   /** When each deferred parallel session was last logged as deferred, by account and reason. */
   private readonly leaseDeferLogged = new Map<string, number>();
+  /** The sweep of the parallel sessions still running, if any (see {@link maintainSlots}). */
+  private leaseSweep: Promise<void> | undefined;
   private readonly accountProbe: AccountProbeLike | undefined;
   private readonly autoSwitchPolicy: AutoSwitchPolicy;
   private readonly settingsReport: PayloadOf<'settings.snapshot'> | undefined;
@@ -1648,17 +1650,6 @@ export class Daemon {
   }
 
   /**
-   * Self-heal every rule slot and repair illegal slot occupancy, once per cycle. First a stale guard
-   * snapshot is rewritten (see the body for why nothing else would). Then, for each rule:
-   * `ensureRuleLive` materializes its profile and makes an available account of its pool live (a
-   * no-op steady-state), and a folder left with no working account is returned, by rule id with the
-   * sentence its alert says (see {@link alertPoolsOut}). Then `checkSlots` finds any invariant
-   * breach and `repairSlots` fixes the (a)-(d) ones under the engine lock; whatever a repair could
-   * NOT resolve (a broken profile link, an unrecognized login) raises one alert per kind per window.
-   * A breach the self-heal itself clears is caught by a check taken before it, and alerted on the
-   * same way as one repairSlots fixes.
-   */
-  /**
    * One full sweep of the parallel sessions (see the engine's `sweepLeases`), logging what it ended,
    * which processes it found running on a session's profile, and each deferral at most once an hour.
    * No phone alert: a terminal closing is no news. A failure is a warning, never a failed cycle.
@@ -1699,12 +1690,28 @@ export class Daemon {
     }
   }
 
+  /**
+   * Self-heal every rule slot and repair illegal slot occupancy, once per cycle. First a stale guard
+   * snapshot is rewritten (see the body for why nothing else would). Then, for each rule:
+   * `ensureRuleLive` materializes its profile and makes an available account of its pool live (a
+   * no-op steady-state), and a folder left with no working account is returned, by rule id with the
+   * sentence its alert says (see {@link alertPoolsOut}). Then `checkSlots` finds any invariant
+   * breach and `repairSlots` fixes the (a)-(d) ones under the engine lock; whatever a repair could
+   * NOT resolve (a broken profile link, an unrecognized login) raises one alert per kind per window.
+   * A breach the self-heal itself clears is caught by a check taken before it, and alerted on the
+   * same way as one repairSlots fixes.
+   */
   private async maintainSlots(rules: FolderRule[]): Promise<Map<string, string>> {
     const poolsOut = new Map<string, string>();
     // Parallel sessions first: one whose terminals are gone (a closed window, a killed process) is
-    // ended here, its rotation adopted, so its account rejoins the pool before anything below reads
-    // the slots. A full check: the daemon can afford the process query.
-    await this.sweepParallelSessions();
+    // ended by a full check, its rotation adopted, and its account rejoins the pool. That check
+    // waits on a process query a busy machine can stretch past a whole poll interval, so it is
+    // started here and not waited for: nothing below, and no other phase of the cycle, may stall
+    // behind it. Whatever it changes is read by the next cycle. One still running is never started
+    // again, so slow sweeps cannot pile up.
+    this.leaseSweep ??= this.sweepParallelSessions().finally(() => {
+      this.leaseSweep = undefined;
+    });
     // Every rule mutation writes the guard snapshot LAST, so a crash between the registry write and
     // the snapshot write leaves the snapshot stale while every slot is legal — nothing below would
     // notice, and the guard would keep enforcing the old binding set (fail-open for a new binding,

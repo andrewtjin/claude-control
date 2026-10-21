@@ -45,6 +45,8 @@ interface Harness {
   /** Live pids; anything else is gone (ESRCH). */
   alive: Set<number>;
   table: ProcessRow[];
+  /** How many times the engine read the process table. */
+  tableReads: { count: number };
   /** The CLAUDE_CONFIG_DIR each stand-in process was started with (null: unset). A pid not here
    *  could not be read, as another user's process. */
   env: Map<number, string | null>;
@@ -62,6 +64,7 @@ async function harness(platform: NodeJS.Platform = 'win32', procFs?: ProcFs): Pr
   const protector = new InsecurePassthroughProtector();
   const alive = new Set<number>([1]);
   const table: ProcessRow[] = [];
+  const tableReads = { count: 0 };
   const env = new Map<number, string | null>();
   const faults: { at?: string | undefined } = {};
   const refreshed: string[] = [];
@@ -92,7 +95,10 @@ async function harness(platform: NodeJS.Platform = 'win32', procFs?: ProcFs): Pr
       leaseProcesses: {
         hostname: () => HOST,
         isAlive: (pid) => alive.has(pid),
-        processTable: () => Promise.resolve(table),
+        processTable: () => {
+          tableReads.count++;
+          return Promise.resolve(table);
+        },
         processConfigDirs: (pids) =>
           Promise.resolve(new Map(pids.filter((p) => env.has(p)).map((p) => [p, env.get(p)!]))),
         ...(fs !== undefined ? { procFs: fs } : {}),
@@ -106,6 +112,7 @@ async function harness(platform: NodeJS.Platform = 'win32', procFs?: ProcFs): Pr
     global: new CredentialStore(paths),
     alive,
     table,
+    tableReads,
     env,
     faults,
     refreshed,
@@ -719,6 +726,41 @@ describe('releaseLease', () => {
     expect((await h.engine.listAccounts()).map((a) => a.label)).toEqual(['A', 'B', 'C']);
   });
 
+  it('a terminal leaving while another still runs reads no process table and keeps the session', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    const kid = child(h, 4188, 4120);
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [kid]);
+    const other = launcher(h, 5120);
+    await h.engine.claimSessionSlot(B.id, other, { launchRuleId: null });
+    h.tableReads.count = 0;
+    const res = await h.engine.releaseLease(leaseRuleId(B.id), [me, kid], noWorkers);
+    expect(res).toMatchObject({ ended: false, remaining: 1 });
+    expect(h.tableReads.count).toBe(0);
+    expect((await h.vault.getRule(leaseRuleId(B.id)))?.lease?.holders.map((x) => x.pid)).toEqual([
+      5120,
+    ]);
+  });
+
+  it('a terminal leaving after the only other one died ends the session at once', async () => {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    const kid = child(h, 4188, 4120);
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [kid]);
+    // A second terminal on the session was closed without releasing: both its processes are gone.
+    await h.engine.claimSessionSlot(B.id, launcher(h, 5120), { launchRuleId: null });
+    await h.engine.addLeaseHolders(leaseRuleId(B.id), [child(h, 5188, 5120)]);
+    h.alive.delete(5120);
+    h.alive.delete(5188);
+    const res = await h.engine.releaseLease(leaseRuleId(B.id), [me, kid], noWorkers);
+    expect(res).toMatchObject({ ended: true });
+    expect(await h.vault.getRule(leaseRuleId(B.id))).toBeUndefined();
+  });
+
   it('two terminals releasing at once: exactly one teardown, and it ran the probe', async () => {
     const h = await harness();
     const { B } = await seed(h);
@@ -843,8 +885,9 @@ describe('sweepLeases', () => {
     const two = launcher(h, 5120);
     await h.engine.claimSessionSlot(B.id, one, { launchRuleId: null });
     await h.engine.claimSessionSlot(B.id, two, { launchRuleId: null });
-    // Terminal two was killed: the first pass judges it dead.
-    h.alive.delete(5120);
+    // Terminal two was killed and a later process took its pid: the first pass, a full check, judges
+    // it dead; the release below checks without a process query, cannot tell, and leaves it on disk.
+    h.table.find((r) => r.pid === 5120)!.startMs = NOW + HOUR;
     const worker: LeaseHolder = {
       pid: 6000,
       start: 0,

@@ -24,6 +24,15 @@ import type { LeaseHolder, LeaseHolderState, ProcessRow, ProcFs } from './types.
 const START_QUERY_TIMEOUT_MS = 10_000;
 
 /**
+ * How long the process table may take. Ending a parallel session on Windows waits for it, so a budget
+ * the query cannot meet keeps the account out of the pool for as long as the machine stays busy. On
+ * a machine with ~800 processes under load it was measured at 17-21 s for long stretches (about 1 s
+ * when quiet); this is about three times that. Past it the machine is not answering at all, and the
+ * end is deferred to the next check.
+ */
+const PROCESS_TABLE_TIMEOUT_MS = 60_000;
+
+/**
  * How far a Windows holder's recorded start may sit from the creation time the OS reports and still
  * be the same process. The recorded side trails the real creation by node's startup (a launcher) or
  * by the spawn call's return (a child). A pid reused within this window of the original start is not
@@ -103,12 +112,14 @@ export function runQuery(
   });
 }
 
-/** How {@link readProcessTable} runs its query (a seam for tests). */
+/** How {@link readProcessTable} and {@link readProcessConfigDirs} run their query (a seam for
+ *  tests): {@link runQuery}'s contract, given the budget the reader sizes for its own query. */
 export type QueryRunner = (
   command: string,
   args: string[],
   env: NodeJS.ProcessEnv,
   detached: boolean,
+  timeoutMs: number,
 ) => Promise<QueryResult>;
 
 /**
@@ -177,6 +188,7 @@ export async function readProcessTable(run: QueryRunner = runQuery): Promise<Pro
     ],
     process.env,
     false,
+    PROCESS_TABLE_TIMEOUT_MS,
   );
   const rows = parseProcessTable(lines);
   if (!complete || rows.length === 0) throw new Error('the process table could not be read');
@@ -184,7 +196,8 @@ export async function readProcessTable(run: QueryRunner = runQuery): Promise<Pro
 }
 
 /** How long the environment read may take: it compiles a small reader first, which a loaded box
- *  can stretch past the process table's budget. */
+ *  stretches. One that runs out answers what it read, and a process it did not reach is judged by
+ *  the process table instead, so it needs no budget as long as the table's. */
 const CONFIG_DIR_QUERY_TIMEOUT_MS = 20_000;
 
 /**
@@ -257,8 +270,7 @@ function configDirReaderScript(pids: readonly number[]): string {
  */
 export async function readProcessConfigDirs(
   pids: readonly number[],
-  run: QueryRunner = (command, args, env, detached) =>
-    runQuery(command, args, env, detached, CONFIG_DIR_QUERY_TIMEOUT_MS),
+  run: QueryRunner = runQuery,
 ): Promise<Map<number, string | null>> {
   const out = new Map<number, string | null>();
   const list = [...new Set(pids.filter((pid) => Number.isInteger(pid) && pid > 0))];
@@ -269,6 +281,7 @@ export async function readProcessConfigDirs(
     ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
     process.env,
     false,
+    CONFIG_DIR_QUERY_TIMEOUT_MS,
   );
   return parseConfigDirLines(lines, list);
 }

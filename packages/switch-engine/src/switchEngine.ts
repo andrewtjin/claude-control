@@ -3056,16 +3056,20 @@ export class SwitchEngine {
   }
 
   /**
-   * Remove this terminal's holders from its parallel session; when none would remain, end the session
-   * (its rotation adopted, its login cleared, the account back in the pool) — unless something still
-   * runs on its profile, which then holds it: a Claude Code the session started that outlived it (a
-   * backgrounded `claude -p`, a detached helper), found the way a full sweep finds one (see
-   * {@link unrecordedProcesses}), or the background service's workers. The roster is read before the
-   * lock, and so is the process evidence when this release looks like the last one out. A Claude Code
-   * still on the profile holds the session whatever else could not be read. Anything that leaves the
-   * question open (an unreadable roster or process table, a slot whose switch cannot be settled, a
-   * login that could not be adopted) writes nothing: the departing holders stay on disk, dead after
-   * this exit, and the next sweep decides with fresh evidence. Never writes an empty holder list.
+   * Remove this terminal's holders from its parallel session, and any other holder that is provably
+   * gone (judged without a process query: kill-0 on Windows, `/proc` on Linux; this terminal's own
+   * are known to be leaving and need no check). So a terminal leaving while another runs reads no
+   * process table at all, and one leaving after the others died needs no daemon. When none would
+   * remain, end the session (its rotation adopted, its login cleared, the account back in the pool)
+   * — unless something still runs on its profile, which then holds it: a Claude Code the session
+   * started that outlived it (a backgrounded `claude -p`, a detached helper), found the way a full
+   * sweep finds one (see {@link unrecordedProcesses}), or the background service's workers. The
+   * roster is read before the lock, and so is the process evidence when this release looks like the
+   * last one out. A Claude Code still on the profile holds the session whatever else could not be
+   * read. Anything that leaves the question open (an unreadable roster or process table, a slot
+   * whose switch cannot be settled, a login that could not be adopted) writes nothing: departing
+   * holders stay on disk, dead after this exit, and the next sweep decides with fresh evidence.
+   * Never writes an empty holder list.
    */
   async releaseLease(
     ruleId: string,
@@ -3075,14 +3079,17 @@ export class SwitchEngine {
     const profileDir = this.configDirForSlot(ruleSlotId(ruleId))!;
     // Undefined: the roster read failed outright, which decides nothing either.
     const workers = await probe(profileDir, { verify: false }).catch(() => undefined);
-    // The process evidence a last holder out needs, read without the lock when this release is the
-    // last one by the rules on disk now; a concurrent release that leaves this one last reads it
-    // under the lock instead.
+    // The holders that stay: every other one not provably gone. A doubt keeps it.
+    const quick = await this.holderEvidence('quick', {});
+    const others = (all: readonly LeaseHolder[]): LeaseHolder[] =>
+      withoutHolders(all, holders).filter((h) => holderState(h, quick) !== 'dead');
+    // The process evidence a last holder out needs (on Windows the one process query a clean exit
+    // makes: a Claude Code the session left running would otherwise lose its login), read without
+    // the lock when this release is the last one by the rules on disk now; a concurrent release that
+    // leaves this one last reads it under the lock instead.
     const before = await this.vault.getRule(ruleId).catch(() => undefined);
     const lastOut =
-      before !== undefined &&
-      isLeaseRule(before) &&
-      withoutHolders(before.lease.holders, holders).length === 0;
+      before !== undefined && isLeaseRule(before) && others(before.lease.holders).length === 0;
     let found = lastOut ? await this.processEvidence('full', {}) : undefined;
     return this.withCredentialLock(async () => {
       const nothing: LeaseRelease = {
@@ -3093,7 +3100,7 @@ export class SwitchEngine {
       };
       const rule = await this.vault.getRule(ruleId);
       if (rule === undefined || !isLeaseRule(rule)) return nothing;
-      const remaining = withoutHolders(rule.lease.holders, holders);
+      const remaining = others(rule.lease.holders);
       if (remaining.length > 0) {
         if (remaining.length !== rule.lease.holders.length) {
           await this.vault.setLeaseHolders(ruleId, remaining);

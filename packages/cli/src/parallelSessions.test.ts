@@ -455,10 +455,27 @@ describe('doctor and parallel sessions', () => {
     const c = checkSessionLeases([view([h(4120, 'dead', { reused: true }), h(4188, 'dead')])]);
     expect(c.ok).toBe(false);
     expect(c.detail).toBe(
-      'the parallel session of W is held only by exited processes (pids 4120, 4188; 4120 is now ' +
-        'another program). The running daemon frees it within one poll; with no daemon running, the ' +
-        'next cctl switch W or cctl claude --account W checks those processes and frees it.',
+      'the parallel session of W is held only by exited processes (pids 4120, 4188; pid 4120 is ' +
+        'now used by another program). The running daemon frees it within one poll; with no daemon ' +
+        'running, the next cctl switch W or cctl claude --account W checks those processes and ' +
+        'frees it.',
     );
+  });
+
+  it('says the same in a proper sentence for one exited holder, and for several reused pids', () => {
+    const several = checkSessionLeases([
+      view([h(42140, 'dead', { reused: true }), h(19344, 'dead', { reused: true })]),
+    ]);
+    expect(several.detail).toContain(
+      'held only by exited processes (pids 42140, 19344, each now used by another program). ',
+    );
+    const one = checkSessionLeases([view([h(4120, 'dead', { reused: true })])]);
+    expect(one.detail).toContain(
+      'held only by an exited process (pid 4120, now used by another program). ',
+    );
+    expect(one.detail).toContain('checks that process and frees it.');
+    const plain = checkSessionLeases([view([h(4120, 'dead')])]);
+    expect(plain.detail).toContain('held only by an exited process (pid 4120). ');
   });
 
   it('names holders this machine cannot check', () => {

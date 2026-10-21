@@ -618,13 +618,23 @@ export function checkSessionLeases(
     }
     const pids = lease.holders.map((h) => h.pid);
     const reused = lease.holders.filter((h) => h.reused === true).map((h) => h.pid);
+    const one = pids.length === 1;
+    const pidWords = (list: readonly number[]): string =>
+      `pid${list.length === 1 ? '' : 's'} ${list.join(', ')}`;
+    // Which of those pids a later process has taken: when all of them, said once about the list.
+    const reusedWords =
+      reused.length === 0
+        ? ''
+        : reused.length === pids.length
+          ? `, ${one ? 'now' : 'each now'} used by another program`
+          : `; ${pidWords(reused)} ${reused.length === 1 ? 'is' : 'are each'} now used by ` +
+            'another program';
     problems.push(
-      `the parallel session of ${label} is held only by exited processes (pids ${pids.join(', ')}` +
-        (reused.length > 0
-          ? `; ${reused.join(', ')} ${reused.length === 1 ? 'is' : 'are'} now another program`
-          : '') +
-        '). The running daemon frees it within one poll; with no daemon running, the next ' +
-        `cctl switch ${label} or cctl claude --account ${label} checks those processes and frees it.`,
+      `the parallel session of ${label} is held only by ` +
+        `${one ? 'an exited process' : 'exited processes'} (${pidWords(pids)}${reusedWords}). ` +
+        'The running daemon frees it within one poll; with no daemon running, the next ' +
+        `cctl switch ${label} or cctl claude --account ${label} checks ` +
+        `${one ? 'that process' : 'those processes'} and frees it.`,
     );
   }
   if (problems.length > 0)

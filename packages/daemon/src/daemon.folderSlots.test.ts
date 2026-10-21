@@ -227,6 +227,8 @@ function fakeEngine(opts: {
   leaseOf?: (accountId: string) => LeaseView | undefined;
   /** What a sweep of the parallel sessions reports (default: nothing done). */
   sweepReport?: LeaseSweepReport;
+  /** The sweep itself, for a case about one that takes long (default: answers `sweepReport`). */
+  sweepImpl?: () => Promise<LeaseSweepReport>;
 }): FakeEngineControls {
   const controls: FakeEngineControls = {
     activateCalls: [],
@@ -337,6 +339,7 @@ function fakeEngine(opts: {
     sweepLeases: (sweep: LeaseSweepOptions): Promise<LeaseSweepReport> => {
       controls.sweepCalls.push(sweep);
       controls.order.push('sweep');
+      if (opts.sweepImpl) return opts.sweepImpl();
       return Promise.resolve(
         opts.sweepReport ?? {
           droppedHolders: 0,
@@ -2194,6 +2197,40 @@ describe('daemon and parallel sessions', () => {
     );
     expect(controls.ensureRuleLiveCalls).not.toContain('session-w');
     expect(slotAlerts(rig.relay).some((a) => a.body.includes('Work'))).toBe(false);
+  });
+
+  it('a sweep that takes long holds up nothing else, and is never run twice at once', async () => {
+    const { accounts, groups, live } = withLease();
+    // A sweep whose process query takes far longer than a poll cycle (a loaded machine).
+    let finish: (() => void) | undefined;
+    const done: LeaseSweepReport = {
+      droppedHolders: 0,
+      adoptedHolders: 0,
+      ended: [],
+      deferred: [],
+      adopted: [],
+    };
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      sweepImpl: () => new Promise((resolve) => (finish = () => resolve(done))),
+    });
+    const rig = await createRig({
+      controls,
+      bodyFor: () => ({ limits: [] }),
+      leaseOccupancyProbe: noWorkers,
+      pollIntervalMs: 25,
+    });
+    await rig.start();
+    // The rest of slot maintenance and the poll go on, cycle after cycle, while it runs.
+    await waitFor(
+      () => controls.refreshSnapshotIfStaleCalls >= 3 && countUsageSnapshots(rig.relay) > 0,
+    );
+    expect(controls.sweepCalls).toHaveLength(1);
+    // Once it is done, the next cycle sweeps again.
+    finish!();
+    await waitFor(() => controls.sweepCalls.length >= 2);
   });
 
   it('logs each session it ended and each process it found still holding one', async () => {
