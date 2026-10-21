@@ -612,7 +612,8 @@ export function checkSessionLeases(
       problems.push(
         `the parallel session of ${label} could not be ended: its slot holds a login that could ` +
           'not be saved to the vault, and clearing it could lose the latest token. Log in again ' +
-          `with cctl accounts relogin ${label}; the next check then frees it.`,
+          `with cctl accounts relogin ${label}, which writes a fresh login of ${label} over it; ` +
+          'the next check then frees it.',
       );
       continue;
     }

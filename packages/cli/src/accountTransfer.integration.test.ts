@@ -3500,6 +3500,44 @@ describe.skipIf(process.platform === 'darwin')('a parallel session on this machi
     await sessionIntact(a, home.id, holder);
   });
 
+  it('refuses export --move of another account logged in inside it before writing anything', async () => {
+    const swept: string[] = [];
+    const a = await machine({
+      sweepParallelSession: (id) => {
+        swept.push(id);
+        return Promise.resolve();
+      },
+    });
+    const work = await a.engine.addAccount('work', bundle('W1', 'u-work'));
+    const home = await a.engine.addAccount('home', bundle('H1', 'u-home'));
+    await a.engine.addAccount('spare', bundle('S1', 'u-spare'));
+    await a.engine.activate(work.id);
+    await startSession(a, home.id);
+    // A /login inside home's session as spare.
+    const inside = sessionLogin(a, home.id);
+    await inside.writeLiveCredentials({
+      accessToken: 'S2',
+      refreshToken: 'r-S2',
+      expiresAt: Date.now() + 20 * HOUR,
+    });
+    await inside.writeOauthAccount({ accountUuid: 'u-spare', emailAddress: 'u-spare@x.com' });
+    const file = join(a.root, 'm');
+
+    const msg = await refusal(
+      runExport(file, { ...exportAll, accounts: 'spare', move: true, yes: true }, a.deps),
+    );
+    expect(msg).toContain('"spare" is in use by a parallel session here');
+    // Whether the session holding it still runs was checked first.
+    expect(swept).toEqual([home.id]);
+    expect(existsSync(file)).toBe(false);
+    expect((await a.engine.listAllAccounts()).map((acc) => acc.label).sort()).toEqual([
+      'home',
+      'spare',
+      'work',
+    ]);
+    expect((await inside.readLiveCredentials())?.refreshToken).toBe('r-S2');
+  });
+
   it('lets export --move go ahead once that check finds the session ended', async () => {
     const a = await machine();
     const work = await a.engine.addAccount('work', bundle('W1', 'u-work'));

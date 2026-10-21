@@ -23,6 +23,7 @@ import {
   scopedRuleOf,
   slotMayHold,
   slotMembers,
+  slotPhrase,
   slotPool,
   withRule,
   type RulesPicture,
@@ -241,6 +242,19 @@ describe('pool order', () => {
 });
 
 describe('liveness and slot helpers', () => {
+  it("slotPhrase names a parallel session's slot by its account, never as a folder slot", () => {
+    const rules = [
+      rule('session-w', { label: 'W', include: ['w'], lease: { holders: [], startedAtMs: 1 } }),
+      rule('r', { folders: ['C:/a'] }),
+      rule('r2', { aliases: [{ folder: 'C:/a', alias: 'job' }] }),
+    ];
+    expect(slotPhrase(GLOBAL, rules)).toBe('the global slot');
+    expect(slotPhrase(ruleSlotId('session-w'), rules)).toBe('the parallel-session slot of W');
+    expect(slotPhrase(R, rules)).toBe('the folder slot of C:/a');
+    expect(slotPhrase(R2, rules)).toBe('the slot of session "job" in C:/a');
+    expect(slotPhrase(ruleSlotId('gone'), rules)).toBe('a folder slot whose rule no longer exists');
+  });
+
   it('liveElsewhere names the first other slot in occupancy order, never the slot asked about', () => {
     const occupancy = new Map<SlotId, Set<string>>([
       [GLOBAL, new Set(['a'])],

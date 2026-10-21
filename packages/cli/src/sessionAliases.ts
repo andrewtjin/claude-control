@@ -27,11 +27,10 @@ import {
 import {
   aliasKey,
   canonicalizeFolder,
-  describeRuleScopes,
-  isLeaseRule,
   recordedFolderFor,
   resolveSessionRule,
   ruleSlotId,
+  slotWordsOf,
   type FolderRule,
   type Paths,
   type SwitchEngine,
@@ -178,14 +177,11 @@ async function withBindings(
   const currentSlot = isSession
     ? await engine.recognizedSlotForConfigDir(deps.env.CLAUDE_CONFIG_DIR ?? null)
     : null;
+  // A recorded slot is a plain string from the session store, so its rule is looked up by slot id.
   const slotLabel = (slot: string): string => {
     if (slot === 'global') return 'the global slot';
     const r = rules.find((x) => ruleSlotId(x.id) === slot);
-    if (r === undefined) return 'a folder slot whose rule no longer exists';
-    // A parallel session (`cctl claude --account`) is named by its account.
-    return isLeaseRule(r)
-      ? `the parallel-session slot of ${r.label}`
-      : `the folder slot of ${describeRuleScopes(r)}`;
+    return r === undefined ? 'a folder slot whose rule no longer exists' : slotWordsOf(r);
   };
   return read.views.map((view) => {
     const m = view.meta;

@@ -224,7 +224,8 @@ changed after it was written, one cut short, or one whose rules hold more than 1
 session aliases in all is refused before anything is imported.
 `--move` refuses before anything is written when an account is the live login of this machine's
 main config (switch to another account first: `cctl switch <account>`), when a parallel session
-runs on it (exit it first; checked as `cctl switch` checks it), when the export goes to
+runs on it or it is logged in inside one with `/login` (exit that session first; checked as
+`cctl switch` checks it), when the export goes to
 `-` (nothing to read back), and when there is no terminal to ask on and no `--yes`. It removes
 nothing unless the written file is on the disk and reads back, opening with the same
 passphrase. After that each account is checked on its own: one that is live in a folder's slot
@@ -811,7 +812,10 @@ Do not run `/login` inside a parallel session: it would put another account in t
 daemon notices that on a later check (nothing happens without it): the other account's refreshed
 login is saved with that account, and the copy in the slot is cleared only when that account
 could be live in another slot too; otherwise it stays, since no other slot can take it meanwhile.
-The session's own account is not changed.
+The session's own account is not changed. An import, `cctl folder include` or `cctl session
+include` that reserves the other account leaves its login in the session's slot as well: the
+folder's or named session's slot takes that account only once the session has ended and saved
+its login.
 
 When the last terminal on `work` exits, its refreshed login returns to cctl and `work` rejoins
 the pool. A closed window or a killed process is cleaned up by the daemon at its next check
@@ -833,7 +837,11 @@ When the release cannot finish, the terminal says so: `could not return <label> 
 (<reason>)` (a roster, process list or slot that could not be read or settled; the daemon or the
 next command above retries), or `<label> stays reserved ...` (a Claude Code process or a
 background-service session started from it still runs on its profile; it rejoins when that
-exits). For an unsaved login the fix is `cctl accounts relogin <label>`. The session shows in
+exits). For a login that could not be saved (a torn file, or a `/login` inside the session as an
+account cctl does not store) the fix is `cctl accounts relogin <label>`: it writes a fresh login
+of `<label>` over that login in the session's slot, and the next check ends the session. To keep
+the other account instead, add it (`cctl accounts add <label> --fresh`, logging in as it): with
+its login stored, the next check ends the session. The session shows in
 `cctl status`, `accounts list`, `usage`, `timeline` and `folder list` as in use. `cctl folder
 include` of an account a session holds waits until it ends, and `cctl accounts remove` is
 refused. `--override` with a parallel session relaxes nothing.

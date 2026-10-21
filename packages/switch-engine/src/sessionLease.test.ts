@@ -1951,3 +1951,167 @@ describe("win32: another user's process is no Claude Code of the session", () =>
     expect(released).toMatchObject({ ended: true });
   });
 });
+
+describe('a re-login frees a parallel session that holds a login cctl does not store', () => {
+  /** A throwaway config dir holding a fresh login of `name`, as `cctl accounts relogin` or
+   *  `accounts add --fresh` captures it. */
+  async function freshLoginOf(h: Harness, name: string): Promise<string> {
+    const capture = join(h.paths.vaultDir, '..', `capture-${name}`);
+    await mkdir(capture, { recursive: true });
+    const store = new CredentialStore({
+      claudeDir: capture,
+      credentialsPath: join(capture, '.credentials.json'),
+      claudeJsonPath: join(capture, '.claude.json'),
+      vaultDir: h.paths.vaultDir,
+    });
+    await store.writeLiveCredentials({
+      accessToken: `${name}-fresh`,
+      refreshToken: `r-${name}-fresh`,
+      expiresAt: NOW + 30 * HOUR,
+    });
+    await store.writeOauthAccount({ accountUuid: `uuid-${name}`, emailAddress: `${name}@x.com` });
+    return capture;
+  }
+
+  /** A session on B inside which the user ran /login as U, an account no row here is: nothing can
+   *  save that login, so its release defers. */
+  async function strandedByUnknownLogin(): Promise<{
+    h: Harness;
+    B: StoredAccount;
+    slot: CredentialStore;
+  }> {
+    const h = await harness();
+    const { B } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    const slot = leaseStore(h.paths, B.id);
+    await slot.writeLiveCredentials({
+      accessToken: 'U',
+      refreshToken: 'r-U',
+      expiresAt: NOW + 20 * HOUR,
+    });
+    await slot.writeOauthAccount({ accountUuid: 'uuid-U', emailAddress: 'U@x.com' });
+    expect(await h.engine.releaseLease(leaseRuleId(B.id), [me], noWorkers)).toMatchObject({
+      ended: false,
+      deferred: 'login_unadopted',
+    });
+    expect(await h.engine.leaseHoldsUnstoredLogin(leaseRuleId(B.id))).toBe(true);
+    return { h, B, slot };
+  }
+
+  it('the release defers, the re-login it advises rewrites the slot, and the next check ends it', async () => {
+    const { h, B, slot } = await strandedByUnknownLogin();
+    const res = await h.engine.reloginFromConfigDir(B.id, await freshLoginOf(h, 'B'));
+    expect(res.healedLiveLogin).toBe(true);
+    expect((await slot.readLiveCredentials())?.refreshToken).toBe('r-B-fresh');
+    expect(await h.engine.getActiveId(ruleSlotId(leaseRuleId(B.id)))).toBe(B.id);
+    expect((await h.global.readLiveCredentials())?.accessToken).toBe('A');
+
+    h.alive.delete(4120);
+    const report = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
+    expect(report.ended.map((e) => e.accountId)).toEqual([B.id]);
+    expect((await h.vault.readBundle(B.id)).claudeAiOauth.refreshToken).toBe('r-B-fresh');
+    expect(await slot.readLiveCredentials()).toBeUndefined();
+  });
+
+  it("leaves another stored account's login there alone: ending the session saves that one", async () => {
+    const h = await harness();
+    const { B, C } = await seed(h);
+    await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
+    const slot = leaseStore(h.paths, B.id);
+    await slot.writeLiveCredentials({
+      accessToken: 'C2',
+      refreshToken: 'r-C2',
+      expiresAt: NOW + 20 * HOUR,
+    });
+    await slot.writeOauthAccount(bundleFor('C').oauthAccount!);
+    const res = await h.engine.reloginFromConfigDir(B.id, await freshLoginOf(h, 'B'));
+    expect(res.healedLiveLogin).toBe(false);
+    expect((await slot.readLiveCredentials())?.refreshToken).toBe('r-C2');
+    expect((await h.vault.readBundle(B.id)).claudeAiOauth.refreshToken).toBe('r-B-fresh');
+
+    h.alive.delete(4120);
+    const report = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
+    expect(report.ended.map((e) => e.accountId)).toEqual([B.id]);
+    expect((await h.vault.readBundle(C.id)).claudeAiOauth.refreshToken).toBe('r-C2');
+  });
+
+  it('adding the account of that login instead keeps it, and the next check ends the session', async () => {
+    const { h, B, slot } = await strandedByUnknownLogin();
+    const U = await h.engine.captureFromConfigDir('U', await freshLoginOf(h, 'U'));
+    h.alive.delete(4120);
+    const report = await h.engine.sweepLeases({ mode: 'full', probe: noWorkers });
+    expect(report.ended.map((e) => e.accountId)).toEqual([B.id]);
+    expect((await h.vault.readBundle(U.id)).claudeAiOauth.refreshToken).toBe('r-U-fresh');
+    expect((await h.vault.readBundle(B.id)).claudeAiOauth.refreshToken).toBe('r-B');
+    expect(await slot.readLiveCredentials()).toBeUndefined();
+  });
+});
+
+describe('ending a parallel session whose account has no stored login', () => {
+  /** A session on B whose Claude Code rotated B's login to B9, after B's stored login was lost (its
+   *  bundle file gone): B9 is then the only copy of B's login. `identity` is what the slot's
+   *  .claude.json says; `token` the login it holds. */
+  async function sessionOnBundlelessB(
+    opts: { identity?: object; refreshToken?: string } = {},
+  ): Promise<{ h: Harness; B: StoredAccount; C: StoredAccount; me: LeaseHolder }> {
+    const h = await harness();
+    const { B, C } = await seed(h);
+    const me = launcher(h, 4120);
+    await h.engine.claimSessionSlot(B.id, me, { launchRuleId: null });
+    const profile = leaseProfile(h, B.id);
+    const rotated = {
+      accessToken: 'B9',
+      refreshToken: opts.refreshToken ?? 'r-B9',
+      expiresAt: NOW + 11 * HOUR,
+    };
+    await writeFile(join(profile, '.credentials.json'), JSON.stringify({ claudeAiOauth: rotated }));
+    await writeFile(
+      join(profile, '.claude.json'),
+      JSON.stringify(opts.identity ?? { oauthAccount: bundleFor('B').oauthAccount }),
+    );
+    await rm(join(h.paths.vaultDir, B.id, 'cred.enc'));
+    return { h, B, C, me };
+  }
+
+  it("stores the slot's login as the account's own, then ends the session", async () => {
+    const { h, B, me } = await sessionOnBundlelessB();
+    const res = await h.engine.releaseLease(leaseRuleId(B.id), [me], noWorkers);
+    expect(res).toMatchObject({ ended: true, adoptedRotation: true });
+    expect((await h.vault.readBundle(B.id)).claudeAiOauth.refreshToken).toBe('r-B9');
+    expect(await leaseStore(h.paths, B.id).readLiveCredentials()).toBeUndefined();
+  });
+
+  it.each([
+    ['names no account', { oauthAccount: {} }],
+    [
+      'names another login of the same email',
+      { oauthAccount: { accountUuid: 'uuid-Z', emailAddress: 'B@x.com' } },
+    ],
+  ])('keeps the slot when its identity block %s: login_unadopted', async (_why, identity) => {
+    const { h, B, me } = await sessionOnBundlelessB({ identity });
+    const res = await h.engine.releaseLease(leaseRuleId(B.id), [me], noWorkers);
+    expect(res).toMatchObject({ ended: false, deferred: 'login_unadopted' });
+    expect((await leaseStore(h.paths, B.id).readLiveCredentials())?.refreshToken).toBe('r-B9');
+    expect(await h.vault.hasBundle(B.id)).toBe(false);
+  });
+
+  it('keeps the slot when the stored login cannot be read, and never writes over it', async () => {
+    const { h, B, me } = await sessionOnBundlelessB();
+    const bundleFile = join(h.paths.vaultDir, B.id, 'cred.enc');
+    await writeFile(bundleFile, 'not a bundle');
+    const res = await h.engine.releaseLease(leaseRuleId(B.id), [me], noWorkers);
+    expect(res).toMatchObject({ ended: false, deferred: 'login_unadopted' });
+    expect((await leaseStore(h.paths, B.id).readLiveCredentials())?.refreshToken).toBe('r-B9');
+    expect(await readFile(bundleFile, 'utf8')).toBe('not a bundle');
+  });
+
+  it("never stores another account's token as its own: that login is kept with its owner", async () => {
+    // The slot holds C's stored token under B's identity.
+    const { h, B, C, me } = await sessionOnBundlelessB({ refreshToken: 'r-C' });
+    const res = await h.engine.releaseLease(leaseRuleId(B.id), [me], noWorkers);
+    expect(res).toMatchObject({ ended: true, adoptedRotation: false });
+    expect(await h.vault.hasBundle(B.id)).toBe(false);
+    expect((await h.vault.readBundle(C.id)).claudeAiOauth.refreshToken).toBe('r-C');
+  });
+});

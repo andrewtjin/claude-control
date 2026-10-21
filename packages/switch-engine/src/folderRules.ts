@@ -500,6 +500,25 @@ export function describeRuleScopes(rule: FolderRule): string {
   return parts.length > 0 ? parts.join(', ') : rule.label;
 }
 
+/** A rule's slot in words: the parallel-session slot of its account, or the folder slot of its
+ *  scopes. Unsanitized, as {@link describeRuleScopes}. */
+export function slotWordsOf(rule: FolderRule): string {
+  if (isLeaseRule(rule)) return `the parallel-session slot of ${rule.label}`;
+  // A rule of named sessions only has no folder to call its slot by.
+  return rule.folders.length === 0
+    ? `the slot of ${describeRuleScopes(rule)}`
+    : `the folder slot of ${describeRuleScopes(rule)}`;
+}
+
+/** A slot in words, as every message and view names it: the global slot, or its rule's slot (see
+ *  {@link slotWordsOf}). Unsanitized, as {@link describeRuleScopes}. */
+export function slotPhrase(slot: SlotId, rules: readonly FolderRule[]): string {
+  const ruleId = ruleIdOfSlot(slot);
+  if (ruleId === undefined) return 'the global slot';
+  const rule = rules.find((r) => r.id === ruleId);
+  return rule === undefined ? 'a folder slot whose rule no longer exists' : slotWordsOf(rule);
+}
+
 /** Which rule a session runs under, and by which scope. */
 export type SessionRuleMatch =
   | { rule: FolderRule; via: 'alias'; folder: string; aliasKey: string }

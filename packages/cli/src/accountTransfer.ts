@@ -21,7 +21,6 @@ import {
   SwitchEngineError,
   canonicalizeFolder,
   defaultPaths,
-  isLeaseRule,
   isWellFormedText,
   sanitizeTerminalText,
   type AccountView,
@@ -109,6 +108,7 @@ export type TransferEngine = Pick<
   | 'setAutoSwitchExcluded'
   | 'removeAccount'
   | 'liveSlots'
+  | 'parallelSessionsHolding'
 >;
 
 /** What writing the export file found out about it. */
@@ -485,21 +485,20 @@ export async function runExport(
   return { failed };
 }
 
-/** The first of `accounts` a parallel session holds, once the sessions among theirs whose processes
- *  are all gone have been ended, or undefined. Such an account is in use in a terminal here, on the
- *  very login an export carries. */
+/** The first of `accounts` a parallel session holds (its own, or another account's it is logged in
+ *  inside), once the sessions holding it whose processes are all gone have been ended, or
+ *  undefined. Such an account is in use in a terminal here, on the very login an export carries. */
 async function heldByParallelSession(
   accounts: readonly AccountView[],
   deps: TransferDeps,
 ): Promise<AccountView | undefined> {
-  const held = async (): Promise<Set<string>> =>
-    new Set((await deps.engine.listRules()).filter(isLeaseRule).map((r) => r.include[0]!));
-  const before = await held();
-  const leased = accounts.filter((a) => before.has(a.id));
-  if (leased.length === 0) return undefined;
-  for (const account of leased) await deps.sweepParallelSession(account.id);
-  const after = await held();
-  return leased.find((a) => after.has(a.id));
+  for (const account of accounts) {
+    const sessions = await deps.engine.parallelSessionsHolding(account.id);
+    if (sessions.length === 0) continue;
+    for (const owner of sessions) await deps.sweepParallelSession(owner);
+    if ((await deps.engine.parallelSessionsHolding(account.id)).length > 0) return account;
+  }
+  return undefined;
 }
 
 /** `--move`'s second half: check the file, ask, and remove each account it can (see runExport).

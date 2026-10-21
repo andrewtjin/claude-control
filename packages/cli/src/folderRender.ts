@@ -9,25 +9,16 @@
 import {
   CLAUDE_CODE_TITLE_MAX_LENGTH,
   aliasFitsSessionTitle,
-  describeRuleScopes,
-  isLeaseRule,
-  ruleIdOfSlot,
   shellQuoteArg,
+  slotPhrase,
   type FolderRule,
   type SlotId,
 } from '@claude-control/switch-engine';
 import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
 
-/** A slot in words: "the global slot", or the folder slot named by its rule's folders (and session
- *  aliases). */
+/** A slot in words, as the engine's messages name it (see slotPhrase). */
 export function slotName(slot: SlotId, rules: readonly FolderRule[]): string {
-  const ruleId = ruleIdOfSlot(slot);
-  if (ruleId === undefined) return 'the global slot';
-  const rule = rules.find((r) => r.id === ruleId);
-  if (rule === undefined) return 'a folder slot whose rule no longer exists';
-  return isLeaseRule(rule)
-    ? `the parallel-session slot of ${rule.label}`
-    : `the folder slot of ${describeRuleScopes(rule)}`;
+  return slotPhrase(slot, rules);
 }
 
 /** Where an account of a folder's pool comes from: the rule's own included accounts, or the shared

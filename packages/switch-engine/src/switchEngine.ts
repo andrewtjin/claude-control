@@ -104,7 +104,9 @@ import {
   ruleScopeCount,
   rulesIncluding,
   slotMayHold,
+  slotPhrase,
   slotPool,
+  slotWordsOf,
   withRule,
   type SeatOccupant,
   type RulesPicture,
@@ -524,14 +526,15 @@ function describeRule(rule: FolderRule): string {
   return describeRuleScopes(rule);
 }
 
-/** A rule's slot in words: the parallel-session slot of its account, or the folder slot of its
- *  scopes. */
-function slotWordsOf(rule: FolderRule): string {
-  if (isLeaseRule(rule)) return `the parallel-session slot of ${rule.label}`;
-  // A rule of named sessions only has no folder to call its slot by.
-  return rule.folders.length === 0
-    ? `the slot of ${describeRule(rule)}`
-    : `the folder slot of ${describeRule(rule)}`;
+/**
+ * Whether a slot is a parallel session's. Such a slot is never a hand-off's mover: it is switched
+ * only by its own claim, never under its terminal. Another account logged in there (a /login inside
+ * the session) stays until the session ends, and since it is live there, no other slot can take it
+ * meanwhile, as repairLeaseSlotLocked leaves it.
+ */
+function isLeaseSlot(slotId: SlotId, rules: readonly FolderRule[]): boolean {
+  const rule = ruleOfSlot(slotId, rules);
+  return rule !== undefined && isLeaseRule(rule);
 }
 
 /** What {@link isClaudeCodeProcess} judges a Windows process-table row by. */
@@ -1026,14 +1029,6 @@ function importCapRefusals(
     for (const id of reserving) reservedByBatch.add(id);
   }
   return refused;
-}
-
-/** A slot as a refusal names it: the global slot, or a rule's folder slot by its scopes. */
-function slotPhrase(slotId: SlotId, rules: readonly FolderRule[]): string {
-  const ruleId = ruleIdOfSlot(slotId);
-  if (ruleId === undefined) return 'the global slot';
-  const rule = rules.find((r) => r.id === ruleId);
-  return `the folder slot of ${rule ? describeRule(rule) : slotId}`;
 }
 
 /** Every scope of a rule, as the engine names scopes. */
@@ -2106,6 +2101,23 @@ export class SwitchEngine {
     return undefined;
   }
 
+  /**
+   * The slot a re-login of an account rewrites: the one it is live in, or else its parallel
+   * session's slot while that holds a login ending the session cannot keep (a /login inside it as
+   * an account cctl does not store, an identity that names nobody). Such a login keeps the session
+   * from ending for good, and the slot is pinned to this account, so the re-login the release and
+   * doctor advise replaces it. Another stored account's login there is left alone: ending the
+   * session saves that one with its account.
+   */
+  private async reloginSlotOf(accountId: string): Promise<SlotId | undefined> {
+    const live = await this.liveSlotOf(accountId);
+    if (live !== undefined) return live;
+    const lease = leaseRuleOf(accountId, await this.vault.listRules());
+    if (lease === undefined) return undefined;
+    const rt = this.slotRuntime(ruleSlotId(lease.id));
+    return (await this.slotHoldsUnstoredLogin(rt)) ? rt.id : undefined;
+  }
+
   /** The slot an account's login runs in as {@link possibleLiveOwners} finds it: by the identity
    *  block, or by the stored token where the slot does not recognize the account. */
   private async possibleLiveSlotOf(accountId: string): Promise<SlotId | undefined> {
@@ -2241,6 +2253,22 @@ export class SwitchEngine {
       { path },
       'set aside a credentials file that could not be parsed before re-login',
     );
+  }
+
+  /** The accounts whose parallel sessions hold this one: its own session, and every session whose
+   *  slot its login may be live in (a /login inside it). Removing it would pull that login out from
+   *  under the session, so a command that would remove it refuses while any is listed. Read-only. */
+  async parallelSessionsHolding(accountId: string): Promise<string[]> {
+    const stored = await this.vault.readStoredTokens();
+    const out: string[] = [];
+    for (const rule of (await this.vault.listRules()).filter(isLeaseRule)) {
+      const own = rule.include[0]!;
+      const slot = ruleSlotId(rule.id);
+      if (own === accountId || (await this.possibleLiveOwners(slot, stored)).has(accountId)) {
+        out.push(own);
+      }
+    }
+    return out;
   }
 
   /** Whether a parallel session's slot holds a login that ending it could not keep (see
@@ -3488,6 +3516,7 @@ export class SwitchEngine {
         .find((r) => r !== undefined && ruleSlotId(r.id) === slotId);
     const movers: ImportMover[] = [];
     for (const [slotId, owners] of states.owners) {
+      if (isLeaseSlot(slotId, picture.rules)) continue;
       const from = picture.shared.find(
         (a) => owners.has(a.id) && reserving.has(a.id) && !slotMayHold(slotId, a.id, after),
       );
@@ -4593,6 +4622,7 @@ export class SwitchEngine {
     const live = occupancy ?? (await this.slotOccupancy(picture));
     const moving: Array<{ slotId: SlotId; from: StoredAccount }> = [];
     for (const [slotId, owners] of live) {
+      if (isLeaseSlot(slotId, picture.rules)) continue;
       const from = reserving.find((a) => owners.has(a.id) && !mayKeep(slotId, a.id));
       if (from !== undefined) moving.push({ slotId, from });
     }
@@ -4737,11 +4767,9 @@ export class SwitchEngine {
         'no_shared_account_remains',
       );
     }
-    const rule = picture.rules.find((r) => r.id === ruleId);
     return new RefreshError(
-      `cannot include "${from.label}": it is live in the folder slot of ` +
-        `${rule ? describeRule(rule) : slotId}, and that folder has no other account to switch to` +
-        note,
+      `cannot include "${from.label}": it is live in ${slotPhrase(slotId, picture.rules)}, and ` +
+        `that folder has no other account to switch to${note}`,
       'no_account_remains',
     );
   }
@@ -4961,10 +4989,7 @@ export class SwitchEngine {
     const rules = picture.rules;
     const stored = await this.vault.readStoredTokens();
     const labelOf = (id: string): string => allRows.find((r) => r.id === id)?.label ?? id;
-    const slotLabel = (slotId: SlotId): string => {
-      const rule = rules.find((r) => ruleSlotId(r.id) === slotId);
-      return rule === undefined ? 'the global slot' : slotWordsOf(rule);
-    };
+    const slotLabel = (slotId: SlotId): string => slotPhrase(slotId, rules);
 
     // Physical occupancy of every slot.
     const physical = new Map<SlotId, PhysicalOccupant>();
@@ -5385,9 +5410,8 @@ export class SwitchEngine {
   ): Promise<void> {
     const picture = await this.vault.readPicture();
     const owner = allRows.find((r) => r.id === ownerId);
-    const rule =
-      rt.ruleId === undefined ? undefined : picture.rules.find((r) => r.id === rt.ruleId);
-    const where = rule === undefined ? 'the global slot' : slotWordsOf(rule);
+    const rule = ruleOfSlot(rt.id, picture.rules);
+    const where = slotPhrase(rt.id, picture.rules);
     const reason = "re-seating a slot whose credentials were under another account's identity";
     if (owner !== undefined && slotMayHold(rt.id, owner.id, picture)) {
       await this.activateInSlot(rt, owner.id, { force: true, origin: 'recovery', reason });
@@ -6190,10 +6214,7 @@ export class SwitchEngine {
     const account = [...picture.shared, ...picture.reserved].find((a) => a.id === accountId);
     if (account === undefined) throw new UnknownAccountError(accountId);
     const label = account.label;
-    const words = (slot: SlotId): string => {
-      const rule = picture.rules.find((r) => ruleSlotId(r.id) === slot);
-      return rule === undefined ? 'the global slot' : slotWordsOf(rule);
-    };
+    const words = (slot: SlotId): string => slotPhrase(slot, picture.rules);
     const liveIn = [...live].filter(([, id]) => id === accountId).map(([slot]) => slot);
     if (liveIn.length > 1) {
       return {
@@ -6525,15 +6546,18 @@ export class SwitchEngine {
     );
   }
 
-  /** The running sessions of a parallel session: its live Claude Code and background holders (a
-   *  quick judgment), as running sessions on its profile. */
+  /** The running sessions of a parallel session: its holders still running (a quick judgment), as
+   *  running sessions on its profile, one per terminal. A launcher counts until it has recorded
+   *  its Claude Code: before that the session is starting, and is about to read the slot's login. */
   private async leaseSessions(
     rule: FolderRule & { lease: SessionLease },
   ): Promise<RunningSession[]> {
     const evidence = await this.holderEvidence('quick', {});
     const profile = this.configDirForSlot(ruleSlotId(rule.id))!;
-    return rule.lease.holders
-      .filter((h) => h.role !== 'launcher' && holderState(h, evidence) !== 'dead')
+    const running = rule.lease.holders.filter((h) => holderState(h, evidence) !== 'dead');
+    const pids = new Set(leaseSessionPids(running));
+    return running
+      .filter((h) => pids.has(h.pid))
       .map((h) => ({ pid: h.pid, cwd: profile, sessionFile: `parallel session holder ${h.pid}` }));
   }
 
@@ -7468,7 +7492,7 @@ export class SwitchEngine {
     // method is about to replace that bundle — asked afterwards, the comparison would run against
     // the fresh capture and could never corroborate. An account live in a rule slot heals that profile, not
     // the global files (see {@link applyReloginBundle}).
-    const liveSlot = await this.liveSlotOf(existing.id);
+    const liveSlot = await this.reloginSlotOf(existing.id);
 
     // File-based capture on every platform (the mac Keychain caveat above applies here too):
     // the transient dir is a plain CLAUDE_CONFIG_DIR the CLI populated with
@@ -7686,7 +7710,7 @@ export class SwitchEngine {
       const existing = await this.vault.getAccount(accountId);
       if (!existing) throw new UnknownAccountError(accountId);
       // Read BEFORE the overwrite, for the same reason reloginFromConfigDirLocked does.
-      const liveSlot = await this.liveSlotOf(existing.id);
+      const liveSlot = await this.reloginSlotOf(existing.id);
       const { claudeAiOauth, oauthAccount } = await this.exchange(params, this.refreshDeps);
       // A code exchange answers with tokens and, at most, a four-field identity block; it never
       // echoes the plan facts the account already knows about itself. Fold it over the stored
@@ -8400,12 +8424,9 @@ export class SwitchEngine {
       : this.paths.credentialsPath;
   }
 
-  /** A slot as a message names it: "the global slot", or the folder slot of a rule's folders. */
+  /** A slot as a message names it (see slotPhrase). */
   private async slotLabelOf(slotId: SlotId): Promise<string> {
-    const ruleId = ruleIdOfSlot(slotId);
-    if (ruleId === undefined) return 'the global slot';
-    const rule = await this.vault.getRule(ruleId).catch(() => undefined);
-    return rule === undefined ? `the folder slot ${slotId}` : slotWordsOf(rule);
+    return slotPhrase(slotId, await this.vault.listRules().catch(() => []));
   }
 
   /**

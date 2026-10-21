@@ -2085,8 +2085,8 @@ async function releaseParallelSession(
     } else if (released.deferred === 'login_unadopted') {
       later(
         LEASE_DEFER_WORDS.login_unadopted,
-        `log in again with cctl accounts relogin ${label}, which rewrites it; the next check ` +
-          'then frees the account.',
+        `log in again with cctl accounts relogin ${label}, which writes a fresh login of ` +
+          `${label} over it; the next check then frees the account.`,
       );
     } else if (released.deferred !== undefined) {
       later(LEASE_DEFER_WORDS[released.deferred]);

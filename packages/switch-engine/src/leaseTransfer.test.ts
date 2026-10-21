@@ -86,8 +86,16 @@ async function harness(): Promise<Harness> {
     leaseProcesses: {
       hostname: () => HOST,
       isAlive: () => true,
-      processTable: () => Promise.resolve([]),
+      // Readable, and running nothing on any profile, so the last terminal out can end its session.
+      processTable: () => Promise.resolve([{ pid: 1, ppid: 0, startMs: NOW }]),
       processConfigDirs: () => Promise.resolve(new Map()),
+      procFs: {
+        stat: () => undefined,
+        bootId: () => undefined,
+        pidNs: () => undefined,
+        configDirOf: () => undefined,
+        pids: () => [],
+      },
       self: { pid: 1, start: NOW },
     },
   });
@@ -340,6 +348,108 @@ describe.skipIf(process.platform === 'darwin')(
       expect((err as SlotError).code).toBe('leased');
       expect((await h.engine.listAllAccounts()).map((a) => a.label).sort()).toEqual(['g', 'x']);
       await sessionIntact(h, x.id);
+    });
+  },
+);
+
+describe.skipIf(process.platform === 'darwin')(
+  'another stored account logged in inside a parallel session',
+  () => {
+    /** g live in the global slot, a parallel session on x, and inside it a /login as y: y's newer
+     *  login now sits in x's slot. */
+    async function loggedInInside(h: Harness): Promise<{ x: string; y: string }> {
+      const g = await h.engine.addAccount('g', bundleFor('G'));
+      const x = await h.engine.addAccount('x', bundleFor('X'));
+      const y = await h.engine.addAccount('y', bundleFor('Y'));
+      await h.engine.activate(g.id, { force: true });
+      await claim(h, x.id);
+      const store = leaseStore(h.paths, x.id);
+      await store.writeLiveCredentials({
+        accessToken: 'Y2',
+        refreshToken: 'r-Y2',
+        expiresAt: NOW + 20 * HOUR,
+      });
+      await store.writeOauthAccount(bundleFor('Y').oauthAccount!);
+      return { x: x.id, y: y.id };
+    }
+
+    /** y's login is still the one in x's slot, y is live in no other slot, and x's session keeps
+     *  its rule and holder. */
+    async function stillInSession(h: Harness, x: string, y: string): Promise<void> {
+      const slot = ruleSlotId(leaseRuleId(x));
+      expect((await leaseStore(h.paths, x).readLiveCredentials())?.refreshToken).toBe('r-Y2');
+      const liveIn = [...(await h.engine.liveSlots())].filter(([, id]) => id === y);
+      expect(liveIn.map(([s]) => s)).toEqual([slot]);
+      const rule = (await h.engine.listRules()).find((r) => r.id === leaseRuleId(x));
+      expect(rule?.lease?.holders).toEqual([launcher(4120)]);
+      expect(rule?.include).toEqual([x]);
+    }
+
+    const handOffs: Array<
+      [string, (h: Harness, y: string, dir: string) => Promise<Array<{ slot: string }>>]
+    > = [
+      [
+        'an import',
+        async (h, y, dir) => {
+          const specs: ImportRuleSpec[] = [{ scopes: [folder(dir)], include: [y], exclude: [] }];
+          const plan = await h.engine.planImportRules(specs);
+          const res = await h.engine.importRules(specs);
+          expect(res.plan).toEqual(plan);
+          expect(res.outcomes[0]?.ok).toBe(true);
+          return [...plan.handOffs, ...plan.seats, ...res.handedOff, ...res.seated];
+        },
+      ],
+      [
+        'a folder include',
+        async (h, y, dir) => (await h.engine.includeInFolder(dir, [y])).handedOff,
+      ],
+      [
+        'a session include',
+        async (h, y, dir) => (await h.engine.includeInAlias(dir, 'job', [y])).handedOff,
+      ],
+    ];
+
+    it.each(handOffs)(
+      '%s reserving it never moves that slot, and it is live in one slot only until the session ends',
+      async (_name, reserve) => {
+        const h = await harness();
+        const { x, y } = await loggedInInside(h);
+        const moved = await reserve(h, y, await ruleFolder(h, 'p'));
+        expect(moved.map((m) => m.slot)).not.toContain(ruleSlotId(leaseRuleId(x)));
+        await stillInSession(h, x, y);
+        const rule = (await h.engine.listRules()).find((r) => r.lease === undefined)!;
+        expect(rule.include).toEqual([y]);
+        // Neither the daemon's repair nor seating the new rule takes y while the session holds it.
+        await h.engine.repairSlots();
+        await h.engine.ensureRuleLive(rule.id);
+        await stillInSession(h, x, y);
+
+        // The session ends: y's login is saved with y, and only then does the rule's slot take it.
+        const released = await h.engine.releaseLease(leaseRuleId(x), [launcher(4120)], () =>
+          Promise.resolve([]),
+        );
+        expect(released).toMatchObject({ ended: true });
+        expect((await h.vault.readBundle(y)).claudeAiOauth.refreshToken).toBe('r-Y2');
+        await h.engine.ensureRuleLive(rule.id);
+        const liveIn = [...(await h.engine.liveSlots())].filter(([, id]) => id === y);
+        expect(liveIn.map(([s]) => s)).toEqual([ruleSlotId(rule.id)]);
+      },
+    );
+
+    it('a removal of it for another machine is refused while the session has only its launcher', async () => {
+      const h = await harness();
+      const { x, y } = await loggedInInside(h);
+      // The launcher has not recorded its Claude Code yet: the session is starting, not over.
+      const err = await h.engine
+        .removeAccount(y, { refuseIfGloballyLive: true, refuseIfRunning: true })
+        .catch((e: unknown) => e);
+      expect((err as { code?: string }).code).toBe('sessions_running');
+      expect((await h.engine.listAllAccounts()).map((a) => a.label).sort()).toEqual([
+        'g',
+        'x',
+        'y',
+      ]);
+      await stillInSession(h, x, y);
     });
   },
 );
