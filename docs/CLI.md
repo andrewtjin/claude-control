@@ -74,20 +74,25 @@ credentials, seals them under a passphrase you choose (scrypt and AES-256-GCM), 
 file; `cctl import` opens it and stores the accounts in this machine's vault. There is no
 plaintext mode. The passphrase comes from `--passphrase-file <file>` (its first line; a file
 saved as UTF-16 or with a byte-order mark, as PowerShell writes one, reads the same), else
-`CCTL_EXPORT_PASSPHRASE`, else a prompt (asked twice on export; at least 8 characters). From any
+`CCTL_EXPORT_PASSPHRASE`, else a prompt (asked twice on export; at least 8 characters; it needs
+a terminal with standard input free, so an import reading the file from standard input cannot
+ask). From any
 of them, a passphrase with a space at either end or a control or invisible character in it is
 refused rather than trimmed: `echo secret > file` in cmd.exe writes `secret ` with the space,
 and no one could type that again on the other machine. Use
 `-` as the file to write to standard output or read from standard input; an import from
-standard input needs the passphrase from a file or the env var. An export never overwrites an
-existing file, and the file it writes is readable by you alone (on a file system that keeps no
-per-user permissions, such as a FAT USB stick, the passphrase alone protects it, and the
-export says so).
+standard input needs the passphrase from a file or the env var. An export to `-` sends its
+report to standard error, so standard output carries only the sealed file. An export never
+overwrites an existing file, and the file it writes is readable by you alone (on Windows, on a
+file system that keeps no per-user permissions, such as a FAT USB stick, the passphrase alone
+protects it, and the export says so; other systems do not check). A file may be up to 16 MiB
+and hold up to 512 accounts; a larger one is refused.
 
 **A login works on one machine at a time.** Refresh tokens are single-use: once either machine
 refreshes a login, the other machine's copy stops working. Keep each account on one machine,
 either by exporting with `--move` or by removing it on the other side
-(`cctl accounts remove <account>`). Every run that carries tokens ends with this reminder.
+(`cctl accounts remove <account>`). An export that carries tokens, and an import that stored
+tokens, end with this reminder; `--dry-run` never prints it.
 
 What travels: each account's id, label, login, email, organization, auto-switch exclusion and
 (unless `--no-tokens`, in which case its plan instead, shown until it is logged in) its
@@ -101,20 +106,21 @@ the daemon's database (sessions, prompts, cards) and usage history. A setting th
 (`CCTL_LOG_FILE`) is left out, as is a quarantined account's stored login (the account travels
 and waits for a login on the other side).
 
-What an import does with each part, printed in full by `--dry-run`:
+What an import does with each part, printed in full by `--dry-run` (the header, any notes and
+this plan; a dry run always exits 0):
 
 - **An account already stored here** (the same account, by the id it keeps when it is
   imported, or the same login) is left as it is. A label alone never makes two accounts the
   same. With `--replace` its tokens are replaced when the file's are newer (a later expiry) or
-  the stored login is quarantined; the account keeps its id, its usage history and the identity
+  the stored login is quarantined or none are stored for it (the import says "none were stored here"); the account keeps its id, its usage history and the identity
   stored for it. Only tokens whose own identity names the stored login can replace it, and a
   stored copy that cannot be read right now is not replaced either (the import says so; run it
   again).
 - **A label already taken here by another login** gets a number, `work (2)`, the same way
   duplicate repair numbers labels.
-- **An account without tokens** is stored waiting for a login (quarantined until then); the
-  output lists `cctl accounts relogin <label>` for each, and that re-login must be the same
-  account.
+- **An account without tokens** is stored waiting for a login (quarantined until then). The
+  dry run says "waiting for a login" for each; the real run lists `cctl accounts relogin <label>`
+  for each one that is still waiting, and that re-login must be the same account.
 - **An account reserved to a rule that is not made here** (its folder is missing here, say, or
   the rule is refused while the import runs) is added but kept out of auto-switch, so a
   client's account does not end up spending its quota on other work; nor does the import move
@@ -123,7 +129,10 @@ What an import does with each part, printed in full by `--dry-run`:
 - **Rules** land whole or not at all: a rule of the file is one slot, and splitting it would
   change which account its folders run on, so it is never made on part of its scopes. A rule
   keeps its identity across machines: a rule the import makes remembers which rule it is, and
-  the export of a rule carries it. Each rule of the file then ends one of three ways:
+  the export of a rule carries it. When the file was written on another platform and holds
+  rules, the output opens with a note that folders of another platform are not looked up here,
+  so rules on such folders are skipped (macOS creates no rules at all). Each rule of the file
+  then ends one of four ways:
   - it **grows** the one rule here that carries its identity (an earlier import made it, say
     before one of its folders existed here; or the file came from this machine): the scopes
     and accounts it lacks are added, whatever changed on either machine since. An account the
@@ -131,8 +140,13 @@ What an import does with each part, printed in full by `--dry-run`:
     is left as it is, and listed;
   - it is **created**, with every scope that can be used here, when no rule here holds any of
     them;
+  - it is **skipped** when this machine already has the rule with these accounts, or when
+    another rule here reserves every account it excludes, so it would change nothing;
   - otherwise it **fails**, counted as a failure (the import exits non-zero), naming the folder
-    or session a rule of this machine holds and that rule. A rule here with another identity,
+    or session a rule of this machine holds and that rule. It also fails when this machine
+    already has it split between several rules (remove all but one with `cctl folder reset`,
+    then import again), or when the file holds the same rule twice (it is imported once). A
+    rule here with another identity,
     or none (made here by hand), is never grown by an import, even on exactly the same
     scopes, whatever accounts it shares with the file's. To bring the two together, remove the
     rule here, every folder and session of it (`cctl folder reset <folder>`, `cctl session reset
@@ -167,11 +181,13 @@ What an import does with each part, printed in full by `--dry-run`:
 
 - **Settings** are checked the way `cctl settings set` checks them and saved the same way. A
   setting this machine already has with another value is kept unless `--replace`. A value that
-  weakens a guard compared with the one in force here (`bind-enforce` below `block`,
-  `identity-check` off, `full-output` on) is never taken from a file, `--replace` or not; the
-  output names the `cctl settings set` command to make it here. When one changed, the output
-  ends with `cctl daemon restart`; a value set in the daemon's environment still wins over the
-  saved one, and the output names any setting that is, saved or already set.
+  weakens a guard compared with the one saved in this machine's config (the default when none
+  is saved), such as `bind-enforce` below `block`, `identity-check` off or `full-output` on, is
+  never taken from a file, `--replace` or not; the output names the `cctl settings set` command
+  to make it here. The comparison is with the saved value, not the one in force: a setting the
+  daemon's environment also sets still wins over the saved one, and the output reports it as
+  overridden. When a setting changed, the real run prints `cctl daemon restart` (a dry run
+  does not).
 
 What `--dry-run` prints for the rules is the decision the import itself makes, made by the same
 code from the same reads, and the real run prints the same lines (in the past tense). Only what
@@ -188,21 +204,30 @@ longer excludes, the account another rule took, or a quarantined login replaced)
 slot that sessions run in is moved only as the run says, and never left with no account: a rule
 that would leave it so fails.
 
+A real run ends, in this order, with the `cctl daemon restart` line (when a setting changed),
+the `cctl accounts relogin` list, a hint when nothing is live on this machine's main login
+afterwards (`cctl switch <label>` for an account that can take it, else `cctl accounts add
+<label>` when the accounts the import brought are all reserved or kept out of auto-switch), and
+the one-machine reminder above. A dry run prints none of these.
+
 An import is safe to run twice: everything already in place is reported as such and left
 alone, and a run that stopped part-way (it still reports every rule it wrote and every slot it
-moved) is completed by the next one, while the daemon settles any slot it did not get to. A rule the file carries without an identity (one exported from a rule cctl did not
-make, by an older build) is given one from its folders and sessions, so the next import of the
+moved) is completed by the next one, while the daemon settles any slot it did not get to. A rule the file carries without an identity (its registry rule had an id that is not a valid
+one, as a hand-edited registry can) is given one from its folders and sessions, so the next import of the
 same file finds the rule the first one made. A rule that failed because
 a rule of this machine is in its way fails again until that rule is removed. A wrong passphrase, a file
 changed after it was written, one cut short, or one whose rules hold more than 1024 folders and
 session aliases in all is refused before anything is imported.
-`--move` refuses an account that is the live login of this machine's main config (switch to
-another account first: `cctl switch <account>`), that is live in a folder's slot while
-sessions run there, or whose removal would dissolve a rule (one naming only that account) whose
-folder's slot sessions are running on (exit them first), and removes nothing unless the written file is
-on the disk and reads back, opening with the same passphrase. It keeps an account whose tokens
-did not travel (a quarantined one), and one whose tokens changed or that became the main login
-while it asked; each is listed with why.
+`--move` refuses before anything is written when an account is the live login of this machine's
+main config (switch to another account first: `cctl switch <account>`), when the export goes to
+`-` (nothing to read back), and when there is no terminal to ask on and no `--yes`. It removes
+nothing unless the written file is on the disk and reads back, opening with the same
+passphrase. After that each account is checked on its own: one that is live in a folder's slot
+while sessions run there, whose removal would dissolve a rule (one naming only that account)
+whose folder's slot sessions are running on (exit them first), whose tokens changed since the
+export, or that became the main login meanwhile is kept, reported as "Could not remove
+<label>: ...", and makes the exit code 1. An account whose tokens did not travel (a
+quarantined one) is kept and listed, without counting as a failure.
 
 ## Folder rules
 
