@@ -26,7 +26,9 @@ import {
   type AccountView,
   type CredentialBundle,
   type FolderRule,
+  type ImportRuleOutcome,
   type ImportRuleSpec,
+  type ImportRulesPlan,
   type RuleLiveResult,
   type SlotHandOff,
   type SlotSeat,
@@ -511,6 +513,7 @@ async function moveOut(
     try {
       await deps.engine.removeAccount(account.id, {
         refuseIfGloballyLive: true,
+        refuseIfRunning: true,
         ...(bundle !== undefined ? { expectRefreshToken: bundle.claudeAiOauth.refreshToken } : {}),
       });
       removed.push(account);
@@ -640,9 +643,15 @@ export async function runImport(
   } else if (plan.settings.some((s) => 'overridden' in s && s.overridden === true)) {
     lines.push(ENV_WINS_NOTE);
   }
-  if (accounts.pending.length > 0) {
+  // An account that came without tokens may have picked up its login since: one already running
+  // here is stored when the import moves a slot off it.
+  const stored = await engine.listAllAccounts();
+  const waiting = accounts.pending.filter(
+    (label) => stored.find((a) => a.label === label)?.quarantined === true,
+  );
+  if (waiting.length > 0) {
     lines.push('Log in to each account that came without tokens:');
-    for (const label of accounts.pending) {
+    for (const label of waiting) {
       lines.push(`  cctl accounts relogin ${shellQuote(safe(label), deps.platform)}`);
     }
   }
@@ -877,6 +886,8 @@ async function importRules(
   }
 
   let changed = false;
+  /** Why the import stopped part-way, when it did. */
+  let stoppedLine: string | undefined;
   const handOffLines: string[] = [];
   /** The lines every slot the run moved gets, whether it finished or not. */
   const moved = (
@@ -903,16 +914,18 @@ async function importRules(
     const keepOut = plan.accounts.flatMap((s) =>
       s.kind === 'add' && s.forRule === true ? (localIds.get(s.entry) ?? []) : [],
     );
-    try {
-      const result = await engine.importRules(
-        sent.map((s) => s.spec),
-        { keepOut },
-      );
-      const names = await namesNow();
-      changed = result.handedOff.length + result.seated.length > 0;
+    /** The lines of each rule sent, from the engine's decision (`decided`) and what each rule it
+     *  wrote came to (`outcomes`). For a run that stopped part-way (`stopped`), a rule it decided to
+     *  write but did not finish says how far it got. */
+    const ruleOutcomes = (
+      decided: ImportRulesPlan,
+      outcomes: ReadonlyArray<ImportRuleOutcome | undefined>,
+      names: ReportNames,
+      stopped?: { allWritten: boolean },
+    ): void => {
       for (const [k, { step }] of sent.entries()) {
-        const verdict = result.plan.rules[k]!;
-        const outcome = result.outcomes[k];
+        const verdict = decided.rules[k]!;
+        const outcome = outcomes[k];
         const where = describeRuleStep(step);
         if (outcome !== undefined && !outcome.ok) {
           if (outcome.partial !== undefined) changed = true;
@@ -928,6 +941,27 @@ async function importRules(
           continue;
         }
         const shown = ruleLines({ ...step, verdict }, 'done', names);
+        const written = verdict.kind === 'create' || verdict.kind === 'grow';
+        if (stopped !== undefined && outcome === undefined && written) {
+          lines.set(
+            step,
+            stopped.allWritten
+              ? {
+                  text: [
+                    ...shown.lines,
+                    'its slot was not seated before the import stopped (cctl folders shows the slot)',
+                  ],
+                  ok: false,
+                }
+              : {
+                  text: [
+                    `${where}: may be written only in part; run the import again to finish it`,
+                  ],
+                  ok: false,
+                },
+          );
+          continue;
+        }
         if (outcome !== undefined) changed = true;
         lines.set(step, {
           text: [
@@ -939,20 +973,33 @@ async function importRules(
           ok: shown.ok,
         });
       }
+    };
+    try {
+      const result = await engine.importRules(
+        sent.map((s) => s.spec),
+        { keepOut },
+      );
+      const names = await namesNow();
+      changed = result.handedOff.length + result.seated.length > 0;
+      ruleOutcomes(result.plan, result.outcomes, names);
       moved(result, names);
     } catch (err) {
       if (!(err instanceof SwitchEngineError)) throw err;
       if (err instanceof ImportInterruptedError) {
-        // It stopped part-way: what it wrote and moved is in place, the guard has to hear of it, and
-        // every slot it moved is reported; the next run finishes the rest.
+        // It stopped part-way after it started writing: what it wrote and moved is in place, the
+        // guard has to hear of it, and every rule and slot is reported as far as it got.
         changed = true;
-        moved(err, await namesNow());
-      }
-      for (const { step } of sent) {
-        lines.set(step, {
-          text: [`${describeRuleStep(step)}: not imported - ${safe(err.message)}`],
-          ok: false,
-        });
+        const names = await namesNow();
+        ruleOutcomes(err.plan, err.outcomes, names, { allWritten: err.allWritten });
+        moved(err, names);
+        stoppedLine = safe(err.message);
+      } else {
+        for (const { step } of sent) {
+          lines.set(step, {
+            text: [`${describeRuleStep(step)}: not imported - ${safe(err.message)}`],
+            ok: false,
+          });
+        }
       }
     }
   }
@@ -963,6 +1010,7 @@ async function importRules(
     for (const line of rest) report(`  ${line}`, true);
   }
   for (const line of handOffLines) report(line, true);
+  if (stoppedLine !== undefined) report(stoppedLine, false);
   return changed;
 }
 

@@ -415,6 +415,10 @@ export interface AddPendingAccountOptions extends Pick<
 export interface RemoveAccountOptions {
   /** Refuse while the account is live on this machine's main login. */
   refuseIfGloballyLive?: boolean;
+  /** Refuse while the account is live in a folder slot that sessions run in: the removal clears that
+   *  slot's login, which those sessions refresh from, and they would go on spending a token the
+   *  account's new machine now holds. */
+  refuseIfRunning?: boolean;
   /** Refuse unless the vault still holds this refresh token for the account. */
   expectRefreshToken?: string;
 }
@@ -516,7 +520,7 @@ export type ImportRuleVerdict =
   | { kind: 'refused'; message: string; conflict?: ImportConflict };
 
 /** Everything an import of rules would do: the verdict on each spec, in spec order, every slot it
- *  would move off an account it reserves, and every slot holding a login that seating the rules it
+ *  would move off an account it reserves, and every rule's slot holding a login that the rules it
  *  writes would put on another account (or none). */
 export interface ImportRulesPlan {
   rules: ImportRuleVerdict[];
@@ -524,9 +528,9 @@ export interface ImportRulesPlan {
   seats: SlotSeat[];
 }
 
-/** A rule's slot that held a login and that an import's seat step put on another account, or on
- *  none: its occupant left the rule's pool, a rule seated before it took the account, the batch
- *  newly includes an account there, or a quarantined occupant was replaced. */
+/** A rule's slot that held a login and that an import put on another account, or on none: its
+ *  occupant left the rule's pool, another slot took the account, the batch newly includes an
+ *  account there, or a quarantined occupant was replaced. */
 export interface SlotSeat {
   slot: SlotId;
   /** The account the slot held, or null for a login no stored account is. */
@@ -555,8 +559,8 @@ export type ImportRuleOutcome =
 
 /** What {@link SwitchEngine.importRules} decided (`plan`, the same decision
  *  {@link SwitchEngine.planImportRules} reports), what it then did with each spec it wrote
- *  (`outcomes`, undefined for one it did not write), the slots it moved first, and the slots its
- *  seat step moved (see {@link ImportRulesPlan.seats}). */
+ *  (`outcomes`, undefined for one it did not write), the slots it moved off accounts its rules now
+ *  reserve, and the rules' slots it put on other accounts (see {@link ImportRulesPlan.seats}). */
 export interface ImportRulesResult {
   plan: ImportRulesPlan;
   outcomes: Array<ImportRuleOutcome | undefined>;
@@ -679,8 +683,9 @@ export interface RuleLiveResult {
    *  be silent). */
   clearedSquatter?: boolean;
   /** Set by an import's seat step when it left the slot as it was although the slot should have
-   *  moved: sessions run under the rule (this many), and the move the import decided on could not
-   *  be made, so it moved the slot nowhere else and cleared nothing. */
+   *  moved (a slot holding a login no account here is): sessions run under the rule (this many),
+   *  and the move the import decided on could not be made, so it moved the slot nowhere else and
+   *  cleared nothing. */
   heldForSessions?: number;
 }
 
@@ -692,12 +697,6 @@ export interface SlotHandOff {
   from: string;
   /** The account the slot now holds. */
   to: string;
-  /**
-   * Set only by an import, for a slot it moved for a rule it then did not bring in (another slot
-   * could not take the account chosen for it) and could not move back: why the switch back failed.
-   * The account the slot left is then not reserved; the move happened all the same.
-   */
-  stranded?: string;
 }
 
 /** What {@link SwitchEngine.includeInFolder} / {@link SwitchEngine.includeInAlias} did — reported so

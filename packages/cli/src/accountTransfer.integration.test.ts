@@ -12,7 +12,6 @@ import { Readable } from 'node:stream';
 import {
   CredentialStore,
   FileCredentialChannel,
-  ImportInterruptedError,
   InsecurePassthroughProtector,
   LockTimeoutError,
   RefreshError,
@@ -20,6 +19,7 @@ import {
   Vault,
   VaultError,
   acquireLock,
+  folderBindingsPath,
   groupProfileDir,
   ruleSlotId,
   sandboxPaths,
@@ -910,6 +910,37 @@ describe('--move hands over only what it can', () => {
     expect(a.out.join('')).toContain(
       "Could not remove alt: it is the live account of this machine's main login",
     );
+  });
+
+  it('keeps an account live in a folder slot that sessions run in', async () => {
+    const a = await machine();
+    const u = await a.engine.addAccount('u', bundle('U1', 'u-u'));
+    const x = await a.engine.addAccount('x', bundle('X1', 'u-x'));
+    await a.engine.addAccount('z', bundle('Z1', 'u-z'));
+    await a.engine.activate(u.id);
+    const p = await folder(a, 'p');
+    const made = await a.engine.includeInFolder(p, [x.id]);
+    const slot = ruleSlotId(made.rule.id);
+    expect(await a.engine.getActiveId(slot)).toBe(x.id);
+    await mkdir(join(a.paths.claudeDir, 'sessions'), { recursive: true });
+    await writeFile(
+      join(a.paths.claudeDir, 'sessions', 'running.json'),
+      JSON.stringify({ pid: process.pid, cwd: p }),
+    );
+
+    const res = await runExport(
+      join(a.root, 'm'),
+      { ...exportAll, move: true, yes: true, accounts: 'x' },
+      a.deps,
+    );
+    expect(res.failed).toBe(1);
+    expect(a.out.join('')).toContain(`Could not remove x: it is live in the folder slot of ${p}`);
+    expect(await a.engine.getActiveId(slot)).toBe(x.id);
+    expect((await a.engine.listAllAccounts()).map((acc) => acc.label).sort()).toEqual([
+      'u',
+      'x',
+      'z',
+    ]);
   });
 
   it('keeps a quarantined account, whose tokens did not travel', async () => {
@@ -3162,11 +3193,12 @@ describe('slots the seat step moves, and an import stopped part-way', () => {
     expect(await b.engine.listRules()).toHaveLength(1);
   });
 
-  it('reports the slots an import moved before it stopped, and brings the guard up to date', async () => {
+  it('reports what an import stopped part-way got done, and brings the guard up to date', async () => {
     const b = await machine();
     const x = await b.engine.addAccount('x', bundle('X1', 'u-x'));
-    const y = await b.engine.addAccount('y', bundle('Y1', 'u-y'));
+    await b.engine.addAccount('y', bundle('Y1', 'u-y'));
     await b.engine.activate(x.id);
+    const p = await folder(b, 'p');
     const file = await sealedFile(
       b,
       filePayload({
@@ -3174,50 +3206,38 @@ describe('slots the seat step moves, and an import stopped part-way', () => {
           { label: 'x', accountUuid: 'u-x', autoSwitchExcluded: false },
           { label: 'y', accountUuid: 'u-y', autoSwitchExcluded: false },
         ],
-        rules: [
-          {
-            label: 'p',
-            folders: [await folder(b, 'p')],
-            aliases: [],
-            include: ['u-x'],
-            exclude: [],
-          },
-        ],
+        rules: [{ label: 'p', folders: [p], aliases: [], include: ['u-x'], exclude: [] }],
       }),
     );
-    b.deps.engine = engineWith(b.engine, {
-      importRules: () =>
-        Promise.reject(
-          new ImportInterruptedError(
-            [{ slot: 'global', from: x.id, to: y.id }],
-            [],
-            new Error('the disk went away'),
-          ),
-        ),
-    });
+    // The guard snapshot cannot be written, the last step: a folder stands where the file goes.
+    const snapshot = folderBindingsPath(b.paths.vaultDir);
+    await rm(snapshot, { force: true });
+    await mkdir(join(snapshot, 'in-the-way'), { recursive: true });
 
     b.out.length = 0;
     expect(await importInto(b, file)).toEqual({ failed: 1 });
     const report = b.out.join('');
+    expect(report).toContain(`folder ${p}: created, include x`);
+    expect(report).not.toContain('not imported');
     expect(report).toContain('the global slot switched off x (now reserved) and is on y');
-    expect(report).toContain('the import stopped part-way (the disk went away)');
+    expect(report.match(/the import stopped part-way/g) ?? []).toHaveLength(1);
+    expect(report).not.toContain('running it again finishes it');
+    expect(await b.engine.listRules()).toHaveLength(1);
     expect(b.guardRuns).toBe(1);
   });
 
   /**
    * a is the main login, rule q (which excludes c) runs on b, and the file's one rule p includes a
    * and b: the global slot is to move a -> c and q's slot b -> d. d's token will not refresh, so q's
-   * slot cannot move and p is not imported. `failing` names the refresh tokens that fail from then
-   * on; `aExpired` gives a a token that has to be refreshed whenever a slot is switched to it.
+   * slot cannot move and p is not imported.
    */
-  async function refusedAfterAMove(aExpired: boolean): Promise<{
+  async function refusedAfterAMove(): Promise<{
     b: Machine;
     file: string;
     ids: Record<'a' | 'b' | 'c', string>;
     p: string;
     q: string;
     qSlot: ReturnType<typeof ruleSlotId>;
-    failing: Set<string>;
   }> {
     const failing = new Set<string>();
     const b = await machine(
@@ -3229,10 +3249,7 @@ describe('slots the seat step moves, and an import stopped part-way', () => {
             : Promise.resolve({ ...cur, accessToken: 'NETWORK-' + cur.accessToken }),
       },
     );
-    const a = await b.engine.addAccount(
-      'a',
-      bundle('A1', 'u-a', aExpired ? Date.now() - HOUR : undefined),
-    );
+    const a = await b.engine.addAccount('a', bundle('A1', 'u-a'));
     const bb = await b.engine.addAccount('b', bundle('B1', 'u-b'));
     const c = await b.engine.addAccount('c', bundle('C1', 'u-c'));
     await b.engine.addAccount('d', bundle('D1', 'u-d', Date.now() - HOUR));
@@ -3259,11 +3276,11 @@ describe('slots the seat step moves, and an import stopped part-way', () => {
     expect(dry).toContain('  the global slot moves off a onto c');
     expect(dry).toContain(`  the folder slot of ${q} moves off b onto d`);
     b.out.length = 0;
-    return { b, file, ids: { a: a.id, b: bb.id, c: c.id }, p, q, qSlot, failing };
+    return { b, file, ids: { a: a.id, b: bb.id, c: c.id }, p, q, qSlot };
   }
 
-  it('puts the main login back when the rule it moved it for is not imported', async () => {
-    const { b, file, ids, p, qSlot } = await refusedAfterAMove(false);
+  it('never moves the main login for a rule that is then not imported', async () => {
+    const { b, file, ids, p, qSlot } = await refusedAfterAMove();
 
     expect(await importInto(b, file)).toEqual({ failed: 1 });
     const report = b.out.join('');
@@ -3276,21 +3293,33 @@ describe('slots the seat step moves, and an import stopped part-way', () => {
     expect(b.guardRuns).toBe(0);
   });
 
-  it('says the main login stayed moved, and why, when it cannot be put back', async () => {
-    const { b, file, ids, p, qSlot, failing } = await refusedAfterAMove(true);
-    failing.add('r-A1');
-
-    expect(await importInto(b, file)).toEqual({ failed: 1 });
-    const report = b.out.join('');
-    expect(report).toContain(`folder ${p}: not imported - cannot include "b"`);
-    expect(report).toContain(
-      'the global slot switched off a for a rule that was then not imported, and is on c: it ' +
-        'could not be switched back (network error during token refresh)',
+  it('keeps the login an account brought without tokens already runs here', async () => {
+    const b = await machine();
+    await b.engine.addAccount('g', bundle('G1', 'u-g'));
+    // n's own login runs on the main login, and was never stored here.
+    await writeFile(
+      b.paths.credentialsPath,
+      JSON.stringify({ claudeAiOauth: bundle('N-LIVE', 'u-n').claudeAiOauth }),
     );
-    expect(report).not.toContain('(now reserved)');
-    expect(await b.engine.getActiveId('global')).toBe(ids.c);
-    expect(await b.engine.getActiveId(qSlot)).toBe(ids.b);
-    expect(await b.engine.listRules()).toHaveLength(1);
-    expect(b.guardRuns).toBe(1);
+    await writeFile(
+      b.paths.claudeJsonPath,
+      JSON.stringify({ oauthAccount: { accountUuid: 'u-n', emailAddress: 'u-n@x.com' } }),
+    );
+    const p = await folder(b, 'p');
+    const file = await sealedFile(
+      b,
+      filePayload({
+        accounts: [{ label: 'n', accountUuid: 'u-n', autoSwitchExcluded: false }],
+        rules: [{ label: 'p', folders: [p], aliases: [], include: ['u-n'], exclude: [] }],
+      }),
+    );
+
+    expect(await importInto(b, file)).toEqual({ failed: 0 });
+    const report = b.out.join('');
+    expect(report).toContain('the global slot switched off n (now reserved) and is on g');
+    expect(report).not.toContain('cctl accounts relogin');
+    const n = (await b.engine.listAllAccounts()).find((acc) => acc.label === 'n')!;
+    expect(n.quarantined).toBeFalsy();
+    expect((await b.vault.readBundle(n.id)).claudeAiOauth.refreshToken).toBe('r-N-LIVE');
   });
 });

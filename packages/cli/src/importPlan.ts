@@ -920,25 +920,23 @@ export function ruleLines(
   }
 }
 
-/** The line a slot the rules move gets: in the plan (`plan`), or as made (`done`). A slot the run
- *  moved for a rule it then did not bring in, and could not switch back, says that instead: the
- *  account it left is not reserved. */
+/** The line a slot the rules move off an account they reserve gets: in the plan (`plan`), or as
+ *  made (`done`). An import moves such a slot only once the rule reserving the account is written,
+ *  so the account it left is reserved by then. */
 export function handOffLine(hand: SlotHandOff, tense: 'plan' | 'done', names: ReportNames): string {
   const slot = safe(names.slotName(hand.slot));
   const from = safe(names.labelOf(hand.from));
   const to = safe(names.labelOf(hand.to));
   if (tense === 'plan') return `${slot} moves off ${from} onto ${to}`;
-  return hand.stranded !== undefined
-    ? `${slot} switched off ${from} for a rule that was then not imported, and is on ${to}: it ` +
-        `could not be switched back (${safe(hand.stranded)})`
-    : `${slot} switched off ${from} (now reserved) and is on ${to}`;
+  return `${slot} switched off ${from} (now reserved) and is on ${to}`;
 }
 
-/** The line a folder slot the seat step moves gets: in the plan (`plan`), or as made (`done`). A
- *  slot holding a login no account here is recognized as names it so. */
+/** The line a folder slot the import puts on another account (or none) gets: in the plan
+ *  (`plan`), or as made (`done`). A slot holding a login no account here is recognized as names it
+ *  so. */
 export function seatLine(seat: SlotSeat, tense: 'plan' | 'done', names: ReportNames): string {
   const slot = safe(names.slotName(seat.slot));
-  const from = seat.from === null ? 'a login no account here is' : safe(names.labelOf(seat.from));
+  const from = seat.from === null ? 'a login of no account here' : safe(names.labelOf(seat.from));
   if (seat.to === null) {
     return tense === 'plan'
       ? `${slot} will be left with no account (${from} is signed out of it)`

@@ -17,6 +17,8 @@ import type { ExportPayload, ExportedAccount, ExportedRule } from './exportPaylo
 import {
   planImport,
   renderImportPlan,
+  seatLine,
+  type ReportNames,
   type AccountStep,
   type FolderLookup,
   type PlanInput,
@@ -1094,5 +1096,30 @@ describe('planImport: accounts a rule of the file reserves', () => {
     expect(await at('win32')).toContain(
       "cctl accounts include 'bob''s work (2)' lets auto-switch use it",
     );
+  });
+});
+
+describe('seatLine', () => {
+  const names: ReportNames = {
+    labelOf: (id) => id,
+    slotName: () => 'the folder slot of work/p',
+    platform: 'linux',
+  };
+
+  it('reads as a sentence for a slot holding a login no account here is', () => {
+    const cases = [
+      seatLine({ slot: 'global', from: null, to: null }, 'plan', names),
+      seatLine({ slot: 'global', from: null, to: null }, 'done', names),
+      seatLine({ slot: 'global', from: null, to: 'k' }, 'plan', names),
+      seatLine({ slot: 'global', from: null, to: 'k' }, 'done', names),
+    ];
+    expect(cases).toEqual([
+      'the folder slot of work/p will be left with no account (a login of no account here is ' +
+        'signed out of it)',
+      'the folder slot of work/p was left with no account (a login of no account here was ' +
+        'signed out of it)',
+      'the folder slot of work/p will run on k instead of a login of no account here',
+      'the folder slot of work/p now runs on k instead of a login of no account here',
+    ]);
   });
 });
