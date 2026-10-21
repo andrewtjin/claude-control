@@ -647,4 +647,12 @@ describe('computePlan — the slot the plan is for', () => {
       computePlan([live, folder, spare], opts),
     );
   });
+
+  it('says the slot can use none of them, not that none exist, when every account is outside it', () => {
+    const plan = computePlan([folder], { ...opts, slotAccountIds: new Set() });
+    expect(plan.recommendedAccountId).toBeNull();
+    expect(plan.reason).not.toMatch(/no accounts configured/i);
+    expect(plan.reason).toMatch(/no account the global slot can switch to/i);
+    expect(plan.ranking.map((r) => r.accountId)).toEqual(['m1']);
+  });
 });
