@@ -91,6 +91,7 @@ import {
   leaseSessionPids,
   occupantCount,
   occupantsPhrase,
+  operatorRules,
   sameHolder,
   sameHolderProcess,
   withHolders,
@@ -3118,10 +3119,13 @@ export class SwitchEngine {
     const claimed = new Set<string>();
     for (const [i, spec] of specs.entries()) {
       if (!open(i)) continue;
+      // A parallel session is no rule of any machine's: it never carries a file's identity.
       const same =
         spec.origin === undefined
           ? []
-          : stored.rules.filter((r) => r.origin === spec.origin || r.id === spec.origin);
+          : operatorRules(stored.rules).filter(
+              (r) => r.origin === spec.origin || r.id === spec.origin,
+            );
       if (same.length > 1) {
         refuse(
           i,
@@ -3168,7 +3172,9 @@ export class SwitchEngine {
           return false;
         }
         if (stored.reserved.some((a) => a.id === id)) {
-          leftOut.push({ id, why: 'reserved-here' });
+          // Reserved by nothing but its parallel session, it is shared again once that ends.
+          const leased = rulesIncluding(id, stored.rules).every(isLeaseRule);
+          leftOut.push({ id, why: leased ? 'leased-here' : 'reserved-here' });
           return false;
         }
         return true;
@@ -3190,8 +3196,10 @@ export class SwitchEngine {
       } else if (into === undefined && include.length + exclude.length === 0) {
         verdicts[i] = {
           kind: 'unchanged',
-          reason:
-            'another rule here reserves every account it excludes, so it would change nothing',
+          reason: leftOut.every((l) => l.why === 'leased-here')
+            ? 'a parallel session runs on every account it excludes, so it would change nothing ' +
+              'now; import again once the session ends'
+            : 'another rule here reserves every account it excludes, so it would change nothing',
           leftOut,
         };
       }

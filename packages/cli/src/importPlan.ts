@@ -818,6 +818,7 @@ const LEFT_OUT_WHY = {
   'excluded-here': 'the rule here excludes it',
   'included-here': 'the rule here includes it',
   'reserved-here': 'another rule here reserves it',
+  'leased-here': 'a parallel session runs on it here; import again once it ends',
 } as const;
 
 /** What follows a rule's members on its line: its name (for a rule it creates), members the file

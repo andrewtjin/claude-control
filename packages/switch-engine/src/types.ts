@@ -535,10 +535,11 @@ export interface PlanImportRulesOptions extends ImportRulesOptions {
 
 /** A member of a rule an import leaves out, and why: the rule here it grows excludes (or
  *  includes) the account already, or another rule here reserves an account to be excluded (only a
- *  shared account can be excluded). */
+ *  shared account can be excluded), or a parallel session runs on it, which holds it out of the
+ *  shared pool only until it ends. */
 export interface ImportLeftOut {
   id: string;
-  why: 'excluded-here' | 'included-here' | 'reserved-here';
+  why: 'excluded-here' | 'included-here' | 'reserved-here' | 'leased-here';
 }
 
 /** The scope that keeps a rule of the file from landing whole: held by a rule of this machine (a
