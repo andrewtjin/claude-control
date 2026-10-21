@@ -709,17 +709,21 @@ describe('cctl usage and timeline: an account reserved to a folder rule', () => 
   const HOUR = 3_600_000;
   type Limit = { kind: 'session' | 'weekly_all'; percent: number; resetsAt: number };
 
-  /** One live snapshot per account in the sandbox's daemon.db, the way the daemon's poll writes it. */
-  function seedUsage(rows: Array<{ id: string; label: string; limits: Limit[] }>): void {
+  /** One live snapshot per row in the sandbox's daemon.db, the way the daemon's poll writes it,
+   *  taken now or at the row's `atMs`. */
+  function seedUsage(
+    rows: Array<{ id: string; label: string; limits: Limit[]; atMs?: number }>,
+  ): void {
     const store = new Store(daemonDbPath());
     try {
       for (const r of rows) {
+        const fetchedAtMs = r.atMs ?? Date.now();
         const json = {
           accountId: r.id,
           label: r.label,
           active: false,
           source: 'live',
-          fetchedAtMs: Date.now(),
+          fetchedAtMs,
           limits: r.limits.map((l) => ({
             kind: l.kind,
             percent: l.percent,
@@ -729,7 +733,7 @@ describe('cctl usage and timeline: an account reserved to a folder rule', () => 
         };
         store.insertUsageSnapshot({
           accountId: r.id,
-          fetchedAtMs: Date.now(),
+          fetchedAtMs,
           source: 'live',
           json: JSON.stringify(json),
         });
@@ -794,16 +798,50 @@ describe('cctl usage and timeline: an account reserved to a folder rule', () => 
     expect(r.out).not.toMatch(/E \(folder\) has the most available headroom/);
   });
 
-  it('counts its plan capacity in the pacing line, as the phone does', async () => {
+  it('keeps it out of the pacing runway, and shows what it holds on a row of its own', async () => {
     engine.listAllAccounts.mockResolvedValue([
       { ...A, rateLimitTier: 'default_claude_max_20x' },
       { ...E, rateLimitTier: 'default_claude_max_5x' },
     ]);
     for (const cmd of ['usage', 'timeline']) {
       const r = await runCli([cmd]);
-      // 20u for A plus 5u for E; without E the fleet reads 20u.
-      expect(r.out).toMatch(/of 25u/);
+      // A's 20u is what the global slot can spend; E's 5u (94% of it left) is its folder's alone.
+      expect(r.out).toContain('left     12u of 20u (60%)');
+      expect(r.out).toContain('folders  +4.7u of 5u in E (folder-only)');
     }
+  });
+
+  it("measures the runway's burn over the shared accounts only", async () => {
+    engine.listAllAccounts.mockResolvedValue([
+      { ...A, rateLimitTier: 'default_claude_max_20x' },
+      { ...E, rateLimitTier: 'default_claude_max_5x' },
+    ]);
+    const now = Date.now();
+    // Over the last two days A spent 30% of a 20x week (6u) and E 90% of a 5x week (4.5u), whose
+    // reset then brought it down to the 6% seeded above.
+    seedUsage([
+      {
+        id: 'a',
+        label: 'A',
+        atMs: now - 48 * HOUR,
+        limits: [{ kind: 'weekly_all', percent: 10, resetsAt: now + 50 * HOUR }],
+      },
+      {
+        id: 'e',
+        label: 'E',
+        atMs: now - 48 * HOUR,
+        limits: [{ kind: 'weekly_all', percent: 0, resetsAt: now + 140 * HOUR }],
+      },
+      {
+        id: 'e',
+        label: 'E',
+        atMs: now - 24 * HOUR,
+        limits: [{ kind: 'weekly_all', percent: 90, resetsAt: now + 140 * HOUR }],
+      },
+    ]);
+    const r = await runCli(['usage']);
+    // A's 6u over the 3-day burn window against its 20u/7d refill; E's 4.5u would make it 3.5u.
+    expect(r.out).toContain('(2u/2.9u burned per day)');
   });
 });
 

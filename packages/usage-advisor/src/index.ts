@@ -52,6 +52,7 @@ export {
   PACING_HORIZON_DAYS,
   PLAIN_PACING_STYLE,
   type AccountPacing,
+  type FolderReserve,
   type Pacing,
   type PacingExclusion,
   type PacingOptions,

@@ -159,13 +159,20 @@ export function renderUsage(
  *  also feeds the Discord embed's own (separately-rendered, prose) pacing field from the same
  *  snapshot — only the compact CLI presentation lives here. Takes an already-adapted
  *  `PacingStyle` (see `ansi.ts`'s `pacingStyle`), the same shape `renderOutlook` takes for its
- *  own `OutlookStyle` — one adaptation convention, not two. */
+ *  own `OutlookStyle` — one adaptation convention, not two. `folderInputs` are the accounts
+ *  reserved to folder rules: kept out of `inputs` (the runway), they get their own row. */
 export function renderPacingLine(
   inputs: AccountUsageInput[],
   options: PacingOptions,
   style: PacingStyle = PLAIN_PACING_STYLE,
+  folderInputs: AccountUsageInput[] = [],
 ): string {
-  return renderPacingSummary(computePacing(inputs, options), options.nowMs, style);
+  return renderPacingSummary(
+    computePacing(inputs, options),
+    options.nowMs,
+    style,
+    folderInputs.length > 0 ? computePacing(folderInputs, { nowMs: options.nowMs }) : undefined,
+  );
 }
 
 /** "· 3d left", or "· 3d left (predicted)" — whole days until this account's weekly reset.
