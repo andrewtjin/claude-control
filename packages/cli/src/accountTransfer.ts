@@ -1458,7 +1458,7 @@ export function buildTransferCommands(program: Command): void {
     .option('--yes', 'with --move, remove without asking')
     .option(
       '--passphrase-file <file>',
-      `read the passphrase from a file (else ${PASSPHRASE_ENV}, else ask)`,
+      `read the passphrase from the first line of a file (else ${PASSPHRASE_ENV}, else ask)`,
     )
     .action(
       async (
@@ -1490,8 +1490,8 @@ export function buildTransferCommands(program: Command): void {
     .command('import <file>')
     .description(
       'add the accounts, rules and settings of a file written by cctl export (- for standard ' +
-        'input); each rule lands whole, growing the rule an earlier import of it made, or fails ' +
-        'naming the rule here in its way',
+        'input); each rule lands whole: it grows the rule an earlier import of it made, is created, ' +
+        'is skipped, or fails naming the rule here in its way',
     )
     .option(
       '--dry-run',
@@ -1504,7 +1504,7 @@ export function buildTransferCommands(program: Command): void {
     )
     .option(
       '--passphrase-file <file>',
-      `read the passphrase from a file (else ${PASSPHRASE_ENV}, else ask)`,
+      `read the passphrase from the first line of a file (else ${PASSPHRASE_ENV}, else ask)`,
     )
     .action(
       async (
