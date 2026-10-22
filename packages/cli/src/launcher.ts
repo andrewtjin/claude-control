@@ -32,7 +32,12 @@
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { existsSync as nodeExistsSync, readFileSync as nodeReadFileSync } from 'node:fs';
 import { extname, posix, win32 } from 'node:path';
-import { aliasKey, canonicalizeFolder, isWithin } from '@claude-control/switch-engine';
+import {
+  aliasKey,
+  canonicalizeFolder,
+  isWithin,
+  withProfileMemoryBase,
+} from '@claude-control/switch-engine';
 
 /** How to invoke a resolved claude candidate, or why we refuse to. */
 export type LaunchTarget =
@@ -203,11 +208,16 @@ export interface BuildLaunchEnvOptions {
   /** For a global slot: whether an inherited CLAUDE_CONFIG_DIR points into the profiles root and so
    *  must be dropped (see {@link configDirPointsIntoProfiles}). Ignored for a group slot. */
   dropInheritedConfigDir: boolean;
+  /** cctl's profiles root: a group slot's session gets the memory base its profile needs (see
+   *  withProfileMemoryBase). */
+  profilesRoot: string;
 }
 
 /**
  * Build the child environment for a launch. A group slot pins CLAUDE_CONFIG_DIR to the group's
- * profile (that IS the account). A global slot inherits the parent env untouched EXCEPT that a
+ * profile (that IS the account) and gives the session the main dir as its memory base, so Claude
+ * Code saves its memory without asking (see withProfileMemoryBase, which also drops a memory base
+ * any other launch inherited). A global slot inherits the parent env untouched EXCEPT that a
  * CLAUDE_CONFIG_DIR pointing into the profiles root is dropped — otherwise a launch from a shell
  * that still has a previous `cctl claude` group session's var set would silently reuse that group's
  * account instead of the global one.
@@ -232,7 +242,7 @@ export function buildLaunchEnv(opts: BuildLaunchEnvOptions): NodeJS.ProcessEnv {
     delete env.CLAUDE_CONFIG_DIR;
   }
   if (opts.overrideToken !== undefined) env.CCTL_BIND_OVERRIDE = opts.overrideToken;
-  return env;
+  return withProfileMemoryBase(env, opts.profilesRoot);
 }
 
 /**

@@ -2,10 +2,17 @@
 // relocates the ENTIRE config — both .credentials.json and .claude.json — while the
 // default (unset) case keeps .claude.json in the home dir.
 
-import { homedir } from 'node:os';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { defaultPaths, groupProfileDir, profilesRoot } from './paths.js';
+import {
+  MEMORY_BASE_ENV,
+  defaultPaths,
+  groupProfileDir,
+  profilesRoot,
+  withProfileMemoryBase,
+} from './paths.js';
 import { groupProfileDir as indexGroupProfileDir } from './index.js';
 
 describe('defaultPaths', () => {
@@ -182,5 +189,139 @@ describe('defaultPaths from inside a group profile', () => {
       readFile: noSnapshot,
     });
     expect(norm(paths.claudeDir)).toBe(norm(root));
+  });
+});
+
+// Claude Code saves `.md` files in a session's own memory dir without asking, unless that path runs
+// through a link. A profile's `projects` is a link to the main dir's, so a folder-bound session must
+// be given the main dir as its memory base: the same files, reached with no link.
+describe('withProfileMemoryBase', () => {
+  const lad = join('C:', 'Users', 'me', 'AppData', 'Local');
+  const root = join(lad, 'claude-control', 'profiles');
+  const profile = join(root, 'g-123');
+  const main = join('C:', 'Users', 'me', '.claude');
+  const norm = (s: string | undefined): string | undefined =>
+    s?.replace(/[\\/]+/g, '/').replace(/\/$/, '');
+  /** A readlink that reports the profile's projects junction the way Windows does. */
+  const junction = (p: string): string => {
+    expect(norm(p)).toBe(norm(join(profile, 'projects')));
+    return '\\\\?\\' + join(main, 'projects') + '\\';
+  };
+  const mustNotRead = (): string => {
+    throw new Error('must not read');
+  };
+
+  it('names the main dir the projects link lands in as the memory base', () => {
+    const env = withProfileMemoryBase({ CLAUDE_CONFIG_DIR: profile, PATH: 'p' }, root, 'win32', {
+      readlink: junction,
+    });
+    expect(norm(env[MEMORY_BASE_ENV])).toBe(norm(main));
+    expect(env.CLAUDE_CONFIG_DIR).toBe(profile);
+    expect(env.PATH).toBe('p');
+  });
+
+  it('does not change the env it was given', () => {
+    const input = { CLAUDE_CONFIG_DIR: profile };
+    withProfileMemoryBase(input, root, 'win32', { readlink: junction });
+    expect(input).toEqual({ CLAUDE_CONFIG_DIR: profile });
+  });
+
+  it('matches the profile case-blind and with a trailing separator on Windows', () => {
+    const env = withProfileMemoryBase(
+      { CLAUDE_CONFIG_DIR: profile.toUpperCase() + '\\' },
+      root,
+      'win32',
+      { readlink: () => join(main, 'projects') },
+    );
+    expect(norm(env[MEMORY_BASE_ENV])).toBe(norm(main));
+  });
+
+  it('replaces an inherited memory base for a profile', () => {
+    const env = withProfileMemoryBase(
+      { CLAUDE_CONFIG_DIR: profile, [MEMORY_BASE_ENV]: 'D:\\elsewhere' },
+      root,
+      'win32',
+      { readlink: junction },
+    );
+    expect(norm(env[MEMORY_BASE_ENV])).toBe(norm(main));
+  });
+
+  it('follows a relative POSIX symlink', () => {
+    const env = withProfileMemoryBase(
+      { CLAUDE_CONFIG_DIR: '/data/claude-control/profiles/g-1' },
+      '/data/claude-control/profiles',
+      'linux',
+      // Relative to the dir holding the link, the profile: up to /, then down to the main dir.
+      { readlink: () => '../../../../home/me/.claude/projects' },
+    );
+    expect(env[MEMORY_BASE_ENV]).toBe('/home/me/.claude');
+  });
+
+  it('returns the env as given with no CLAUDE_CONFIG_DIR, reading nothing', () => {
+    const input = { PATH: 'p' };
+    expect(withProfileMemoryBase(input, root, 'win32', { readlink: mustNotRead })).toBe(input);
+    const blank = { CLAUDE_CONFIG_DIR: '  ' };
+    expect(withProfileMemoryBase(blank, root, 'win32', { readlink: mustNotRead })).toBe(blank);
+  });
+
+  // Every process inherits the variable, so one a profile session left behind must not follow a
+  // session on any other config dir: a sandboxed CLAUDE_CONFIG_DIR would still save its memory in
+  // the real main dir.
+  it('drops an inherited memory base from every env that is not a linked profile', () => {
+    const einval = (): string => {
+      throw new Error('EINVAL');
+    };
+    for (const configDir of [undefined, main, join(profile, 'nested'), profile]) {
+      const input: NodeJS.ProcessEnv = { PATH: 'p', [MEMORY_BASE_ENV]: main };
+      if (configDir !== undefined) input.CLAUDE_CONFIG_DIR = configDir;
+      const env = withProfileMemoryBase(input, root, 'win32', { readlink: einval });
+      expect(MEMORY_BASE_ENV in env).toBe(false);
+      expect(env.PATH).toBe('p');
+      expect(env.CLAUDE_CONFIG_DIR).toBe(configDir);
+      // The env given is never changed.
+      expect(input[MEMORY_BASE_ENV]).toBe(main);
+    }
+  });
+
+  it('leaves a config dir outside the profiles root alone, reading nothing', () => {
+    for (const dir of [main, join(lad, 'claude-control', 'profiles-not', 'g-1'), root]) {
+      const input = { CLAUDE_CONFIG_DIR: dir };
+      expect(withProfileMemoryBase(input, root, 'win32', { readlink: mustNotRead })).toBe(input);
+    }
+  });
+
+  it('leaves a dir inside a profile alone (Claude Code keys memory on the config dir itself)', () => {
+    const input = { CLAUDE_CONFIG_DIR: join(profile, 'nested') };
+    expect(withProfileMemoryBase(input, root, 'win32', { readlink: mustNotRead })).toBe(input);
+  });
+
+  it('leaves the env alone when projects is not a link, or links somewhere not named projects', () => {
+    const notLink = { CLAUDE_CONFIG_DIR: profile };
+    const einval = (): string => {
+      throw new Error('EINVAL');
+    };
+    expect(withProfileMemoryBase(notLink, root, 'win32', { readlink: einval })).toBe(notLink);
+    const odd = { CLAUDE_CONFIG_DIR: profile };
+    expect(
+      withProfileMemoryBase(odd, root, 'win32', { readlink: () => join(main, 'history') }),
+    ).toBe(odd);
+  });
+
+  // The real filesystem: a junction on Windows, a directory symlink elsewhere, read by the default
+  // readlink, as a launch reads the profile cctl made.
+  it('reads a real projects link', () => {
+    const base = mkdtempSync(join(tmpdir(), 'cctl-membase-'));
+    try {
+      const realMain = join(base, 'main');
+      mkdirSync(join(realMain, 'projects'), { recursive: true });
+      const realRoot = join(base, 'profiles');
+      const realProfile = join(realRoot, 'g-1');
+      mkdirSync(realProfile, { recursive: true });
+      symlinkSync(join(realMain, 'projects'), join(realProfile, 'projects'), 'junction');
+      const env = withProfileMemoryBase({ CLAUDE_CONFIG_DIR: realProfile }, realRoot);
+      expect(norm(env[MEMORY_BASE_ENV])?.toLowerCase()).toBe(norm(realMain)?.toLowerCase());
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });

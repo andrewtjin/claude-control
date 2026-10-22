@@ -20,6 +20,9 @@ import {
   defaultPaths,
   defaultProtector,
   folderBindingsPath,
+  MEMORY_BASE_ENV,
+  profilesRoot,
+  withProfileMemoryBase,
   type Logger,
   type Paths,
   type Protector,
@@ -169,12 +172,16 @@ export function dpapiIdentityStore(filePath: string, protector: Protector): Iden
  * it only drops an inherited CLAUDE_CONFIG_DIR that names a group profile so a global session is
  * not silently redirected onto a group's account.
  *
+ * `profRoot` (cctl's profiles root) lets a folder-bound session save auto memory without asking:
+ * its env gets the memory base its profile needs (see withProfileMemoryBase).
+ *
  * `create` is injectable so the composition-root wiring (configDir → deps) can be verified
  * without constructing the real SDK client; it defaults to the live adapter.
  */
 export function makeAgentSdkClientFactory(
   logger: Logger,
   create: (deps: CreateAgentSdkClientDeps) => AgentSdkClient = createAgentSdkClient,
+  profRoot?: string,
 ): (configDir?: string, scrubInheritedConfigDir?: boolean) => AgentSdkClient {
   return (configDir?: string, scrubInheritedConfigDir?: boolean) =>
     create({
@@ -187,6 +194,17 @@ export function makeAgentSdkClientFactory(
       // A folder-bound spawn passes the group's profile dir; pin the session's CLAUDE_CONFIG_DIR
       // to it so the session runs on the group's live member, not the global account.
       ...(configDir !== undefined ? { configDirForAccount: () => configDir } : {}),
+      // The SDK builds the session env from baseEnv plus that CLAUDE_CONFIG_DIR; seeding baseEnv
+      // from the same dir carries the profile's memory base through.
+      ...(configDir !== undefined && profRoot !== undefined
+        ? {
+            baseEnv: withProfileMemoryBase(
+              { ...process.env, CLAUDE_CONFIG_DIR: configDir },
+              profRoot,
+              process.platform,
+            ),
+          }
+        : {}),
       ...(scrubInheritedConfigDir ? { scrubInheritedConfigDir: true } : {}),
     });
 }
@@ -256,6 +274,10 @@ export async function runShutdownSequence(steps: ShutdownSequence): Promise<void
  *  deliberately never awaited here. The process then stays alive on the hook receiver's
  *  server + the control-plane socket until Ctrl+C. */
 export async function runDaemon(options: DaemonRunOptions): Promise<void> {
+  // A daemon started from a folder-bound session's shell inherits that session's memory base, and
+  // a global session the daemon starts takes this process's env as is. The base belongs to the
+  // profile only; makeAgentSdkClientFactory gives folder-bound sessions their own.
+  delete process.env[MEMORY_BASE_ENV];
   const paths: Paths = defaultPaths();
   const dataDir = dirname(paths.vaultDir);
   // Last-breath crash visibility: the daemon died silently once and nothing said why or
@@ -583,6 +605,9 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
         settingsPath,
         hooks: buildDaemonHookSpecs({ secret: hookSecret, forwarderPath }),
         ownedCommandMarker: DEFAULT_SECRET_HEADER,
+        // Every profile dir, read without the rules so a registry that fails to load still gets the
+        // forwarder; only those sharing main's inode are touched.
+        profileSettingsPaths: resolveGuardProfileSettingsPaths(paths.vaultDir, [], false),
       });
       // Reconcile the enforcement guard beside the forwarder, keyed off whether any folder is bound.
       // Without this the guard is never installed and folder rules are recorded but never enforced
@@ -611,7 +636,11 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     scanTranscripts: (sinceMs) => readTranscriptTurns({ claudeDir: paths.claudeDir, sinceMs }),
     // Real SDK adapter with the daemon's logger on the accountId fall-through — see
     // makeAgentSdkClientFactory for the shared-config/hot-swap tradeoff behind its deps.
-    createAgentSdkClient: makeAgentSdkClientFactory(logger),
+    createAgentSdkClient: makeAgentSdkClientFactory(
+      logger,
+      createAgentSdkClient,
+      profilesRoot(paths.vaultDir),
+    ),
     // A session's custom title and recorded folder, read from its one transcript under this config
     // dir, so a phone spawn that resumes a NAMED session, and a named background session the mover
     // considers, land on that alias's rule (see resolveSessionRuleFor).

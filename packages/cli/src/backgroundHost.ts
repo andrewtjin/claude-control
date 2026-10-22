@@ -83,8 +83,10 @@ import {
 } from '@claude-control/daemon';
 import {
   LockTimeoutError,
+  MEMORY_BASE_ENV,
   acquireLock,
   profilesRoot,
+  withProfileMemoryBase,
   type Paths,
 } from '@claude-control/switch-engine';
 import { findClaudeOnPath, resolveLaunchTarget } from './launcher.js';
@@ -742,14 +744,19 @@ export function createClaudeBackgroundHost(
 
   /** The environment for a command against a config dir's service: this process's, minus session
    *  markers and any CLAUDE_CONFIG_DIR it inherited, with the one that names that service. One main
-   *  config dir for every read and every command: the files read are the service talked to. */
+   *  config dir for every read and every command: the files read are the service talked to. A
+   *  profile's service gets the memory base its sessions need (see withProfileMemoryBase): the
+   *  service it starts runs every session it hosts in this environment. */
   const envFor = (configDir: string | null): NodeJS.ProcessEnv => {
     const env: NodeJS.ProcessEnv = { ...baseEnv };
     for (const key of SESSION_MARKERS) delete env[key];
     delete env.CLAUDE_CONFIG_DIR;
+    delete env[MEMORY_BASE_ENV];
     const named = configEnv(configDir);
     if (named !== undefined) env.CLAUDE_CONFIG_DIR = named;
-    return env;
+    return options.profilesRoot === undefined
+      ? env
+      : withProfileMemoryBase(env, options.profilesRoot, platform);
   };
 
   /** Run a command and require exit 0; otherwise fail with what Claude Code said. */
