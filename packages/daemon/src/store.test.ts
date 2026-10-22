@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -756,6 +757,59 @@ describe('Store migration', () => {
       store.close();
     }
   });
+
+  it(
+    'waits out another process holding the write lock instead of failing that migration',
+    { timeout: 30_000 },
+    async () => {
+      const dbPath = join(dir, 'daemon.db');
+      new Store(dbPath).close();
+      const legacy = new DatabaseSync(dbPath);
+      legacy.exec('DROP TABLE session_slot_spans');
+      legacy.close();
+      // Another process (the running daemon, in production) is mid-commit when this build's first
+      // open has a table to add. It says when it holds the lock and, on committing, when it did.
+      const holder = spawn(process.execPath, [
+        '--no-warnings',
+        '-e',
+        `const { DatabaseSync } = require('node:sqlite');
+         const db = new DatabaseSync(${JSON.stringify(dbPath)});
+         db.exec('BEGIN IMMEDIATE');
+         console.log('locked');
+         setTimeout(() => {
+           db.exec('COMMIT');
+           console.log('committed ' + Date.now());
+           db.close();
+         }, 3000);`,
+      ]);
+      let output = '';
+      holder.stdout.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+      });
+      // 'close' rather than 'exit': it fires only once the output has been read in full.
+      const closed = new Promise((resolve) => holder.once('close', resolve));
+      await new Promise<void>((resolve, reject) => {
+        holder.stdout.once('data', () => resolve());
+        holder.once('error', reject);
+        void closed.then((code) => reject(new Error(`lock holder exited first (${String(code)})`)));
+      });
+      const openingAt = Date.now();
+      const store = new Store(dbPath);
+      const openedAt = Date.now();
+      try {
+        // It waited for the commit rather than throwing `database is locked`, then migrated.
+        expect(store.listSessionSlotSpans()).toEqual([]);
+      } finally {
+        store.close();
+        await closed;
+      }
+      // Timed against the holder's own commit, not against when its output reached this process:
+      // the open began while the lock was held and finished only once it was released.
+      const committedAt = Number(/committed (\d+)/.exec(output)?.[1]);
+      expect(openingAt).toBeLessThan(committedAt);
+      expect(openedAt).toBeGreaterThanOrEqual(committedAt);
+    },
+  );
 
   it('keeps recorded slot spans across a reopen', () => {
     const dbPath = join(dir, 'daemon.db');

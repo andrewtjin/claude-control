@@ -32,6 +32,7 @@ import {
   isOverloadCode,
   parsePastedCode,
   resolveAccountRef,
+  type AccountView,
   type StoredAccount,
 } from '@claude-control/switch-engine';
 import {
@@ -405,7 +406,8 @@ export function buildProgram(): Command {
     .action(async () => {
       await healAccounts(buildEngine());
       const nowMs = Date.now();
-      const state = await readUsageState(nowMs);
+      const fleet = await readUsageState(nowMs);
+      const state = withFolderTags(fleet);
       const rows: UsageRow[] = state.accounts.map((a) => {
         // The prediction is measured here, from the same history the pacing line below reads,
         // and handed to the row: an account whose endpoint reset has already passed has no
@@ -421,14 +423,9 @@ export function buildProgram(): Command {
       });
       let text = renderUsage(rows, nowMs, detectPalette());
       // Pacing needs the same weekly-limit view the burn plan uses (accountId + quarantine
-      // state), which UsageRow doesn't carry — build it separately rather than widen UsageRow
-      // for one trailing line.
-      const inputs = buildAdvisorInputs(state);
-      if (inputs.length > 0) {
-        text +=
-          '\n\n' +
-          renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
-      }
+      // state), which UsageRow doesn't carry — `renderPacing` builds it separately rather than
+      // widen UsageRow for one trailing block.
+      if (fleet.accounts.length > 0) text += '\n\n' + renderPacing(fleet, nowMs);
       text += await renderFolderRulesAppendix(buildEngine(), detectPalette());
       const banner = await exhaustionBanner(await cliAutoSwitchPolicy(), nowMs);
       process.stdout.write((banner !== undefined ? `${banner}\n\n` : '') + text + '\n');
@@ -440,8 +437,8 @@ export function buildProgram(): Command {
     .action(async () => {
       await healAccounts(buildEngine());
       const nowMs = Date.now();
-      const state = await readUsageState(nowMs);
-      const inputs = buildAdvisorInputs(state);
+      const fleet = await readUsageState(nowMs);
+      const inputs = buildAdvisorInputs(withFolderTags(fleet));
       const outlook = computeOutlook(inputs, nowMs);
       const autoSwitchPolicy = await cliAutoSwitchPolicy();
       const banner = await exhaustionBanner(autoSwitchPolicy, nowMs);
@@ -470,9 +467,7 @@ export function buildProgram(): Command {
               slotAccountIds: await globalSlotAccountsNow(),
             }),
           );
-        text +=
-          '\n\n' +
-          renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
+        text += '\n\n' + renderPacing(fleet, nowMs);
       }
       // What each folder rule runs on, so a folder burning its own accounts shows beside the plan.
       text += await renderFolderRulesAppendix(buildEngine(), detectPalette());
@@ -1325,23 +1320,25 @@ async function readStatusSummary(): Promise<SetupSummary> {
  *  a not-yet-created db just yields an empty one. A corrupt snapshot row is skipped, never
  *  fatal. */
 interface UsageState {
-  accounts: StoredAccount[];
+  accounts: AccountView[];
   activeId: string | null;
   usageFor: (accountId: string) => AccountUsage | undefined;
   /** Next weekly reset predicted from stored history, for accounts the endpoint has stopped
    *  publishing one for. Absent when the account has no observed reset in history at all. */
   predictedResetFor: (accountId: string) => number | undefined;
-  /** Fleet burn in Pro-equivalent units/day, or undefined when history cannot measure one. */
+  /** The shared accounts' burn in Pro-equivalent units/day, or undefined when history cannot
+   *  measure one. Accounts reserved to folder rules are left out: see `renderPacing`. */
   burnUnitsPerDay: number | undefined;
 }
 
-/** The usage view's state: the shared accounts, the global live account and each account's latest
- *  snapshot. `only` names the accounts to read instead (the outage judgement reads the whole fleet,
- *  reserved accounts included). */
-async function readUsageState(nowMs: number, only?: StoredAccount[]): Promise<UsageState> {
+/** The usage view's state: the whole fleet (shared accounts and those reserved to folder rules,
+ *  the set the daemon polls, so each account's numbers match the phone's), the global live
+ *  account and each account's latest snapshot. `fleet` is the registry's accounts when the caller
+ *  has already read them. */
+async function readUsageState(nowMs: number, fleet?: AccountView[]): Promise<UsageState> {
   const engine = buildEngine();
   const [accounts, activeId] = await Promise.all([
-    only !== undefined ? Promise.resolve(only) : engine.listAccounts(),
+    fleet !== undefined ? Promise.resolve(fleet) : engine.listAllAccounts(),
     engine.getActiveId(),
   ]);
   const store = new Store(daemonDbPath());
@@ -1356,23 +1353,62 @@ async function readUsageState(nowMs: number, only?: StoredAccount[]): Promise<Us
         // a corrupt row must not crash the whole view
       }
     }
-    // The same measurement the daemon makes each poll cycle, over the same store and the one
-    // implementation — so a number the CLI prints can never disagree with the one the phone got.
-    const history = readFleetHistory(
-      store,
-      accounts.map((a) => ({ accountId: a.id, ...resolvedWeight(a) })),
-      nowMs,
-    );
+    // The measurement the daemon makes each poll cycle, over the same store and the one
+    // implementation, so each account's predicted reset matches the phone's. The burn is the shared
+    // accounts' alone, the pool whose runway pacing judges; the reserved ones are read apart only
+    // for their resets.
+    const historyOf = (subset: AccountView[]) =>
+      readFleetHistory(
+        store,
+        subset.map((a) => ({ accountId: a.id, ...resolvedWeight(a) })),
+        nowMs,
+      );
+    const pool = historyOf(accounts.filter((a) => !isReserved(a)));
+    const folders = historyOf(accounts.filter(isReserved));
     return {
       accounts,
       activeId,
       usageFor: (accountId) => byId.get(accountId),
-      predictedResetFor: (accountId) => history.predictedResetByAccount.get(accountId),
-      burnUnitsPerDay: history.burnUnitsPerDay,
+      predictedResetFor: (accountId) =>
+        pool.predictedResetByAccount.get(accountId) ??
+        folders.predictedResetByAccount.get(accountId),
+      burnUnitsPerDay: pool.burnUnitsPerDay,
     };
   } finally {
     store.close();
   }
+}
+
+/** True for an account reserved to folder rules: only the folders that include it can use it. */
+function isReserved(account: AccountView): boolean {
+  return (account.ruleIds ?? []).length > 0;
+}
+
+/** `usage` and `timeline`'s copy of the state, with every account reserved to a folder rule
+ *  labeled "<label> (folder)": it is listed like any other account, but only the folders that
+ *  include it can use it, and the global plan never sends the global slot there. */
+function withFolderTags(state: UsageState): UsageState {
+  return {
+    ...state,
+    accounts: state.accounts.map((a) =>
+      isReserved(a) ? { ...a, label: `${a.label} (folder)` } : a,
+    ),
+  };
+}
+
+/** The pacing block under `usage` and `timeline`. Its runway is the shared accounts' (the pool the
+ *  global slot draws on, whose burn `readUsageState` measures): an account reserved to a folder
+ *  rule adds only the "folders" row, since no global session can spend what it holds. Takes the
+ *  untagged state, so that row names each reserved account by its own label. */
+function renderPacing(state: UsageState, nowMs: number): string {
+  const reserved = new Set(state.accounts.filter(isReserved).map((a) => a.id));
+  const inputs = buildAdvisorInputs(state);
+  return renderPacingLine(
+    inputs.filter((i) => !reserved.has(i.accountId)),
+    { nowMs, ...burnOption(state) },
+    pacingStyle(detectPalette()),
+    inputs.filter((i) => reserved.has(i.accountId)),
+  );
 }
 
 /** Build the advisor's `AccountUsageInput` view shared by `timeline`'s outlook/plan and both

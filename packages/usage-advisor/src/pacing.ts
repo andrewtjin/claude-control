@@ -22,7 +22,7 @@
 //                    at reset rather than banked.
 //   - at reset     = the account returns to its full allowance and whatever it still held is
 //                    LOST. Modelling that loss is what produces the waste figure, which is the
-//                    single most actionable output: "use tjin.29 before Friday or lose a week
+//                    single most actionable output: "use main.01 before Friday or lose a week
 //                    of it" is advice a ratio can never give.
 //
 // Every input the simulation cannot see is reported as a note rather than assumed away: an
@@ -427,7 +427,7 @@ interface WasteByAccount {
 }
 
 /** Aggregate waste events PER ACCOUNT rather than per reset: an account that wastes at two
- *  resets inside the horizon is one decision ("use tjin.29"), not two, and naming it twice
+ *  resets inside the horizon is one decision ("use main.01"), not two, and naming it twice
  *  buries the other accounts. */
 function wasteByAccount(waste: PacingWaste[]): WasteByAccount[] {
   const byAccount = new Map<string, WasteByAccount>();
@@ -471,7 +471,7 @@ function rankWasteByDeadline(waste: PacingWaste[]): WasteByAccount[] {
   );
 }
 
-/** "38u expires unused within 14d: 20u on tjin.29 in 6d, 18u on legoboy in 5d 3h." The named
+/** "38u expires unused within 14d: 20u on main.01 in 6d, 18u on standby in 5d 3h." The named
  *  entries are capped, but the remainder is COUNTED in the sentence, never dropped. */
 function wasteNote(
   waste: PacingWaste[],
@@ -609,7 +609,7 @@ const ROW_LABEL_WIDTH = 7;
  *
  *   Pacing  [ok] sustainable past 14d (6u/11.4u burned per day)
  *     left     54u of 80u (67%)
- *     expires  jina25 9.6u in 4d 1h, then 2 more - 72u total over 14d
+ *     expires  work-2 9.6u in 4d 1h, then 2 more - 72u total over 14d
  *     1u = one Pro account-week (a Max 20x counts 20)
  *
  * EVERY NUMBER IS LABELLED, which the first compact version did not manage: it printed
@@ -632,6 +632,10 @@ const ROW_LABEL_WIDTH = 7;
  * own per-account rows (quarantine included), but `cctl usage` prints nothing of the sort, so on
  * that surface this block is the only pacing signal there is: anything that stops the fleet from
  * being measurable at all has to survive compaction here, or the operator is told nothing.
+ *
+ * `folders` is the pacing of the accounts reserved to folder rules, computed apart from `pacing`:
+ * only their folders can spend what they hold, so it gets its own row (see `folderRow`) and never
+ * enters the totals the verdict is judged on.
  */
 export function renderPacingSummary(
   pacing: Pick<
@@ -650,11 +654,24 @@ export function renderPacingSummary(
   >,
   nowMs: number,
   style: PacingStyle = PLAIN_PACING_STYLE,
+  folders?: FolderReserve,
 ): string {
+  // Built where it prints, like every other segment: the style hooks run in display order. The
+  // legend speaks for the runway's accounts only; the folders row states its own fallback.
+  const legend = (): string => `  ${style.dim(unitLegend(pacing.tiersUnknown))}`;
   // No contributing account, so there are no totals to print — but "no data" and "the data is
   // fine and every account is locked out" are opposite situations with opposite fixes, and only
-  // the accounts themselves say which one this is.
-  if (pacing.capacityUnits <= 0) return renderNoCapacity(pacing.accounts, style);
+  // the accounts themselves say which one this is. What the folders hold is still worth a row,
+  // and with no shared account at all the runway is empty for want of one, not of data.
+  if (pacing.capacityUnits <= 0) {
+    const reserve = folderRow(folders, style);
+    if (reserve === undefined) return renderNoCapacity(pacing.accounts, style);
+    const none =
+      pacing.accounts.length === 0
+        ? 'Pacing: no shared account, so the global slot has nothing to spend.'
+        : renderNoCapacity(pacing.accounts, style);
+    return [none, reserve, legend()].join('\n');
+  }
 
   const pct = Math.round((pacing.availableUnits / pacing.capacityUnits) * 100);
   const marker =
@@ -691,9 +708,41 @@ export function renderPacingSummary(
     const expiring = renderExpiring(pacing.waste, pacing.wastedUnits, pacing.horizonDays, nowMs);
     if (expiring !== undefined) rows.push(row('expires', style.waste(expiring), style));
   }
-  rows.push(`  ${style.dim(unitLegend(pacing.tiersUnknown))}`);
+  const reserve = folderRow(folders, style);
+  if (reserve !== undefined) rows.push(reserve);
+  rows.push(legend());
 
   return [head, ...rows].join('\n');
+}
+
+/** The pacing of the accounts reserved to folder rules, as `renderPacingSummary` takes it. */
+export type FolderReserve = Pick<
+  Pacing,
+  'availableUnits' | 'capacityUnits' | 'accounts' | 'tiersUnknown'
+>;
+
+/** "folders  +4.7u of 5u in research (folder-only)": what the accounts reserved to folder rules
+ *  still hold, named, so a reader sees that capacity exists and why the runway above leaves it
+ *  out. A reserved account of unknown plan tier counts 1u, said here rather than in the legend,
+ *  which describes the runway. Undefined when none of them contributes. */
+function folderRow(folders: FolderReserve | undefined, style: PacingStyle): string | undefined {
+  if (folders === undefined || folders.capacityUnits <= 0) return undefined;
+  const holders = folders.accounts.filter((a) => a.contributing);
+  const named = holders
+    .slice(0, MAX_NAMED_ACCOUNTS)
+    .map((a) => a.label)
+    .join(', ');
+  const rest = holders.length - MAX_NAMED_ACCOUNTS;
+  const pct = Math.round((folders.availableUnits / folders.capacityUnits) * 100);
+  const held = `+${units(folders.availableUnits)} of ${units(folders.capacityUnits)}`;
+  const note = folders.tiersUnknown
+    ? 'folder-only; unknown plan tier counted as 1u'
+    : 'folder-only';
+  return row(
+    'folders',
+    `${style.percent(held, 100 - pct)} in ${named}${rest > 0 ? ` +${rest}` : ''} (${note})`,
+    style,
+  );
 }
 
 /** One labelled row, padded on the PLAIN label so the value columns align regardless of style. */
@@ -719,7 +768,7 @@ function burnFraction(
   return ` (${style.percent(text, shareOfRefill)})`;
 }
 
-/** "jina25 9.6u in 4d 1h, then 2 more - 72u total over 14d".
+/** "work-2 9.6u in 4d 1h, then 2 more - 72u total over 14d".
  *
  *  The named account is the one whose budget expires FIRST, paired with ITS OWN loss and ITS OWN
  *  deadline. That pairing is the load-bearing part: an earlier version printed the fleet-wide

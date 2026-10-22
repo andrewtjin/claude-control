@@ -19,10 +19,10 @@ import {
   type FolderRule,
   type PoolEntry,
 } from '@claude-control/switch-engine';
-import { BIND_GUARD_MARKER } from '@claude-control/daemon';
+import { BIND_GUARD_MARKER, Store } from '@claude-control/daemon';
 import { backgroundHostOptions, createClaudeBackgroundHost } from './backgroundHost.js';
 import { buildProgram } from './program.js';
-import { CliFailure, reportFatal } from './context.js';
+import { CliFailure, daemonDbPath, reportFatal } from './context.js';
 import type { SettingsReport } from './settings.js';
 
 // Every path the commands resolve (vault, profiles, the guard's settings.json, daemon.db) lands in a
@@ -630,7 +630,7 @@ describe('cctl accounts list', () => {
       subscriptionType: 'team',
       rateLimitTier: 'default_claude_max_5x',
       billingType: 'stripe_subscription',
-      subscriptionCreatedAt: '2026-09-20T22:09:56.946Z',
+      subscriptionCreatedAt: '2026-09-20T12:00:00.000Z',
     };
     // A shared twin with identical signals: whatever the shared table says, the reserved row says.
     const twin = account('t', { label: 'T', emailAddress: 't@example.com', ...signals });
@@ -702,6 +702,220 @@ describe('cctl timeline plan', () => {
     expect(r.exited).toBe(false);
     expect(r.out).not.toContain('F has the most available headroom');
     expect(r.out).toContain('G has the most available headroom');
+  });
+});
+
+describe('cctl usage and timeline: an account reserved to a folder rule', () => {
+  const HOUR = 3_600_000;
+  /** A limit as the endpoint reports it; `resetsAt` is absent once a weekly window has closed. */
+  type Limit = { kind: 'session' | 'weekly_all'; percent: number; resetsAt?: number };
+
+  /** One live snapshot per row in the sandbox's daemon.db, the way the daemon's poll writes it,
+   *  taken now or at the row's `atMs`. */
+  function seedUsage(
+    rows: Array<{ id: string; label: string; limits: Limit[]; atMs?: number }>,
+  ): void {
+    const store = new Store(daemonDbPath());
+    try {
+      for (const r of rows) {
+        const fetchedAtMs = r.atMs ?? Date.now();
+        const json = {
+          accountId: r.id,
+          label: r.label,
+          active: false,
+          source: 'live',
+          fetchedAtMs,
+          limits: r.limits.map((l) => ({
+            kind: l.kind,
+            percent: l.percent,
+            ...(l.resetsAt !== undefined ? { resetsAt: new Date(l.resetsAt).toISOString() } : {}),
+            isActive: true,
+          })),
+        };
+        store.insertUsageSnapshot({
+          accountId: r.id,
+          fetchedAtMs,
+          source: 'live',
+          json: JSON.stringify(json),
+        });
+      }
+    } finally {
+      store.close();
+    }
+  }
+
+  // A live globally (40% of its week gone), E reserved to the research folder and live in its slot.
+  beforeEach(() => {
+    const now = Date.now();
+    engine.listAllAccounts.mockResolvedValue([A, E]);
+    engine.getActiveId.mockResolvedValue('a');
+    engine.listRules.mockResolvedValue([ruleOn(research, { include: ['e'], activeId: 'e' })]);
+    engine.liveSlots.mockResolvedValue(
+      new Map([
+        ['global', 'a'],
+        ['group:r1', 'e'],
+      ]),
+    );
+    seedUsage([
+      {
+        id: 'a',
+        label: 'A',
+        limits: [{ kind: 'weekly_all', percent: 40, resetsAt: now + 50 * HOUR }],
+      },
+      {
+        id: 'e',
+        label: 'E',
+        limits: [
+          { kind: 'session', percent: 6, resetsAt: now + 4 * HOUR },
+          { kind: 'weekly_all', percent: 6, resetsAt: now + 140 * HOUR },
+        ],
+      },
+    ]);
+  });
+
+  it('usage lists it with its own numbers, labeled (folder), and never marks it live globally', async () => {
+    const r = await runCli(['usage']);
+    expect(r.exited).toBe(false);
+    const lines = r.out.split('\n');
+    const e = lines.find((l) => l.includes('E (folder)'));
+    expect(e).toBeDefined();
+    expect(e).toContain('5h 6%');
+    expect(e).toContain('week 6%');
+    expect(e?.startsWith(' ')).toBe(true);
+    expect(lines.find((l) => l.includes('A  ('))?.startsWith('*')).toBe(true);
+  });
+
+  it('timeline gives it a budget line, a track and its resets, labeled (folder)', async () => {
+    const r = await runCli(['timeline']);
+    expect(r.exited).toBe(false);
+    expect(r.out).toMatch(/ E \(folder\)\s+window open \(6% used, resets in /);
+    expect(r.out).toMatch(/ E \(folder\)\s+\|/);
+    expect(r.out).toMatch(/in [^\n]+ E \(folder\)\s+5h window resets \(6% used clears\)/);
+  });
+
+  it('timeline never plans the global slot onto it, though it has the most headroom', async () => {
+    const r = await runCli(['timeline']);
+    expect(r.out).toContain('A has the most available headroom');
+    expect(r.out).not.toMatch(/E \(folder\) has the most available headroom/);
+  });
+
+  it('keeps it out of the pacing runway, and shows what it holds on a row of its own', async () => {
+    engine.listAllAccounts.mockResolvedValue([
+      { ...A, rateLimitTier: 'default_claude_max_20x' },
+      { ...E, rateLimitTier: 'default_claude_max_5x' },
+    ]);
+    for (const cmd of ['usage', 'timeline']) {
+      const r = await runCli([cmd]);
+      // A's 20u is what the global slot can spend; E's 5u (94% of it left) is its folder's alone.
+      expect(r.out).toContain('left     12u of 20u (60%)');
+      expect(r.out).toContain('folders  +4.7u of 5u in E (folder-only)');
+    }
+  });
+
+  it("measures the runway's burn over the shared accounts only", async () => {
+    engine.listAllAccounts.mockResolvedValue([
+      { ...A, rateLimitTier: 'default_claude_max_20x' },
+      { ...E, rateLimitTier: 'default_claude_max_5x' },
+    ]);
+    const now = Date.now();
+    // Over the last two days A spent 30% of a 20x week (6u) and E 90% of a 5x week (4.5u), whose
+    // reset then brought it down to the 6% seeded above.
+    seedUsage([
+      {
+        id: 'a',
+        label: 'A',
+        atMs: now - 48 * HOUR,
+        limits: [{ kind: 'weekly_all', percent: 10, resetsAt: now + 50 * HOUR }],
+      },
+      {
+        id: 'e',
+        label: 'E',
+        atMs: now - 48 * HOUR,
+        limits: [{ kind: 'weekly_all', percent: 0, resetsAt: now + 140 * HOUR }],
+      },
+      {
+        id: 'e',
+        label: 'E',
+        atMs: now - 24 * HOUR,
+        limits: [{ kind: 'weekly_all', percent: 90, resetsAt: now + 140 * HOUR }],
+      },
+    ]);
+    const r = await runCli(['usage']);
+    // A's 6u over the 3-day burn window against its 20u/7d refill; E's 4.5u would make it 3.5u.
+    expect(r.out).toContain('(2u/2.9u burned per day)');
+  });
+
+  it('says the global slot has no shared account when every account is reserved', async () => {
+    engine.listAllAccounts.mockResolvedValue([{ ...E, rateLimitTier: 'default_claude_max_5x' }]);
+    engine.getActiveId.mockResolvedValue(null);
+    for (const cmd of ['usage', 'timeline']) {
+      const r = await runCli([cmd]);
+      expect(r.exited).toBe(false);
+      expect(r.out).toContain(
+        'Pacing: no shared account, so the global slot has nothing to spend.',
+      );
+      expect(r.out).toContain('folders  +4.7u of 5u in E (folder-only)');
+      expect(r.out).not.toContain('no usage data yet');
+    }
+  });
+
+  it('predicts its weekly reset from history once the endpoint stops reporting one', async () => {
+    const now = Date.now();
+    // The last reset seen was a day ago; the newest reading carries none, as after a window closes.
+    seedUsage([
+      {
+        id: 'e',
+        label: 'E',
+        atMs: now - 48 * HOUR,
+        limits: [{ kind: 'weekly_all', percent: 3, resetsAt: now - 24 * HOUR }],
+      },
+      {
+        id: 'e',
+        label: 'E',
+        atMs: now + 1_000,
+        limits: [{ kind: 'weekly_all', percent: 6 }],
+      },
+    ]);
+    const r = await runCli(['usage']);
+    expect(r.out.split('\n').find((l) => l.includes('E (folder)'))).toMatch(/left \(predicted\)$/);
+  });
+});
+
+describe('cctl stats: a folder session on a reserved account', () => {
+  it("bills the session's turns to the account live in its rule's slot, by its recorded slot", async () => {
+    const t0 = Date.now() - 3_600_000;
+    const session = 'sess-research';
+    const paths = sandboxPaths(sandbox.root);
+    const dir = join(paths.claudeDir, 'projects', 'C--repos-research');
+    mkdirSync(dir, { recursive: true });
+    const turn = {
+      type: 'assistant',
+      timestamp: new Date(t0 + 60_000).toISOString(),
+      message: {
+        id: 'msg-1',
+        model: 'claude-opus-5-5',
+        usage: { input_tokens: 10, output_tokens: 20 },
+      },
+    };
+    writeFileSync(join(dir, `${session}.jsonl`), JSON.stringify(turn) + '\n');
+    const store = new Store(daemonDbPath());
+    try {
+      store.replaceActivationIntervals([
+        { accountId: 'a', startedAtMs: t0, endedAtMs: null, origin: null, slot: 'global' },
+        { accountId: 'e', startedAtMs: t0, endedAtMs: null, origin: null, slot: 'group:r1' },
+      ]);
+      store.recordSessionSlot(session, 'group:r1', t0);
+    } finally {
+      store.close();
+    }
+    engine.listAllAccounts.mockResolvedValue([A, E]);
+
+    const r = await runCli(['stats', '--days', '1']);
+    expect(r.exited).toBe(false);
+    const byAccount = r.out.split('By model')[0] ?? '';
+    // Labeled by name (the reserved row is in the label map), and not billed to the global A.
+    expect(byAccount).toMatch(/\nE\s+1\s/);
+    expect(byAccount).not.toMatch(/\nA\s/);
   });
 });
 

@@ -468,8 +468,9 @@ export function buildUsageEmbed(
 
 /** The "Pacing" field shared by `/usage` and `/timeline`: the fleet verdict layered on top of
  *  the account-by-account view above it, computed by the same pure model the CLI uses from the
- *  same snapshot both embeds already render from — so the phone and the terminal print the same
- *  sentence, not two independently-derived ones.
+ *  same snapshot both embeds already render from. One difference: this verdict counts every
+ *  account, while the terminal's runway counts only the shared ones and lists what accounts
+ *  reserved to folder rules hold on a row of its own.
  *
  *  The two inputs the model cannot derive from a moment (each account's predicted weekly reset
  *  and the fleet's measured burn rate) come from snapshot history, which only the daemon holds;

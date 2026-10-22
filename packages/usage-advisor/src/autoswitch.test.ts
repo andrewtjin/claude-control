@@ -422,7 +422,7 @@ describe('decideAutoSwitch — stale snapshots', () => {
 
   /** An active account whose weekly reads `percent` as of `fetchedAtMs`. */
   function activeAt(percent: number, fetchedAtMs?: number): AccountUsageInput {
-    return acct('debate', { active: true, ...(fetchedAtMs !== undefined ? { fetchedAtMs } : {}) }, [
+    return acct('backup', { active: true, ...(fetchedAtMs !== undefined ? { fetchedAtMs } : {}) }, [
       { kind: 'weekly_all', percent, resetsAt: NOW + 48 * H },
     ]);
   }
@@ -437,7 +437,7 @@ describe('decideAutoSwitch — stale snapshots', () => {
     const decision = decideAutoSwitch([activeAt(93, NOW - 2 * H), freshSpare()], NOW);
     expect(decision?.targetAccountId).toBe('spare');
     expect(decision?.reason).toContain(
-      'debate is at 93% of its weekly budget on usage data 2h old',
+      'backup is at 93% of its weekly budget on usage data 2h old',
     );
     expect(decision?.reason).toContain('hopping preemptively');
     expect(decision?.reason).toContain('spare has the soonest weekly reset');
@@ -474,7 +474,7 @@ describe('decideAutoSwitch — stale snapshots', () => {
     const decision = decideAutoSwitch([activeAt(96, NOW - 2 * H), freshSpare()], NOW);
     expect(decision?.targetAccountId).toBe('spare');
     expect(decision?.reason).toContain(
-      'debate is at 96% of its weekly budget — spare has the soonest',
+      'backup is at 96% of its weekly budget — spare has the soonest',
     );
     expect(decision?.reason).not.toContain('preemptively');
   });
