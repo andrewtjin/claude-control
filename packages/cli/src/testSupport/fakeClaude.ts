@@ -222,8 +222,16 @@ if (args[0] === 'agents') {
       refreshToken: o.refreshToken.replace(/~r[0-9.]+$/, '') + '~r' + process.pid + '.' + n,
       expiresAt: o.expiresAt + 60000 } };
     const tmp = credPath + '.tmp' + process.pid;
-    fs.writeFileSync(tmp, JSON.stringify(next));
-    fs.renameSync(tmp, credPath);
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(next));
+      fs.renameSync(tmp, credPath);
+    } catch {
+      // Windows refuses a rename onto a file another session on the same profile is replacing at
+      // that moment (EPERM, EBUSY). That rotation did not land, so it is not recorded; the next
+      // tick tries again, rather than the session dying with its login unrotated.
+      fs.rmSync(tmp, { force: true });
+      return;
+    }
     note();
   }, every);
   const after = Number(process.env.FAKE_EXIT_AFTER_MS || 0);

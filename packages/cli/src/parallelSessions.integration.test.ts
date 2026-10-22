@@ -450,9 +450,14 @@ describe('a parallel session, end to end', () => {
       l.proc.kill('SIGKILL');
       fake.kill('SIGKILL');
       await until(() => !running(l.proc.pid!) && !running(fake.pid!));
+      // A kill can land between the fake's rotation and its record of it, so the login the session
+      // left is the one on its profile, not the last one it recorded.
+      const left = JSON.parse(
+        await readFile(join(leaseProfile(w, w.W.id), '.credentials.json'), 'utf8'),
+      ) as { claudeAiOauth: { refreshToken: string } };
       const report = await w.engine.sweepLeases({ mode: 'full', probe: w.probe });
       expect(report.ended.map((e) => e.accountId)).toEqual([w.W.id]);
-      await expectEnded(w, w.W, (await fakeRecord(w, fake.pid!)).seen.at(-1)!);
+      await expectEnded(w, w.W, left.claudeAiOauth.refreshToken);
     },
   );
 
