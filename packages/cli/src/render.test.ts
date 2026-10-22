@@ -472,22 +472,32 @@ describe('renderPacingLine', () => {
       );
     });
 
-    it('still shows that row when no shared account has data', () => {
+    it('says there is no shared account, not no data, when every account is reserved', () => {
       expect(renderPacingLine([], { nowMs: NOW }, plain, [research])).toBe(
         [
-          'Pacing: no usage data yet.',
+          'Pacing: no shared account, so the global slot has nothing to spend.',
           '  folders  +4.7u of 5u in research (folder-only)',
           '  1u = one Pro account-week (a Max 20x counts 20)',
         ].join('\n'),
       );
     });
 
-    it('states the 1u fallback when one of their plan tiers is unknown', () => {
+    it('still says no data when the shared accounts have none yet', () => {
+      const unpolled = { ...input('a', 50, 3), limits: [] };
+      const line = renderPacingLine([unpolled], { nowMs: NOW }, plain, [research]);
+      expect(line.split('\n')[0]).toBe('Pacing: no usage data yet.');
+      expect(line).toContain('  folders  +4.7u of 5u in research (folder-only)');
+    });
+
+    it('states the 1u fallback on their row when one of their plan tiers is unknown', () => {
       const untiered: AccountUsageInput = { ...research };
       delete untiered.weight;
       const line = renderPacingLine([input('a', 50, 3)], { nowMs: NOW }, plain, [untiered]);
-      expect(line).toContain('  folders  +0.9u of 1u in research (folder-only)');
-      expect(line).toContain('plan tiers unknown, so every account counts 1u');
+      expect(line).toContain(
+        '  folders  +0.9u of 1u in research (folder-only; unknown plan tier counted as 1u)',
+      );
+      // The legend describes the runway, whose one account has a known tier.
+      expect(line).toContain('  1u = one Pro account-week (a Max 20x counts 20)');
     });
 
     it('prints no row when none of them contributes', () => {

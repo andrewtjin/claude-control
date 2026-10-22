@@ -656,16 +656,21 @@ export function renderPacingSummary(
   style: PacingStyle = PLAIN_PACING_STYLE,
   folders?: FolderReserve,
 ): string {
-  // Built where it prints, like every other segment: the style hooks run in display order.
-  const legend = (): string =>
-    `  ${style.dim(unitLegend(pacing.tiersUnknown || (folders?.tiersUnknown ?? false)))}`;
+  // Built where it prints, like every other segment: the style hooks run in display order. The
+  // legend speaks for the runway's accounts only; the folders row states its own fallback.
+  const legend = (): string => `  ${style.dim(unitLegend(pacing.tiersUnknown))}`;
   // No contributing account, so there are no totals to print — but "no data" and "the data is
   // fine and every account is locked out" are opposite situations with opposite fixes, and only
-  // the accounts themselves say which one this is. What the folders hold is still worth a row.
+  // the accounts themselves say which one this is. What the folders hold is still worth a row,
+  // and with no shared account at all the runway is empty for want of one, not of data.
   if (pacing.capacityUnits <= 0) {
-    const none = renderNoCapacity(pacing.accounts, style);
     const reserve = folderRow(folders, style);
-    return reserve !== undefined ? [none, reserve, legend()].join('\n') : none;
+    if (reserve === undefined) return renderNoCapacity(pacing.accounts, style);
+    const none =
+      pacing.accounts.length === 0
+        ? 'Pacing: no shared account, so the global slot has nothing to spend.'
+        : renderNoCapacity(pacing.accounts, style);
+    return [none, reserve, legend()].join('\n');
   }
 
   const pct = Math.round((pacing.availableUnits / pacing.capacityUnits) * 100);
@@ -718,7 +723,8 @@ export type FolderReserve = Pick<
 
 /** "folders  +4.7u of 5u in research (folder-only)": what the accounts reserved to folder rules
  *  still hold, named, so a reader sees that capacity exists and why the runway above leaves it
- *  out. Undefined when none of them contributes. */
+ *  out. A reserved account of unknown plan tier counts 1u, said here rather than in the legend,
+ *  which describes the runway. Undefined when none of them contributes. */
 function folderRow(folders: FolderReserve | undefined, style: PacingStyle): string | undefined {
   if (folders === undefined || folders.capacityUnits <= 0) return undefined;
   const holders = folders.accounts.filter((a) => a.contributing);
@@ -729,9 +735,12 @@ function folderRow(folders: FolderReserve | undefined, style: PacingStyle): stri
   const rest = holders.length - MAX_NAMED_ACCOUNTS;
   const pct = Math.round((folders.availableUnits / folders.capacityUnits) * 100);
   const held = `+${units(folders.availableUnits)} of ${units(folders.capacityUnits)}`;
+  const note = folders.tiersUnknown
+    ? 'folder-only; unknown plan tier counted as 1u'
+    : 'folder-only';
   return row(
     'folders',
-    `${style.percent(held, 100 - pct)} in ${named}${rest > 0 ? ` +${rest}` : ''} (folder-only)`,
+    `${style.percent(held, 100 - pct)} in ${named}${rest > 0 ? ` +${rest}` : ''} (${note})`,
     style,
   );
 }
