@@ -22,7 +22,7 @@
 //                    at reset rather than banked.
 //   - at reset     = the account returns to its full allowance and whatever it still held is
 //                    LOST. Modelling that loss is what produces the waste figure, which is the
-//                    single most actionable output: "use tjin.29 before Friday or lose a week
+//                    single most actionable output: "use main.01 before Friday or lose a week
 //                    of it" is advice a ratio can never give.
 //
 // Every input the simulation cannot see is reported as a note rather than assumed away: an
@@ -427,7 +427,7 @@ interface WasteByAccount {
 }
 
 /** Aggregate waste events PER ACCOUNT rather than per reset: an account that wastes at two
- *  resets inside the horizon is one decision ("use tjin.29"), not two, and naming it twice
+ *  resets inside the horizon is one decision ("use main.01"), not two, and naming it twice
  *  buries the other accounts. */
 function wasteByAccount(waste: PacingWaste[]): WasteByAccount[] {
   const byAccount = new Map<string, WasteByAccount>();
@@ -471,7 +471,7 @@ function rankWasteByDeadline(waste: PacingWaste[]): WasteByAccount[] {
   );
 }
 
-/** "38u expires unused within 14d: 20u on tjin.29 in 6d, 18u on legoboy in 5d 3h." The named
+/** "38u expires unused within 14d: 20u on main.01 in 6d, 18u on standby in 5d 3h." The named
  *  entries are capped, but the remainder is COUNTED in the sentence, never dropped. */
 function wasteNote(
   waste: PacingWaste[],
@@ -609,7 +609,7 @@ const ROW_LABEL_WIDTH = 7;
  *
  *   Pacing  [ok] sustainable past 14d (6u/11.4u burned per day)
  *     left     54u of 80u (67%)
- *     expires  jina25 9.6u in 4d 1h, then 2 more - 72u total over 14d
+ *     expires  work-2 9.6u in 4d 1h, then 2 more - 72u total over 14d
  *     1u = one Pro account-week (a Max 20x counts 20)
  *
  * EVERY NUMBER IS LABELLED, which the first compact version did not manage: it printed
@@ -759,7 +759,7 @@ function burnFraction(
   return ` (${style.percent(text, shareOfRefill)})`;
 }
 
-/** "jina25 9.6u in 4d 1h, then 2 more - 72u total over 14d".
+/** "work-2 9.6u in 4d 1h, then 2 more - 72u total over 14d".
  *
  *  The named account is the one whose budget expires FIRST, paired with ITS OWN loss and ITS OWN
  *  deadline. That pairing is the load-bearing part: an earlier version printed the fleet-wide

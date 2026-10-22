@@ -43,11 +43,11 @@ shows. Both write into the EXISTING vault entry — same account id, usage attri
 quarantine cleared — and both refuse if you log into a different account.
 Two accounts can never answer to one name. `cctl accounts add` refuses a label another
 account already has (in any case) and refuses a login that is already stored under another
-row (`this login is account … ("jina25"), which is already stored; run cctl accounts relogin
-jina25`). Rows created by an older build that broke this are resolved the next time
+row (`this login is account … ("work-2"), which is already stored; run cctl accounts relogin
+work-2`). Rows created by an older build that broke this are resolved the next time
 `cctl accounts list`, `cctl usage`, `cctl timeline` or the daemon runs: the same login stored
 twice is merged onto one row (the active one, else the most recently captured), and two
-logins under one label keep the earlier row's label while the later one becomes `jina25 (2)`.
+logins under one label keep the earlier row's label while the later one becomes `work-2 (2)`.
 Each repair is printed above the listing it precedes.
 
 ## Folder rules

@@ -143,32 +143,32 @@ describe('computePlan — burn-before-reset (the core behavior)', () => {
   });
 
   it('never treats an expiring SESSION window as burnable quota (the 5h window rolls back)', () => {
-    // The owner's real trio: legoboy's empty session resets soonest, but its weekly budget
-    // is safe for 7 days — the old algorithm said "burn legoboy"; the right call is to burn
-    // the soonest-expiring WEEKLY budgets: jina25 (9h) then tjin.29 (19h).
-    const legoboy = acct('lego', 'legoboy', [
+    // Three accounts: standby's empty session resets soonest, but its weekly budget
+    // is safe for 7 days — the old algorithm said "burn standby"; the right call is to burn
+    // the soonest-expiring WEEKLY budgets: work-2 (9h) then main.01 (19h).
+    const standby = acct('stby', 'standby', [
       { kind: 'session', percent: 1, resetsAt: NOW + 4 * HOUR },
       { kind: 'weekly_all', percent: 0, resetsAt: NOW + 7 * DAY },
     ]);
-    const jina = acct(
-      'jina',
-      'jina25',
+    const work2 = acct(
+      'work2',
+      'work-2',
       [
         { kind: 'session', percent: 5, resetsAt: NOW + 5 * HOUR },
         { kind: 'weekly_all', percent: 52, resetsAt: NOW + 9 * HOUR },
       ],
       { active: true },
     );
-    const tjin = acct('tjin', 'tjin.29', [
+    const main = acct('main', 'main.01', [
       { kind: 'session', percent: 0, resetsAt: NOW + 4 * HOUR },
       { kind: 'weekly_all', percent: 20, resetsAt: NOW + 19 * HOUR },
     ]);
-    const plan = computePlan([legoboy, jina, tjin], opts);
+    const plan = computePlan([standby, work2, main], opts);
 
-    expect(plan.recommendedAccountId).toBe('jina');
+    expect(plan.recommendedAccountId).toBe('work2');
     expect(plan.reason).toBe(
-      'Burn jina25 (48% weekly left, resets in 9h) → tjin.29 (80% weekly left, in 19h); ' +
-        'hold legoboy (weekly resets in 7d).',
+      'Burn work-2 (48% weekly left, resets in 9h) → main.01 (80% weekly left, in 19h); ' +
+        'hold standby (weekly resets in 7d).',
     );
     expect(plan.advisories).toEqual([]);
   });
@@ -595,7 +595,7 @@ describe('computePlan — determinism', () => {
 
 describe('computePlan — the scoped (Fable) weekly cap is not the weekly budget', () => {
   it('does not advertise fable-left as burnable when the shared weekly budget is empty', () => {
-    // Andrew's live case: fable quota remains, weekly_all has none. The near-empty account
+    // A live case: fable quota remains, weekly_all has none. The near-empty account
     // must not be recommended as a burn target on the strength of stranded fable quota.
     const stranded = acct('a', 'Stranded', [
       { kind: 'weekly_all', percent: 97 },

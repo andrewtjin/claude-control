@@ -420,14 +420,14 @@ describe('buildProgram', () => {
 
   it('prints what the duplicate-account heal did above the accounts listing', async () => {
     engine.dedupeAccounts.mockResolvedValueOnce({
-      merged: [{ label: 'jina25', keptId: 'keep-1', removedId: 'dup-2' }],
-      relabelled: [{ id: 'x-3', from: 'jina25', to: 'jina25 (2)' }],
+      merged: [{ label: 'work-2', keptId: 'keep-1', removedId: 'dup-2' }],
+      relabelled: [{ id: 'x-3', from: 'work-2', to: 'work-2 (2)' }],
     });
     const out = await run(['accounts', 'list']);
     expect(
       out.startsWith(
-        'merged duplicate account jina25: kept keep-1, removed dup-2 (the same login was stored twice)\n' +
-          'renamed account jina25 (x-3) to "jina25 (2)": another account already had that label\n',
+        'merged duplicate account work-2: kept keep-1, removed dup-2 (the same login was stored twice)\n' +
+          'renamed account work-2 (x-3) to "work-2 (2)": another account already had that label\n',
       ),
     ).toBe(true);
     // Nothing to heal prints nothing extra.
@@ -438,12 +438,12 @@ describe('buildProgram', () => {
   it("surfaces the vault's refusal of a duplicate on accounts add, not the no-login hint", async () => {
     engine.captureCurrentLogin.mockRejectedValueOnce(
       new VaultError(
-        '"jina25" already refers to account abc ("jina25"); two accounts answering to one name could not be told apart on switch',
+        '"work-2" already refers to account abc ("work-2"); two accounts answering to one name could not be told apart on switch',
       ),
     );
-    const r = await runCli(['accounts', 'add', 'jina25']);
+    const r = await runCli(['accounts', 'add', 'work-2']);
     expect(r.exited).toBe(true);
-    expect(r.err).toContain('error: "jina25" already refers to account abc ("jina25")');
+    expect(r.err).toContain('error: "work-2" already refers to account abc ("work-2")');
     expect(r.err).not.toContain('no live login');
     // Any other failure still reads as the capture finding nothing to store.
     engine.captureCurrentLogin.mockRejectedValueOnce(new Error('boom'));

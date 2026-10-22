@@ -10,7 +10,7 @@ function fakeVault(activeId: string | null, accountUuid?: string) {
         id === activeId
           ? {
               id,
-              label: 'legoboy',
+              label: 'standby',
               quarantined: false,
               createdAtMs: 0,
               updatedAtMs: 0,
