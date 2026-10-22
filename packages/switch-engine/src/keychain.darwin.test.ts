@@ -8,7 +8,7 @@ import { KeychainProtector } from './keychain.js';
 // the CLI's cross-app `Claude Code-credentials` item — so it needs no logged-in Claude account,
 // and because `security` created the item itself the read matches the item's own ACL principal
 // and raises no GUI prompt. The cross-app read, which is the part that may prompt, cannot be
-// exercised from a test and stays owner-run on hardware (docs/VERIFICATION.md gate 13).
+// exercised from a test and stays maintainer-run on hardware (docs/VERIFICATION.md gate 13).
 //
 // NON-DESTRUCTIVE: it uses the idempotent get-or-create key path, reusing an existing vault-key or
 // creating one exactly as cctl's first run would. It never deletes a key, so running it on a
