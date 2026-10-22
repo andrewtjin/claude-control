@@ -687,7 +687,8 @@ describe('cctl timeline plan', () => {
 
 describe('cctl usage and timeline: an account reserved to a folder rule', () => {
   const HOUR = 3_600_000;
-  type Limit = { kind: 'session' | 'weekly_all'; percent: number; resetsAt: number };
+  /** A limit as the endpoint reports it; `resetsAt` is absent once a weekly window has closed. */
+  type Limit = { kind: 'session' | 'weekly_all'; percent: number; resetsAt?: number };
 
   /** One live snapshot per row in the sandbox's daemon.db, the way the daemon's poll writes it,
    *  taken now or at the row's `atMs`. */
@@ -707,7 +708,7 @@ describe('cctl usage and timeline: an account reserved to a folder rule', () => 
           limits: r.limits.map((l) => ({
             kind: l.kind,
             percent: l.percent,
-            resetsAt: new Date(l.resetsAt).toISOString(),
+            ...(l.resetsAt !== undefined ? { resetsAt: new Date(l.resetsAt).toISOString() } : {}),
             isActive: true,
           })),
         };
@@ -822,6 +823,41 @@ describe('cctl usage and timeline: an account reserved to a folder rule', () => 
     const r = await runCli(['usage']);
     // A's 6u over the 3-day burn window against its 20u/7d refill; E's 4.5u would make it 3.5u.
     expect(r.out).toContain('(2u/2.9u burned per day)');
+  });
+
+  it('says the global slot has no shared account when every account is reserved', async () => {
+    engine.listAllAccounts.mockResolvedValue([{ ...E, rateLimitTier: 'default_claude_max_5x' }]);
+    engine.getActiveId.mockResolvedValue(null);
+    for (const cmd of ['usage', 'timeline']) {
+      const r = await runCli([cmd]);
+      expect(r.exited).toBe(false);
+      expect(r.out).toContain(
+        'Pacing: no shared account, so the global slot has nothing to spend.',
+      );
+      expect(r.out).toContain('folders  +4.7u of 5u in E (folder-only)');
+      expect(r.out).not.toContain('no usage data yet');
+    }
+  });
+
+  it('predicts its weekly reset from history once the endpoint stops reporting one', async () => {
+    const now = Date.now();
+    // The last reset seen was a day ago; the newest reading carries none, as after a window closes.
+    seedUsage([
+      {
+        id: 'e',
+        label: 'E',
+        atMs: now - 48 * HOUR,
+        limits: [{ kind: 'weekly_all', percent: 3, resetsAt: now - 24 * HOUR }],
+      },
+      {
+        id: 'e',
+        label: 'E',
+        atMs: now + 1_000,
+        limits: [{ kind: 'weekly_all', percent: 6 }],
+      },
+    ]);
+    const r = await runCli(['usage']);
+    expect(r.out.split('\n').find((l) => l.includes('E (folder)'))).toMatch(/left \(predicted\)$/);
   });
 });
 
