@@ -868,7 +868,7 @@ describe('derived account metadata is repaired from the stored bundle', () => {
       emailAddress: access + '@x.com',
       organizationRateLimitTier: PLAN_TIER,
       billingType: 'stripe_subscription',
-      subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+      subscriptionCreatedAt: '2026-07-15T12:00:00.000000Z',
     },
   });
 

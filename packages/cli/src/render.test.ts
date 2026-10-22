@@ -112,7 +112,7 @@ describe('renderAccountsTable', () => {
         [
           acct('id-1', 'Work', {
             billingType: 'stripe_subscription',
-            subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+            subscriptionCreatedAt: '2026-07-15T12:00:00.000000Z',
           }),
         ],
         null,
@@ -129,7 +129,7 @@ describe('renderAccountsTable', () => {
         [
           acct('id-1', 'Trialing', {
             billingType: 'stripe_subscription',
-            subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+            subscriptionCreatedAt: '2026-07-15T12:00:00.000000Z',
             claudeCodeTrialEndsAt: '2026-08-01T00:00:00.000Z',
           }),
         ],
@@ -241,7 +241,7 @@ describe('renderAccountsTable', () => {
       const accounts = [
         acct('id-1', 'Work', {
           billingType: 'stripe_subscription',
-          subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+          subscriptionCreatedAt: '2026-07-15T12:00:00.000000Z',
         }),
       ];
       const plain = renderAccountsTable(accounts, 'id-1', PLAIN_PALETTE, NOW);

@@ -610,7 +610,7 @@ describe('cctl accounts list', () => {
       subscriptionType: 'team',
       rateLimitTier: 'default_claude_max_5x',
       billingType: 'stripe_subscription',
-      subscriptionCreatedAt: '2026-09-20T22:09:56.946Z',
+      subscriptionCreatedAt: '2026-09-20T12:00:00.000Z',
     };
     // A shared twin with identical signals: whatever the shared table says, the reserved row says.
     const twin = account('t', { label: 'T', emailAddress: 't@example.com', ...signals });
