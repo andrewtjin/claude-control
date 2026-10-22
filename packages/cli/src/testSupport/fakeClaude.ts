@@ -198,7 +198,7 @@ if (args[0] === 'agents') {
   // An interactive session on CLAUDE_CONFIG_DIR's login, as Claude Code runs one: it reads the
   // credentials there, and on a timer rotates them (a new access and refresh token, a later
   // expiry) with a temp file and a rename, as Claude Code writes them. It records itself in
-  // FAKE_RUN_DIR (<pid>.json: its config dir and every token it held) and exits when <pid>.exit
+  // FAKE_RUN_DIR (<pid>.json: its config dir, its memory base and every token it held) and exits when <pid>.exit
   // appears there, or after FAKE_EXIT_AFTER_MS.
   const credPath = path.join(cfg, '.credentials.json');
   const runDir = process.env.FAKE_RUN_DIR;
@@ -206,7 +206,7 @@ if (args[0] === 'agents') {
   const note = () => {
     const cur = rd(credPath);
     if (cur && cur.claudeAiOauth) seen.push(cur.claudeAiOauth.refreshToken);
-    if (runDir) fs.writeFileSync(path.join(runDir, process.pid + '.json'), JSON.stringify({ cfg, ppid: process.ppid, seen }));
+    if (runDir) fs.writeFileSync(path.join(runDir, process.pid + '.json'), JSON.stringify({ cfg, ppid: process.ppid, memoryBase: process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR, seen }));
   };
   note();
   log({ session: true });

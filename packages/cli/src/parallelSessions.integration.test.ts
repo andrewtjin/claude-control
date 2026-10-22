@@ -163,10 +163,15 @@ async function until(check: () => boolean | Promise<boolean>, timeoutMs = 60_000
   }
 }
 
-/** What a fake Claude Code recorded: its config dir and every refresh token it held, last one last. */
-async function fakeRecord(w: World, pid: number): Promise<{ cfg: string; seen: string[] }> {
+/** What a fake Claude Code recorded: its config dir, its memory base and every refresh token it
+ *  held, last one last. */
+async function fakeRecord(
+  w: World,
+  pid: number,
+): Promise<{ cfg: string; memoryBase?: string; seen: string[] }> {
   return JSON.parse(await readFile(join(w.runDir, `${pid}.json`), 'utf8')) as {
     cfg: string;
+    memoryBase?: string;
     seen: string[];
   };
 }
@@ -369,6 +374,9 @@ describe('a parallel session, end to end', () => {
       expect(names).toHaveLength(1);
       const last = await fakeRecord(w, Number(names[0]!.slice(0, -5)));
       expect(last.cfg.toLowerCase()).toBe(profile.toLowerCase());
+      // Its memory lives under the main dir, where the profile's projects link lands, so Claude Code
+      // saves it without asking, as in any rule's profile.
+      expect(last.memoryBase?.toLowerCase()).toBe(w.paths.claudeDir.toLowerCase());
       expect(last.seen.length).toBeGreaterThan(1);
       await expectEnded(w, w.W, last.seen.at(-1)!);
       // The global slot never moved.
