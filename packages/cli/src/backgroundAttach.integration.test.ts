@@ -181,6 +181,7 @@ async function cctlClaude(
         ? { kind: 'global', label: 'Shared', context: 'global' }
         : { kind: 'group', profileDir: configDir, label: 'Inc', context: 'rule' },
     dropInheritedConfigDir: true,
+    profilesRoot: join(r.root, 'profiles'),
   });
   const named = host.configEnv(configDir);
   if (named !== undefined) env.CLAUDE_CONFIG_DIR = named;

@@ -53,6 +53,33 @@ async function atomicWriteFile(target: string, data: string): Promise<void> {
   await rename(tmp, target);
 }
 
+/**
+ * Write main settings.json crash-safely, then re-link each profile settings.json that shared the
+ * replaced inode. The temp+rename gives main a fresh inode, leaving such a profile on a copy of the
+ * old main; it holds nothing main did not, yet the profile repair would back it up as a losing copy
+ * and push older backups out of the bounded set. A profile on any other inode is left alone, for the
+ * guard propagation and the profile repair to back up first.
+ */
+async function writeSettings(
+  settingsPath: string,
+  data: string,
+  profileSettingsPaths: readonly string[] = [],
+): Promise<void> {
+  const old = await stat(settingsPath, { bigint: true }).catch(() => undefined);
+  await atomicWriteFile(settingsPath, data);
+  if (old === undefined || old.ino === 0n) return;
+  for (const profilePath of profileSettingsPaths) {
+    try {
+      const profile = await stat(profilePath, { bigint: true });
+      if (profile.ino === old.ino && profile.dev === old.dev) {
+        await linkOrCopy(settingsPath, profilePath);
+      }
+    } catch {
+      // Best-effort: the profile repair still heals a link this could not.
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Shapes
 // ---------------------------------------------------------------------------
@@ -151,10 +178,15 @@ export interface InstallHooksOptions {
    *  would append a fresh entry and leave the old one behind. Optional because the marker is
    *  meaningless for callers whose commands are stable across runs. */
   ownedCommandMarker?: string;
+  /** Group profile settings.json files that share main's inode; kept on it across a rewrite. */
+  profileSettingsPaths?: string[];
 }
 
 export async function installHooks(options: InstallHooksOptions): Promise<void> {
   const settings = await readSettings(options.settingsPath);
+  // Serialized before the merge so an install that changes nothing writes nothing: a temp+rename
+  // gives main a fresh inode, cutting the hard links that share it into group profiles.
+  const before = JSON.stringify(settings, null, 2);
 
   // Self-healing: an unrecognizable `hooks` value (missing, null, a string, ...) is replaced
   // with a fresh object rather than erroring — the rest of the file is untouched either way.
@@ -171,7 +203,10 @@ export async function installHooks(options: InstallHooksOptions): Promise<void> 
     mergeOneHook(hooksSection, spec);
   }
 
-  await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+  const after = JSON.stringify(settings, null, 2);
+  if (after !== before) {
+    await writeSettings(options.settingsPath, after, options.profileSettingsPaths);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +220,8 @@ export interface InstallBindGuardOptions {
   /** The event the guard fires on. Defaults to UserPromptSubmit (spec §9); overridable only so a
    *  caller with renamed events can keep them consistent. */
   eventName?: string;
+  /** Group profile settings.json files that share main's inode; kept on it across a rewrite. */
+  profileSettingsPaths?: string[];
 }
 
 /**
@@ -193,13 +230,15 @@ export interface InstallBindGuardOptions {
  * {@link installHooks}: it prunes only PRIOR GENERATIONS OF THE GUARD (recognized by the script
  * filename, so a node/script/snapshot path change is replaced, not accumulated) and leaves every
  * other entry — the forwarder, other tools' hooks, foreign keys — byte-value-equivalent. Idempotent:
- * a settings.json already carrying the current guard command is rewritten to the same shape.
+ * a settings.json already carrying the current guard command is left as it is.
  *
  * "Upgrade from a settings.json that only has the old hooks" is exactly this path: the forwarder
  * entry is present, no guard is, and this adds one without disturbing the forwarder.
  */
 export async function installBindGuard(options: InstallBindGuardOptions): Promise<void> {
   const settings = await readSettings(options.settingsPath);
+  // As in installHooks: skip the write when nothing changed, so the profile hard links survive.
+  const before = JSON.stringify(settings, null, 2);
   const hooksSection: JsonObject = isRecord(settings.hooks) ? settings.hooks : {};
   settings.hooks = hooksSection;
 
@@ -226,7 +265,10 @@ export async function installBindGuard(options: InstallBindGuardOptions): Promis
   }
 
   hooksSection[event] = groups;
-  await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+  const after = JSON.stringify(settings, null, 2);
+  if (after !== before) {
+    await writeSettings(options.settingsPath, after, options.profileSettingsPaths);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +279,8 @@ export interface RemoveBindGuardOptions {
   settingsPath: string;
   /** The event the guard was installed on. Defaults to UserPromptSubmit (spec §9). */
   eventName?: string;
+  /** Group profile settings.json files that share main's inode; kept on it across a rewrite. */
+  profileSettingsPaths?: string[];
 }
 
 /**
@@ -276,7 +320,11 @@ export async function removeBindGuard(options: RemoveBindGuardOptions): Promise<
   if (!changed) return false;
   if (kept.length === 0) delete hooksSection[event];
   else hooksSection[event] = kept;
-  await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+  await writeSettings(
+    options.settingsPath,
+    JSON.stringify(settings, null, 2),
+    options.profileSettingsPaths,
+  );
   return true;
 }
 
@@ -323,7 +371,11 @@ export async function ensureBindGuard(
   const eventOpt = options.eventName !== undefined ? { eventName: options.eventName } : {};
   const profileSettingsPaths = options.profileSettingsPaths ?? [];
   if (!options.hasBindings) {
-    const removed = await removeBindGuard({ settingsPath: options.settingsPath, ...eventOpt });
+    const removed = await removeBindGuard({
+      settingsPath: options.settingsPath,
+      ...eventOpt,
+      profileSettingsPaths,
+    });
     // A guard entry can be stranded in a profile settings.json whose hard link to main was severed
     // by an earlier write; clean those too so the last unbind leaves nothing enforcing.
     for (const profilePath of profileSettingsPaths) {
@@ -344,6 +396,7 @@ export async function ensureBindGuard(
       ...(options.nodePath !== undefined ? { nodePath: options.nodePath } : {}),
     }),
     ...eventOpt,
+    profileSettingsPaths,
   });
   // Propagate the guard into each group profile's settings.json. The install above wrote main via
   // temp+rename (a fresh inode), so any profile still hard-linked to the OLD main inode now points at
@@ -620,6 +673,8 @@ export interface UninstallHooksOptions {
    *  `buildDaemonHookSpecs`) — pass the same custom names here if the daemon was ever
    *  installed with `eventNames` overridden, otherwise those entries are left behind. */
   eventNames?: HookEventNames;
+  /** Group profile settings.json files that share main's inode; kept on it across a rewrite. */
+  profileSettingsPaths?: string[];
 }
 
 /**
@@ -686,7 +741,11 @@ export async function uninstallHooks(options: UninstallHooksOptions): Promise<'r
   }
 
   if (!changed) return 'none';
-  await atomicWriteFile(options.settingsPath, JSON.stringify(settings, null, 2));
+  await writeSettings(
+    options.settingsPath,
+    JSON.stringify(settings, null, 2),
+    options.profileSettingsPaths,
+  );
   return 'removed';
 }
 
