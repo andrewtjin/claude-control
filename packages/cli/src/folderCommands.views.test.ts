@@ -197,7 +197,7 @@ describe('buildReservedViews', () => {
           subscriptionType: 'team',
           rateLimitTier: 'default_claude_max_5x',
           billingType: 'stripe_subscription',
-          subscriptionCreatedAt: '2026-09-20T22:09:56.946Z',
+          subscriptionCreatedAt: '2026-09-20T12:00:00.000Z',
         }),
         account('f', { ruleIds: ['r2'] }),
       ],

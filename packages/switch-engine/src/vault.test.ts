@@ -97,14 +97,14 @@ describe('Vault registry + bundles', () => {
         accountUuid: 'uuid-a',
         organizationRateLimitTier: 'default_claude_max_20x',
         billingType: 'stripe_subscription',
-        subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+        subscriptionCreatedAt: '2026-07-15T12:00:00.000000Z',
         claudeCodeTrialEndsAt: null,
       },
     });
     expect(acct.rateLimitTier).toBe('default_claude_max_20x');
     expect(acct.organizationRateLimitTier).toBe('default_claude_max_20x');
     expect(acct.billingType).toBe('stripe_subscription');
-    expect(acct.subscriptionCreatedAt).toBe('2026-07-15T20:35:34.215673Z');
+    expect(acct.subscriptionCreatedAt).toBe('2026-07-15T12:00:00.000000Z');
     // A null trial-end (no active trial) must never surface as the literal string "null".
     expect(acct).not.toHaveProperty('claudeCodeTrialEndsAt');
   });
@@ -160,14 +160,14 @@ describe('Vault registry + bundles', () => {
         },
         oauthAccount: {
           billingType: 'stripe_subscription',
-          subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+          subscriptionCreatedAt: '2026-07-15T12:00:00.000000Z',
         },
       });
 
       const after = await v.getAccount(acct.id);
       expect(after?.rateLimitTier).toBe('default_claude_max_20x');
       expect(after?.billingType).toBe('stripe_subscription');
-      expect(after?.subscriptionCreatedAt).toBe('2026-07-15T20:35:34.215673Z');
+      expect(after?.subscriptionCreatedAt).toBe('2026-07-15T12:00:00.000000Z');
     });
 
     it('reflects a plan upgrade rather than serving the stale tier forever', async () => {
@@ -416,7 +416,7 @@ describe('Vault registry + bundles', () => {
         emailAddress: 'me@x.com',
         organizationRateLimitTier: 'default_claude_max_20x',
         billingType: 'stripe_subscription',
-        subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+        subscriptionCreatedAt: '2026-07-15T12:00:00.000000Z',
       },
     };
 
@@ -438,7 +438,7 @@ describe('Vault registry + bundles', () => {
       const after = await v.getAccount(acct.id);
       expect(after?.organizationRateLimitTier).toBe('default_claude_max_20x');
       expect(after?.billingType).toBe('stripe_subscription');
-      expect(after?.subscriptionCreatedAt).toBe('2026-07-15T20:35:34.215673Z');
+      expect(after?.subscriptionCreatedAt).toBe('2026-07-15T12:00:00.000000Z');
       expect(after?.metadataRev).toBe(ACCOUNT_METADATA_REV);
       expect(needsMetadataBackfill(after!, 0)).toBe(false);
     });
