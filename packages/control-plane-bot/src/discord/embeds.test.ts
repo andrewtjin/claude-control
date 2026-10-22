@@ -1135,11 +1135,11 @@ describe('embed field overflow (regression)', () => {
     weekly: spriteToken,
     both: spriteToken,
   };
-  const fleet = ['legoboy', 'jina25', 'tjin.29', 'debate'].map((label, i) =>
+  const fleet = ['standby', 'work-2', 'main.01', 'backup'].map((label, i) =>
     account({
       accountId: `acct-${label}`,
       label,
-      active: label === 'tjin.29',
+      active: label === 'main.01',
       limits: [
         { kind: 'session', percent: 40 + i, isActive: true, resetsAt: '2026-07-17T14:00:00.000Z' },
         {
@@ -1167,7 +1167,7 @@ describe('embed field overflow (regression)', () => {
     // The sprite render overflows, so the field falls back to unicode marks — which fit,
     // keeping EVERY event visible instead of dropping the far tail.
     expect(upcoming?.value).not.toContain(spriteToken);
-    for (const label of ['legoboy', 'jina25', 'tjin.29', 'debate']) {
+    for (const label of ['standby', 'work-2', 'main.01', 'backup']) {
       expect(upcoming?.value).toContain(`**${label}**`);
     }
   });

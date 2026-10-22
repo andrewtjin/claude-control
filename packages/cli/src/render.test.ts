@@ -763,17 +763,17 @@ describe('renderAccountHeal', () => {
 
   it('explains each merge and each relabel on its own line, painting only the verb', () => {
     const report = {
-      merged: [{ label: 'jina25', keptId: 'keep-1', removedId: 'dup-2' }],
-      relabelled: [{ id: 'x-3', from: 'jina25', to: 'jina25 (2)' }],
+      merged: [{ label: 'work-2', keptId: 'keep-1', removedId: 'dup-2' }],
+      relabelled: [{ id: 'x-3', from: 'work-2', to: 'work-2 (2)' }],
     };
     expect(renderAccountHeal(report)).toBe(
-      'merged duplicate account jina25: kept keep-1, removed dup-2 (the same login was stored twice)\n' +
-        'renamed account jina25 (x-3) to "jina25 (2)": another account already had that label\n',
+      'merged duplicate account work-2: kept keep-1, removed dup-2 (the same login was stored twice)\n' +
+        'renamed account work-2 (x-3) to "work-2 (2)": another account already had that label\n',
     );
     const ESC = String.fromCharCode(27);
     const painted = renderAccountHeal(report, ANSI_PALETTE);
-    expect(painted.startsWith(`${ESC}[33mmerged${ESC}[0m duplicate account jina25`)).toBe(true);
-    expect(painted).toContain(`\n${ESC}[33mrenamed${ESC}[0m account jina25 (x-3)`);
+    expect(painted.startsWith(`${ESC}[33mmerged${ESC}[0m duplicate account work-2`)).toBe(true);
+    expect(painted).toContain(`\n${ESC}[33mrenamed${ESC}[0m account work-2 (x-3)`);
   });
 });
 

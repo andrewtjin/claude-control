@@ -233,7 +233,7 @@ describe('truncateLabeled', () => {
 describe('escapeDiscordMarkdown', () => {
   it('leaves an ordinary label untouched', () => {
     expect(escapeDiscordMarkdown('Work')).toBe('Work');
-    expect(escapeDiscordMarkdown('jina25')).toBe('jina25');
+    expect(escapeDiscordMarkdown('work-2')).toBe('work-2');
   });
 
   it('keeps a mid-word hyphen clean (no stray backslash)', () => {
