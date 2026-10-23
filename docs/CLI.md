@@ -24,8 +24,10 @@ cctl accounts list                 # list stored accounts (active marked with *)
 cctl accounts add <label>          # capture the currently logged-in account
 cctl accounts add <label> --fresh  # log in as a NEW account in a throwaway window,
                                     # without touching the live login
-cctl accounts relogin <id|label>   # re-login an existing account in a throwaway window,
-                                    # keeping its id (and its usage history)
+cctl accounts relogin <id|label>   # re-login an existing account through the browser
+                                    # (`claude auth login`), keeping its id (and its usage history)
+cctl accounts relogin <id|label> --window
+                                    # same, but in an interactive throwaway `claude` window
 cctl accounts reauth <id|label>    # same in-place re-login, but via a login LINK you open
                                     # anywhere and a code you paste back — no browser needed
                                     # on this host (the phone's /reauth runs the same path)
@@ -37,10 +39,21 @@ cctl accounts rename <id|label> <new-label>
                                     # give an account a new label; its id and usage history stay
 ```
 
-`relogin` and `reauth` differ only in how the login happens: `relogin` spawns a throwaway
-`claude` window here, `reauth` prints a URL and reads back the `code#state` the approval page
-shows. Both write into the EXISTING vault entry — same account id, usage attribution intact,
-quarantine cleared — and both refuse if you log into a different account.
+`relogin` and `reauth` differ only in how the login happens: `relogin` runs a login on this
+host, `reauth` prints a URL and reads back the `code#state` the approval page shows. Both write
+into the EXISTING vault entry — same account id, usage attribution intact, quarantine cleared —
+and both refuse if you log into a different account.
+
+`relogin` runs `claude auth login --claudeai --email <the account's email>` in a throwaway config
+dir: it opens the browser, waits for the sign-in (or a pasted code, if the browser cannot hand it
+back) and needs no interactive terminal, so it also works from Claude Code's `!` prefix. The email
+only pre-fills the login page — a browser already signed in to claude.ai as a **different**
+account still offers that account's Authorize button, and `relogin` refuses the login if you
+click it. So check the account before you click Authorize and switch it on claude.ai if needed,
+or use `--window` or `reauth` instead. A
+Claude Code too old to have `claude auth login` gets the interactive window automatically
+(`/login`, send one message, `/exit`), which `--window` asks for explicitly. A login that does not
+finish within 15 minutes is stopped.
 Two accounts can never answer to one name. `cctl accounts add` refuses a label another
 account already has (in any case) and refuses a login that is already stored under another
 row (`this login is account … ("work-2"), which is already stored; run cctl accounts relogin
