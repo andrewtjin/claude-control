@@ -6,10 +6,11 @@
 // The fault seam stands for the process dying at a checkpoint.
 
 import { describe, it, expect, afterEach } from 'vitest';
+import { realpathSync, statSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SwitchEngine } from './switchEngine.js';
+import { SwitchEngine, type BindFs } from './switchEngine.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
 import { CredentialStore, FileCredentialChannel } from './credentialStore.js';
 import { Vault } from './vault.js';
@@ -30,6 +31,24 @@ import type {
 const NOW = 1_760_000_000_000;
 const HOUR = 3_600_000;
 const HOST = 'BOX';
+/** A Windows project folder the harness's engine sees as a directory, so a folder rule can be made
+ *  wherever the tests run (a win32 engine cannot check a real folder of another platform). */
+const FOLDER = 'C:\\work\\lease';
+
+/** The real folder checks, with {@link FOLDER} standing as an existing directory. */
+const bindFs: BindFs = {
+  realpath: (p) => (p === FOLDER ? p : realpathSync.native(p)),
+  isDirectory: (p) => {
+    if (p === FOLDER) return true;
+    try {
+      return statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  },
+  cwd: () => process.cwd(),
+  homedir: () => homedir(),
+};
 
 let dirs: string[] = [];
 afterEach(async () => {
@@ -86,6 +105,7 @@ async function harness(platform: NodeJS.Platform = 'win32', procFs?: ProcFs): Pr
       minSwitchIntervalMs: 0,
       lockOptions: { timeoutMs: 4000, pollMs: 10 },
       platform: p,
+      bindFs,
       faultAt: (checkpoint) => {
         if (faults.at === checkpoint) {
           faults.at = undefined;
@@ -1456,8 +1476,7 @@ describe('the rest of the engine around a parallel session', () => {
   it("emptying a folder's slot is not refused for a parallel session that merely works in that folder", async () => {
     const h = await harness();
     const { B, C } = await seed(h);
-    const folder = await mkdtemp(join(tmpdir(), 'ce-lease-f-'));
-    dirs.push(folder);
+    const folder = FOLDER;
     await h.engine.includeInFolder(folder, [C.id]);
     await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
     // B's Claude Code runs in that folder: the shared roster lists it with that cwd.
@@ -1717,8 +1736,7 @@ describe("emptying a folder's slot counts every session that may run on it", () 
    *  process as a session working in that folder. */
   async function setup(h: Harness): Promise<{ B: StoredAccount; folder: string }> {
     const { B, C } = await seed(h);
-    const folder = await mkdtemp(join(tmpdir(), 'ce-lease-f-'));
-    dirs.push(folder);
+    const folder = FOLDER;
     await h.engine.includeInFolder(folder, [C.id]);
     await h.engine.claimSessionSlot(B.id, launcher(h, 4120), { launchRuleId: null });
     await mkdir(join(h.paths.claudeDir, 'sessions'), { recursive: true });

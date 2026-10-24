@@ -127,8 +127,10 @@ describe('live-state guard', () => {
       probes.push(join(realHome, '.claude', target.slice(link.length + 1)));
       expect(() => fs.writeFileSync(target, 'x')).toThrow(refused);
     } finally {
-      // Remove the link itself; never a recursive delete, which must not walk into the target.
-      fs.rmdirSync(link);
+      // Remove the link itself; never a recursive delete, which must not walk into the target. A
+      // junction goes as a directory; a POSIX symlink is a file entry.
+      if (process.platform === 'win32') fs.rmdirSync(link);
+      else fs.unlinkSync(link);
     }
   });
 
