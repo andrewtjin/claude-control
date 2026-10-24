@@ -1133,6 +1133,8 @@ cctl settings set <name> <value>    # persist a daemon setting by alias or env v
                                     # daemon next starts: `cctl daemon restart`;
                                     # aliases listed below)
 cctl settings unset <name>          # remove a persisted daemon setting
+cctl settings set quiet on|off      # Discord quiet mode; unlike the rest, a running daemon
+                                    # applies it at once (and saves it itself)
 cctl doctor     # environment checks: Node version, vault crypto round-trip, vault dir,
                 # live login, ~/.claude.json, and whether the daemon has autostart;
                 # with folder rules or parallel sessions also slots, rule-scopes,
@@ -1329,6 +1331,41 @@ cctl run   # (needs the running daemon + hosted bot) start a remote session
 Until the daemon is connected to the bot, `cctl run` fails with a pointer to
 `docs/VERIFICATION.md` rather than doing nothing silently.
 
+## Discord quiet mode
+
+Quiet mode is **on by default**: Discord gets the cards that need you and little else.
+
+- **Kept:** permission and question cards (from terminal and phone-started sessions alike),
+  their expiry edits, and the Approve/Deny/answer round trip; the replies to your own commands
+  (`/usage`, `/switch`, the cards that answer a `/say`, error replies); the alert that an
+  account needs a re-login; and, for a session started from the phone, one message per turn
+  with Claude's final reply (or why the turn failed).
+- **Dropped:** the done card after every terminal turn, command output cards (including the
+  output of a tool you approved from the phone), "Claude is waiting" nags, API-error cards; a
+  phone-started session's tool lines, progress lines, retry and usage-limit notes, waiting
+  lines and end-of-session summary card; and the daemon's own fleet notices (auto-switch
+  results, outage start and end, folder slot alerts, moved and parked sessions).
+
+Quiet mode wins over `command-output`, `waiting-cards` and `full-output`: with it on, those
+settings change nothing. Turn it off to get every card back:
+
+```
+cctl settings set quiet off    # or /quiet action:off on the phone
+cctl settings unset quiet      # back to the default (on)
+```
+
+Both apply to the running daemon at once and are saved in `config.json`, so they also hold
+after a restart; `/quiet action:show` and `cctl settings` show the value in force. With no
+daemon running, `cctl settings set quiet` saves the value for the next start like any other
+setting. When `CCTL_DISCORD_QUIET` is set in the environment the daemon starts in, that
+value wins over `config.json`, so a live change is refused with the variable named: unset it
+there and restart the daemon first.
+
+The daemon does the dropping, so quiet mode works with any bot. Two parts live in the bot and
+need one from this release: `/quiet` itself, and leaving out a phone-started session's live
+card, waiting lines and summary card (an older bot still posts those). `/quiet` against a
+daemon older than this release says to update cctl on that machine instead of waiting.
+
 ## Persisted settings and override precedence
 
 Every daemon knob resolves the same way, highest precedence first: a `cctl daemon run`
@@ -1354,7 +1391,8 @@ level):
 }
 ```
 
-The daemon reads the file at start-up, so a change applies when it next starts —
+The daemon reads the file at start-up, so a change applies when it next starts (quiet
+mode is the one exception, see [Discord quiet mode](#discord-quiet-mode)) —
 `cctl daemon restart` does that now, and until then `cctl settings` shows the saved
 value beside the running one (`on (off after cctl daemon restart)`) with the restart command in the
 section title, and says whether the report belongs to a daemon that is still running. A file
@@ -1384,6 +1422,7 @@ Every setting has a short alias for the command line (case and `-`/`_` do not ma
 | `permission-hold`   | `CCTL_PERMISSION_HOLD_MS`                | milliseconds          |
 | `question-hold`     | `CCTL_QUESTION_HOLD_MS`                  | milliseconds          |
 | `command-output`    | `CCTL_COMMAND_OUTPUT`                    | on / off              |
+| `quiet`             | `CCTL_DISCORD_QUIET`                     | on / off              |
 | `identity-check`    | `CCTL_IDENTITY_CHECK`                    | on / off              |
 | `full-output`       | `CCTL_TOOL_OUTPUT_FULL`                  | on / off              |
 | `relay`             | `CCTL_RELAY_URL`                         | ws:// or wss:// url   |
