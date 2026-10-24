@@ -1,5 +1,6 @@
 // Correlates a `stats.request` sent for one Discord interaction with the `stats.result` that
-// answers it.
+// answers it — and, through the same generic registry, a `settings.quiet.set` with its
+// `settings.quiet.result`.
 //
 // WHY this exists: every other slash command in this bot answers from the state cache and replies
 // synchronously. `/stats days:N` cannot — the number does not exist until the HOST re-reads its
@@ -18,8 +19,11 @@
 import type { PayloadOf } from '@claude-control/shared-protocol';
 
 /** How a wait ended. `busy` is refused BEFORE any frame is sent — see {@link MAX_IN_FLIGHT}. */
-export type StatsScanOutcome =
-  { kind: 'result'; payload: PayloadOf<'stats.result'> } | { kind: 'timeout' } | { kind: 'busy' };
+export type ReplyOutcome<P> =
+  { kind: 'result'; payload: P } | { kind: 'timeout' } | { kind: 'busy' };
+
+/** How a stats scan wait ended. */
+export type StatsScanOutcome = ReplyOutcome<PayloadOf<'stats.result'>>;
 
 /** Ceiling on concurrently awaited scans. The daemon runs exactly one scan at a time and answers
  *  the rest with "already scanning", so in practice this is never approached; it exists so a user
@@ -28,25 +32,27 @@ export type StatsScanOutcome =
  *  exists is always settled by exactly one of result/timeout, never dropped mid-wait. */
 const MAX_IN_FLIGHT = 16;
 
-interface Pending {
-  settle: (outcome: StatsScanOutcome) => void;
+interface Pending<P> {
+  settle: (outcome: ReplyOutcome<P>) => void;
   timer: ReturnType<typeof setTimeout>;
 }
 
-export class PendingStatsScans {
-  private readonly byRequestId = new Map<string, Pending>();
+/** Waiting interactions keyed by requestId, each settled once by its reply `P` or its timeout.
+ *  Generic over the reply payload so every request/reply command shares one set of guarantees. */
+export class PendingReplies<P> {
+  private readonly byRequestId = new Map<string, Pending<P>>();
 
   /**
    * Wait for the result of `requestId`, or give up after `timeoutMs`.
    *
-   * MUST be called before the `stats.request` frame is sent, not after: the daemon's answer can
+   * MUST be called before the request frame is sent, not after: the daemon's answer can
    * arrive on the delivery path before the caller's next line runs, and a result that lands with
    * nobody registered is dropped (see {@link settle}). The returned promise never rejects — every
    * failure mode is a value, so the caller has exactly one thing to render.
    */
-  awaitResult(requestId: string, timeoutMs: number): Promise<StatsScanOutcome> {
+  awaitResult(requestId: string, timeoutMs: number): Promise<ReplyOutcome<P>> {
     if (this.byRequestId.size >= MAX_IN_FLIGHT) return Promise.resolve({ kind: 'busy' });
-    return new Promise<StatsScanOutcome>((resolve) => {
+    return new Promise<ReplyOutcome<P>>((resolve) => {
       const timer = setTimeout(() => {
         // Drop the entry FIRST: a late result must then take the no-waiter path rather than
         // resolving an already-resolved promise.
@@ -62,14 +68,14 @@ export class PendingStatsScans {
   }
 
   /**
-   * Hand a delivered `stats.result` to whoever is waiting for it.
+   * Hand a delivered reply to whoever is waiting for it.
    *
    * Returns false when no one is — a result for a requestId this bot never registered, or whose
    * wait already timed out, or that arrived after a bot restart. That is a normal outcome, not an
    * error: the caller's contract is to drop it silently. Never a new message, because the only
    * surface this payload was ever meant for is an interaction that no longer exists.
    */
-  settle(requestId: string, payload: PayloadOf<'stats.result'>): boolean {
+  settle(requestId: string, payload: P): boolean {
     const pending = this.byRequestId.get(requestId);
     if (pending === undefined) return false;
     this.byRequestId.delete(requestId);
@@ -100,3 +106,6 @@ export class PendingStatsScans {
     return this.byRequestId.size;
   }
 }
+
+/** The `/stats days:N` waits: a scan result per requestId. */
+export class PendingStatsScans extends PendingReplies<PayloadOf<'stats.result'>> {}

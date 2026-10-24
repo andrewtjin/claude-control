@@ -24,6 +24,7 @@ import type { BarRenderer } from './emojiBars.js';
 import type { TimelineTrackStyle } from './richFormat.js';
 import { pruneButtons, type ButtonSpec } from './buttons.js';
 import type { SessionChannelSource } from './sessionChannels.js';
+import type { ReplyOutcome } from './pendingStatsScans.js';
 
 export interface CommandDeps {
   relay: RelaySender;
@@ -709,4 +710,117 @@ export function buildThreadHereResult(
         text: 'Your session threads already go to your DMs. Nothing changed.',
       };
   }
+}
+
+// ---------------------------------------------------------------------------
+// `/quiet` — Discord quiet mode on the user's daemon.
+//
+// Quiet mode lives on the DAEMON (it decides what it sends), so `on`/`off` are a round trip: the
+// daemon applies the value, persists it, re-sends its settings snapshot, and answers with
+// `settings.quiet.result`. `show` answers from that snapshot, like `/settings`. Every reply string
+// is built here; the gateway only defers, sends, and waits.
+
+/** What the user asked for. */
+export type QuietAction = 'on' | 'off' | 'show';
+
+/** The settings row the daemon reports quiet mode under, read for its source. */
+const QUIET_ROW_NAME = 'discord quiet';
+
+/** What quiet mode means, said the same way in every reply that names it. */
+const QUIET_ON_MEANING =
+  'Discord gets only permission and question cards, plus one final reply per turn of a session ' +
+  'started here.';
+const QUIET_OFF_MEANING =
+  'Discord gets every card: done cards, command output, session progress lines and daemon notices.';
+
+/** The reply for a daemon from before quiet mode: its settings snapshot has no `quiet` field, and
+ *  a `settings.quiet.set` sent to it would be dropped unanswered — so it is never sent. */
+export const QUIET_OLD_DAEMON_MESSAGE =
+  'The cctl on that machine is too old for quiet mode. Update cctl there ' +
+  '(`npm i -g @andrewtjin/cctl`, then `cctl daemon restart`) and try again.';
+
+/** The current quiet value this user's daemon reported, or the reply that explains why there is
+ *  none: no snapshot yet (the daemon has not reported in), or one from a daemon too old to know
+ *  quiet mode. The single gate both `show` and `on`/`off` pass through. */
+function reportedQuiet(
+  deps: CommandDeps,
+  discordUserId: string,
+): { quiet: boolean; pinnedByEnv: boolean } | CommandResult {
+  const settings = deps.cache.getSettings(discordUserId);
+  if (!settings) {
+    return { kind: 'error', message: 'No settings yet — the daemon has not reported in.' };
+  }
+  if (settings.quiet === undefined || settings.quiet === null) {
+    return { kind: 'error', message: QUIET_OLD_DAEMON_MESSAGE };
+  }
+  const row = settings.settings.find((r) => r.name === QUIET_ROW_NAME);
+  return { quiet: settings.quiet, pinnedByEnv: row?.source === 'env' };
+}
+
+/** A reported quiet value is an object without a `kind`; a CommandResult always has one. */
+function isCommandResult(
+  value: { quiet: boolean; pinnedByEnv: boolean } | CommandResult,
+): value is CommandResult {
+  return 'kind' in value;
+}
+
+/** `/quiet action:show` — the value the daemon last reported, what it means, and how to change it
+ *  (or that it cannot be changed from here, when the daemon's environment sets it). */
+export function handleQuietShow(deps: CommandDeps, discordUserId: string): CommandResult {
+  const reported = reportedQuiet(deps, discordUserId);
+  if (isCommandResult(reported)) return reported;
+  const how = reported.pinnedByEnv
+    ? 'It is set in the environment the daemon runs in, so it can only be changed there.'
+    : `\`/quiet action:${reported.quiet ? 'off' : 'on'}\` turns it ${reported.quiet ? 'off' : 'on'}.`;
+  return {
+    kind: 'text',
+    text:
+      `Quiet mode is ${reported.quiet ? 'on' : 'off'}: ` +
+      `${reported.quiet ? QUIET_ON_MEANING : QUIET_OFF_MEANING} ${how}`,
+  };
+}
+
+/** `/quiet action:on|off` — send the change to this user's daemon. Only SENDS: the answer arrives
+ *  later on the delivery path and is matched back by `requestId`, so the caller registers its wait
+ *  first (see PendingReplies). Refuses without sending when the daemon cannot answer — no report
+ *  yet, or a daemon too old to know the frame — so the wait can never be one that nothing ends. */
+export function handleQuietSet(
+  deps: CommandDeps,
+  discordUserId: string,
+  quiet: boolean,
+  requestId: string,
+): CommandResult {
+  const reported = reportedQuiet(deps, discordUserId);
+  if (isCommandResult(reported)) return reported;
+  const result = deps.relay.sendToUser(discordUserId, (daemonId) => ({
+    daemonId,
+    type: 'settings.quiet.set',
+    payload: { requestId, quiet },
+  }));
+  return result.ok
+    ? { kind: 'text', text: `Turning quiet mode ${quiet ? 'on' : 'off'}…` }
+    : { kind: 'error', message: result.error };
+}
+
+/** How a `/quiet` change ended, as the reply. A refusal shows the daemon's own sentence — only the
+ *  daemon knows why (its environment pins the value, or it could not save it). */
+export function buildQuietSetResult(
+  outcome: ReplyOutcome<PayloadOf<'settings.quiet.result'>>,
+  timeoutMs: number,
+): CommandResult {
+  if (outcome.kind === 'busy') {
+    return { kind: 'error', message: 'Too many requests are waiting — try again in a moment.' };
+  }
+  if (outcome.kind === 'timeout') {
+    return {
+      kind: 'error',
+      message:
+        `The daemon did not answer within ${Math.round(timeoutMs / 1000)}s, so quiet mode may ` +
+        'not have changed. `/quiet action:show` reports the value it last sent.',
+    };
+  }
+  const { ok, quiet, message } = outcome.payload;
+  if (!ok)
+    return { kind: 'error', message: `${message} Quiet mode is still ${quiet ? 'on' : 'off'}.` };
+  return { kind: 'text', text: `${message} ${quiet ? QUIET_ON_MEANING : QUIET_OFF_MEANING}` };
 }

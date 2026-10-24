@@ -577,3 +577,78 @@ describe('SessionPlanner — folder-bound slot on the card', () => {
     expect(embedFields(card).some((f) => f.name === 'Slot')).toBe(false);
   });
 });
+
+describe('SessionPlanner — quiet mode', () => {
+  /** Every content string the ops would post, in order (embeds by title). */
+  const posted = (ops: GatewayOp[]): (string | undefined)[] =>
+    ops.map((o) => (o.kind === 'sendMessage' ? (o.content ?? embedTitle(o)) : o.kind));
+
+  for (const mode of ['card', 'stream'] as const) {
+    describe(`${mode} mode`, () => {
+      it("posts one line per turn — the daemon's summary — and nothing else", () => {
+        const p = new SessionPlanner();
+        const ops: GatewayOp[] = [];
+        ops.push(...p.onStatus(ROUTE, status('starting'), 0, mode, true).ops);
+        ops.push(...p.onStatus(ROUTE, status('running'), 10, mode, true).ops);
+        ops.push(...p.onStatus(ROUTE, status('waiting_permission'), 20, mode, true).ops);
+        ops.push(...p.onStatus(ROUTE, status('running'), 30, mode, true).ops);
+        ops.push(
+          ...p.onOutput(ROUTE, output(0, 'summary', 'Session complete: done'), 40, mode, true).ops,
+        );
+        ops.push(...p.onStatus(ROUTE, status('waiting_input'), 50, mode, true).ops);
+        // No live card, no waiting lines: just the final reply.
+        expect(posted(ops)).toEqual(['📝 Session complete: done']);
+      });
+
+      it('posts no summary embed and no attachment when the session ends', () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        p.onOutput(ROUTE, output(0, 'error', 'Error: ' + 'x'.repeat(3000)), 10, mode, true);
+        const end = p.onStatus(ROUTE, status('failed'), 20, mode, true);
+        expect(cardSends(end.ops)).toHaveLength(0);
+        expect(lineSends(end.ops)).toHaveLength(0);
+        expect(uploads(end.ops)).toHaveLength(0);
+      });
+
+      it("posts the failure line the daemon sends as that turn's outcome", () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        const r = p.onOutput(
+          ROUTE,
+          output(0, 'error', 'Error: the connection dropped'),
+          10,
+          mode,
+          true,
+        );
+        expect(posted(r.ops)).toEqual(['❗ Error: the connection dropped']);
+      });
+
+      it('keeps the orphaned line: the interrupted turn has no other outcome', () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        const r = p.onStatus(ROUTE, status('orphaned'), 10, mode, true);
+        expect(posted(r.ops)).toHaveLength(1);
+        expect(posted(r.ops)[0]).toContain('🪦');
+      });
+    });
+  }
+
+  it('keeps editing a card posted before quiet mode was turned on, adding no message', () => {
+    const p = new SessionPlanner({ coalesceWindowMs: 1000 });
+    expect(cardSends(p.onStatus(ROUTE, status('running'), 0, 'card', false).ops)).toHaveLength(1);
+    const later = p.onStatus(ROUTE, status('done'), 5000, 'card', true);
+    // The terminal edit lands, so the card never freezes on "running"; nothing new is sent.
+    expect(edits(later.ops)).toHaveLength(1);
+    expect(cardSends(later.ops)).toHaveLength(0);
+    expect(lineSends(later.ops)).toHaveLength(0);
+  });
+
+  it('reads quiet per frame: turning it off brings the state lines and summary card back', () => {
+    const p = new SessionPlanner();
+    p.onStatus(ROUTE, status('running'), 0, 'stream', true);
+    const waiting = p.onStatus(ROUTE, status('waiting_input'), 10, 'stream', false);
+    expect(posted(waiting.ops)[0]).toContain('⌨️ waiting for input');
+    const end = p.onStatus(ROUTE, status('done'), 20, 'stream', false);
+    expect(lineSends(end.ops)).toHaveLength(1); // the summary embed
+  });
+});

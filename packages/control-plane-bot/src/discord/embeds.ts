@@ -780,7 +780,14 @@ export function buildSettingsEmbed(snapshot: SettingsSnapshot): EmbedBuilder {
       // Knob names and values come from the daemon and grow with its config surface; clamped so a
       // long settings list degrades to its head rather than making `/settings` throw.
       .setDescription(clampDescription(lines.join('\n')))
-      .setFooter({ text: 'as of daemon start' })
+      // Dated by the daemon's start, except quiet mode: a daemon that reports it re-sends the
+      // report whenever it changes, so that one row is current.
+      .setFooter({
+        text:
+          snapshot.quiet == null
+            ? 'as of daemon start'
+            : 'as of daemon start; quiet mode is current',
+      })
       .setTimestamp(snapshot.startedAtMs),
   );
 }
