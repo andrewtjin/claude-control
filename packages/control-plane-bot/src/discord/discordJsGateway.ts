@@ -1957,12 +1957,16 @@ export class DiscordJsGateway implements DiscordGateway {
 
   /** `/quiet action:on|off` — ask this user's daemon to change quiet mode and wait for its answer.
    *  The wait is registered BEFORE the frame is sent (the answer can arrive first), and abandoned
-   *  when nothing was sent, so every path ends in exactly one reply. */
+   *  when nothing was sent, so every path ends in exactly one reply. A full registry refuses before
+   *  sending: the daemon would apply a change the reply then tells the user to retry. */
   private async onQuietSet(
     userId: string,
     quiet: boolean,
     requestId: string,
   ): Promise<CommandResult> {
+    if (this.pendingQuiet.isFull()) {
+      return commands.buildQuietSetResult({ kind: 'busy' }, QUIET_SET_TIMEOUT_MS);
+    }
     const waiting = this.pendingQuiet.awaitResult(requestId, QUIET_SET_TIMEOUT_MS);
     const sent = commands.handleQuietSet(this.deps, userId, quiet, requestId);
     if (sent.kind === 'error') {

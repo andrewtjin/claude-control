@@ -630,12 +630,98 @@ describe('SessionPlanner — quiet mode', () => {
         expect(posted(r.ops)).toHaveLength(1);
         expect(posted(r.ops)[0]).toContain('🪦');
       });
+
+      for (const cutOff of ['starting', 'running', 'waiting_permission'] as const) {
+        it(`says the session ended when a stop cuts off a turn (${cutOff} → done)`, () => {
+          const p = new SessionPlanner();
+          p.onStatus(ROUTE, status('starting'), 0, mode, true);
+          p.onStatus(ROUTE, status(cutOff), 10, mode, true);
+          const r = p.onStatus(ROUTE, status('done'), 20, mode, true);
+          expect(posted(r.ops)).toEqual(['⏹ the session ended before replying']);
+        });
+      }
+
+      it('posts no second outcome when the stop lands after the reply', () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        p.onOutput(ROUTE, output(0, 'summary', 'Session complete: done'), 10, mode, true);
+        expect(posted(p.onStatus(ROUTE, status('done'), 20, mode, true).ops)).toEqual([]);
+      });
+
+      it('a new turn that is cut off still says so, after an earlier turn replied', () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        p.onOutput(ROUTE, output(0, 'summary', 'Session complete: one'), 10, mode, true);
+        p.onStatus(ROUTE, status('waiting_input'), 20, mode, true);
+        p.onStatus(ROUTE, status('running'), 30, mode, true);
+        const r = p.onStatus(ROUTE, status('done'), 40, mode, true);
+        expect(posted(r.ops)).toEqual(['⏹ the session ended before replying']);
+      });
+
+      it('posts nothing when an idle session is stopped: its last turn already replied', () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        p.onStatus(ROUTE, status('waiting_input'), 10, mode, true);
+        expect(posted(p.onStatus(ROUTE, status('done'), 20, mode, true).ops)).toEqual([]);
+      });
+
+      it('posts nothing for a first-seen done: a restarted bot cannot know it was mid-turn', () => {
+        const p = new SessionPlanner();
+        expect(posted(p.onStatus(ROUTE, status('done'), 0, mode, true).ops)).toEqual([]);
+      });
+
+      it('splits a reply longer than one message across several, losing none of it', () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        const reply = Array.from({ length: 100 }, (_, i) => `line ${i} ${'y'.repeat(40)}`).join(
+          '\n',
+        );
+        const r = p.onOutput(ROUTE, output(0, 'summary', reply), 10, mode, true);
+        const lines = lineSends(r.ops).map((o) => (o.kind === 'sendMessage' ? o.content : ''));
+        expect(lines.length).toBeGreaterThan(1);
+        for (const l of lines) expect(l!.length).toBeLessThanOrEqual(2000);
+        expect(lines.join('\n')).toBe(`📝 ${reply}`);
+        expect(uploads(r.ops)).toHaveLength(0);
+      });
+
+      it('attaches a reply too long to split into messages, whole', () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        const reply = 'z'.repeat(20_000);
+        const r = p.onOutput(ROUTE, output(0, 'summary', reply), 10, mode, true);
+        expect(lineSends(r.ops)).toHaveLength(0);
+        const files = uploads(r.ops);
+        expect(files).toHaveLength(1);
+        expect(files[0]!.kind === 'uploadAttachment' && files[0]!.text).toBe(`📝 ${reply}`);
+      });
     });
   }
+
+  it('posts no restart or gap marker into a quiet thread, only the reply', () => {
+    const p = new SessionPlanner({ gapGraceMs: 100 });
+    p.onStatus(ROUTE, status('running'), 0, 'stream', true);
+    p.onOutput(ROUTE, output(0, 'summary', 'first', false, 'run-a'), 10, 'stream', true);
+    // A daemon restart resumes the session: new epoch, seq back at 0.
+    const resumed = p.onOutput(
+      ROUTE,
+      output(0, 'summary', 'second', false, 'run-b'),
+      20,
+      'stream',
+      true,
+    );
+    expect(posted(resumed.ops)).toEqual(['📝 second']);
+    // A bot that restarted mid-session first sees a seq above 0: a gap, but no marker message.
+    const q = new SessionPlanner({ gapGraceMs: 100 });
+    q.onStatus(ROUTE, status('running'), 0, 'stream', true);
+    const held = q.onOutput(ROUTE, output(3, 'summary', 'late reply'), 10, 'stream', true);
+    const ops = [...held.ops, ...q.flush(ROUTE, 500).ops];
+    expect(posted(ops)).toEqual(['📝 late reply']);
+  });
 
   it('keeps editing a card posted before quiet mode was turned on, adding no message', () => {
     const p = new SessionPlanner({ coalesceWindowMs: 1000 });
     expect(cardSends(p.onStatus(ROUTE, status('running'), 0, 'card', false).ops)).toHaveLength(1);
+    p.onStatus(ROUTE, status('waiting_input'), 10, 'card', true);
     const later = p.onStatus(ROUTE, status('done'), 5000, 'card', true);
     // The terminal edit lands, so the card never freezes on "running"; nothing new is sent.
     expect(edits(later.ops)).toHaveLength(1);

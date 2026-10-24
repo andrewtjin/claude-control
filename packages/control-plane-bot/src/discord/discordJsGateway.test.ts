@@ -12,7 +12,7 @@
 // since that loop's state (pending sends, resume guards, thread rebinds) is gateway-local too.
 // None touches a real Discord connection.
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -2081,6 +2081,21 @@ describe('DiscordJsGateway — /quiet', () => {
       'defer',
       expect.stringMatching(/^edit:Error: .*too old for quiet mode/),
     ]);
+  });
+
+  it('refuses a change while too many are waiting, without sending it', async () => {
+    // A relay that never answers: every wait stays open, as for daemons gone quiet after the send.
+    const r = quietRelay();
+    const gw = r.make();
+    await gw.deliver(USER, snapshot(true));
+    for (let i = 0; i < 16; i += 1) void gw.slash(interaction('off').fake);
+    await vi.waitFor(() => expect(r.sent).toHaveLength(16));
+
+    const { fake, events } = interaction('off');
+    await gw.slash(fake);
+    // The daemon was never asked, so the reply telling the user to retry is the truth.
+    expect(r.sent).toHaveLength(16);
+    expect(events).toEqual(['defer', expect.stringMatching(/^edit:Error: Too many requests/)]);
   });
 
   it('answers `show` straight from the cached snapshot', async () => {

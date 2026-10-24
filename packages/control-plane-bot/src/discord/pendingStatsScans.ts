@@ -51,7 +51,7 @@ export class PendingReplies<P> {
    * failure mode is a value, so the caller has exactly one thing to render.
    */
   awaitResult(requestId: string, timeoutMs: number): Promise<ReplyOutcome<P>> {
-    if (this.byRequestId.size >= MAX_IN_FLIGHT) return Promise.resolve({ kind: 'busy' });
+    if (this.isFull()) return Promise.resolve({ kind: 'busy' });
     return new Promise<ReplyOutcome<P>>((resolve) => {
       const timer = setTimeout(() => {
         // Drop the entry FIRST: a late result must then take the no-waiter path rather than
@@ -99,6 +99,12 @@ export class PendingReplies<P> {
     this.byRequestId.delete(requestId);
     clearTimeout(pending.timer);
     pending.settle({ kind: 'timeout' });
+  }
+
+  /** Whether a new wait would be refused as `busy`. Asked BEFORE the request frame is built, so a
+   *  refused request is never sent: the daemon would act on it while the user is told to retry. */
+  isFull(): boolean {
+    return this.byRequestId.size >= MAX_IN_FLIGHT;
   }
 
   /** Currently awaited scans — exposed for tests and diagnostics. */
