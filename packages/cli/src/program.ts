@@ -25,7 +25,7 @@ import {
   parsePastedCode,
   resolveAccountRef,
   isLeaseRule,
-  operatorRules,
+  leaseRuleId,
   type AccountView,
   type FolderRule,
   type LeaseView,
@@ -351,7 +351,7 @@ export function buildProgram(): Command {
       const all = await readUsageState(nowMs);
       // An account a parallel session holds is out of the pool (and of the rows and pacing below),
       // but it is the one that terminal is using: its usage is shown on its own.
-      const leased = await parallelSessionAccountIds(buildEngine());
+      const leased = parallelSessionAccountIds(all);
       const fleet = narrowed(all, (a) => !leased.has(a.id));
       let text = renderUsage(usageRowsOf(withFolderTags(fleet)), nowMs, detectPalette());
       // Pacing needs the same weekly-limit view the burn plan uses (accountId + quarantine
@@ -376,7 +376,7 @@ export function buildProgram(): Command {
       await healAccounts(buildEngine());
       const nowMs = Date.now();
       const all = await readUsageState(nowMs);
-      const leased = await parallelSessionAccountIds(buildEngine());
+      const leased = parallelSessionAccountIds(all);
       const fleet = narrowed(all, (a) => !leased.has(a.id));
       const inputs = buildAdvisorInputs(withFolderTags(fleet));
       const outlook = computeOutlook(inputs, nowMs);
@@ -1367,19 +1367,16 @@ function narrowed(state: UsageState, keep: (account: AccountView) => boolean): U
 /** How `cctl usage` and `cctl timeline` head the accounts parallel sessions hold. */
 const PARALLEL_SESSION_HEADING = 'In use by a parallel session (out of the pool until it ends):';
 
-/** The accounts only a parallel session holds: out of the shared pool, so out of the usage rows and
- *  the pacing, and in no folder rule's section either. An account a folder or alias rule includes
- *  too stays with that rule's accounts. */
-async function parallelSessionAccountIds(
-  engine: ReturnType<typeof buildEngine>,
-): Promise<Set<string>> {
-  const rules = await engine.listRules().catch(() => [] as FolderRule[]);
-  const reserved = new Set(operatorRules(rules).flatMap((r) => r.include));
+/** The accounts of `state` only a parallel session holds (their one rule is the session's): out of
+ *  the shared pool, so out of the usage rows and the pacing, and in no folder rule's section
+ *  either. An account a folder or alias rule includes too stays with that rule's accounts. Read
+ *  from the same registry read as the rows, so a session ending meanwhile cannot leave its account
+ *  tagged as a folder's. */
+function parallelSessionAccountIds(state: UsageState): Set<string> {
   return new Set(
-    rules
-      .filter(isLeaseRule)
-      .map((r) => r.include[0]!)
-      .filter((id) => !reserved.has(id)),
+    state.accounts
+      .filter((a) => a.ruleIds?.length === 1 && a.ruleIds[0] === leaseRuleId(a.id))
+      .map((a) => a.id),
   );
 }
 

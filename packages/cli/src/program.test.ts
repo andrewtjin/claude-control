@@ -1819,6 +1819,32 @@ describe('the banner and the plan agree with the running daemon', () => {
     }
   });
 
+  it('an account a folder rule includes too stays with the folder accounts, not the parallel section', async () => {
+    const now = Date.now();
+    const both = {
+      id: 'b1',
+      label: 'bee',
+      quarantined: false,
+      createdAtMs: 0,
+      updatedAtMs: 0,
+      ruleIds: ['r1', 'session-b1'],
+    };
+    engine.listAllAccounts.mockImplementation(async () => [...(await engine.listAccounts()), both]);
+    try {
+      await seedUsage([
+        { id: 'b1', label: 'bee', limits: [{ kind: 'session', percent: 40, resetsAt: now + H }] },
+      ]);
+      const usage = await runCli(['usage']);
+      expect(usage.out).toContain('bee (folder)');
+      expect(usage.out).not.toContain('In use by a parallel session');
+      const timeline = await runCli(['timeline']);
+      expect(timeline.out).toContain('bee (folder)');
+      expect(timeline.out).not.toContain('In use by a parallel session');
+    } finally {
+      engine.listAllAccounts.mockImplementation(() => engine.listAccounts());
+    }
+  });
+
   it('a Fable-cap opt-out saved since the daemon started does not hide its outage', async () => {
     // The running daemon counts the cap (its report), and has an outage open on it.
     await seedHeartbeat('alive');

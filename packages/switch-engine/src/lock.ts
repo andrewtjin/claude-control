@@ -129,7 +129,9 @@ export class Lock {
     } catch (err) {
       // The delete empties the directory before removing it, and on POSIX a contender's claim (a
       // rename) may replace an empty directory: its last step then finds the successor's lock.
-      // Ours is gone and the successor's is untouched, so the release is done.
+      // Ours is gone and the successor's is untouched, so the release is done. (On Windows the
+      // owner record can still be pending deletion under a contender reading it; the directory
+      // left then has no owner, which the next contender reclaims as broken.)
       if ((err as NodeJS.ErrnoException).code !== 'ENOTEMPTY') throw err;
     }
   }

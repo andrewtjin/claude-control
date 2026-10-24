@@ -82,11 +82,11 @@ function canonical(target, follow = true, hops = 0) {
         // Not a link: a part that is simply missing.
       }
       if (link !== undefined) {
-        return canonical(
-          path.join(path.resolve(path.dirname(head), link), ...tail),
-          true,
-          hops + 1,
-        );
+        // A relative target is read from where the link really is, so a `..` in it climbs out of
+        // the real folder, not the lexical one; a `\\?\` prefix is dropped, as the OS reads it.
+        const from = canonical(path.dirname(head), true, hops + 1);
+        const to = path.resolve(from, link.replace(/^\\\\\?\\/, ''));
+        return canonical(path.join(to, ...tail), true, hops + 1);
       }
     }
     const parent = path.dirname(head);

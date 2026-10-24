@@ -225,11 +225,13 @@ if (args[0] === 'agents') {
     try {
       fs.writeFileSync(tmp, JSON.stringify(next));
       fs.renameSync(tmp, credPath);
-    } catch {
+    } catch (err) {
       // Windows refuses a rename onto a file another session on the same profile is replacing at
-      // that moment (EPERM, EBUSY). That rotation did not land, so it is not recorded; the next
-      // tick tries again, rather than the session dying with its login unrotated.
+      // that moment (EPERM, EBUSY, EACCES). That rotation did not land, so it is not recorded; the
+      // next tick tries again, rather than the session dying with its login unrotated. Any other
+      // failure is the profile's login being unwritable, which a session would not survive either.
       fs.rmSync(tmp, { force: true });
+      if (!['EPERM', 'EBUSY', 'EACCES'].includes(err.code)) throw err;
       return;
     }
     note();
