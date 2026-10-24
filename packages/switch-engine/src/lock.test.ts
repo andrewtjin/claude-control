@@ -15,7 +15,13 @@ import { LockTimeoutError } from './errors.js';
 //
 // `renames` makes the next renames onto an owner record fail with a code of its choosing, the way
 // Windows refuses to replace a file a contender has open just then.
-const rmState = vi.hoisted(() => ({ failFor: new Set<string>() }));
+//
+// `claimedWhenEmptied` makes the next delete of a path find a successor's lock there once it has
+// emptied it, the way POSIX lets a contender's claim (a rename) replace an empty directory.
+const rmState = vi.hoisted(() => ({
+  failFor: new Set<string>(),
+  claimedWhenEmptied: new Set<string>(),
+}));
 const writes = vi.hoisted(() => ({ paths: [] as string[] }));
 const renames = vi.hoisted(() => ({ failures: 0, code: 'EPERM' }));
 vi.mock('node:fs', async (importOriginal) => {
@@ -35,6 +41,14 @@ vi.mock('node:fs', async (importOriginal) => {
       if (rmState.failFor.has(String(target))) {
         const err: NodeJS.ErrnoException = new Error('EBUSY: resource busy or locked');
         err.code = 'EBUSY';
+        throw err;
+      }
+      if (rmState.claimedWhenEmptied.delete(String(target))) {
+        actual.rmSync(target, options);
+        actual.mkdirSync(target);
+        actual.writeFileSync(`${String(target)}/owner.json`, JSON.stringify({ token: 'successor' }));
+        const err: NodeJS.ErrnoException = new Error('ENOTEMPTY: directory not empty');
+        err.code = 'ENOTEMPTY';
         throw err;
       }
       return actual.rmSync(target, options);
@@ -72,6 +86,29 @@ describe('acquireLock', () => {
     const lock = await acquireLock(join(root, '.lock'));
     lock.release();
     expect(() => lock.release()).not.toThrow();
+  });
+
+  it("releases without throwing when a contender claims the lock the moment it is emptied, leaving the successor's", async () => {
+    const root = await sandbox();
+    const dir = join(root, '.lock');
+    const lock = await acquireLock(dir);
+    rmState.claimedWhenEmptied.add(dir);
+    expect(() => lock.release()).not.toThrow();
+    expect(JSON.parse(await readFile(join(dir, 'owner.json'), 'utf8'))).toEqual({
+      token: 'successor',
+    });
+  });
+
+  it('still throws a release that fails for any other reason', async () => {
+    const root = await sandbox();
+    const dir = join(root, '.lock');
+    const lock = await acquireLock(dir);
+    rmState.failFor.add(dir);
+    try {
+      expect(() => lock.release()).toThrow(/EBUSY/);
+    } finally {
+      rmState.failFor.delete(dir);
+    }
   });
 
   it('times out when a live holder keeps the lock', async () => {

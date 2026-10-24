@@ -123,7 +123,15 @@ export class Lock {
     this.released = true;
     // Remove the lock directory only while it is still this claim's. A holder that outlived the
     // staleness had it reclaimed, and the directory there now is its successor's.
-    if (this.stillOurs()) rmSync(this.dir, { recursive: true, force: true });
+    if (!this.stillOurs()) return;
+    try {
+      rmSync(this.dir, { recursive: true, force: true });
+    } catch (err) {
+      // The delete empties the directory before removing it, and on POSIX a contender's claim (a
+      // rename) may replace an empty directory: its last step then finds the successor's lock.
+      // Ours is gone and the successor's is untouched, so the release is done.
+      if ((err as NodeJS.ErrnoException).code !== 'ENOTEMPTY') throw err;
+    }
   }
 }
 
