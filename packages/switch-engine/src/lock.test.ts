@@ -46,7 +46,10 @@ vi.mock('node:fs', async (importOriginal) => {
       if (rmState.claimedWhenEmptied.delete(String(target))) {
         actual.rmSync(target, options);
         actual.mkdirSync(target);
-        actual.writeFileSync(`${String(target)}/owner.json`, JSON.stringify({ token: 'successor' }));
+        actual.writeFileSync(
+          `${String(target)}/owner.json`,
+          JSON.stringify({ token: 'successor' }),
+        );
         const err: NodeJS.ErrnoException = new Error('ENOTEMPTY: directory not empty');
         err.code = 'ENOTEMPTY';
         throw err;

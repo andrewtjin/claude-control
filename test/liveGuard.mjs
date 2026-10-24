@@ -82,7 +82,11 @@ function canonical(target, follow = true, hops = 0) {
         // Not a link: a part that is simply missing.
       }
       if (link !== undefined) {
-        return canonical(path.join(path.resolve(path.dirname(head), link), ...tail), true, hops + 1);
+        return canonical(
+          path.join(path.resolve(path.dirname(head), link), ...tail),
+          true,
+          hops + 1,
+        );
       }
     }
     const parent = path.dirname(head);
