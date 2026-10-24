@@ -134,6 +134,20 @@ describe('live-state guard', () => {
     }
   });
 
+  it('follows a planted link to a protected folder that does not exist yet', () => {
+    const link = join(tmpdir(), `cctl-guard-dangling-${process.pid}`);
+    const missing = join(realHome, '.claude', `cctl-guard-missing-${process.pid}`);
+    probes.push(missing);
+    fs.symlinkSync(missing, link, 'junction');
+    try {
+      expect(() => fs.mkdirSync(link, { recursive: true })).toThrow(refused);
+      expect(() => fs.writeFileSync(join(link, 'probe.tmp'), 'x')).toThrow(refused);
+    } finally {
+      if (process.platform === 'win32') fs.rmdirSync(link);
+      else fs.unlinkSync(link);
+    }
+  });
+
   it('is preloaded into node children, which refuse the same writes', () => {
     const target = probe(join(realHome, '.claude'));
     const child = spawnSync(

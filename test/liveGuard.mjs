@@ -51,13 +51,17 @@ const NODE_PRELOAD = `--import=${import.meta.url}`;
 // can never recurse into it.
 const realExistsSync = fs.existsSync;
 const realRealpathSync = fs.realpathSync.native;
+const realReadlinkSync = fs.readlinkSync;
 const realAppendFileSync = fs.appendFileSync;
+
+/** How many dangling links {@link canonical} follows before it stops, as the OS stops a loop. */
+const MAX_LINK_HOPS = 40;
 
 /** Fold a path to the form protected entries are compared in: absolute, resolved through any
  *  junction or symlink on its existing part, and case-folded on Windows. With `follow` false the
  *  last component is kept as named, for calls that act on a link itself (removing or renaming
  *  it) rather than on what it points at. */
-function canonical(target, follow = true) {
+function canonical(target, follow = true, hops = 0) {
   let resolved = path.resolve(target);
   if (!follow) {
     const parent = path.dirname(resolved);
@@ -68,6 +72,19 @@ function canonical(target, follow = true) {
   let head = resolved;
   const tail = [];
   while (!realExistsSync(head)) {
+    // A link whose target does not exist yet does not "exist" either, yet a write through it
+    // creates that target: follow it rather than step past it to the lexical path.
+    if (hops < MAX_LINK_HOPS) {
+      let link;
+      try {
+        link = realReadlinkSync(head);
+      } catch {
+        // Not a link: a part that is simply missing.
+      }
+      if (link !== undefined) {
+        return canonical(path.join(path.resolve(path.dirname(head), link), ...tail), true, hops + 1);
+      }
+    }
     const parent = path.dirname(head);
     if (parent === head) break;
     tail.unshift(path.basename(head));
