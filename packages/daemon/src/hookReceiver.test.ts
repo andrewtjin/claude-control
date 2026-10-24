@@ -2676,6 +2676,20 @@ describe('HookReceiver in Discord quiet mode', () => {
     expect(emitted.map((e) => e.type)).toEqual(['question.request', 'hook.notification']);
   });
 
+  it('still delivers queued /say steering through the Stop hook', async () => {
+    receiver.setSteeringSource((sessionId) => (sessionId === 'sess-q' ? 'keep going' : undefined));
+    const stop = await hook({
+      hook_event_name: 'Stop',
+      session_id: 'sess-q',
+      last_assistant_message: 'done',
+    });
+    // The operator asked for this text to reach the session; quiet mode only drops what posts on
+    // its own, never a delivery the operator is waiting on.
+    expect(stop.status).toBe(200);
+    expect(stop.body).toEqual({ decision: 'block', reason: 'keep going' });
+    expect(emitted).toHaveLength(0);
+  });
+
   it('drops the Stop done card and the Notification nag, still answering 200', async () => {
     const stop = await hook({
       hook_event_name: 'Stop',
@@ -2749,6 +2763,24 @@ describe('HookReceiver in Discord quiet mode', () => {
       await route({ quiet: true });
       await route({ quiet: null });
       expect(seen).toEqual([false, true, undefined]);
+    });
+
+    it("passes an unset's outcome through: whether the file held a value, and the env pin", async () => {
+      receiver.setSettingsHandlers({
+        setQuiet: () =>
+          Promise.resolve({
+            ok: true,
+            quiet: true,
+            changed: false,
+            report,
+            removed: true,
+            pinned: true,
+          }),
+      });
+      expect(await route({ quiet: null })).toEqual({
+        status: 200,
+        body: { ok: true, quiet: true, changed: false, removed: true, pinned: true },
+      });
     });
 
     it('refuses a missing or non-boolean value as a client bug, never reading it as unset', async () => {

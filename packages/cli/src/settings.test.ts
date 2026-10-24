@@ -27,6 +27,7 @@ import {
   readDaemonConfigFile,
   readSettingsReport,
   renderSettingApplied,
+  renderSettingClearedLive,
   renderSettingForgotten,
   renderSettingSaved,
   renderSettings,
@@ -257,9 +258,13 @@ describe('resolveDaemonConfig', () => {
       { env: { CCTL_DISCORD_QUIET: 'off' } },
     );
     expect(row(both.rows, 'discord quiet')).toMatchObject({ value: 'on', source: 'env' });
-    // A typo falls back to the default, and says so.
+    // A typo in the environment falls back to the default value, but the environment still pins
+    // it (the live control refuses a change), so the row names the environment.
     const typo = resolveDaemonConfig({ CCTL_DISCORD_QUIET: 'nope' });
-    expect(row(typo.rows, 'discord quiet')).toMatchObject({ value: 'on', source: 'default' });
+    expect(row(typo.rows, 'discord quiet')).toMatchObject({ value: 'on', source: 'env' });
+    // A typo only in the file pins nothing: the default is what is in force.
+    const fileTypo = resolveDaemonConfig({}, {}, { env: { CCTL_DISCORD_QUIET: 'nope' } });
+    expect(row(fileTypo.rows, 'discord quiet')).toMatchObject({ value: 'on', source: 'default' });
   });
 
   it('settles quiet mode under the short alias `quiet`', () => {
@@ -1405,10 +1410,31 @@ describe('renderSettingApplied', () => {
     );
     expect(text).not.toContain('restart');
   });
+});
+
+describe('renderSettingClearedLive', () => {
+  const quiet = findDaemonEnvSetting('quiet') as DaemonEnvSetting;
 
   it('says a live unset puts the running daemon back on the default', () => {
-    expect(renderSettingApplied(quiet, undefined, 'cfg.json')).toBe(
-      'Cleared CCTL_DISCORD_QUIET from cfg.json; the running daemon is back on the default now.\n',
+    const cleared =
+      'Cleared CCTL_DISCORD_QUIET from cfg.json; the running daemon is back on the default now.\n';
+    expect(renderSettingClearedLive(quiet, 'cfg.json', { removed: true, pinned: false })).toBe(
+      cleared,
+    );
+    // A daemon that does not say what it removed is taken at its word.
+    expect(renderSettingClearedLive(quiet, 'cfg.json', {})).toBe(cleared);
+  });
+
+  it('reads an unset with nothing to remove exactly as it does with no daemon running', () => {
+    expect(renderSettingClearedLive(quiet, 'cfg.json', { removed: false, pinned: false })).toBe(
+      renderSettingForgotten(quiet, 'cfg.json', false),
+    );
+  });
+
+  it('names the environment as what stays in force when it pins the value', () => {
+    expect(renderSettingClearedLive(quiet, 'cfg.json', { removed: true, pinned: true })).toBe(
+      "Removed CCTL_DISCORD_QUIET from cfg.json; the daemon's environment still sets " +
+        'CCTL_DISCORD_QUIET, so that value stays in force.\n',
     );
   });
 });

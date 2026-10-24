@@ -22,10 +22,19 @@ export type QuietRefusal = 'env_pinned' | 'persist_failed' | 'unsupported';
 
 /** Outcome of {@link QuietControl.set}. On success, `report` is the settings report with the quiet
  *  row and field rewritten, for the daemon to re-send so `/settings` and the bot's planner see the
- *  live value. `changed` is false when the value in force did not move (a repeat). On a refusal
- *  `quiet` is the unchanged value, so a reply can say what still holds. */
+ *  live value. `changed` is false when the value in force did not move (a repeat). For an unset,
+ *  `removed` says whether config.json held a value to remove, and `pinned` that the environment
+ *  sets the variable, so its value stays in force (only an unset succeeds while pinned). On a
+ *  refusal `quiet` is the unchanged value, so a reply can say what still holds. */
 export type QuietSetResult =
-  | { ok: true; quiet: boolean; changed: boolean; report: SettingsSnapshot }
+  | {
+      ok: true;
+      quiet: boolean;
+      changed: boolean;
+      report: SettingsSnapshot;
+      removed?: boolean;
+      pinned?: boolean;
+    }
   | { ok: false; quiet: boolean; reason: QuietRefusal; message: string };
 
 /** The live quiet-mode setting. */

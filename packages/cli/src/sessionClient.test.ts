@@ -585,6 +585,24 @@ describe('callDaemonQuietSetting', () => {
     expect(asked).toEqual([false, true, undefined]);
   });
 
+  it("returns an unset's outcome: whether the file held a value, and the env pin", async () => {
+    const h = await harness(() => ({ ok: true, status: 'applied', session: view }));
+    h.receiver.setSettingsHandlers({
+      setQuiet: () =>
+        Promise.resolve({
+          ok: true,
+          quiet: true,
+          changed: false,
+          report: { startedAtMs: 1, settings: [] },
+          removed: false,
+          pinned: true,
+        }),
+    });
+    expect(
+      await callDaemonQuietSetting(undefined, { dataDir: h.dataDir, protector: h.protector }),
+    ).toEqual({ quiet: true, changed: false, removed: false, pinned: true });
+  });
+
   it("refuses with the daemon's own sentence when its environment pins the value", async () => {
     const h = await harness(() => ({ ok: true, status: 'applied', session: view }));
     h.receiver.setSettingsHandlers({

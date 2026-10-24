@@ -305,10 +305,14 @@ export async function callDaemonUsageRepoll(
 }
 
 /** The running daemon's answer to a quiet-mode change: the value now in force, and whether it
- *  moved (false for a repeat of the value already set). */
+ *  moved (false for a repeat of the value already set). For an unset, `removed` says whether
+ *  config.json held a value, and `pinned` that the daemon's environment sets the variable, so its
+ *  value stays in force; a daemon that does not report them leaves them out. */
 export interface DaemonQuietResult {
   quiet: boolean;
   changed: boolean;
+  removed?: boolean;
+  pinned?: boolean;
 }
 
 /**
@@ -343,5 +347,10 @@ export async function callDaemonQuietSetting(
   ) {
     throw new SessionClientError(body?.message ?? body?.error ?? 'unexpected daemon response');
   }
-  return { quiet: body.quiet, changed: body.changed };
+  return {
+    quiet: body.quiet,
+    changed: body.changed,
+    ...(typeof body.removed === 'boolean' ? { removed: body.removed } : {}),
+    ...(typeof body.pinned === 'boolean' ? { pinned: body.pinned } : {}),
+  };
 }

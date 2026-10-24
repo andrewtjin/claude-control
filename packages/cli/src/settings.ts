@@ -163,6 +163,14 @@ export const QUIET_ENV_NAME = 'CCTL_DISCORD_QUIET';
  *  commentary of every turn. */
 export const DEFAULT_DISCORD_QUIET = true;
 
+/** Whether the daemon's own environment pins quiet mode, so a live change would revert at its next
+ *  start. Non-blank, not merely parseable: the environment shadows config.json even with a value
+ *  it cannot read (see layerFileEnv), so a typo there pins the default just as firmly. One
+ *  predicate for the row's source and the live control's refusal, so the two always agree. */
+export function quietPinnedByEnv(env: NodeJS.ProcessEnv): boolean {
+  return blankAsUnset(env[QUIET_ENV_NAME]) !== undefined;
+}
+
 /** The settings row for quiet mode — one builder for the startup resolution and the live change,
  *  so the row a running daemon rewrites reads exactly like the one it started with. */
 export function discordQuietRow(quiet: boolean, source: SettingSource): SettingRow {
@@ -298,19 +306,36 @@ export function renderSettingSaved(
   );
 }
 
-/** What `cctl settings set|unset` prints when the running daemon took the change itself (quiet
- *  mode): it is in force now and saved for the next start, so there is no restart to suggest.
- *  `value` undefined is an unset, which returns the daemon to the setting's default. Painted like
- *  a save — the change is done. */
+/** What `cctl settings set` prints when the running daemon took the change itself (quiet mode):
+ *  it is in force now and saved for the next start, so there is no restart to suggest. Painted
+ *  like a save — the change is done. */
 export function renderSettingApplied(
   setting: DaemonEnvSetting,
-  value: string | undefined,
+  value: string,
   filePath: string,
   palette: Palette = PLAIN_PALETTE,
 ): string {
-  return value !== undefined
-    ? `${palette.green(`Saved ${setting.name}=${value}`)} to ${filePath}; the running daemon ` +
-        'applied it now.\n'
+  return (
+    `${palette.green(`Saved ${setting.name}=${value}`)} to ${filePath}; the running daemon ` +
+    'applied it now.\n'
+  );
+}
+
+/** What `cctl settings unset` prints when the running daemon carried the unset out itself (quiet
+ *  mode). Told apart by what happened to the file: nothing to remove reads exactly as it does with
+ *  no daemon running, and a removal says which value is in force now — the default, or the
+ *  daemon's environment when that sets the variable. A daemon that does not say whether it removed
+ *  anything is reported as having cleared the entry, which is what it was asked to do. */
+export function renderSettingClearedLive(
+  setting: DaemonEnvSetting,
+  filePath: string,
+  outcome: { removed?: boolean; pinned?: boolean },
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  if (outcome.removed === false) return renderSettingForgotten(setting, filePath, false, palette);
+  return outcome.pinned === true
+    ? `${palette.green(`Removed ${setting.name}`)} from ${filePath}; the daemon's environment ` +
+        `still sets ${setting.name}, so that value stays in force.\n`
     : `${palette.green(`Cleared ${setting.name}`)} from ${filePath}; the running daemon is back ` +
         'on the default now.\n';
 }
@@ -938,7 +963,12 @@ export function resolveDaemonConfig(
       source: sourceOf('CCTL_COMMAND_OUTPUT', commandOutputEnv !== undefined),
       detail: "CCTL_COMMAND_OUTPUT (every shell command's output as a phone card; off silences)",
     },
-    discordQuietRow(discordQuiet, sourceOf(QUIET_ENV_NAME, discordQuietEnv !== undefined)),
+    // Named `env` whenever the environment pins it, an unreadable value included: that is what the
+    // live control refuses on, and `/quiet` reads the source to say whether a change can work.
+    discordQuietRow(
+      discordQuiet,
+      quietPinnedByEnv(env) ? 'env' : sourceOf(QUIET_ENV_NAME, discordQuietEnv !== undefined),
+    ),
     {
       name: 'identity check',
       value: identityCheck ? 'on' : 'off',

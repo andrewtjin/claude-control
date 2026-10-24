@@ -123,7 +123,13 @@ vi.mock('./settings.js', async (importOriginal) => ({
 // gets the real client (which, in the sandboxed home, finds no daemon at all).
 const quietIo = vi.hoisted(() => ({
   call: undefined as
-    undefined | ((value: boolean | undefined) => Promise<{ quiet: boolean; changed: boolean }>),
+    | undefined
+    | ((value: boolean | undefined) => Promise<{
+        quiet: boolean;
+        changed: boolean;
+        removed?: boolean;
+        pinned?: boolean;
+      }>),
 }));
 vi.mock('./sessionClient.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./sessionClient.js')>();
@@ -392,6 +398,19 @@ describe('buildProgram', () => {
       expect(asked).toEqual([false, undefined]);
       // The daemon owns the write on this path; the CLI writing too would race it.
       await expect(readFile(settingsIo.configPath, 'utf8')).rejects.toThrow();
+    });
+
+    it('reports a live unset by what it did to the file', async () => {
+      quietIo.call = () => Promise.resolve({ quiet: true, changed: false, removed: false });
+      const nothing = await runCli(['settings', 'unset', 'quiet']);
+      expect(nothing.out).toBe(`CCTL_DISCORD_QUIET is not set in ${settingsIo.configPath}.\n`);
+      // Pinned by the daemon's environment: the entry still goes, and the reply says what decides.
+      quietIo.call = () =>
+        Promise.resolve({ quiet: true, changed: false, removed: true, pinned: true });
+      const pinned = await runCli(['settings', 'unset', 'quiet']);
+      expect(pinned.exited).toBe(false);
+      expect(pinned.out).toContain('Removed CCTL_DISCORD_QUIET from');
+      expect(pinned.out).toContain("the daemon's environment still sets CCTL_DISCORD_QUIET");
     });
 
     it("refuses with the daemon's words when it will not take the change, saving nothing", async () => {

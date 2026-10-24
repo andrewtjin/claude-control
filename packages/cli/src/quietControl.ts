@@ -8,17 +8,19 @@
 //
 // The one refusal that matters: when the daemon's own environment sets CCTL_DISCORD_QUIET, that
 // value outranks config.json, so a live change would quietly revert at the next start. That is
-// refused with the variable named, rather than applied for an afternoon and then lost.
+// refused with the variable named, rather than applied for an afternoon and then lost. An unset is
+// still carried out: removing a file entry the environment already overrides changes nothing in
+// force now or at the next start, so there is nothing to refuse.
 
 import type { QuietControl, QuietSetResult } from '@claude-control/daemon';
 import {
   DEFAULT_DISCORD_QUIET,
   QUIET_ENV_NAME,
-  blankAsUnset,
   discordQuietRow,
   findDaemonEnvSetting,
   forgetDaemonSetting,
   persistDaemonSetting,
+  quietPinnedByEnv,
   writeSettingsReport,
   type SettingsReport,
 } from './settings.js';
@@ -47,15 +49,13 @@ export function createQuietControl(options: QuietControlOptions): QuietControl {
   // The table and this module are in one package, so a miss is a build defect, not input.
   if (setting === undefined)
     throw new Error(`${QUIET_ENV_NAME} is missing from the settings table`);
-  // Non-blank, not merely parseable: the environment shadows the file even with a value it cannot
-  // read (see layerFileEnv), so a typo there pins the default just as firmly.
-  const pinned = blankAsUnset(options.shellEnv[QUIET_ENV_NAME]) !== undefined;
+  const pinned = quietPinnedByEnv(options.shellEnv);
   let quiet = options.quiet;
   let report: SettingsReport = { ...options.report, quiet };
   let queue: Promise<unknown> = Promise.resolve();
 
   const apply = async (value: boolean | undefined): Promise<QuietSetResult> => {
-    if (pinned) {
+    if (pinned && value !== undefined) {
       return {
         ok: false,
         quiet,
@@ -66,8 +66,9 @@ export function createQuietControl(options: QuietControlOptions): QuietControl {
           'environment the daemon starts in, restart the daemon, then try again.',
       };
     }
+    let removed = false;
     try {
-      if (value === undefined) await forgetDaemonSetting(options.configPath, setting);
+      if (value === undefined) removed = await forgetDaemonSetting(options.configPath, setting);
       else await persistDaemonSetting(options.configPath, setting, value ? 'on' : 'off');
     } catch (err) {
       return {
@@ -79,6 +80,9 @@ export function createQuietControl(options: QuietControlOptions): QuietControl {
           'nothing changed',
       };
     }
+    // Pinned: only the file entry went; the environment's value is still the one in force, and the
+    // row already names it.
+    if (pinned) return { ok: true, quiet, changed: false, report, removed, pinned };
     const next = value ?? DEFAULT_DISCORD_QUIET;
     const changed = next !== quiet;
     quiet = next;
@@ -91,7 +95,14 @@ export function createQuietControl(options: QuietControlOptions): QuietControl {
     await writeSettingsReport(options.reportPath, report).catch((err: unknown) =>
       options.onReportWriteError?.(err),
     );
-    return { ok: true, quiet: next, changed, report };
+    return {
+      ok: true,
+      quiet: next,
+      changed,
+      report,
+      ...(value === undefined ? { removed } : {}),
+      pinned,
+    };
   };
 
   return {

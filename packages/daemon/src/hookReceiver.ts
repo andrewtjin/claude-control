@@ -1419,7 +1419,8 @@ export class HookReceiver {
   /** `POST /cli/settings/quiet { quiet: true | false | null }`: change quiet mode on this daemon and
    *  persist it; `null` forgets the persisted value. A boolean or null, strictly — a missing field
    *  is a client bug, not "unset", since set and unset are opposite intents. The 200 body carries
-   *  the value now in force and whether it moved; a refusal carries the daemon's own sentence, at a
+   *  the value now in force and whether it moved (and, for an unset, whether config.json held a
+   *  value and whether the environment still pins it); a refusal carries the daemon's own sentence, at a
    *  status that says whether retrying could help (409: change the environment first; 500: the
    *  file could not be written; 501: this daemon cannot change it live). */
   private async handleQuietSetting(
@@ -1436,7 +1437,15 @@ export class HookReceiver {
     }
     const result = await this.settingsHandlers.setQuiet(body.quiet ?? undefined);
     if (result.ok) {
-      this.respond(res, 200, { ok: true, quiet: result.quiet, changed: result.changed });
+      // `removed` and `pinned` let the CLI say what an unset actually did to the file and whether
+      // the environment still decides; absent fields mean a set, or a daemon that says no more.
+      this.respond(res, 200, {
+        ok: true,
+        quiet: result.quiet,
+        changed: result.changed,
+        ...(result.removed !== undefined ? { removed: result.removed } : {}),
+        ...(result.pinned !== undefined ? { pinned: result.pinned } : {}),
+      });
       return;
     }
     const status: Record<QuietRefusal, number> = {

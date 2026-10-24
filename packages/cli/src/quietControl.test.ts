@@ -84,7 +84,7 @@ describe('createQuietControl', () => {
     await control.set(false);
     const result = await control.set(undefined);
 
-    expect(result).toMatchObject({ ok: true, quiet: true, changed: true });
+    expect(result).toMatchObject({ ok: true, quiet: true, changed: true, removed: true });
     expect(await readDaemonConfigFile(options.configPath)).toEqual({});
     if (result.ok) expect(result.report.settings).toContainEqual(discordQuietRow(true, 'default'));
   });
@@ -107,6 +107,33 @@ describe('createQuietControl', () => {
     // A blank one does not: it is an absent override, as everywhere else.
     const blank = createQuietControl(await setup({ shellEnv: { CCTL_DISCORD_QUIET: '  ' } }));
     expect(await blank.set(false)).toMatchObject({ ok: true, quiet: false });
+  });
+
+  it('carries out an unset while pinned: removing an overridden entry changes nothing in force', async () => {
+    const options = await setup({ shellEnv: { CCTL_DISCORD_QUIET: 'on' } });
+    await writeFile(options.configPath, JSON.stringify({ env: { CCTL_DISCORD_QUIET: 'off' } }));
+    const control = createQuietControl(options);
+    const result = await control.set(undefined);
+
+    expect(result).toMatchObject({
+      ok: true,
+      quiet: true,
+      changed: false,
+      removed: true,
+      pinned: true,
+    });
+    expect(control.isQuiet()).toBe(true);
+    expect((await readDaemonConfigFile(options.configPath))?.env ?? {}).toEqual({});
+  });
+
+  it('says when an unset found nothing in config.json to remove', async () => {
+    const control = createQuietControl(await setup());
+    expect(await control.set(undefined)).toMatchObject({
+      ok: true,
+      changed: false,
+      removed: false,
+      pinned: false,
+    });
   });
 
   it('refuses, changing nothing, when config.json cannot be written', async () => {
