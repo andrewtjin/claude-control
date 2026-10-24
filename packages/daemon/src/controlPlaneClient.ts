@@ -73,6 +73,9 @@ export interface ControlPlaneHandlers {
    *  only, as with every other inbound command — the scan, the day bound, and the result reply
    *  live in the daemon's handler. */
   onStatsRequest?: (msg: MessageOf<'stats.request'>) => void;
+  /** Phone-initiated quiet-mode change (`/quiet on|off`). Routing only, as with every other
+   *  inbound command — the env-pin refusal, the save and the result reply live in the daemon. */
+  onQuietSet?: (msg: MessageOf<'settings.quiet.set'>) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +390,7 @@ export class ControlPlaneClient {
     else if (isType(envelope, 'session.stop')) this.opts.handlers.onSessionStop?.(envelope);
     else if (isType(envelope, 'session.prune')) this.opts.handlers.onSessionPrune?.(envelope);
     else if (isType(envelope, 'stats.request')) this.opts.handlers.onStatsRequest?.(envelope);
+    else if (isType(envelope, 'settings.quiet.set')) this.opts.handlers.onQuietSet?.(envelope);
     // Any other type (usage.snapshot, session.output, etc.) is bot->phone traffic the daemon
     // itself never receives from the relay; silently ignored rather than treated as an error.
   }

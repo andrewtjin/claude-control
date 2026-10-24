@@ -148,7 +148,16 @@ export {
   type HookReceiverChannelHandlers,
   type ChannelAttachRequest,
   type ChannelInjectionView,
+  type HookReceiverSettingsHandlers,
 } from './hookReceiver.js';
+
+export {
+  QUIET_DROPPED_NOTICES,
+  quietDropsNotice,
+  type QuietControl,
+  type QuietRefusal,
+  type QuietSetResult,
+} from './quietMode.js';
 
 // The daemon's half of live-channel delivery. Exported because the channel package composes
 // exactly these against its own server and link to prove the wire BETWEEN the two packages,

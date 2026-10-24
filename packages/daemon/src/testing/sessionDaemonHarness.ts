@@ -18,6 +18,7 @@ import {
   negotiateVersion,
   type Envelope,
   type EnvelopeDraft,
+  type SettingsSnapshot,
 } from '@claude-control/shared-protocol';
 import type {
   ActivateResult,
@@ -43,6 +44,7 @@ import { AttributionJournal } from '../attributionJournal.js';
 import { HookReceiver } from '../hookReceiver.js';
 import { ControlPlaneClient, type DaemonIdentity } from '../controlPlaneClient.js';
 import { Daemon, type AutoSwitcherLike, type SwitchEngineLike } from '../daemon.js';
+import type { QuietControl } from '../quietMode.js';
 
 /** A minimal steady-state relay: accepts `hello`, answers `ping`, collects everything the
  *  daemon sends, and can push envelopes down to it. Enough wire protocol to drive the daemon's
@@ -327,6 +329,10 @@ export interface HarnessOptions {
   /** Effectively off by default: most tests drive exactly one cycle via start(). */
   pollIntervalMs?: number;
   logger?: Logger;
+  /** Discord quiet mode (see DaemonOptions.quiet); absent = never quiet. */
+  quiet?: QuietControl;
+  /** The settings report the daemon pushes (see DaemonOptions.settingsReport). */
+  settingsReport?: SettingsSnapshot;
 }
 
 export interface Harness {
@@ -335,6 +341,8 @@ export interface Harness {
   store: Store;
   switchEngine: FakeSwitchEngine;
   sessionManager: SessionManager;
+  /** The daemon's loopback receiver, for driving its CLI routes once the daemon has started. */
+  hookReceiver: HookReceiver;
   /** Envelopes the daemon has sent, newest last. */
   sent: Envelope[];
   dispose: () => Promise<void>;
@@ -390,6 +398,8 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
       : {}),
     ...(options.autoSwitcher !== undefined ? { autoSwitcher: options.autoSwitcher } : {}),
     ...(options.logger !== undefined ? { logger: options.logger } : {}),
+    ...(options.quiet !== undefined ? { quiet: options.quiet } : {}),
+    ...(options.settingsReport !== undefined ? { settingsReport: options.settingsReport } : {}),
     pollIntervalMs: options.pollIntervalMs ?? 100_000,
   });
   return {
@@ -398,6 +408,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
     store,
     switchEngine,
     sessionManager,
+    hookReceiver,
     sent: relay.received,
     async dispose() {
       await daemon.stop().catch(() => undefined);

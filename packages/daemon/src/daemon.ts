@@ -106,6 +106,7 @@ import {
   type ScopeView,
 } from './exhaustionLog.js';
 import { folderNameOf, globalSlotAccountIds, rulesPictureOf } from './folderSlots.js';
+import { quietDropsNotice, type QuietControl, type QuietSetResult } from './quietMode.js';
 import type { Store } from './store.js';
 import { slotBySessionMap } from './store.js';
 import {
@@ -251,9 +252,13 @@ export interface DaemonOptions {
    *  executor; absent everywhere = the executor's own defaults. */
   autoSwitchPolicy?: AutoSwitchPolicy;
   /** The effective-settings report resolved at startup (see cli/settings.ts). When present
-   *  it is re-pushed with every poll cycle — settings never change mid-run, but the bot's
-   *  cache is in-memory, so the repeat is what survives a bot restart. */
+   *  it is re-pushed with every poll cycle — the bot's cache is in-memory, so the repeat is what
+   *  survives a bot restart — and at once whenever quiet mode changes (see {@link quiet}). */
   settingsReport?: PayloadOf<'settings.snapshot'>;
+  /** Discord quiet mode, live (see quietMode.ts). Read on every managed-session event and every
+   *  fleet notice, and changed by the phone's `settings.quiet.set` and the CLI's
+   *  `/cli/settings/quiet`. Absent: never quiet, and a request to change it is refused. */
+  quiet?: QuietControl;
   /** Real Agent SDK adapter (live boundary), overridable so tests never touch a real SDK. The
    *  optional `configDir` binds the spawned session's `CLAUDE_CONFIG_DIR` to a folder-bound group's
    *  profile dir; absent, the session runs in the shared/global config dir (the historical model).
@@ -788,7 +793,15 @@ export class Daemon {
   private leaseSweep: Promise<void> | undefined;
   private readonly accountProbe: AccountProbeLike | undefined;
   private readonly autoSwitchPolicy: AutoSwitchPolicy;
-  private readonly settingsReport: PayloadOf<'settings.snapshot'> | undefined;
+  /** Not readonly: a quiet-mode change replaces it with the report the control rewrote. */
+  private settingsReport: PayloadOf<'settings.snapshot'> | undefined;
+  private readonly quiet: QuietControl | undefined;
+  /** Quiet mode only: the latest error line of each managed session's turn, held back instead of
+   *  posted. A turn that dies of an error event or a thrown stream reports its reason as an error
+   *  line and then goes `failed`; that line is the turn's outcome, so it is posted when the session
+   *  fails — and dropped when the turn ends any other way (prose lines that merely mention an
+   *  error are classified the same, and must stay off the phone). */
+  private readonly quietHeldErrors = new Map<string, string>();
   private readonly createAgentSdkClient: (
     configDir?: string,
     scrubInheritedConfigDir?: boolean,
@@ -1003,6 +1016,7 @@ export class Daemon {
     // is reading the executor's policy, not a second one that can drift from it.
     this.autoSwitchPolicy = options.autoSwitchPolicy ?? options.poller.autoSwitchPolicy ?? {};
     this.settingsReport = options.settingsReport;
+    this.quiet = options.quiet;
     // The default adapter binds the config dir when one is given (a folder-bound spawn), else runs
     // in the shared config dir. The composition root's factory (makeAgentSdkClientFactory) does the
     // same; this fallback keeps a bare `new Daemon` working in tests.
@@ -1137,6 +1151,9 @@ export class Daemon {
     this.hookReceiver.setChannelHandlers(this.channelHandlers());
     // …and for an on-demand usage refresh: the receiver owns the route, this class owns the poller.
     this.hookReceiver.setUsageHandlers({ repollUsage: (ids) => this.repollUsage(ids) });
+    // …and for a live quiet-mode change from `cctl settings set|unset quiet`: one path with the
+    // phone's, so both re-send the settings snapshot the same way.
+    this.hookReceiver.setSettingsHandlers({ setQuiet: (value) => this.setQuiet(value) });
 
     const hookPort = await this.hookReceiver.listen(0);
 
@@ -1233,6 +1250,11 @@ export class Daemon {
       onStatsRequest: (msg) => {
         this.handleStatsRequest(msg).catch((err: unknown) => {
           this.logger.error({ err }, 'error handling stats.request');
+        });
+      },
+      onQuietSet: (msg) => {
+        this.handleQuietSet(msg).catch((err: unknown) => {
+          this.logger.error({ err }, 'error handling settings.quiet.set');
         });
       },
     });
@@ -1612,12 +1634,9 @@ export class Daemon {
       });
     });
 
-    // Piggyback the (static) effective-settings report on the usage cadence: a tiny frame,
-    // and re-sending keeps `/settings` answerable even after the bot restarts and loses its
-    // in-memory cache.
-    if (this.settingsReport) {
-      this.sendEnvelope({ type: 'settings.snapshot', payload: this.settingsReport });
-    }
+    // Piggyback the effective-settings report on the usage cadence: a tiny frame, and re-sending
+    // keeps `/settings` answerable even after the bot restarts and loses its in-memory cache.
+    this.sendSettingsSnapshot();
 
     // Auto-switch runs AFTER the snapshot ships, so the phone always sees the usage state
     // that triggered a hop before the hop's own switch.result arrives. AutoSwitcher absorbs
@@ -2281,6 +2300,80 @@ export class Daemon {
     } finally {
       this.statsScanInFlight = false;
     }
+  }
+
+  /** Whether Discord is in quiet mode right now (see quietMode.ts). */
+  private isQuiet(): boolean {
+    return this.quiet?.isQuiet() ?? false;
+  }
+
+  /** Push the current settings report, when there is one. Shared by the poll cycle's repeat and a
+   *  live quiet-mode change, so `/settings` and the bot's planner read the same report either way. */
+  private sendSettingsSnapshot(): void {
+    if (this.settingsReport) {
+      this.sendEnvelope({ type: 'settings.snapshot', payload: this.settingsReport });
+    }
+  }
+
+  /**
+   * Change quiet mode on this daemon — the one path behind the phone's `/quiet` and the CLI's
+   * `cctl settings set|unset quiet`. The control persists the value and rewrites the report; on a
+   * change this re-sends the report at once, so the phone reflects it without waiting for the next
+   * poll cycle. Never throws: a control that rejects is reported as a failed save, because the
+   * caller is a person waiting on a reply.
+   */
+  private async setQuiet(value: boolean | undefined): Promise<QuietSetResult> {
+    const control = this.quiet;
+    if (control === undefined) {
+      return {
+        ok: false,
+        quiet: false,
+        reason: 'unsupported',
+        message: 'this daemon cannot change quiet mode while it runs',
+      };
+    }
+    let result: QuietSetResult;
+    try {
+      result = await control.set(value);
+    } catch (err) {
+      this.logger.warn({ err }, 'quiet mode change failed');
+      return {
+        ok: false,
+        quiet: control.isQuiet(),
+        reason: 'persist_failed',
+        message: 'quiet mode could not be saved on the host; nothing changed',
+      };
+    }
+    if (result.ok) {
+      this.settingsReport = result.report;
+      if (result.changed) this.sendSettingsSnapshot();
+      this.logger.info({ quiet: result.quiet, changed: result.changed }, 'quiet mode set');
+    } else {
+      this.logger.info({ reason: result.reason }, 'quiet mode change refused');
+    }
+    return result;
+  }
+
+  /** Phone-initiated `/quiet on|off`. A request/reply like stats.request: one Discord interaction
+   *  is waiting, so every path ends in exactly one `settings.quiet.result` carrying the requestId.
+   *  The snapshot (re-sent by setQuiet on a change) goes out first, so the bot's cache is current
+   *  by the time it renders the reply. */
+  private async handleQuietSet(msg: MessageOf<'settings.quiet.set'>): Promise<void> {
+    const { requestId, quiet } = msg.payload;
+    const result = await this.setQuiet(quiet);
+    this.sendEnvelope({
+      type: 'settings.quiet.result',
+      payload: result.ok
+        ? {
+            requestId,
+            ok: true,
+            quiet: result.quiet,
+            message: result.changed
+              ? `Quiet mode is now ${result.quiet ? 'on' : 'off'}.`
+              : `Quiet mode was already ${result.quiet ? 'on' : 'off'}.`,
+          }
+        : { requestId, ok: false, quiet: result.quiet, message: result.message },
+    });
   }
 
   /** One transcript scan turned into a wire-ready snapshot — the single place a window becomes
@@ -4704,9 +4797,9 @@ export class Daemon {
         ...(req.permissionMode !== undefined ? { permissionMode: req.permissionMode } : {}),
       },
     });
-    // Deliberately NO companion hook.notification (the hook path sends one): a managed
-    // session's own event stream already surfaces the "Permission required: …" milestone as
-    // session.output, so a notification here would be a duplicate card on the phone.
+    // Deliberately NO companion hook.notification, the same as the hook path: the card is the
+    // message, and a managed session's own event stream already carries the "Permission
+    // required: …" milestone outside quiet mode.
   }
 
   /** Drop every permission route owned by `sessionId` once it ends, mirroring the runtime's
@@ -4797,6 +4890,14 @@ export class Daemon {
       if (event.state === 'waiting_input') this.drainManagedInjects(sessionId);
       else if (event.state === 'done' || event.state === 'failed')
         this.dropManagedInjects(sessionId);
+      // A held error line is the reason a quiet-mode turn failed: posted just ahead of the failed
+      // status, as that turn's one outcome line. Any other transition means the turn ended some
+      // other way, so the held line was only prose and is dropped.
+      const heldError = this.quietHeldErrors.get(sessionId);
+      this.quietHeldErrors.delete(sessionId);
+      if (event.state === 'failed' && heldError !== undefined && this.isQuiet()) {
+        this.sendSessionOutput(sessionId, 'error', heldError);
+      }
       this.sendEnvelope({
         type: 'session.status',
         payload: {
@@ -4814,6 +4915,24 @@ export class Daemon {
     }
 
     const kind = event.kind === 'output' ? 'stdout' : event.kind;
+    // Quiet mode sends one message per turn: the turn's summary, which carries Claude's final reply
+    // (or why the turn failed). Prose, tool and milestone lines (retry, park and resume notes
+    // included) stay off the phone; an error line is held as the possible failure reason (see
+    // quietHeldErrors). Skipped lines take no seq, so the bot sees no gap where there is no loss.
+    if (this.isQuiet() && kind !== 'summary') {
+      if (kind === 'error') this.quietHeldErrors.set(sessionId, event.text);
+      return;
+    }
+    if (kind === 'summary') this.quietHeldErrors.delete(sessionId);
+    this.sendSessionOutput(sessionId, kind, event.text);
+  }
+
+  /** Ship one `session.output` chunk under the session's next seq. */
+  private sendSessionOutput(
+    sessionId: string,
+    kind: PayloadOf<'session.output'>['kind'],
+    text: string,
+  ): void {
     const seq = this.outputSeq.get(sessionId) ?? 0;
     this.outputSeq.set(sessionId, seq + 1);
     this.sendEnvelope({
@@ -4824,7 +4943,7 @@ export class Daemon {
         sessionId,
         seq,
         kind,
-        text: event.text,
+        text,
         truncated: false,
         epoch: this.outputEpoch,
       },
@@ -5241,6 +5360,16 @@ export class Daemon {
   // ---- outbound ----
 
   private sendEnvelope(draft: EnvelopeDraftSansDaemonId): void {
+    // The one gate for the daemon's own fleet notices in quiet mode: every one of them leaves
+    // through here, so a notice site cannot forget it. The kept ones (quarantine, the replies to a
+    // `/say`) are simply not on the dropped list.
+    if (draft.type === 'hook.notification' && this.isQuiet() && quietDropsNotice(draft.payload)) {
+      this.logger.info(
+        { notificationType: draft.payload.notificationType },
+        'fleet notice suppressed (quiet mode)',
+      );
+      return;
+    }
     const daemonId = this.controlPlaneClient.getIdentity()?.daemonId ?? 'unknown';
     this.controlPlaneClient.send({ ...draft, daemonId });
   }
