@@ -185,6 +185,10 @@ function renderNotification(p: PayloadOf<'hook.notification'>): RenderedPush | u
   // suppressed here to avoid a confusing double render — the card, not this note, is what the user
   // acts on.
   if (p.notificationType === 'question_prompt') return undefined;
+  // Likewise every `permission` event: the daemon only ever sends one as a companion of a prompt
+  // card it has just sent. Current daemons no longer send the permission card's companion; this
+  // keeps an older daemon's from rendering as a second message under the card.
+  if (p.event === 'permission') return undefined;
   if (p.event === 'stop') {
     return {
       embeds: [

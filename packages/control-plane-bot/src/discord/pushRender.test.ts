@@ -110,6 +110,22 @@ describe('renderPush — question.request', () => {
       ),
     ).toBeUndefined();
   });
+
+  it('suppresses the "Permission requested" companion an older daemon sends beside the card', () => {
+    // Untyped, so it used to fall through to the generic card: a second message under every
+    // permission card.
+    expect(
+      renderPush(
+        env('hook.notification', {
+          event: 'permission',
+          sessionId: 'sess-1',
+          title: 'Permission requested',
+          body: 'run ls',
+          level: 'info',
+        }),
+      ),
+    ).toBeUndefined();
+  });
 });
 
 describe('renderPush — lifecycle notification cards', () => {

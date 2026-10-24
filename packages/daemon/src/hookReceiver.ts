@@ -1631,17 +1631,9 @@ export class HookReceiver {
         expiresAt: now + this.permissionHoldMs,
       },
     });
-    this.emit({
-      daemonId: this.daemonId(),
-      type: 'hook.notification',
-      payload: {
-        event: 'permission',
-        sessionId,
-        title: 'Permission requested',
-        body: summary,
-        level: 'info',
-      },
-    });
+    // No companion `hook.notification` beside the card: the card already names the tool and its
+    // summary, and nothing reads a companion (the bot's state cache ignores notifications), so a
+    // second envelope could only ever render as a duplicate message under the card.
 
     // THE round-trip: hold this HTTP response open. A phone Approve/Deny lands in
     // `resolvePermission`, which answers it with the CLI's decision schema; the hold lapsing
@@ -1715,9 +1707,10 @@ export class HookReceiver {
         expiresAt: now + this.questionHoldMs,
       },
     });
-    // Companion card, mirroring the permission path's own `hook.notification` companion — event
-    // 'permission' so it groups with permission cards, but tagged `question_prompt` and titled
-    // with the first question so the phone can render it as a "Claude has a question" card.
+    // Companion notification — event 'permission' so it groups with permission cards, tagged
+    // `question_prompt` and titled with the first question. Every bot that renders question cards
+    // suppresses it (the card is the answerable surface); an older bot without question cards shows
+    // it as a plain "Claude has a question" note, which is why it is still sent.
     const firstQuestion = questions[0]?.question;
     this.emit({
       daemonId: this.daemonId(),

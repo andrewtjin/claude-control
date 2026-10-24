@@ -165,7 +165,7 @@ describe('HookReceiver', () => {
   });
 
   describe('PermissionRequest -> emits + persists (response held)', () => {
-    it('persists a pending permission and emits permission.request + hook.notification', async () => {
+    it('persists a pending permission and emits ONLY the permission.request card', async () => {
       const held = post(
         port,
         '/',
@@ -185,13 +185,14 @@ describe('HookReceiver', () => {
       expect(row).toBeDefined();
       expect(row?.resolvedDecision).toBeNull();
 
-      expect(emitted).toHaveLength(2);
+      // One envelope: no "Permission requested" companion, which would render as a second
+      // message under the card.
+      expect(emitted).toHaveLength(1);
       expect(emitted[0]?.type).toBe('permission.request');
       if (emitted[0]?.type === 'permission.request') {
         expect(emitted[0].payload.requestId).toBe('req-1');
         expect(emitted[0].payload.cwd).toBe('/tmp');
       }
-      expect(emitted[1]?.type).toBe('hook.notification');
 
       // Complete the hold so the held socket doesn't outlive the test.
       await post(
