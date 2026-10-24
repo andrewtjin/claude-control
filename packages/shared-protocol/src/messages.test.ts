@@ -1046,3 +1046,81 @@ describe('session.status slot (additive, N/N-1 tolerant)', () => {
     expect(decode(rawFrame('session.status', { ...base, slot: '' })).ok).toBe(false);
   });
 });
+
+describe('quiet mode (settings.snapshot.quiet, settings.quiet.set / .result)', () => {
+  const snapshot = {
+    startedAtMs: 1,
+    settings: [{ name: 'x', value: 'on', source: 'default' as const }],
+  };
+
+  it('parses a snapshot without quiet: a daemon predating quiet mode stays valid', () => {
+    const result = decode(rawFrame('settings.snapshot', snapshot));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'settings.snapshot')) {
+      // Absence is the signal /quiet reads to tell an older daemon apart, so it must survive.
+      expect(result.envelope.payload.quiet ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('carries quiet through a snapshot round-trip', () => {
+    const env = stamp({
+      daemonId: 'daemon-1',
+      type: 'settings.snapshot',
+      payload: { ...snapshot, quiet: true },
+    });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'settings.snapshot')) {
+      expect(result.envelope.payload.quiet).toBe(true);
+    }
+  });
+
+  it('round-trips a set and its result', () => {
+    const set = decode(rawFrame('settings.quiet.set', { requestId: 'req-1', quiet: false }));
+    expect(set.ok).toBe(true);
+    const result = decode(
+      rawFrame('settings.quiet.result', {
+        requestId: 'req-1',
+        ok: false,
+        quiet: true,
+        message: 'pinned',
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'settings.quiet.result')) {
+      expect(result.envelope.payload).toEqual({
+        requestId: 'req-1',
+        ok: false,
+        quiet: true,
+        message: 'pinned',
+      });
+    }
+  });
+
+  it('rejects a set without a boolean value — "toggle" is not a wire meaning', () => {
+    expect(decode(rawFrame('settings.quiet.set', { requestId: 'req-1' })).ok).toBe(false);
+    expect(decode(rawFrame('settings.quiet.set', { requestId: 'req-1', quiet: 'on' })).ok).toBe(
+      false,
+    );
+  });
+
+  it('rejects a result without the value in force — the reply must say what holds', () => {
+    expect(
+      decode(rawFrame('settings.quiet.result', { requestId: 'req-1', ok: true, message: 'ok' })).ok,
+    ).toBe(false);
+  });
+
+  it('both are registered in the schema map and the Envelope union', () => {
+    expect(isMessageType('settings.quiet.set')).toBe(true);
+    expect(isMessageType('settings.quiet.result')).toBe(true);
+    const set = Envelope.safeParse({
+      v: PROTOCOL_VERSION,
+      id: 'msg-1',
+      ts: 1,
+      daemonId: 'daemon-1',
+      type: 'settings.quiet.set',
+      payload: { requestId: 'req-1', quiet: true },
+    });
+    expect(set.success).toBe(true);
+  });
+});

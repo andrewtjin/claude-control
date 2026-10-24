@@ -297,13 +297,40 @@ const UsageSnapshotPayload = z.object({
 });
 
 /** The daemon's effective settings, resolved once at startup (flags and env are read only
- *  then, so the report is immutable for the life of the run). `startedAtMs` dates the
- *  report — the phone shows "as of daemon start", never pretending settings are live.
+ *  then). `startedAtMs` dates the report — the phone shows "as of daemon start". The one
+ *  exception is quiet mode, which `/quiet` and `cctl settings set quiet` change on the running
+ *  daemon: its row and `quiet` are rewritten and the snapshot re-sent at once.
  *  Exported (unlike the other payload schemas) because the daemon persists this exact
  *  shape to disk for `cctl settings`, which re-validates it with the same schema. */
 export const SettingsSnapshot = z.object({
   startedAtMs: z.number().int().nonnegative(),
   settings: z.array(SettingRow),
+  /** Whether Discord is in quiet mode (permission and question cards only, plus one final reply
+   *  per turn of a phone-started session). Machine-readable beside the display row because the bot
+   *  acts on it: its session planner drops state lines and summary cards, and `/quiet` reads it.
+   *  Absent from a daemon predating quiet mode — which is how `/quiet` knows that daemon cannot be
+   *  asked to change it, rather than sending a frame the older daemon would drop unanswered. */
+  quiet: z.boolean().nullish(),
+});
+
+/** Phone-initiated change of quiet mode (`/quiet on|off`). No idempotency key: the value is
+ *  absolute, so a replayed frame sets the same value again and changes nothing — and, as with
+ *  stats.request, a daemon that ignored a duplicate would strand the reply the phone is waiting on. */
+const SettingsQuietSetPayload = z.object({
+  requestId: RequestId,
+  quiet: z.boolean(),
+});
+
+/** The daemon's answer to settings.quiet.set, correlated by `requestId` because one Discord
+ *  interaction is waiting on it. `quiet` is the value in force AFTER the request — on a refusal
+ *  (the value is pinned by the daemon's environment, or could not be saved) that is the unchanged
+ *  value, so the reply can say what still holds. `message` is the daemon's own sentence for the
+ *  outcome, shown as is: only the daemon knows why it refused. */
+const SettingsQuietResultPayload = z.object({
+  requestId: RequestId,
+  ok: z.boolean(),
+  quiet: z.boolean(),
+  message: z.string(),
 });
 
 const SwitchCommandPayload = z.object({
@@ -741,6 +768,8 @@ export const messageSchemas = {
   'stats.request': frame('stats.request', TokenStatsRequestPayload),
   'stats.result': frame('stats.result', TokenStatsResultPayload),
   'settings.snapshot': frame('settings.snapshot', SettingsSnapshot),
+  'settings.quiet.set': frame('settings.quiet.set', SettingsQuietSetPayload),
+  'settings.quiet.result': frame('settings.quiet.result', SettingsQuietResultPayload),
   'switch.command': frame('switch.command', SwitchCommandPayload),
   'switch.result': frame('switch.result', SwitchResultPayload),
   'reauth.start': frame('reauth.start', ReauthStartPayload),
@@ -777,6 +806,8 @@ export const Envelope = z.discriminatedUnion('type', [
   messageSchemas['stats.request'],
   messageSchemas['stats.result'],
   messageSchemas['settings.snapshot'],
+  messageSchemas['settings.quiet.set'],
+  messageSchemas['settings.quiet.result'],
   messageSchemas['switch.command'],
   messageSchemas['switch.result'],
   messageSchemas['reauth.start'],
