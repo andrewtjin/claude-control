@@ -26,6 +26,7 @@ import {
   persistDaemonSetting,
   readDaemonConfigFile,
   readSettingsReport,
+  renderSettingApplied,
   renderSettingForgotten,
   renderSettingSaved,
   renderSettings,
@@ -114,6 +115,7 @@ describe('resolveDaemonConfig', () => {
       waitingCards: false,
       permissionHoldMs: undefined,
       commandOutputCards: true,
+      discordQuiet: true,
       fullToolOutput: false,
       identityCheck: true,
       autoContinue: true,
@@ -229,6 +231,40 @@ describe('resolveDaemonConfig', () => {
     const { values, rows } = resolveDaemonConfig({ CCTL_WAITING_CARDS: '1' });
     expect(values.waitingCards).toBe(true);
     expect(row(rows, 'waiting cards')).toMatchObject({ value: 'on', source: 'env' });
+  });
+
+  it('runs Discord quiet mode by default, and says it wins over the card knobs', () => {
+    const { values, rows } = resolveDaemonConfig({});
+    expect(values.discordQuiet).toBe(true);
+    expect(row(rows, 'discord quiet')).toMatchObject({ value: 'on', source: 'default' });
+    const detail = row(rows, 'discord quiet').detail ?? '';
+    for (const knob of ['CCTL_DISCORD_QUIET', 'command-output', 'waiting-cards', 'full-output']) {
+      expect(detail).toContain(knob);
+    }
+  });
+
+  it('turns quiet mode off from the environment or the file, naming the layer', () => {
+    const fromEnv = resolveDaemonConfig({ CCTL_DISCORD_QUIET: 'off' });
+    expect(fromEnv.values.discordQuiet).toBe(false);
+    expect(row(fromEnv.rows, 'discord quiet')).toMatchObject({ value: 'off', source: 'env' });
+    const fromFile = resolveDaemonConfig({}, {}, { env: { CCTL_DISCORD_QUIET: 'off' } });
+    expect(fromFile.values.discordQuiet).toBe(false);
+    expect(row(fromFile.rows, 'discord quiet')).toMatchObject({ value: 'off', source: 'config' });
+    // The environment still wins over the file.
+    const both = resolveDaemonConfig(
+      { CCTL_DISCORD_QUIET: 'on' },
+      {},
+      { env: { CCTL_DISCORD_QUIET: 'off' } },
+    );
+    expect(row(both.rows, 'discord quiet')).toMatchObject({ value: 'on', source: 'env' });
+    // A typo falls back to the default, and says so.
+    const typo = resolveDaemonConfig({ CCTL_DISCORD_QUIET: 'nope' });
+    expect(row(typo.rows, 'discord quiet')).toMatchObject({ value: 'on', source: 'default' });
+  });
+
+  it('settles quiet mode under the short alias `quiet`', () => {
+    expect(findDaemonEnvSetting('quiet')?.name).toBe('CCTL_DISCORD_QUIET');
+    expect(findDaemonEnvSetting('CCTL_DISCORD_QUIET')?.alias).toBe('quiet');
   });
 
   it('silences command output cards via CCTL_COMMAND_OUTPUT=off (a default-on knob)', () => {
@@ -1356,5 +1392,23 @@ describe('fileSettingNames', () => {
       }),
     ).toEqual(['CCTL_AUTOSWITCH_ON_FABLE_CAP', 'CCTL_AUTOSWITCH_TRIGGER_PCT']);
     expect(fileSettingNames({ relayUrl: 'wss://a.example' })).toEqual(['CCTL_RELAY_URL']);
+  });
+});
+
+describe('renderSettingApplied', () => {
+  const quiet = findDaemonEnvSetting('quiet') as DaemonEnvSetting;
+
+  it('says a live set is in force now and saved, with no restart to suggest', () => {
+    const text = renderSettingApplied(quiet, 'off', 'cfg.json');
+    expect(text).toBe(
+      'Saved CCTL_DISCORD_QUIET=off to cfg.json; the running daemon applied it now.\n',
+    );
+    expect(text).not.toContain('restart');
+  });
+
+  it('says a live unset puts the running daemon back on the default', () => {
+    expect(renderSettingApplied(quiet, undefined, 'cfg.json')).toBe(
+      'Cleared CCTL_DISCORD_QUIET from cfg.json; the running daemon is back on the default now.\n',
+    );
   });
 });

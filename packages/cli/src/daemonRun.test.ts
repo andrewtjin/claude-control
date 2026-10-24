@@ -15,6 +15,7 @@ import {
   type CreateAgentSdkClientDeps,
 } from '@claude-control/session-runtime';
 import {
+  autoSwitchNotifier,
   dpapiIdentityStore,
   makeAgentSdkClientFactory,
   pollerAdvisorOptions,
@@ -233,5 +234,38 @@ describe('pollerAdvisorOptions', () => {
       autoSwitchPolicy: policy,
       greedyAutoSwitch: true,
     });
+  });
+});
+
+describe('autoSwitchNotifier', () => {
+  const hop = {
+    requestId: 'auto-1',
+    ok: true,
+    outcome: 'hot_applied' as const,
+    activeAccountId: 'acct-b',
+    message: 'switched',
+  };
+
+  it('reports every hop to the phone with quiet mode off', () => {
+    const sent: unknown[] = [];
+    autoSwitchNotifier({ isQuiet: () => false, send: (p) => sent.push(p), logger: noopLogger })(
+      hop,
+    );
+    expect(sent).toEqual([hop]);
+  });
+
+  it('keeps hops off the phone in quiet mode, reading the setting at each hop', () => {
+    const sent: unknown[] = [];
+    let quiet = true;
+    const notify = autoSwitchNotifier({
+      isQuiet: () => quiet,
+      send: (p) => sent.push(p),
+      logger: noopLogger,
+    });
+    notify(hop);
+    expect(sent).toEqual([]);
+    quiet = false;
+    notify(hop);
+    expect(sent).toEqual([hop]);
   });
 });

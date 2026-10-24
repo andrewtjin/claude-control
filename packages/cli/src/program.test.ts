@@ -118,6 +118,23 @@ vi.mock('./settings.js', async (importOriginal) => ({
   daemonHeartbeatPath: () => settingsIo.heartbeatPath,
   readSettingsReport: settingsIo.readSettingsReport,
 }));
+// `cctl settings set|unset quiet` asks the running daemon first. Its client has its own tests
+// against a real receiver; here a test can stand in for the daemon's answer, and every other test
+// gets the real client (which, in the sandboxed home, finds no daemon at all).
+const quietIo = vi.hoisted(() => ({
+  call: undefined as
+    undefined | ((value: boolean | undefined) => Promise<{ quiet: boolean; changed: boolean }>),
+}));
+vi.mock('./sessionClient.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./sessionClient.js')>();
+  return {
+    ...real,
+    callDaemonQuietSetting: (
+      value: boolean | undefined,
+      deps?: Parameters<typeof real.callDaemonQuietSetting>[1],
+    ) => (quietIo.call ? quietIo.call(value) : real.callDaemonQuietSetting(value, deps)),
+  };
+});
 // The lifecycle commands' policy has its own unit tests against fake deps; here only the
 // wiring is exercised (outcome → rendered lines, control error → the one error line), so the
 // three operations are stubbed and nothing near a real daemon, task, or process is touched.
@@ -345,10 +362,68 @@ describe('buildProgram', () => {
     afterEach(async () => {
       settingsIo.configPath = '';
       settingsIo.reportPath = '';
+      quietIo.call = undefined;
       await rm(dir, { recursive: true, force: true });
     });
     const config = async () =>
       JSON.parse(await readFile(settingsIo.configPath, 'utf8')) as Record<string, unknown>;
+
+    it('saves quiet mode for the next start when no daemon is running', async () => {
+      const r = await runCli(['settings', 'set', 'quiet', 'off']);
+      expect(r.exited).toBe(false);
+      expect(r.out).toContain(`Saved CCTL_DISCORD_QUIET=off to ${settingsIo.configPath}.`);
+      expect(r.out).toMatch(/next starts/);
+      expect(await config()).toEqual({ env: { CCTL_DISCORD_QUIET: 'off' } });
+    });
+
+    it('applies quiet mode on the running daemon, which saves it itself', async () => {
+      const asked: (boolean | undefined)[] = [];
+      quietIo.call = (value) => {
+        asked.push(value);
+        return Promise.resolve({ quiet: value ?? true, changed: true });
+      };
+      const set = await runCli(['settings', 'set', 'quiet', 'off']);
+      expect(set.exited).toBe(false);
+      expect(set.out).toContain('Saved CCTL_DISCORD_QUIET=off to');
+      expect(set.out).toContain('the running daemon applied it now');
+      expect(set.out).not.toMatch(/restart/);
+      const unset = await runCli(['settings', 'unset', 'quiet']);
+      expect(unset.out).toContain('Cleared CCTL_DISCORD_QUIET from');
+      expect(asked).toEqual([false, undefined]);
+      // The daemon owns the write on this path; the CLI writing too would race it.
+      await expect(readFile(settingsIo.configPath, 'utf8')).rejects.toThrow();
+    });
+
+    it("refuses with the daemon's words when it will not take the change, saving nothing", async () => {
+      const { SessionClientError } = await import('./sessionClient.js');
+      quietIo.call = () =>
+        Promise.reject(
+          new SessionClientError('CCTL_DISCORD_QUIET is set in the daemon environment', 'refused'),
+        );
+      const r = await runCli(['settings', 'set', 'quiet', 'off']);
+      expect(r.exited).toBe(true);
+      expect(r.err).toContain('CCTL_DISCORD_QUIET is set in the daemon environment');
+      await expect(readFile(settingsIo.configPath, 'utf8')).rejects.toThrow();
+    });
+
+    it('saves for the next start when the running daemon is too old to change it live', async () => {
+      const { SessionClientError } = await import('./sessionClient.js');
+      quietIo.call = () => Promise.reject(new SessionClientError('older', 'older_daemon'));
+      const r = await runCli(['settings', 'set', 'quiet', 'on']);
+      expect(r.exited).toBe(false);
+      expect(r.out).toMatch(/next starts/);
+      expect(await config()).toEqual({ env: { CCTL_DISCORD_QUIET: 'on' } });
+    });
+
+    it('never asks the daemon about any other setting', async () => {
+      let asked = false;
+      quietIo.call = () => {
+        asked = true;
+        return Promise.resolve({ quiet: true, changed: false });
+      };
+      await runCli(['settings', 'set', 'command-output', 'off']);
+      expect(asked).toBe(false);
+    });
 
     it('nests set and unset under settings, keeping the bare view', async () => {
       const settings = buildProgram().commands.find((c) => c.name() === 'settings');

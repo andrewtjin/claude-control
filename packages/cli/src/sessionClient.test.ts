@@ -17,6 +17,7 @@ import {
 } from '@claude-control/daemon';
 import { InsecurePassthroughProtector, type Protector } from '@claude-control/switch-engine';
 import {
+  callDaemonQuietSetting,
   callDaemonSession,
   callDaemonUsageRepoll,
   resolveSessionId,
@@ -301,10 +302,13 @@ describe('callDaemonUsageRepoll', () => {
    * Point the client at a stand-in daemon that refuses every request with `status` and `error`,
    * and return the message the client failed with plus what the stand-in was sent. The secret it
    * expects is the real one the harness wrote, so a request that forgot it would show here.
+   * `call` is the client call under test (the usage refresh unless a test names another route).
    */
   async function refusedWith(
     status: number,
     error: string,
+    call: (deps: { dataDir: string; protector: Protector }) => Promise<unknown> = (deps) =>
+      callDaemonUsageRepoll(undefined, deps),
   ): Promise<{
     message: string;
     failure: string;
@@ -332,10 +336,7 @@ describe('callDaemonUsageRepoll', () => {
       const address = standIn.address();
       if (address === null || typeof address === 'string') throw new Error('no address');
       await writeHookEndpoint(hookEndpointPath(h.dataDir), { port: address.port });
-      const err = await callDaemonUsageRepoll(undefined, {
-        dataDir: h.dataDir,
-        protector: h.protector,
-      }).then(
+      const err = await call({ dataDir: h.dataDir, protector: h.protector }).then(
         () => undefined,
         (e: unknown) => e,
       );
@@ -394,6 +395,34 @@ describe('callDaemonUsageRepoll', () => {
     expect(err).toBeInstanceOf(SessionClientError);
     expect((err as Error).message).toBe('malformed body: body too large');
     expect(h.asked).toEqual([]);
+  });
+
+  describe('callDaemonQuietSetting from a daemon that predates live quiet changes', () => {
+    const quietCall = (deps: { dataDir: string; protector: Protector }) =>
+      callDaemonQuietSetting(true, deps);
+    const OLDER_FOR_QUIET =
+      'the running daemon is older than this cctl and cannot change quiet mode while it runs';
+
+    it('reads its session complaint and its unknown-endpoint answer as an older daemon', async () => {
+      expect(
+        await refusedWith(400, 'sessionId and idempotencyKey are required', quietCall),
+      ).toEqual({
+        message: OLDER_FOR_QUIET,
+        failure: 'older_daemon',
+        url: '/cli/settings/quiet',
+        secretSent: true,
+      });
+      expect((await refusedWith(404, 'unknown CLI endpoint', quietCall)).failure).toBe(
+        'older_daemon',
+      );
+    });
+
+    it("keeps a current daemon's refusal in its own words", async () => {
+      expect(await refusedWith(409, 'CCTL_DISCORD_QUIET is pinned', quietCall)).toMatchObject({
+        message: 'CCTL_DISCORD_QUIET is pinned',
+        failure: 'refused',
+      });
+    });
   });
 
   it("surfaces the daemon's own words for any other refusal", async () => {
@@ -531,5 +560,59 @@ describe('what kind of failure each daemon call reports', () => {
       protector: h.protector,
     }).catch((e: unknown) => e);
     expect((err as SessionClientError).failure).toBe('refused');
+  });
+});
+
+describe('callDaemonQuietSetting', () => {
+  it('sends on, off and unset to the running daemon and returns the value it now runs with', async () => {
+    const h = await harness(() => ({ ok: true, status: 'applied', session: view }));
+    const asked: (boolean | undefined)[] = [];
+    h.receiver.setSettingsHandlers({
+      setQuiet: (value) => {
+        asked.push(value);
+        return Promise.resolve({
+          ok: true,
+          quiet: value ?? true,
+          changed: value === false,
+          report: { startedAtMs: 1, settings: [] },
+        });
+      },
+    });
+    const deps = { dataDir: h.dataDir, protector: h.protector };
+    expect(await callDaemonQuietSetting(false, deps)).toEqual({ quiet: false, changed: true });
+    expect(await callDaemonQuietSetting(true, deps)).toEqual({ quiet: true, changed: false });
+    expect(await callDaemonQuietSetting(undefined, deps)).toEqual({ quiet: true, changed: false });
+    expect(asked).toEqual([false, true, undefined]);
+  });
+
+  it("refuses with the daemon's own sentence when its environment pins the value", async () => {
+    const h = await harness(() => ({ ok: true, status: 'applied', session: view }));
+    h.receiver.setSettingsHandlers({
+      setQuiet: () =>
+        Promise.resolve({
+          ok: false,
+          quiet: true,
+          reason: 'env_pinned',
+          message: 'CCTL_DISCORD_QUIET is set in the environment',
+        }),
+    });
+    const err = await callDaemonQuietSetting(false, {
+      dataDir: h.dataDir,
+      protector: h.protector,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SessionClientError);
+    expect((err as SessionClientError).failure).toBe('refused');
+    expect((err as Error).message).toBe('CCTL_DISCORD_QUIET is set in the environment');
+  });
+
+  it('reads no running daemon as down, so the caller can save for the next start', async () => {
+    const h = await harness(() => ({ ok: true, status: 'applied', session: view }), {
+      writeEndpoint: false,
+    });
+    const err = await callDaemonQuietSetting(true, {
+      dataDir: h.dataDir,
+      protector: h.protector,
+    }).catch((e: unknown) => e);
+    expect((err as SessionClientError).failure).toBe('down');
   });
 });

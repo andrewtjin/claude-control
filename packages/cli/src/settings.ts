@@ -154,6 +154,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  *  ways that could disagree. */
 const RELAY_ENV_NAME = 'CCTL_RELAY_URL';
 
+/** Discord quiet mode's env var. Named once because, unlike every other knob, its value can change
+ *  on a running daemon (`/quiet`, `cctl settings set quiet`): the live path persists it and checks
+ *  whether the environment pins it by this same name. */
+export const QUIET_ENV_NAME = 'CCTL_DISCORD_QUIET';
+
+/** Quiet mode is ON by default: Discord carries the cards that need the operator, not a running
+ *  commentary of every turn. */
+export const DEFAULT_DISCORD_QUIET = true;
+
+/** The settings row for quiet mode — one builder for the startup resolution and the live change,
+ *  so the row a running daemon rewrites reads exactly like the one it started with. */
+export function discordQuietRow(quiet: boolean, source: SettingSource): SettingRow {
+  return {
+    name: 'discord quiet',
+    value: quiet ? 'on' : 'off',
+    source,
+    detail:
+      `${QUIET_ENV_NAME} (Discord gets only permission and question cards, plus one final reply ` +
+      'per turn of a phone-started session; wins over command-output, waiting-cards and ' +
+      'full-output; /quiet or cctl settings set quiet changes the running daemon)',
+  };
+}
+
 /** How a value is checked before it is persisted. Each kind uses the SAME parser the daemon
  *  reads with, so `cctl settings set` can only store what the daemon will honor — a value the
  *  daemon would silently treat as unset is the one typo the file exists to protect from. */
@@ -203,6 +226,7 @@ export const DAEMON_ENV_SETTINGS: readonly DaemonEnvSetting[] = [
   { name: 'CCTL_PERMISSION_HOLD_MS', alias: 'permission-hold', kind: 'number' },
   { name: 'CCTL_QUESTION_HOLD_MS', alias: 'question-hold', kind: 'number' },
   { name: 'CCTL_COMMAND_OUTPUT', alias: 'command-output', kind: 'bool' },
+  { name: QUIET_ENV_NAME, alias: 'quiet', kind: 'bool' },
   {
     name: 'CCTL_IDENTITY_CHECK',
     alias: 'identity-check',
@@ -272,6 +296,23 @@ export function renderSettingSaved(
     `${palette.green(`Saved ${setting.name}=${value}`)} to ${filePath}.\n` +
     `Applies when the daemon next starts: cctl daemon restart. ${ENV_WINS_NOTE}\n`
   );
+}
+
+/** What `cctl settings set|unset` prints when the running daemon took the change itself (quiet
+ *  mode): it is in force now and saved for the next start, so there is no restart to suggest.
+ *  `value` undefined is an unset, which returns the daemon to the setting's default. Painted like
+ *  a save — the change is done. */
+export function renderSettingApplied(
+  setting: DaemonEnvSetting,
+  value: string | undefined,
+  filePath: string,
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  return value !== undefined
+    ? `${palette.green(`Saved ${setting.name}=${value}`)} to ${filePath}; the running daemon ` +
+        'applied it now.\n'
+    : `${palette.green(`Cleared ${setting.name}`)} from ${filePath}; the running daemon is back ` +
+        'on the default now.\n';
 }
 
 /** The line `cctl settings unset` prints. A removal is painted like a save — the file changed
@@ -587,6 +628,9 @@ export interface DaemonConfig {
     permissionHoldMs: number | undefined;
     questionHoldMs: number | undefined;
     commandOutputCards: boolean;
+    /** Discord quiet mode at startup (see {@link discordQuietRow}); the running daemon's value can
+     *  move from here, which is why daemonRun hands it to a live control rather than to the gates. */
+    discordQuiet: boolean;
     fullToolOutput: boolean;
     identityCheck: boolean;
     autoContinue: boolean;
@@ -720,6 +764,10 @@ export function resolveDaemonConfig(
   // pushed as a card in every permission mode; `off` silences chatty sessions.
   const commandOutputEnv = envBool(layered, 'CCTL_COMMAND_OUTPUT');
   const commandOutputCards = commandOutputEnv ?? true;
+  // Default ON (see DEFAULT_DISCORD_QUIET). Attributed like every other row; the source matters
+  // more here than elsewhere, since an `env` source is what refuses a live change.
+  const discordQuietEnv = envBool(layered, QUIET_ENV_NAME);
+  const discordQuiet = discordQuietEnv ?? DEFAULT_DISCORD_QUIET;
   // Default OFF: cards ship a phone-sized excerpt; full output arrives as a file attachment.
   const fullToolOutput = envFlag(layered, 'CCTL_TOOL_OUTPUT_FULL');
   // Default ON: each poll verifies the vault token's OWNER against the OAuth profile
@@ -890,6 +938,7 @@ export function resolveDaemonConfig(
       source: sourceOf('CCTL_COMMAND_OUTPUT', commandOutputEnv !== undefined),
       detail: "CCTL_COMMAND_OUTPUT (every shell command's output as a phone card; off silences)",
     },
+    discordQuietRow(discordQuiet, sourceOf(QUIET_ENV_NAME, discordQuietEnv !== undefined)),
     {
       name: 'identity check',
       value: identityCheck ? 'on' : 'off',
@@ -974,6 +1023,7 @@ export function resolveDaemonConfig(
       permissionHoldMs,
       questionHoldMs,
       commandOutputCards,
+      discordQuiet,
       fullToolOutput,
       identityCheck,
       autoContinue,
