@@ -501,14 +501,14 @@ describe('buildProgram', () => {
 
   it('prints what the duplicate-account heal did above the accounts listing', async () => {
     engine.dedupeAccounts.mockResolvedValueOnce({
-      merged: [{ label: 'jina25', keptId: 'keep-1', removedId: 'dup-2' }],
-      relabelled: [{ id: 'x-3', from: 'jina25', to: 'jina25 (2)' }],
+      merged: [{ label: 'work-2', keptId: 'keep-1', removedId: 'dup-2' }],
+      relabelled: [{ id: 'x-3', from: 'work-2', to: 'work-2 (2)' }],
     });
     const out = await run(['accounts', 'list']);
     expect(
       out.startsWith(
-        'merged duplicate account jina25: kept keep-1, removed dup-2 (the same login was stored twice)\n' +
-          'renamed account jina25 (x-3) to "jina25 (2)": another account already had that label\n',
+        'merged duplicate account work-2: kept keep-1, removed dup-2 (the same login was stored twice)\n' +
+          'renamed account work-2 (x-3) to "work-2 (2)": another account already had that label\n',
       ),
     ).toBe(true);
     // Nothing to heal prints nothing extra.
@@ -519,13 +519,13 @@ describe('buildProgram', () => {
   it("surfaces the vault's refusal of a duplicate on accounts add, not the no-login hint", async () => {
     engine.captureCurrentLogin.mockRejectedValueOnce(
       new VaultError(
-        '"jina25" already refers to account abc ("jina25"); two accounts answering to one name could not be told apart on switch',
+        '"work-2" already refers to account abc ("work-2"); two accounts answering to one name could not be told apart on switch',
         { code: 'label_taken' },
       ),
     );
-    const r = await runCli(['accounts', 'add', 'jina25']);
+    const r = await runCli(['accounts', 'add', 'work-2']);
     expect(r.exited).toBe(true);
-    expect(r.err).toContain('error: "jina25" already refers to account abc ("jina25")');
+    expect(r.err).toContain('error: "work-2" already refers to account abc ("work-2")');
     expect(r.err).not.toContain('no live login');
     // Any other failure still reads as the capture finding nothing to store.
     engine.captureCurrentLogin.mockRejectedValueOnce(new Error('boom'));
@@ -1766,7 +1766,15 @@ describe('the banner and the plan agree with the running daemon', () => {
 
   it('usage and timeline show the account a parallel session holds, apart from the pool', async () => {
     const now = Date.now();
-    const vee = { id: 'v1', label: 'vee', quarantined: false, createdAtMs: 0, updatedAtMs: 0 };
+    // Reserved to its session's rule, as the vault lists it.
+    const vee = {
+      id: 'v1',
+      label: 'vee',
+      quarantined: false,
+      createdAtMs: 0,
+      updatedAtMs: 0,
+      ruleIds: ['session-v1'],
+    };
     engine.listAllAccounts.mockImplementation(async () => [...(await engine.listAccounts()), vee]);
     engine.listRules.mockImplementation(() =>
       Promise.resolve([
@@ -1798,10 +1806,13 @@ describe('the banner and the plan agree with the running daemon', () => {
       const at = usage.out.indexOf('In use by a parallel session (out of the pool until it ends');
       expect(at).toBeGreaterThan(0);
       expect(usage.out.slice(at)).toContain('vee');
+      // Only there: not a row of the pool, not a folder's account, not in the pacing.
+      expect(usage.out.slice(0, at)).not.toContain('vee');
+      expect(usage.out).not.toContain('(folder)');
       const timeline = await runCli(['timeline']);
-      expect(timeline.out).toContain(
-        'In use by a parallel session (out of the pool until it ends): vee',
-      );
+      const heading = 'In use by a parallel session (out of the pool until it ends): vee';
+      expect(timeline.out).toContain(heading);
+      expect(timeline.out.slice(0, timeline.out.indexOf(heading))).not.toContain('vee');
     } finally {
       engine.listAllAccounts.mockImplementation(() => engine.listAccounts());
       engine.listRules.mockImplementation(() => Promise.resolve([]));

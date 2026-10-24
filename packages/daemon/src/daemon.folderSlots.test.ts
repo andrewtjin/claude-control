@@ -975,7 +975,7 @@ describe('daemon folder-bound slots — a spawn that cannot take its group slot 
 
 describe('daemon folder-bound slots — group out of quota alert', () => {
   it('alerts once per window and names the bound folder when a single-member group is exhausted', async () => {
-    // The owner's real shape: one work account bound to a research folder. The group label defaults
+    // A common shape: one work account bound to a research folder. The group label defaults
     // to the joined member labels, so it EQUALS the member label here — the alert must name the
     // FOLDER (the actionable thing), not the label, or it would read "work@corp account work@corp".
     const only = view('m1', 'work@corp', 'g1');

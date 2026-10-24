@@ -151,7 +151,7 @@ describe('renderAccountsTable', () => {
         [
           acct('id-1', 'Work', {
             billingType: 'stripe_subscription',
-            subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+            subscriptionCreatedAt: '2026-07-15T12:00:00.000000Z',
           }),
         ],
         null,
@@ -168,7 +168,7 @@ describe('renderAccountsTable', () => {
         [
           acct('id-1', 'Trialing', {
             billingType: 'stripe_subscription',
-            subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+            subscriptionCreatedAt: '2026-07-15T12:00:00.000000Z',
             claudeCodeTrialEndsAt: '2026-08-01T00:00:00.000Z',
           }),
         ],
@@ -280,7 +280,7 @@ describe('renderAccountsTable', () => {
       const accounts = [
         acct('id-1', 'Work', {
           billingType: 'stripe_subscription',
-          subscriptionCreatedAt: '2026-07-15T20:35:34.215673Z',
+          subscriptionCreatedAt: '2026-07-15T12:00:00.000000Z',
         }),
       ];
       const plain = renderAccountsTable(accounts, 'id-1', PLAIN_PALETTE, NOW);
@@ -486,6 +486,69 @@ describe('renderPacingLine', () => {
 
   it('reports pacing unknown with no accounts', () => {
     expect(renderPacingLine([], { nowMs: NOW })).toBe('Pacing: no usage data yet.');
+  });
+
+  describe('accounts reserved to folder rules', () => {
+    const plain = pacingStyle(PLAIN_PALETTE);
+    const research = { ...input('research', 6, 6), weight: 5 };
+
+    it('shows what they hold on a row of its own, outside the runway', () => {
+      const line = renderPacingLine([input('a', 50, 3)], { nowMs: NOW }, plain, [research]);
+      expect(line).toBe(
+        [
+          'Pacing  [--] burn rate not measured yet',
+          '  left     10u of 20u (50%)',
+          '  folders  +4.7u of 5u in research (folder-only)',
+          '  1u = one Pro account-week (a Max 20x counts 20)',
+        ].join('\n'),
+      );
+    });
+
+    it('says there is no shared account, not no data, when every account is reserved', () => {
+      expect(renderPacingLine([], { nowMs: NOW }, plain, [research])).toBe(
+        [
+          'Pacing: no shared account, so the global slot has nothing to spend.',
+          '  folders  +4.7u of 5u in research (folder-only)',
+          '  1u = one Pro account-week (a Max 20x counts 20)',
+        ].join('\n'),
+      );
+    });
+
+    it('still says no data when the shared accounts have none yet', () => {
+      const unpolled = { ...input('a', 50, 3), limits: [] };
+      const line = renderPacingLine([unpolled], { nowMs: NOW }, plain, [research]);
+      expect(line.split('\n')[0]).toBe('Pacing: no usage data yet.');
+      expect(line).toContain('  folders  +4.7u of 5u in research (folder-only)');
+    });
+
+    it('states the 1u fallback on their row when one of their plan tiers is unknown', () => {
+      const untiered: AccountUsageInput = { ...research };
+      delete untiered.weight;
+      const line = renderPacingLine([input('a', 50, 3)], { nowMs: NOW }, plain, [untiered]);
+      expect(line).toContain(
+        '  folders  +0.9u of 1u in research (folder-only; unknown plan tier counted as 1u)',
+      );
+      // The legend describes the runway, whose one account has a known tier.
+      expect(line).toContain('  1u = one Pro account-week (a Max 20x counts 20)');
+    });
+
+    it('prints no row when none of them contributes', () => {
+      const locked = { ...research, quarantined: true };
+      expect(renderPacingLine([input('a', 50, 3)], { nowMs: NOW }, plain, [locked])).toBe(
+        renderPacingLine([input('a', 50, 3)], { nowMs: NOW }),
+      );
+    });
+
+    it('colors the row without changing its text', () => {
+      const opts = { nowMs: NOW };
+      const colored = renderPacingLine([input('a', 50, 3)], opts, pacingStyle(ANSI_PALETTE), [
+        research,
+      ]);
+      expect(colored).toContain(ANSI_PALETTE.bold('folders'));
+      expect(stripAnsi(colored)).toBe(
+        renderPacingLine([input('a', 50, 3)], opts, plain, [research]),
+      );
+    });
   });
 
   it('tells a wholly quarantined fleet to re-login instead of claiming there is no data', () => {
@@ -795,17 +858,17 @@ describe('renderAccountHeal', () => {
 
   it('explains each merge and each relabel on its own line, painting only the verb', () => {
     const report = {
-      merged: [{ label: 'jina25', keptId: 'keep-1', removedId: 'dup-2' }],
-      relabelled: [{ id: 'x-3', from: 'jina25', to: 'jina25 (2)' }],
+      merged: [{ label: 'work-2', keptId: 'keep-1', removedId: 'dup-2' }],
+      relabelled: [{ id: 'x-3', from: 'work-2', to: 'work-2 (2)' }],
     };
     expect(renderAccountHeal(report)).toBe(
-      'merged duplicate account jina25: kept keep-1, removed dup-2 (the same login was stored twice)\n' +
-        'renamed account jina25 (x-3) to "jina25 (2)": another account already had that label\n',
+      'merged duplicate account work-2: kept keep-1, removed dup-2 (the same login was stored twice)\n' +
+        'renamed account work-2 (x-3) to "work-2 (2)": another account already had that label\n',
     );
     const ESC = String.fromCharCode(27);
     const painted = renderAccountHeal(report, ANSI_PALETTE);
-    expect(painted.startsWith(`${ESC}[33mmerged${ESC}[0m duplicate account jina25`)).toBe(true);
-    expect(painted).toContain(`\n${ESC}[33mrenamed${ESC}[0m account jina25 (x-3)`);
+    expect(painted.startsWith(`${ESC}[33mmerged${ESC}[0m duplicate account work-2`)).toBe(true);
+    expect(painted).toContain(`\n${ESC}[33mrenamed${ESC}[0m account work-2 (x-3)`);
   });
 });
 

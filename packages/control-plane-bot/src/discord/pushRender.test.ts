@@ -266,7 +266,7 @@ describe('renderPush — lifecycle notification cards', () => {
       env('hook.notification', {
         event: 'notification',
         sessionId: 'abcd1234-9999',
-        cwd: '/home/andrew/proj/',
+        cwd: '/home/me/proj/',
         title: 'Output — ls',
         body: 'files',
         level: 'info',

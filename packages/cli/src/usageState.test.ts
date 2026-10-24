@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store, readFleetHistory } from '@claude-control/daemon';
-import type { StoredAccount } from '@claude-control/switch-engine';
+import type { AccountView, StoredAccount } from '@claude-control/switch-engine';
 import { UsageReader } from './usageState.js';
 
 const NOW = Date.UTC(2026, 9, 1, 12);
@@ -20,7 +20,8 @@ describe('UsageReader', () => {
   let dir: string;
   let dbPath: string;
   const engine = {
-    listAccounts: () => Promise.resolve([stored('a'), stored('b'), stored('c')]),
+    listAllAccounts: (): Promise<AccountView[]> =>
+      Promise.resolve([stored('a'), stored('b'), stored('c')]),
     getActiveId: () => Promise.resolve('a'),
   };
 
@@ -138,12 +139,21 @@ describe('UsageReader', () => {
     }
   });
 
-  it('still measures the burn rate for a reader that wants it', async () => {
+  it('measures the burn rate over the shared accounts alone, the reserved ones only for resets', async () => {
     const readHistory = vi.fn(readFleetHistory);
-    const reader = new UsageReader(engine, { dbPath, readHistory });
+    const fleet = {
+      ...engine,
+      listAllAccounts: (): Promise<AccountView[]> =>
+        Promise.resolve([stored('a'), { ...stored('b'), ruleIds: ['r1'] }, stored('c')]),
+    };
+    const reader = new UsageReader(fleet, { dbPath, readHistory });
     try {
-      await reader.read(NOW);
-      expect(readHistory).toHaveBeenCalledTimes(1);
+      const usage = await reader.read(NOW);
+      const subsets = readHistory.mock.calls.map(([, inputs]) => inputs.map((i) => i.accountId));
+      expect(subsets).toEqual([['a', 'c'], ['b']]);
+      const pool = readHistory.mock.results[0]?.value as ReturnType<typeof readFleetHistory>;
+      expect(usage.burnUnitsPerDay).toBe(pool.burnUnitsPerDay);
+      expect(usage.accounts.map((a) => a.id)).toEqual(['a', 'b', 'c']);
     } finally {
       reader.close();
     }

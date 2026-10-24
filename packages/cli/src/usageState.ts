@@ -8,7 +8,7 @@
 // surface come from one reader. A one-shot command reads once; the view keeps one reader open for
 // as long as it runs (see {@link UsageReader}).
 
-import type { StoredAccount } from '@claude-control/switch-engine';
+import type { AccountView, StoredAccount } from '@claude-control/switch-engine';
 import { Store, readFleetHistory, readFleetResets, type SessionRow } from '@claude-control/daemon';
 import { AccountUsage } from '@claude-control/shared-protocol';
 import { planWeight } from '@claude-control/usage-advisor';
@@ -23,14 +23,15 @@ type Engine = ReturnType<typeof buildEngine>;
  *  a not-yet-created db just yields an empty one. A corrupt snapshot row (one that does not parse,
  *  or parses to something other than a usage reading) is skipped, never fatal. */
 export interface UsageState {
-  accounts: StoredAccount[];
+  accounts: AccountView[];
   activeId: string | null;
   usageFor: (accountId: string) => AccountUsage | undefined;
   /** Next weekly reset predicted from stored history, for accounts the endpoint has stopped
    *  publishing one for. Absent when the account has no observed reset in history at all. */
   predictedResetFor: (accountId: string) => number | undefined;
-  /** Fleet burn in Pro-equivalent units/day, or undefined when history cannot measure one (or
-   *  the reader was built not to measure it). */
+  /** The shared accounts' burn in Pro-equivalent units/day, or undefined when history cannot
+   *  measure one (or the reader was built not to measure it). Accounts reserved to rules are left
+   *  out: no global session can spend what they hold. */
   burnUnitsPerDay: number | undefined;
 }
 
@@ -62,7 +63,7 @@ export class UsageReader {
   private readonly burn: boolean;
 
   constructor(
-    private readonly engine: Pick<Engine, 'listAccounts' | 'getActiveId'>,
+    private readonly engine: Pick<Engine, 'listAllAccounts' | 'getActiveId'>,
     options: UsageReaderOptions = {},
   ) {
     this.dbPath = options.dbPath ?? daemonDbPath();
@@ -70,12 +71,13 @@ export class UsageReader {
     this.burn = options.burn ?? true;
   }
 
-  /** The usage picture now. `only` names the accounts to read instead of the shared pool;
-   *  `activeId` is the live account when the caller already knows it (asking the engine again
-   *  costs another read of the live login). */
-  async read(nowMs: number, only?: StoredAccount[], activeId?: string | null): Promise<UsageState> {
+  /** The usage picture now: of the whole fleet (shared accounts and those reserved to rules, the
+   *  set the daemon polls, so each account's numbers match the phone's), or of `only` when the
+   *  caller has already read the accounts. `activeId` is the live account when the caller already
+   *  knows it (asking the engine again costs another read of the live login). */
+  async read(nowMs: number, only?: AccountView[], activeId?: string | null): Promise<UsageState> {
     const [accounts, active] = await Promise.all([
-      only !== undefined ? Promise.resolve(only) : this.engine.listAccounts(),
+      only !== undefined ? Promise.resolve(only) : this.engine.listAllAccounts(),
       activeId !== undefined ? Promise.resolve(activeId) : this.engine.getActiveId(),
     ]);
     return this.withStore((store) => {
@@ -98,11 +100,13 @@ export class UsageReader {
   }
 
   /** The history-derived measurements: both, through the same measurement the daemon makes each
-   *  poll cycle (so a number the CLI prints never disagrees with the one the phone got), or only
-   *  the reset predictions, from the newest reported reset per account. */
+   *  poll cycle (so each account's predicted reset matches the phone's), or only the reset
+   *  predictions, from the newest reported reset per account. The burn is the shared accounts'
+   *  alone, the pool whose runway pacing judges; the reserved ones are read apart only for their
+   *  resets. */
   private historyFor(
     store: Store,
-    accounts: StoredAccount[],
+    accounts: AccountView[],
     nowMs: number,
   ): { predictedResetByAccount: Map<string, number>; burnUnitsPerDay: number | undefined } {
     if (!this.burn) {
@@ -115,11 +119,20 @@ export class UsageReader {
         burnUnitsPerDay: undefined,
       };
     }
-    const inputs = accounts.map((a) => ({ accountId: a.id, ...resolvedWeight(a) }));
-    const history = this.readHistory(store, inputs, nowMs);
+    const historyOf = (subset: AccountView[]) =>
+      this.readHistory(
+        store,
+        subset.map((a) => ({ accountId: a.id, ...resolvedWeight(a) })),
+        nowMs,
+      );
+    const pool = historyOf(accounts.filter((a) => !isReserved(a)));
+    const reserved = historyOf(accounts.filter(isReserved));
     return {
-      predictedResetByAccount: history.predictedResetByAccount,
-      burnUnitsPerDay: history.burnUnitsPerDay,
+      predictedResetByAccount: new Map([
+        ...reserved.predictedResetByAccount,
+        ...pool.predictedResetByAccount,
+      ]),
+      burnUnitsPerDay: pool.burnUnitsPerDay,
     };
   }
 
@@ -165,13 +178,13 @@ function parseUsage(json: string): AccountUsage | undefined {
   return parsed.success ? parsed.data : undefined;
 }
 
-/** The usage view's state: the shared accounts, the global live account and each account's latest
- *  snapshot. `only` names the accounts to read instead (the outage judgement reads the whole fleet,
- *  reserved accounts included). `engine` is the one to read through; a caller drawing its own
- *  screen passes one whose diagnostics land somewhere other than stderr. */
+/** The usage view's state: the whole fleet (see {@link UsageReader.read}), the global live account
+ *  and each account's latest snapshot. `only` is the registry's accounts when the caller has
+ *  already read them. `engine` is the one to read through; a caller drawing its own screen passes
+ *  one whose diagnostics land somewhere other than stderr. */
 export async function readUsageState(
   nowMs: number,
-  only?: StoredAccount[],
+  only?: AccountView[],
   engine: Engine = buildEngine(),
 ): Promise<UsageState> {
   const reader = new UsageReader(engine);
@@ -180,6 +193,12 @@ export async function readUsageState(
   } finally {
     reader.close();
   }
+}
+
+/** True for an account reserved to rules (a folder or alias rule, or a parallel session): only
+ *  the sessions those rules run can use it. */
+export function isReserved(account: AccountView): boolean {
+  return (account.ruleIds ?? []).length > 0;
 }
 
 /** `{ weight }` when the account's plan tier resolves, `{}` when it does not — the same

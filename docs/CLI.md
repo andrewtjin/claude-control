@@ -47,11 +47,11 @@ shows. Both write into the EXISTING vault entry — same account id, usage attri
 quarantine cleared — and both refuse if you log into a different account.
 Two accounts can never answer to one name. `cctl accounts add` refuses a label another
 account already has (in any case) and refuses a login that is already stored under another
-row (`this login is account … ("jina25"), which is already stored; run cctl accounts relogin
-jina25`). Rows created by an older build that broke this are resolved the next time
+row (`this login is account … ("work-2"), which is already stored; run cctl accounts relogin
+work-2`). Rows created by an older build that broke this are resolved the next time
 `cctl accounts list`, `cctl usage`, `cctl timeline` or the daemon runs: the same login stored
 twice is merged onto one row (the active one, else the most recently captured), and two
-logins under one label keep the earlier row's label while the later one becomes `jina25 (2)`.
+logins under one label keep the earlier row's label while the later one becomes `work-2 (2)`.
 Each repair is printed above the listing it precedes.
 
 ## Moving accounts to another machine
@@ -298,9 +298,10 @@ global live account when that is one it excludes.
 live in its slot (and whether that one is included or inherited), and the whole pool in
 order, with what limits each account: live elsewhere, quarantined, or not an auto-switch
 target. It ends with the global slot and the guard's state. `cctl usage` and `cctl timeline`
-end with a short per-folder section (the live account and the pool on one line), and
-`cctl accounts list` shows the reserved accounts in their own table, each with its email, plan
-and billing (as the shared table shows them) and the folders that include it.
+list each reserved account among the others as `<label> (folder)`. Both end with a short
+per-folder section (the live account and the pool on one line). `cctl accounts list` shows the
+reserved accounts in their own table, each with its email, plan and billing (as the shared
+table shows them) and the folders that include it.
 
 Nesting is allowed: a subfolder can have its own rule, and the **longest matching rule
 wins**, with no merging: a nested rule does not add to its parent's, it replaces it there.
@@ -981,6 +982,14 @@ out (see below).
 Where folder rules exist, both end with a section per rule: its folders, the account live in its
 slot, and its pool in order (`cctl folders` has the full picture).
 
+An account reserved to a folder rule is listed with the others, labeled `<label> (folder)`: its
+usage, 5-hour windows and resets show like any other account's. The `*` still marks the account
+live in the global slot, and the plan is the global slot's, so it never names a reserved account
+as somewhere to switch. Pacing works the same way: its runway (`left`, the burn and when it runs
+dry) is the shared accounts', since no global session can spend what a reserved account holds,
+and a `folders` row says what the reserved accounts still have (`+4.7u of 5u in research
+(folder-only)`). The phone's pacing still counts the whole fleet in one runway.
+
 ## When every account is out of usage
 
 ```
@@ -1084,6 +1093,11 @@ under your Claude config dir (`CLAUDE_CONFIG_DIR`, else `~/.claude`) and joins e
 timestamp against the daemon's switch journal to decide which account was live at the
 time. Input, output, cache-write and cache-read tokens are reported separately — cache
 reads usually dominate, so one combined number would hide everything interesting.
+
+A session in a folder with a folder rule is billed to the account live in that rule's slot,
+reserved accounts included. The daemon learns each session's slot from the session's hook
+events, so a turn from before the daemon first heard from the session keeps the attribution it
+had before: the slot the session was registered with, or else the global slot's account.
 
 No network call is made and no daemon needs to be running. The same numbers reach the
 phone as `/stats`, pushed by the daemon every 15 minutes.

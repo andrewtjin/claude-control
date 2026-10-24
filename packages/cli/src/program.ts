@@ -26,9 +26,9 @@ import {
   resolveAccountRef,
   isLeaseRule,
   operatorRules,
+  type AccountView,
   type FolderRule,
   type LeaseView,
-  type StoredAccount,
 } from '@claude-control/switch-engine';
 import { cliLeaseProbe, leaseInUse } from './leaseCli.js';
 import { olderInstallReason } from './folderRulesSupport.js';
@@ -84,7 +84,7 @@ import {
   setExcluded,
   switchAccount,
 } from './accountActions.js';
-import { readUsageState, resolvedWeight, type UsageState } from './usageState.js';
+import { isReserved, readUsageState, resolvedWeight, type UsageState } from './usageState.js';
 import { fullScreenBlocker, isInteractiveTerminal } from './terminalSupport.js';
 import { StatusLog, runTui } from './tui/run.js';
 import { createTuiSources } from './tui/sources.js';
@@ -348,23 +348,19 @@ export function buildProgram(): Command {
     .action(async () => {
       await healAccounts(buildEngine());
       const nowMs = Date.now();
-      const state = await readUsageState(nowMs);
-      let text = renderUsage(usageRowsOf(state), nowMs, detectPalette());
+      const all = await readUsageState(nowMs);
+      // An account a parallel session holds is out of the pool (and of the rows and pacing below),
+      // but it is the one that terminal is using: its usage is shown on its own.
+      const leased = await parallelSessionAccountIds(buildEngine());
+      const fleet = narrowed(all, (a) => !leased.has(a.id));
+      let text = renderUsage(usageRowsOf(withFolderTags(fleet)), nowMs, detectPalette());
       // Pacing needs the same weekly-limit view the burn plan uses (accountId + quarantine
-      // state), which UsageRow doesn't carry — build it separately rather than widen UsageRow
-      // for one trailing line.
-      const inputs = buildAdvisorInputs(state);
-      if (inputs.length > 0) {
-        text +=
-          '\n\n' +
-          renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
-      }
+      // state), which UsageRow doesn't carry — `renderPacing` builds it separately rather than
+      // widen UsageRow for one trailing block.
+      if (fleet.accounts.length > 0) text += '\n\n' + renderPacing(fleet, nowMs);
       text += await renderFolderRulesAppendix(buildEngine(), detectPalette());
-      // An account a parallel session holds is out of the pool (and of the pacing above), but it
-      // is the one that terminal is using: its usage is shown on its own.
-      const leased = await parallelSessionAccounts(buildEngine());
-      if (leased.length > 0) {
-        const held = await readUsageState(nowMs, leased);
+      const held = narrowed(all, (a) => leased.has(a.id));
+      if (held.accounts.length > 0) {
         text +=
           `\n\n${PARALLEL_SESSION_HEADING}\n` +
           renderUsage(usageRowsOf(held), nowMs, detectPalette());
@@ -379,8 +375,10 @@ export function buildProgram(): Command {
     .action(async () => {
       await healAccounts(buildEngine());
       const nowMs = Date.now();
-      const state = await readUsageState(nowMs);
-      const inputs = buildAdvisorInputs(state);
+      const all = await readUsageState(nowMs);
+      const leased = await parallelSessionAccountIds(buildEngine());
+      const fleet = narrowed(all, (a) => !leased.has(a.id));
+      const inputs = buildAdvisorInputs(withFolderTags(fleet));
       const outlook = computeOutlook(inputs, nowMs);
       const autoSwitchPolicy = await cliAutoSwitchPolicy();
       const banner = await exhaustionBanner(autoSwitchPolicy, nowMs);
@@ -409,19 +407,17 @@ export function buildProgram(): Command {
               slotAccountIds: await globalSlotAccountsNow(),
             }),
           );
-        text +=
-          '\n\n' +
-          renderPacingLine(inputs, { nowMs, ...burnOption(state) }, pacingStyle(detectPalette()));
+        text += '\n\n' + renderPacing(fleet, nowMs);
       }
       // What each folder rule runs on, so a folder burning its own accounts shows beside the plan.
       text += await renderFolderRulesAppendix(buildEngine(), detectPalette());
       // The accounts parallel sessions hold are in no plan above: name them, so the one a terminal
       // is using does not just vanish.
-      const leased = await parallelSessionAccounts(buildEngine());
-      if (leased.length > 0) {
+      const held = all.accounts.filter((a) => leased.has(a.id));
+      if (held.length > 0) {
         text +=
           `\n\n${PARALLEL_SESSION_HEADING} ` +
-          leased.map((a) => sanitizeForTerminal(a.label)).join(', ');
+          held.map((a) => sanitizeForTerminal(a.label)).join(', ');
       }
       process.stdout.write(text + '\n');
     });
@@ -1362,19 +1358,56 @@ function usageRowsOf(state: UsageState): UsageRow[] {
   });
 }
 
+/** `state` with only the accounts `keep` accepts; its readings and measurements stay the whole
+ *  read's. */
+function narrowed(state: UsageState, keep: (account: AccountView) => boolean): UsageState {
+  return { ...state, accounts: state.accounts.filter(keep) };
+}
+
 /** How `cctl usage` and `cctl timeline` head the accounts parallel sessions hold. */
 const PARALLEL_SESSION_HEADING = 'In use by a parallel session (out of the pool until it ends):';
 
 /** The accounts only a parallel session holds: out of the shared pool, so out of the usage rows and
- *  the pacing, and in no folder rule's section either. */
-async function parallelSessionAccounts(
+ *  the pacing, and in no folder rule's section either. An account a folder or alias rule includes
+ *  too stays with that rule's accounts. */
+async function parallelSessionAccountIds(
   engine: ReturnType<typeof buildEngine>,
-): Promise<StoredAccount[]> {
+): Promise<Set<string>> {
   const rules = await engine.listRules().catch(() => [] as FolderRule[]);
-  const held = new Set(rules.filter(isLeaseRule).map((r) => r.include[0]!));
-  if (held.size === 0) return [];
   const reserved = new Set(operatorRules(rules).flatMap((r) => r.include));
-  return (await engine.listAllAccounts()).filter((a) => held.has(a.id) && !reserved.has(a.id));
+  return new Set(
+    rules
+      .filter(isLeaseRule)
+      .map((r) => r.include[0]!)
+      .filter((id) => !reserved.has(id)),
+  );
+}
+
+/** `usage` and `timeline`'s copy of the state, with every account reserved to a folder rule
+ *  labeled "<label> (folder)": it is listed like any other account, but only the folders that
+ *  include it can use it, and the global plan never sends the global slot there. */
+function withFolderTags(state: UsageState): UsageState {
+  return {
+    ...state,
+    accounts: state.accounts.map((a) =>
+      isReserved(a) ? { ...a, label: `${a.label} (folder)` } : a,
+    ),
+  };
+}
+
+/** The pacing block under `usage` and `timeline`. Its runway is the shared accounts' (the pool the
+ *  global slot draws on, whose burn `readUsageState` measures): an account reserved to a folder
+ *  rule adds only the "folders" row, since no global session can spend what it holds. Takes the
+ *  untagged state, so that row names each reserved account by its own label. */
+function renderPacing(state: UsageState, nowMs: number): string {
+  const reserved = new Set(state.accounts.filter(isReserved).map((a) => a.id));
+  const inputs = buildAdvisorInputs(state);
+  return renderPacingLine(
+    inputs.filter((i) => !reserved.has(i.accountId)),
+    { nowMs, ...burnOption(state) },
+    pacingStyle(detectPalette()),
+    inputs.filter((i) => reserved.has(i.accountId)),
+  );
 }
 
 /** Build the advisor's `AccountUsageInput` view shared by `timeline`'s outlook/plan and both

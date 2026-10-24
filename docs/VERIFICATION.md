@@ -35,11 +35,9 @@ unit tests over a mock never close a wet gate. Do not mark a wet gate done from 
 
 ## Wet gates (need on-machine confirmation)
 
-Run these on the owner's machine with a spare/test account before trusting the feature.
+Run these on the maintainer's machine with a spare/test account before trusting the feature.
 
-> **2026-07-16 wet-test run (CLI 2.1.211):** gates 1–3 were exercised by the harness in
-> `claude-control-orchestrator/wet-tests/` (raw evidence: `results.json`, verdicts:
-> `RESULTS.md`). Per-gate status is stamped below. Bonus findings from the same run:
+> **2026-07-16 on-machine run (CLI 2.1.211):** gates 1–3 were exercised by a local harness. Per-gate status is stamped below. Bonus findings from the same run:
 > `CLAUDE_CONFIG_DIR` relocates the **entire** config — `.claude.json` included — which is
 > what makes `cctl accounts add --fresh` safe (WT-1); `--resume` works across accounts and
 > transcripts are identity-free, so the attribution journal is load-bearing (WT-4); refresh
@@ -63,7 +61,7 @@ accurate; the "staged for next launch" fallback UX is not needed on this CLI ver
 **Result (WT-6):** rotation SEMANTICS confirmed — single-use refresh tokens, rotation on
 CLI use, stale copy fails with the auth error above, and reuse does NOT revoke the newer
 token.
-**Result (live probe, owner-run per `claude-control-orchestrator/tasks/m0-wet-gate-runbook.md`):**
+**Result (live probe, maintainer-run per the maintainer's runbook):**
 CONFIRMED — with `CCTL_REFRESH_SKEW_MS` forcing the refresh path, `cctl switch spare`
 printed `Activated spare (credentials written, token refreshed).` — i.e. this module's own
 request to `DEFAULT_TOKEN_ENDPOINT` with `CLAUDE_CODE_CLIENT_ID` succeeded and the rotated
@@ -98,7 +96,7 @@ both containers (fix @ 013f053; the verbatim live body is a test fixture).
 **Verify:** the bot logs in (`DISCORD_BOT_TOKEN`), registers slash commands, creates a
 per-user channel on `/pair`, and renders the usage + plan embed with a working switch
 button.
-**Result (owner-run per `claude-control-orchestrator/tasks/m2-wet-gate-runbook.md`):**
+**Result (maintainer-run per the maintainer's runbook):**
 CONFIRMED end-to-end from a phone — `/pair` minted a code and `cctl daemon run --pair`
 bound the PC, adopting a DPAPI-persisted daemon identity; `/status`/`/usage`/`/accounts`
 answered from delivered `usage.snapshot`s; `/switch` completed on the PC (audit
@@ -119,13 +117,13 @@ profile's `settings.json` is non-destructive.
 (+reason), UserPromptSubmit, PreToolUse (+tool_use_id/permission_mode/effort), PostToolUse
 (+tool_response/duration_ms), Notification (+notification_type; `idle_prompt` = the
 "waiting" card), Stop (+last_assistant_message = the "done" card), SubagentStop.
-**Still open:** the permission-time event itself — unobservable on the owner's machine
+**Still open:** the permission-time event itself — unobservable on the maintainer's machine
 (global `permissions.defaultMode: "auto"` means no prompt ever fires). Confirm at M3 in
 `default` mode; the phone card set must be mode-aware (`PreToolUse.permission_mode` is on
 every payload).
 **M3 landed on `feat/remote-control`** (daemon `hookInstaller`/`hookReceiver`/`hookSecret`,
 mode-aware cards, two-tap, quarantine debounce) and is unit-proven.
-**Result (owner-run 2026-07-17, `feat/remote-control` through `ba37019`):** the
+**Result (maintainer-run 2026-07-17, `feat/remote-control` through `ba37019`):** the
 permission-time event is **`PermissionRequest`**, and it fires only while the CLI is
 actually blocking on a prompt. The daemon holds the hook's HTTP response open for the
 remote decision; the terminal prompt and the phone card race concurrently, first answer
@@ -138,9 +136,9 @@ keep Approve/Deny in EVERY mode and show the mode as footer context (shipped @ `
 after the button-less design proved wrong live). Bonus, same run: every completed shell
 command delivers an output card in every permission mode (truncated by default;
 `CCTL_TOOL_OUTPUT_FULL` ships the rest as a file attachment).
-**Result (owner sign-off 2026-07-19):** the remaining item — done / waiting / quarantine
+**Result (maintainer sign-off 2026-07-19):** the remaining item — done / waiting / quarantine
 notices, including the quarantine debounce and the `cctl accounts relogin <label>` guided
-copy — ran clean in the owner's live sessions (the quarantine path was exercised for real
+copy — ran clean in real sessions (the quarantine path was exercised for real
 during a live vault repair). Gate closed on that confirmation, with no regressions
 outstanding at the merged tip.
 
@@ -152,7 +150,7 @@ parking, `interrupt`, and input injection — end to end through the Discord liv
 **M4 landed on `feat/remote-control`** (session-runtime permission gate + ordered output,
 daemon permission routing / stop / orphan resume, bot thread-per-session live card +
 attachments, C6 `cctl session` commands + `cctl accounts relogin`) and is unit-proven.
-**Progress (owner-run 2026-07-17, in flight):** item (1) confirmed live — `/run` streams a
+**Progress (maintainer-run 2026-07-17, in flight):** item (1) confirmed live — `/run` streams a
 live card that edits in place, milestone lines post as their own messages, and `/say`
 injects a follow-up into the running session. Two live defects were found and fixed on the
 branch: a managed session's own Stop hook duplicated every turn's summary as a
@@ -160,12 +158,12 @@ branch: a managed session's own Stop hook duplicated every turn's summary as a
 daemon manages — permission requests and armed output watches still forward), and a
 multi-line turn summary kept only its first line (structured SDK events now emit their
 display event directly instead of being re-classified line by line).
-**Result (owner sign-off 2026-07-19):** the pass criteria below were exercised across the
-owner's live runs — permission round-trips (exactly-once across a double-tap), Stop
+**Result (maintainer sign-off 2026-07-19):** the pass criteria below were exercised across the
+real runs — permission round-trips (exactly-once across a double-tap), Stop
 escalation, orphan resume, output attachments, the `cctl session` command set, and
-`accounts relogin` — and the owner confirmed the gate clean with no regressions
+`accounts relogin` — and the maintainer confirmed the gate clean with no regressions
 outstanding at the merged tip. Kept for the record:
-**Pass — run `claude-control-orchestrator/tasks/m4-wet-gate-runbook.md`:** (1) `/run`
+**Pass (the maintainer's M4 runbook):** (1) `/run`
 starts a managed session that streams a live card to the phone (DM today — channel-per-user
 is not built) with real tool names and milestone lines; `/say` injects a follow-up prompt;
 (2) the managed permission gate blocks the tool with **no timer**, round-trips Approve/Deny,
@@ -196,8 +194,8 @@ absence of `node-pty` degrades gracefully with a clear message.
 **Verify:** switching rewrites only the `oauthAccount` block and preserves every other
 key (projects, history, settings), including the duplicate-key quirk seen on real
 files.
-**Result (owner-run, same M2 gate):** CONFIRMED semantically — before/after comparison of
-the real file (81 top-level keys, 50 `projects` entries): zero keys added or removed,
+**Result (maintainer-run, same M2 gate):** CONFIRMED semantically — before/after comparison of
+a real, long-used file: zero keys added or removed,
 `projects` deep-equal, and the only switch-caused change was `oauthAccount`
 (`promptQueueUseCount` also moved, mutated by the running CLI itself, not the engine).
 Cosmetic caveat: the engine re-serializes the file minified onto one line, so a TEXT diff
@@ -261,11 +259,11 @@ drives a **fake `ExecRunner`**, never the real binary. Nothing below has run on 
 so macOS is **not a supported platform** no matter how green the suite is. Record the verdict
 as **arch-scoped** (arm64 ≠ Intel — do not generalize one to the other).
 
-**Run `claude-control-orchestrator/tasks/mac-wet-gate-runbook.md`** — the runbook holds the
+**Run the maintainer's macOS runbook** — it holds the
 exact commands and per-step pass/fail criteria; results are stamped back **here**, the same
 cross-repo split gates 2, 4 and 6 use.
 
-**Verify (assumptions A1–A4, defined in `claude-control-orchestrator/tasks/mac-compatibility-plan.md`):**
+**Verify (assumptions A1–A4, defined in the macOS compatibility plan):**
 
 - **A1 — item name/account.** The current CLI stores its live credentials in Keychain under the
   fixed account `claude-code-user`, service `Claude Code` + `-credentials` + (when the config dir

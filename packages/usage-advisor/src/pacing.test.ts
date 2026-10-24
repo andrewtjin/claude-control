@@ -177,10 +177,10 @@ describe('computePacing — waste', () => {
   it('reports the units, the account, and the reset that destroys them', () => {
     const pacing = computePacing(
       [
-        account({ accountId: 'used', label: 'debate', weight: 20, limits: [weekly(60, 4)] }),
+        account({ accountId: 'used', label: 'backup', weight: 20, limits: [weekly(60, 4)] }),
         account({
           accountId: 'idle',
-          label: 'tjin.29',
+          label: 'main.01',
           weight: 20,
           predictedResetAt: NOW + 6 * DAY_MS,
           limits: [weekly(0)],
@@ -189,17 +189,17 @@ describe('computePacing — waste', () => {
       { nowMs: NOW, burnUnitsPerDay: 0 },
     );
     const first = pacing.waste[0];
-    expect(first?.label).toBe('debate');
+    expect(first?.label).toBe('backup');
     expect(first?.units).toBeCloseTo(8, 6);
     expect(first?.atMs).toBe(NOW + 4 * DAY_MS);
     // Both accounts reset twice inside the 14d horizon; nothing is burned, so all of it goes.
     expect(pacing.wastedUnits).toBeCloseTo(8 + 20 + 20 + 20, 6);
-    // Named once per ACCOUNT, biggest loss first: the two tjin.29 resets are one decision, not
-    // two entries crowding debate off the line — but the deadline is paired only with what that
+    // Named once per ACCOUNT, biggest loss first: the two main.01 resets are one decision, not
+    // two entries crowding backup off the line — but the deadline is paired only with what that
     // first reset destroys, never with the account's whole-horizon total.
     expect(pacing.notes[0]).toBe(
-      '68u expires unused within 14d: 40u on tjin.29 across 2 resets, the first 20u in 6d, ' +
-        '28u on debate across 2 resets, the first 8u in 4d.',
+      '68u expires unused within 14d: 40u on main.01 across 2 resets, the first 20u in 6d, ' +
+        '28u on backup across 2 resets, the first 8u in 4d.',
     );
   });
 
@@ -296,7 +296,7 @@ describe('computePacing — degraded inputs are stated, never assumed', () => {
       [
         account({
           accountId: 'a',
-          label: 'legoboy',
+          label: 'standby',
           weight: 20,
           predictedResetAt: NOW + 5 * DAY_MS,
           limits: [weekly(0)],
@@ -306,7 +306,7 @@ describe('computePacing — degraded inputs are stated, never assumed', () => {
     );
     expect(pacing.accounts[0]?.resetPredicted).toBe(true);
     expect(pacing.accounts[0]?.resetsAt).toBe(NOW + 5 * DAY_MS);
-    expect(pacing.notes).toContain('next weekly reset predicted from history for legoboy.');
+    expect(pacing.notes).toContain('next weekly reset predicted from history for standby.');
   });
 
   it('refuses a prediction that is already in the past', () => {
@@ -532,14 +532,14 @@ describe('renderPacingSummary', () => {
     // operator looking for a poll that already happened instead of re-logging in.
     const pacing = computePacing(
       [
-        account({ accountId: 'tjin.29', quarantined: true, weight: 20, limits: [weekly(40, 3)] }),
-        account({ accountId: 'legoboy', quarantined: true, weight: 20, limits: [weekly(10, 5)] }),
+        account({ accountId: 'main.01', quarantined: true, weight: 20, limits: [weekly(40, 3)] }),
+        account({ accountId: 'standby', quarantined: true, weight: 20, limits: [weekly(10, 5)] }),
       ],
       { nowMs: NOW, burnUnitsPerDay: 1 },
     );
     expect(pacing.capacityUnits).toBe(0);
     expect(renderPacingSummary(pacing, NOW)).toBe(
-      'Pacing: [--] no usable accounts - tjin.29, legoboy quarantined; run: cctl accounts relogin <label>',
+      'Pacing: [--] no usable accounts - main.01, standby quarantined; run: cctl accounts relogin <label>',
     );
   });
 

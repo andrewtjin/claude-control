@@ -59,7 +59,7 @@ describe('buildLaunchEnv and the memory base', () => {
   it("gives a group slot's session its profile and the main dir as memory base", () => {
     const env = buildLaunchEnv({
       baseEnv: { PATH: 'x' },
-      slot: { kind: 'group', profileDir: layout.profile, label: 'SPAR', context: 'rule' },
+      slot: { kind: 'group', profileDir: layout.profile, label: 'research', context: 'rule' },
       dropInheritedConfigDir: false,
       profilesRoot: layout.root,
     });
@@ -180,7 +180,7 @@ describe('daemon-managed sessions', () => {
 
 describe('cctl folder where', () => {
   const rule = (memoryBase?: string): NonNullable<WhereView['rule']> => ({
-    label: 'SPAR',
+    label: 'research',
     folders: ['C:\\work'],
     include: ['research'],
     exclude: [],
