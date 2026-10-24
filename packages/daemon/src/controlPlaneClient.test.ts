@@ -531,6 +531,51 @@ describe('ControlPlaneClient', () => {
     expect(store.countOutbox()).toBe(0);
   });
 
+  it('opens every connection with the onOpen envelopes, ahead of the outbox replay', async () => {
+    const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
+    relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
+    let opens = 0;
+    client = new ControlPlaneClient({
+      url: relay.url(),
+      identityStore: memoryIdentityStore(identity),
+      store,
+      hostLabel: 'h',
+      heartbeatMs: 100_000,
+      reconnectBaseMs: 10,
+      reconnectCapMs: 50,
+      handlers: {
+        onOpen: () => {
+          opens += 1;
+          return [
+            {
+              daemonId: identity.daemonId,
+              type: 'hook.notification',
+              payload: { event: 'notification', title: `open-${opens}`, body: 'x', level: 'info' },
+            },
+          ];
+        },
+      },
+    });
+    await client.connect();
+    const notes = () => relay.received.filter((e) => e.type === 'hook.notification');
+    // Let the first connection's frame land before cutting the link, or it dies in flight.
+    await waitFor(() => notes().length === 1);
+    relay.disconnectAll();
+    await waitFor(() => client!.getState() !== 'open');
+    // Queued while the link is down: on reconnect these replay, and the open frame must lead them.
+    client.send({
+      daemonId: identity.daemonId,
+      type: 'hook.notification',
+      payload: { event: 'notification', title: 'queued', body: 'x', level: 'info' },
+    });
+    await waitFor(() => notes().length >= 3, 5000);
+    const titles = relay.received.flatMap((e) =>
+      e.type === 'hook.notification' ? [e.payload.title] : [],
+    );
+    expect(titles).toEqual(['open-1', 'open-2', 'queued']);
+    expect(store.countOutbox()).toBe(0);
+  });
+
   it('bounds the outbox by dropping the oldest entries past the configured limit', () => {
     const identityStore = memoryIdentityStore(); // never connects — outbox math only
     client = new ControlPlaneClient({

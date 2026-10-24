@@ -139,6 +139,25 @@ describe('Daemon quiet mode: a phone-started session', () => {
     expect(outputs(h).map((o) => o.text)).toEqual(['Session failed: out of budget']);
   });
 
+  it('still posts a held failure reason when quiet mode was turned off before the turn failed', async () => {
+    const quiet = fakeQuiet(true);
+    harness = await createHarness({ quiet });
+    const h = harness;
+    await h.daemon.start();
+    const handle = await spawnSession(h);
+
+    handle.emit({ kind: 'status', state: 'running' });
+    handle.emit({ kind: 'error', text: 'Error: the API connection dropped' });
+    quiet.value = false;
+    handle.emit({ kind: 'status', state: 'failed' });
+    await waitFor(sawStatus(h, 'failed'));
+
+    // Held while quiet, so it never went out live: the failed status is its one chance.
+    expect(outputs(h).map((o) => [o.kind, o.text])).toEqual([
+      ['error', 'Error: the API connection dropped'],
+    ]);
+  });
+
   it('drops a held error line when the turn ends any other way', async () => {
     harness = await createHarness({ quiet: fakeQuiet(true) });
     const h = harness;
@@ -262,7 +281,8 @@ describe('Daemon quiet mode: changing it live', () => {
   const snapshots = (h: Harness): PayloadOf<'settings.snapshot'>[] =>
     h.sent.flatMap((e) => (e.type === 'settings.snapshot' ? [e.payload] : []));
 
-  /** Start, and let the first poll cycle's snapshot go out so later snapshots are the change's. */
+  /** Start, and let the startup snapshots go out — the one that opens the connection and the first
+   *  poll cycle's — so later snapshots are the change's. */
   async function started(quiet: QuietControl | undefined): Promise<Harness> {
     harness = await createHarness({
       ...(quiet !== undefined ? { quiet } : {}),
@@ -270,9 +290,18 @@ describe('Daemon quiet mode: changing it live', () => {
     });
     const h = harness;
     await h.daemon.start();
-    await waitFor(() => snapshots(h).length === 1);
+    await waitFor(() => snapshots(h).length === 2);
     return h;
   }
+
+  it('opens the connection with the settings snapshot, before any other frame', async () => {
+    const h = await started(fakeQuiet(true));
+    // A restarted bot holds no settings; the very first frame after the handshake gives it quiet
+    // mode, so no queued or live session frame is rendered without it.
+    expect(h.sent.map((e) => e.type).slice(0, 2)).toEqual(['hello', 'settings.snapshot']);
+    const first = h.sent[1];
+    expect(first?.type === 'settings.snapshot' && first.payload.quiet).toBe(true);
+  });
 
   it('applies a phone change, re-sends the snapshot first, then answers the request', async () => {
     const quiet = fakeQuiet(true);
@@ -284,11 +313,16 @@ describe('Daemon quiet mode: changing it live', () => {
     expect(results(h)).toEqual([
       { requestId: 'q-1', ok: true, quiet: false, message: 'Quiet mode is now off.' },
     ]);
-    expect(snapshots(h).map((s) => s.quiet)).toEqual([true, false]);
+    expect(snapshots(h).map((s) => s.quiet)).toEqual([true, true, false]);
     const order = h.sent
       .filter((e) => e.type === 'settings.snapshot' || e.type === 'settings.quiet.result')
       .map((e) => e.type);
-    expect(order).toEqual(['settings.snapshot', 'settings.snapshot', 'settings.quiet.result']);
+    expect(order).toEqual([
+      'settings.snapshot',
+      'settings.snapshot',
+      'settings.snapshot',
+      'settings.quiet.result',
+    ]);
   });
 
   it('answers a repeat without re-sending the snapshot', async () => {
@@ -296,7 +330,7 @@ describe('Daemon quiet mode: changing it live', () => {
     setFromPhone(h, true);
     await waitFor(() => results(h).length === 1);
     expect(results(h)[0]?.message).toBe('Quiet mode was already on.');
-    expect(snapshots(h)).toHaveLength(1);
+    expect(snapshots(h)).toHaveLength(2);
   });
 
   it("relays the control's refusal in its own words, leaving everything as it was", async () => {
@@ -307,7 +341,7 @@ describe('Daemon quiet mode: changing it live', () => {
     setFromPhone(h, false);
     await waitFor(() => results(h).length === 1);
     expect(results(h)).toEqual([{ requestId: 'q-1', ok: false, quiet: true, message }]);
-    expect(snapshots(h)).toHaveLength(1);
+    expect(snapshots(h)).toHaveLength(2);
   });
 
   it('answers a control that throws as a failed save, never leaving the phone waiting', async () => {
@@ -343,7 +377,7 @@ describe('Daemon quiet mode: changing it live', () => {
       headers: { 'content-type': 'application/json', 'x-claude-control-secret': 'shh' },
       body: JSON.stringify({ quiet: false }),
     });
-    await waitFor(() => snapshots(h).length === 2);
-    expect(snapshots(h)[1]?.quiet).toBe(false);
+    await waitFor(() => snapshots(h).length === 3);
+    expect(snapshots(h)[2]?.quiet).toBe(false);
   });
 });

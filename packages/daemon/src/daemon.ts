@@ -1257,6 +1257,19 @@ export class Daemon {
           this.logger.error({ err }, 'error handling settings.quiet.set');
         });
       },
+      // The settings report decides how the bot renders session frames (quiet mode above all), and
+      // the bot holds it in memory only — so every new connection opens with it, ahead of any
+      // replayed frame, rather than leaving a restarted bot to guess until the next poll cycle.
+      onOpen: () =>
+        this.settingsReport
+          ? [
+              {
+                type: 'settings.snapshot',
+                payload: this.settingsReport,
+                daemonId: this.controlPlaneClient.getIdentity()?.daemonId ?? 'unknown',
+              },
+            ]
+          : [],
     });
 
     // Kicked off NOW (so identity load and the socket come up concurrently with the local
@@ -4892,10 +4905,12 @@ export class Daemon {
         this.dropManagedInjects(sessionId);
       // A held error line is the reason a quiet-mode turn failed: posted just ahead of the failed
       // status, as that turn's one outcome line. Any other transition means the turn ended some
-      // other way, so the held line was only prose and is dropped.
+      // other way, so the held line was only prose and is dropped. Not gated on quiet mode being
+      // on NOW: a line is only ever held while it was, so quiet mode turned off mid-turn must not
+      // lose the one reason the phone never saw.
       const heldError = this.quietHeldErrors.get(sessionId);
       this.quietHeldErrors.delete(sessionId);
-      if (event.state === 'failed' && heldError !== undefined && this.isQuiet()) {
+      if (event.state === 'failed' && heldError !== undefined) {
         this.sendSessionOutput(sessionId, 'error', heldError);
       }
       this.sendEnvelope({

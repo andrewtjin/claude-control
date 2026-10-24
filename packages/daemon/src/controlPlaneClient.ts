@@ -76,6 +76,12 @@ export interface ControlPlaneHandlers {
   /** Phone-initiated quiet-mode change (`/quiet on|off`). Routing only, as with every other
    *  inbound command — the env-pin refusal, the save and the result reply live in the daemon. */
   onQuietSet?: (msg: MessageOf<'settings.quiet.set'>) => void;
+  /** Envelopes the bot must hold before anything else this connection carries — the daemon's
+   *  current settings, which decide how the bot renders every session frame. Asked for each time
+   *  the handshake completes and written ahead of the outbox replay: the bot keeps that state in
+   *  memory only, so a bot that restarted would otherwise render the replayed and live frames
+   *  without it until the next periodic re-send. */
+  onOpen?: () => EnvelopeDraft[];
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +445,11 @@ export class ControlPlaneClient {
     this.state = 'open';
     this.reconnectAttempt = 0;
     this.startHeartbeat();
+    // Straight to the socket, not through send(): with rows queued, send() would put these behind
+    // the very frames they have to precede.
+    for (const draft of this.opts.handlers.onOpen?.() ?? []) {
+      this.liveSocket()?.send(encode(stamp(draft)));
+    }
     this.flushOutbox();
     this.resolveConnect();
   }
