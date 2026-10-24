@@ -2,9 +2,13 @@
 
 `cctl` runs local, one-shot commands over the switch engine and the daemon's data, plus
 the guided first-run wizard and the background daemon itself. Bare `cctl` (no
-subcommand) prints `Not set up yet. Run: cctl setup` before setup, or a short status
-summary afterward — it never dumps raw command-tree usage. `cctl --help` lists every
-command; this page adds the detail and the unhappy paths.
+subcommand) prints `Not set up yet. Run: cctl setup` before setup. Afterward it opens the
+full-screen view (see [Full-screen view](#full-screen-view)) when both its input and its
+output are a terminal that can draw it, and prints a short status summary otherwise, so a
+pipe, a script or `cctl > file` gets the same plain text it always did. A terminal that
+cannot move the cursor (`TERM=dumb`, as in an Emacs shell buffer) or the legacy Windows
+console gets the summary too. It never dumps raw command-tree usage.
+`cctl --help` lists every command; this page adds the detail and the unhappy paths.
 
 ## First run
 
@@ -49,6 +53,187 @@ work-2`). Rows created by an older build that broke this are resolved the next t
 twice is merged onto one row (the active one, else the most recently captured), and two
 logins under one label keep the earlier row's label while the later one becomes `work-2 (2)`.
 Each repair is printed above the listing it precedes.
+
+## Moving accounts to another machine
+
+```
+cctl export <file>                  # write every account, its folder and session rules, and
+                                    # the persisted settings to a passphrase-sealed file
+cctl export <file> --accounts work,home
+                                    # only these accounts (labels, emails or ids)
+cctl export <file> --no-tokens      # leave the logins out: each account is logged in
+                                    # again on the other machine
+cctl export <file> --move           # remove the exported accounts here once the file is
+                                    # written and read back (asks first; --yes skips that)
+cctl import <file>                  # add what the file holds to this machine
+cctl import <file> --dry-run        # print what an import would do, and change nothing
+cctl import <file> --replace        # also take the file's tokens for a stored account when
+                                    # they are newer or the stored login is quarantined, and
+                                    # the file's settings where this machine has others
+```
+
+The vault is sealed to the machine that wrote it (DPAPI on Windows, a local key file on
+Linux), so a copy of the vault never opens anywhere else. `cctl export` reads each account's
+credentials, seals them under a passphrase you choose (scrypt and AES-256-GCM), and writes one
+file; `cctl import` opens it and stores the accounts in this machine's vault. There is no
+plaintext mode. The passphrase comes from `--passphrase-file <file>` (its first line; a file
+saved as UTF-16 or with a byte-order mark, as PowerShell writes one, reads the same), else
+`CCTL_EXPORT_PASSPHRASE`, else a prompt (asked twice on export; at least 8 characters; it needs
+a terminal with standard input free, so an import reading the file from standard input cannot
+ask). From any
+of them, a passphrase with a space at either end or a control or invisible character in it is
+refused rather than trimmed: `echo secret > file` in cmd.exe writes `secret ` with the space,
+and no one could type that again on the other machine. Use
+`-` as the file to write to standard output or read from standard input; an import from
+standard input needs the passphrase from a file or the env var. An export to `-` sends its
+report to standard error, so standard output carries only the sealed file. An export never
+overwrites an existing file, and the file it writes is readable by you alone (on Windows, on a
+file system that keeps no per-user permissions, such as a FAT USB stick, the passphrase alone
+protects it, and the export says so; other systems do not check). A file may be up to 16 MiB
+and hold up to 512 accounts; a larger one is refused.
+
+**A login works on one machine at a time.** Refresh tokens are single-use: once either machine
+refreshes a login, the other machine's copy stops working. Keep each account on one machine,
+either by exporting with `--move` or by removing it on the other side
+(`cctl accounts remove <account>`). An export that carries tokens, and an import that stored
+tokens, end with this reminder; `--dry-run` never prints it.
+
+What travels: each account's id, label, login, email, organization, auto-switch exclusion and
+(unless `--no-tokens`, in which case its plan instead, shown until it is logged in) its
+credentials, freshest copy first (a rotation a running session made
+is adopted before it is read); every rule a travelling account is a member of, whole, with all
+of its members named by login (a member that stays behind is found by its login if the other
+machine already has it, and left out otherwise); and the settings `cctl settings set`
+persisted. What never travels: the relay (its URL and its pairing, which belong to this
+machine), the hook secret, the vault key, switch recovery files, the guard snapshot, profiles,
+the daemon's database (sessions, prompts, cards) and usage history. A setting that names a path
+(`CCTL_LOG_FILE`) is left out, as is a quarantined account's stored login (the account travels
+and waits for a login on the other side).
+
+What an import does with each part, printed in full by `--dry-run` (the header, any notes and
+this plan; a dry run always exits 0):
+
+- **An account already stored here** (the same account, by the id it keeps when it is
+  imported, or the same login) is left as it is. A label alone never makes two accounts the
+  same. With `--replace` its tokens are replaced when the file's are newer (a later expiry) or
+  the stored login is quarantined or none are stored for it (the import says "none were stored here"); the account keeps its id, its usage history and the identity
+  stored for it. Only tokens whose own identity names the stored login can replace it, and a
+  stored copy that cannot be read right now is not replaced either (the import says so; run it
+  again).
+- **A label already taken here by another login** gets a number, `work (2)`, the same way
+  duplicate repair numbers labels.
+- **An account without tokens** is stored waiting for a login (quarantined until then). The
+  dry run says "waiting for a login" for each; the real run lists `cctl accounts relogin <label>`
+  for each one that is still waiting, and that re-login must be the same account.
+- **An account reserved to a rule that is not made here** (its folder is missing here, say, or
+  the rule is refused while the import runs) is added but kept out of auto-switch, so a
+  client's account does not end up spending its quota on other work; nor does the import move
+  a slot onto it, or seat a rule it makes with it. `cctl accounts include <account>` hands it
+  back to auto-switch.
+- **Rules** land whole or not at all: a rule of the file is one slot, and splitting it would
+  change which account its folders run on, so it is never made on part of its scopes. A rule
+  keeps its identity across machines: a rule the import makes remembers which rule it is, and
+  the export of a rule carries it. When the file was written on another platform and holds
+  rules, the output opens with a note that folders of another platform are not looked up here,
+  so rules on such folders are skipped (macOS creates no rules at all). Each rule of the file
+  then ends one of four ways:
+  - it **grows** the one rule here that carries its identity (an earlier import made it, say
+    before one of its folders existed here; or the file came from this machine): the scopes
+    and accounts it lacks are added, whatever changed on either machine since. An account the
+    rule here holds the other way round (included where the file excludes it, or the reverse)
+    is left as it is, and listed;
+  - it is **created**, with every scope that can be used here, when no rule here holds any of
+    them;
+  - it is **skipped** when this machine already has the rule with these accounts, or when
+    another rule here reserves every account it excludes, so it would change nothing;
+  - otherwise it **fails**, counted as a failure (the import exits non-zero), naming the folder
+    or session a rule of this machine holds and that rule. It also fails when this machine
+    already has it split between several rules (remove all but one with `cctl folder reset`,
+    then import again), or when the file holds the same rule twice (it is imported once). A
+    rule here with another identity,
+    or none (made here by hand), is never grown by an import, even on exactly the same
+    scopes, whatever accounts it shares with the file's. To bring the two together, remove the
+    rule here, every folder and session of it (`cctl folder reset <folder>`, `cctl session reset
+<alias> --cwd <folder>`; resetting its last one removes the rule), and import again, which
+    then makes the file's rule whole; the failure line names the commands. A folder of the file's
+    rule that cannot be used here still counts: a rule here holding it fails the rule too, since
+    making it on the rest would split it.
+
+  A scope that cannot be used here is left out, and listed: its folder does not exist here, is
+  a network folder (those are never looked up from a file), is a folder of another platform, or
+  is one no rule may cover (a drive root, the home folder, cctl's own folders). Once it can be,
+  the next import adds it to the rule the first one made (unless a rule of this machine holds
+  it, see above). An exclusion of an account another
+  rule here reserves is left out, and listed (only a shared account can be excluded). A rule is skipped, and listed, when
+  none of its scopes is left, none of its accounts came along, none of the accounts it includes
+  is in the file or here (with only its exclusions it would open its folders to every account),
+  or it names one account both to include and to exclude. A rule fails, saying why, when it
+  would pass the 64-rule limit or a limit on one rule (32 accounts included or excluded, 256
+  folders, 256 session aliases), the 256 accounts reserved in all, or when reserving an account
+  would leave this machine's main login, a folder slot that sessions run in, or the slot of a
+  rule the file does not change, with no account to run on, or when an exclusion would leave a
+  folder that sessions run in with no account, counting what the rest of the file reserves (the
+  slot of a rule the file changes, with no sessions in it, is left empty instead, as an exclusion
+  leaves it); within one file, the rule that fails is the first whose addition causes it. A rule that reserves the account live in a slot here moves that slot to another
+  account (never onto one the file excludes from that slot's rule), and says so; the slots are
+  chosen together, so one slot can take the account another leaves, and none takes the only
+  account another could use while it has another to spare. Who is
+  live in a slot is read from the slot itself, not from what cctl recorded
+  for it, so a login made by hand inside a folder's profile counts, and so does this machine's
+  main login when it runs an account of the file that cctl had not stored yet. Folder rules are
+  not created on macOS, nor while a daemon older than this build runs (`cctl daemon restart`).
+
+- **Settings** are checked the way `cctl settings set` checks them and saved the same way. A
+  setting this machine already has with another value is kept unless `--replace`. A value that
+  weakens a guard compared with the one saved in this machine's config (the default when none
+  is saved), such as `bind-enforce` below `block`, `identity-check` off or `full-output` on, is
+  never taken from a file, `--replace` or not; the output names the `cctl settings set` command
+  to make it here. The comparison is with the saved value, not the one in force: a setting the
+  daemon's environment also sets still wins over the saved one, and the output reports it as
+  overridden. When a setting changed, the real run prints `cctl daemon restart` (a dry run
+  does not).
+
+What `--dry-run` prints for the rules is the decision the import itself makes, made by the same
+code from the same reads, and the real run prints the same lines (in the past tense). Only what
+changes on this machine between the two runs can make them differ: a session that starts or
+stops in a folder a rule would leave with no account, a switch left unfinished in a slot (the
+real run settles it first), an account a slot is to be moved onto that cannot go live then (its
+login will not refresh: the real run checks every such account before it writes or moves
+anything, and decides again without it, so the slot moves onto another account or the rule
+fails, and no slot is ever moved for a rule that then fails), or an account, rule or login
+changed in between. With `--replace`, a quarantined login the file brings tokens for counts as usable in the dry run too,
+since the real run always takes them. Both runs also name every folder slot holding a login that
+seating the rules puts on another account (an account the file newly includes there, one it no
+longer excludes, the account another rule took, or a quarantined login replaced) or on none. A
+slot that sessions run in is moved only as the run says, and never left with no account: a rule
+that would leave it so fails.
+
+A real run ends, in this order, with the `cctl daemon restart` line (when a setting changed),
+the `cctl accounts relogin` list, a hint when nothing is live on this machine's main login
+afterwards (`cctl switch <label>` for an account that can take it, else `cctl accounts add
+<label>` when the accounts the import brought are all reserved or kept out of auto-switch), and
+the one-machine reminder above. A dry run prints none of these.
+
+An import is safe to run twice: everything already in place is reported as such and left
+alone, and a run that stopped part-way (it still reports every rule it wrote and every slot it
+moved) is completed by the next one, while the daemon settles any slot it did not get to. A rule the file carries without an identity (its registry rule had an id that is not a valid
+one, as a hand-edited registry can) is given one from its folders and sessions, so the next import of the
+same file finds the rule the first one made. A rule that failed because
+a rule of this machine is in its way fails again until that rule is removed. A wrong passphrase, a file
+changed after it was written, one cut short, or one whose rules hold more than 1024 folders and
+session aliases in all is refused before anything is imported.
+`--move` refuses before anything is written when an account is the live login of this machine's
+main config (switch to another account first: `cctl switch <account>`), when a parallel session
+runs on it or it is logged in inside one with `/login` (exit that session first; checked as
+`cctl switch` checks it), when the export goes to
+`-` (nothing to read back), and when there is no terminal to ask on and no `--yes`. It removes
+nothing unless the written file is on the disk and reads back, opening with the same
+passphrase. After that each account is checked on its own: one that is live in a folder's slot
+while sessions run there, whose removal would dissolve a rule (one naming only that account)
+whose folder's slot sessions are running on (exit them first), whose tokens changed since the
+export, or that became the main login meanwhile is kept, reported as "Could not remove
+<label>: ...", and makes the exit code 1. An account whose tokens did not travel (a
+quarantined one) is kept and listed, without counting as a failure.
 
 ## Folder rules
 
@@ -302,15 +487,17 @@ A rule only takes effect for a session that launches on the folder's slot. That 
 ```
 cctl claude                        # launch Claude Code on the folder's slot (or the global
                                     # slot when no rule applies here)
-cctl claude --account <id|label>   # launch on a specific account for this one session
+cctl claude --account <id|label>   # run on that account in this terminal only: on the slot where it is
+                                    # live, following that slot's switches (global, this launch's rule,
+                                    # a named session's), else in a slot of its own (see "Parallel sessions")
 cctl claude --override             # launch here on the global account, on purpose (see below)
 cctl claude -- <claude args...>    # everything after -- is passed through to claude
 cctl claude attach <id|name>       # open a background session on its folder's account (see
 cctl claude --resume <id|title>    # "Opening a background session" below)
 ```
 
-`cctl claude` resolves which slot to use (an explicit `--account`, else the folder's
-rule, else global), makes sure an account is live there, prints a one-line banner naming
+`cctl claude` resolves which slot to use (an explicit `--account`, which outranks a rule that
+would otherwise decide, within the limits under Parallel sessions; else the folder's rule; else global), makes sure an account is live there, prints a one-line banner naming
 the account and the rule, and hands off to the real `claude` executable. Its exit code is
 yours; Ctrl+C reaches Claude Code, not the wrapper.
 
@@ -590,22 +777,189 @@ so the daemon cannot move the session in between. With `--account` or `--overrid
 session is never moved, but it is still opened where it runs rather than taken from there.
 
 To run in a ruled folder on the global account _on purpose_ for one session, launch it
-with `cctl claude --override`; to run a reserved account in a folder that does not include
-it, launch with `cctl claude --account <that account>`. Both are honored by the guard for
-that session only. `--override` relaxes a session on the global slot only: from a shell whose
+with `cctl claude --override`; `--account` runs the account you name here instead of the
+rule's (refused in some cases: see Parallel sessions). Both are honored by the guard for that session only.
+`--override` relaxes a session on the global slot only: from a shell whose
 `CLAUDE_CONFIG_DIR` names a config dir cctl does not manage, the session runs there and is
 refused as above.
+
+### Parallel sessions (one account per terminal)
+
+`claude --account work` (through the shell wrapper; `cctl claude --account work` without it)
+runs Claude Code on `work` in this terminal only. Other terminals and folders keep their
+accounts.
+
+Where it runs:
+
+- on the global slot when `work` is live there. That session then follows global switches,
+  from any terminal or the phone;
+- in the slot of the rule this launch runs under when `work` is live there: this folder's
+  rule, or the rule of the named session its arguments open (`--resume <title>`). It then
+  follows that rule's switches;
+- in the slot of a folder or named session `work` is reserved to (a rule that includes it),
+  when it is live there, from any folder. The session then follows that rule's switches,
+  which can move it off `work`;
+- otherwise, when `work` is live in no folder's or named session's slot, in a
+  parallel-session slot of its own.
+
+Live in the slot of any other rule, `work` is refused: a shared account serving another
+folder's or named session's slot, or a reserved account live in a rule that does not include
+it. It is also refused when it is live in two slots, when it is quarantined (fix:
+`cctl accounts relogin work`; joining a parallel session already running on it is allowed), and
+when the rules registry is full (64 rules, parallel sessions included). That covers this folder's own slot too when the launch opens a named session whose rule has
+a slot of its own. Run claude where that slot applies, or switch that slot to another account
+first (for a named session's slot, keep `work` out of it with `cctl session exclude`).
+
+While a parallel session runs:
+
+- `work` leaves every pool. No switch or auto-switch picks it, `cctl switch work` refuses and
+  says so, and the phone cannot start or resume a session on it.
+- The slot never auto-switches. At a usage limit the session stops, as at any limit.
+- Two terminals on `work` share one slot.
+
+Do not run `/login` inside a parallel session: it would put another account in that slot. The
+daemon notices that on a later check (nothing happens without it): the other account's refreshed
+login is saved with that account, and the copy in the slot is cleared only when that account
+could be live in another slot too; otherwise it stays, since no other slot can take it meanwhile.
+The session's own account is not changed. An import, `cctl folder include` or `cctl session
+include` that reserves the other account leaves its login in the session's slot as well: the
+folder's or named session's slot takes that account only once the session has ended and saved
+its login.
+
+When the last terminal on `work` exits, its refreshed login returns to cctl and `work` rejoins
+the pool. A closed window or a killed process is cleaned up by the daemon at its next check
+(a busy Windows machine can take longer; a check that cannot decide is retried), or, with no
+daemon, by the next `cctl switch`, `accounts remove`, `folder exclude`, `session exclude` or
+`cctl claude --account`, which first end every session whose processes are gone.
+
+A Claude Code the session started that outlives it on its profile (a backgrounded `claude -p`)
+keeps `work` reserved until it exits: it may still use the login. The terminal names its pid
+when it exits, and `cctl doctor` names it too. Anything else the session started (a dev server,
+an editor) does not hold `work`: it never reads the login.
+
+On Windows the last terminal out may pause while the process list is read (up to 60 s). From
+the claim until the release, Ctrl-C, Ctrl-Break and closing the console are ignored in the
+wrapper, so a stray one cannot cut the release short; a terminal that is not the last reads
+nothing on the way out. A session holds at most 32 processes.
+
+When the release cannot finish, the terminal says so: `could not return <label> to the pool yet
+(<reason>)` (a roster, process list or slot that could not be read or settled; the daemon or the
+next command above retries), or `<label> stays reserved ...` (a Claude Code process or a
+background-service session started from it still runs on its profile; it rejoins when that
+exits). For a login that could not be saved (a torn file, or a `/login` inside the session as an
+account cctl does not store) the fix is `cctl accounts relogin <label>`: it writes a fresh login
+of `<label>` over that login in the session's slot, and the next check ends the session. To keep
+the other account instead, add it (`cctl accounts add <label> --fresh`, logging in as it): with
+its login stored, the next check ends the session. The session shows in
+`cctl status`, `accounts list`, `usage`, `timeline` and `folder list` as in use. `cctl folder
+include` of an account a session holds waits until it ends, and `cctl accounts remove` is
+refused. `--override` with a parallel session relaxes nothing.
+
+History is shared, as in folder profiles: `--resume` and `--continue` see every conversation.
+
+Not available with it (for now): `--bg`, `attach`/`stop`/`rm`/`kill`/`respawn`, and Claude
+Code subcommands. For a named session that should keep an account, use
+`cctl session include <alias> <account>`.
+
+It needs a build that reads parallel sessions (1.1.0 or later) everywhere it can run. A running
+daemon on an older build is refused (fix: `cctl daemon restart`), and so is an older `cctl` on
+PATH, in the PowerShell `claude` wrapper or in the autostart registration (fix: update that
+install). An older cctl cannot read the rules file while a parallel session exists.
+
+macOS: not available yet, except for an account that is already live in the global slot.
 
 ### macOS
 
 Folder rules are **not supported on macOS yet** — `cctl folder include|exclude` refuse
 there. The isolation relies on a per-slot credential store, and on macOS each store would
-prompt the Keychain. See `docs/PLATFORM.md`.
+prompt the Keychain. See `docs/PLATFORM.md`. Parallel sessions likewise.
+
+## Full-screen view
+
+```
+cctl            # on a terminal, once set up
+cctl tui        # the same view, by name; works before setup too
+```
+
+One screen with four panes, refreshed every 2 seconds (a timed refresh is skipped while an action runs or a read is still in
+flight, and a read follows the action) and after every action: **Accounts**
+(each account's plan, its 5-hour and weekly usage with reset times, any per-model weekly
+windows, its folder rules, whether it is excluded or quarantined, and how old the reading is),
+**Sessions** (what `cctl session status` shows), **Folders** (`cctl folders`) and **Outages**
+(`cctl outages`). The header says whether the daemon is running, whether auto-switch is on, and
+when it last polled (the newest usage reading of any account, or "no poll yet"). The auto-switch
+part only shows while the daemon is running. Colour is used when the output is a terminal and
+`NO_COLOR` is unset. Everything is read locally from the vault and the daemon's database, the
+same places the commands read; nothing in the view calls Anthropic. A reset marked `~` is
+predicted from history rather than reported.
+
+| Key                 | What it does                                                                                                                                                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| up/down or k/j      | move the selection (Accounts) or scroll (other panes)                                                                                                                                                                                 |
+| PgUp/PgDn, Home/End | move or scroll further                                                                                                                                                                                                                |
+| Tab / Shift-Tab     | next / previous pane                                                                                                                                                                                                                  |
+| Enter               | switch to the selected account (same as `cctl switch`)                                                                                                                                                                                |
+| e                   | exclude the selected account from auto-switch, or include it again                                                                                                                                                                    |
+| r                   | rename the selected account                                                                                                                                                                                                           |
+| a                   | add an account: the screen steps aside for a Claude login window (as `cctl accounts add --fresh`), then comes back                                                                                                                    |
+| d                   | remove the selected account; you type its label to confirm                                                                                                                                                                            |
+| u                   | ask the running daemon to refresh usage now; it still honors each account's poll floor and any rate-limit backoff, and says which accounts it held back and until when. Unavailable, with the reason, while the daemon is not running |
+| l                   | show the command that runs Claude as the selected account, to paste in another terminal                                                                                                                                               |
+| m                   | show the last message in full (a long one is cut on the status line)                                                                                                                                                                  |
+| ?                   | the key list                                                                                                                                                                                                                          |
+| q or Esc            | quit                                                                                                                                                                                                                                  |
+
+Enter, e, r, d and l act on the selected account, so they work only in the Accounts pane;
+elsewhere the status line tells you to Tab to it. a, u, ?, m and q work in every pane.
+
+q and Esc quit from the list. In a prompt, Esc cancels it and q is just typed; in the help,
+message and launch overlays, q and Esc close the overlay. While an action is running q and Esc
+do nothing; Ctrl-C always works. It quits the view as soon as the action finishes; a second
+Ctrl-C gives the screen back at once, and cctl exits when the action has finished (it is never
+cut off part way). Either way, how the action ended is printed on the normal screen, and a
+refused action makes the exit code non-zero. A signal exits with 128 plus its number (SIGHUP 129,
+SIGINT 130, SIGTERM 143); one that arrives during an action waits for it and prints "Still
+finishing the running action...". While a login window is up, Ctrl-C and Ctrl+Break belong to
+that window and the view ignores them.
+
+The help and message overlays scroll with the movement keys, including Home/End and
+PgUp/PgDn, in a short terminal. They and the
+launch line close on Esc or any other key except Enter, so a doubled Enter never reaches the
+account list. A prompt takes Backspace, filters out control characters and caps its input at 200
+characters. A rename, add or remove prompt whose Enter does not go through (an empty label, a
+label another account already has, a mistyped confirmation) stays open and says why, and a rename
+or remove the vault refuses opens its prompt again with the reason; Esc then leaves the reason on
+the status line, where m shows all of it. A removal is checked against the label you typed once
+more when it runs, so an account renamed elsewhere in the meantime is not removed. A prompt whose
+account is removed elsewhere while it is open takes nothing more and closes on Esc. When the
+selected account is removed, here or elsewhere, no account is selected until j/k picks one, so no
+key lands on an account you did not pick. Pasted text only ever goes into a prompt; in the list it does nothing. Keys typed while the
+screen is stepped aside for a login window are dropped when it comes back, for as long as they
+keep arriving.
+
+As the terminal narrows, columns give way in a fixed order: per-model windows first, then reset
+times, then the plan; after that the label column narrows and the tags are cut, and the key-hint line
+drops its least important hints first. Below 40 columns (or 6 rows) the view shows a notice instead, and only q,
+Esc and Ctrl-C do anything until it is larger. A long message wraps onto up to three status
+rows, never taking the selected account's row; one longer than that keeps its start and its end,
+and m shows all of it. cctl's own messages are drawn with plain ASCII punctuation, so they are as
+wide on a terminal set up for CJK text as anywhere else. Diagnostics that
+would normally go to stderr appear on the status line, so they never draw over the screen; every
+one logged while an action ran is shown with that action's result (and printed after an error
+ends the view). Quitting, a signal, a closed terminal and an error all give the terminal back as
+it was. `cctl tui` refuses to start when its input or output is redirected, or on a terminal that
+cannot draw it (`TERM=dumb`, or a Windows console that does not answer a cursor-position query,
+as the legacy console does not), and points at `cctl usage` for plain output; bare `cctl` prints
+the summary there instead. The legacy console setting only applies to windows opened after it is
+changed.
 
 ## Switching and recovery
 
 ```
-cctl switch <id|label>       # activate an account (a reserved account switches its folder's slot)
+cctl switch <id|label>       # activate an account (a reserved account switches its folder's slot;
+                             # refused while the account runs a parallel session; a session
+                             # whose processes are gone is ended first, as `accounts remove`,
+                             # `folder exclude` and `session exclude` also do)
 cctl switch <id|label> --force   # bypass the switch-cadence guard
 cctl recover                 # recover from an interrupted switch (safe to run anytime);
                              # exits 1 with the reason when it cannot be settled yet
@@ -780,7 +1134,10 @@ cctl settings set <name> <value>    # persist a daemon setting by alias or env v
                                     # aliases listed below)
 cctl settings unset <name>          # remove a persisted daemon setting
 cctl doctor     # environment checks: Node version, vault crypto round-trip, vault dir,
-                # live login, ~/.claude.json, and whether the daemon has autostart
+                # live login, ~/.claude.json, and whether the daemon has autostart;
+                # with folder rules or parallel sessions also slots, rule-scopes,
+                # guard-snapshot, guard-hook, parallel-sessions, daemon-folder-rules,
+                # daemon-alias-rules and daemon-parallel-sessions
 ```
 
 ## The daemon

@@ -103,6 +103,11 @@ export interface StoredAccount {
   updatedAtMs: number;
 }
 
+/** The quarantine reason of an account stored without tokens (an import of a file made with
+ *  `--no-tokens`): it has never been logged in on this machine, which a view says rather than
+ *  calling its login expired. */
+export const PENDING_LOGIN_REASON = 'imported without tokens - log in with cctl accounts relogin';
+
 /** The registry index persisted at `vault/accounts.json`.
  *
  *  Holds only SHARED (global-pool) rows. A reserved account's row is MOVED out of here into
@@ -182,6 +187,12 @@ export interface FolderRule {
   id: string;
   /** Display name. Defaults to the folder the rule was created on. */
   label: string;
+  /** Which rule this one is on the machine an import brought it from: that rule's own origin, else
+   *  its id. Set on a rule an import made. Absent on a rule made here by hand, which an import never
+   *  grows. A later import finds the rule by it whatever changed since on either machine (members,
+   *  folders, name), so a rule brought over part way is grown rather than made again beside itself.
+   *  A lower-case uuid; unlike the id it names nothing on disk. */
+  origin?: string;
   /** Canonical folder paths this rule applies to (see `folderPath.ts`). Unique across all rules.
    *  Empty for a rule that applies only to a session alias. */
   folders: string[];
@@ -204,15 +215,67 @@ export interface FolderRule {
   activeId: string | null;
   createdAtMs: number;
   updatedAtMs: number;
+  /** Present exactly when this rule is a parallel-session slot: `cctl claude --account <id>` running
+   *  that one account in a terminal without moving any other slot. Such a rule has no folders and no
+   *  aliases, includes exactly that account, excludes nothing, and its id is `session-<accountId>`.
+   *  It lives while processes hold it (see {@link SessionLease}). */
+  lease?: SessionLease;
+}
+
+/** One process that holds a parallel session. A holder is judged alive or dead from the process
+ *  that reads it (see processStarts.ts `holderState`); every doubt counts as alive, because ending a
+ *  session's slot under it logs that session out. */
+export interface LeaseHolder {
+  pid: number;
+  /** The process's start, never derived from the current wall clock at check time. On win32 the
+   *  creation time in epoch ms (compared within a tolerance); on linux field 22 of
+   *  `/proc/<pid>/stat`, clock ticks since boot (compared exactly, so a wall-clock step cannot make a
+   *  live holder look reused). 0 = unknown, which counts as alive. */
+  start: number;
+  /** `os.hostname()` of the machine that recorded it. Not the environment's idea of the host, which
+   *  differs between a terminal and a service-started daemon. */
+  host: string;
+  /** A WSL distro and its Windows host can share a host name; the platform tells them apart. Leases
+   *  exist only on these two. */
+  platform: 'win32' | 'linux';
+  /** linux: the boot the holder was recorded in. A different boot means the process is gone. */
+  bootId?: string;
+  /** linux: the pid namespace it was recorded in. Another namespace (another WSL distro, a
+   *  container) is foreign: its pids mean nothing here. */
+  pidNs?: string;
+  /** linux: `/etc/machine-id` of the machine that recorded it. A renamed machine keeps it, so a
+   *  holder recorded under the old host name is still judged here (see `holderState`). */
+  machineId?: string;
+  /** launcher: the `cctl claude` process. claude: its Claude Code child, or a process found running
+   *  on the slot's profile. background: a worker the profile's background service hosts. */
+  role: 'launcher' | 'claude' | 'background';
+  /** For a claude holder a launcher recorded: that launcher's pid, so a check can tell whether a dead
+   *  launcher's child was ever recorded. */
+  parent?: number;
+  /** A claude holder no launcher recorded: found running on the profile once the session's terminals
+   *  had exited (something the session started that outlived it). It holds the session the same
+   *  way; it is only counted apart, since no terminal runs it. */
+  found?: true;
+}
+
+/** What makes a rule a parallel-session slot (see {@link FolderRule.lease}). */
+export interface SessionLease {
+  /** Never empty on disk: a lease ends by removing its rule in one write. */
+  holders: LeaseHolder[];
+  startedAtMs: number;
+  /** Where the account sat in `accounts.json` before this lease reserved it, so ending the lease
+   *  puts it back in the same place in the shared pool. Absent when another rule already reserved
+   *  it. */
+  restoreIndex?: number;
 }
 
 /** The `groups.json` file: the reserved side of the one logical registry plus the folder rules over
  *  it. An account is in `reserved` (and absent from `accounts.json`) exactly while at least one rule
- *  includes it. Schema 1 (set-bound groups) is migrated on read. `schemaVersion` is 3 exactly while
- *  some rule carries an alias scope, so a build that knows only folder rules refuses the file instead
- *  of ignoring the alias rules it cannot honor; else 2. */
+ *  includes it. Schema 1 (set-bound groups) is migrated on read. `schemaVersion` is the highest the
+ *  content needs, so a build that cannot honor a kind of rule refuses the file instead of ignoring
+ *  it: 4 while a parallel session exists, else 3 while some rule carries an alias scope, else 2. */
 export interface RulesFile {
-  schemaVersion: 2 | 3;
+  schemaVersion: 2 | 3 | 4;
   /** Bumped on every write; the guard snapshot (see {@link FolderBindingSnapshot}) carries it so a
    *  stale snapshot can be detected. */
   generation: number;
@@ -307,6 +370,10 @@ export interface FolderBindingSnapshotGroup {
    *  printable text: the engine refuses control and bidi characters). Absent in a snapshot written by
    *  a build that predates alias rules, which the guard reads as none. */
   aliases?: { folder: string; aliasKey: string; alias?: string }[];
+  /** 'lease' for a parallel-session slot, whose sessions run wherever the operator started them on
+   *  purpose. Written only on such a group, so the snapshot keeps schema 1: the guard fails open on an
+   *  unknown schema, and a bump would switch enforcement off for every older guard. */
+  kind?: 'lease';
 }
 
 /** Write-ahead record of an in-progress switch, for crash recovery. Carries NO secrets.
@@ -356,6 +423,227 @@ export interface ReloginResult {
   /** True when the re-logged account was the live one and the fresh credentials (and identity)
    *  were written to the live files. False for a non-live account — its live files were
    *  deliberately untouched — or when the live write failed/could not be verified. */
+  healedLiveLogin: boolean;
+}
+
+/** The identity a registry row is known by, as a caller states it (an import, from its file). */
+export type AccountIdentity = Pick<
+  StoredAccount,
+  'accountUuid' | 'emailAddress' | 'organizationUuid'
+>;
+
+/** The plan and billing facts a registry row keeps, copied from a login's bundle. */
+export const ACCOUNT_PLAN_KEYS = [
+  'subscriptionType',
+  'rateLimitTier',
+  'organizationRateLimitTier',
+  'billingType',
+  'subscriptionCreatedAt',
+  'claudeCodeTrialEndsAt',
+] as const;
+
+/** A row's plan and billing facts (see {@link ACCOUNT_PLAN_KEYS}). */
+export type AccountPlanFacts = Pick<StoredAccount, (typeof ACCOUNT_PLAN_KEYS)[number]>;
+
+/** What a caller adding an account knows beyond its bundle (see `Vault.addAccount`). */
+export interface AddAccountOptions {
+  /** Store the account excluded from auto-switch, in the same write that adds it. */
+  autoSwitchExcluded?: boolean;
+  /** The identity to record for each anchor the bundle's identity block does not carry. */
+  identity?: AccountIdentity;
+  /** The id to store the account under: an import keeps the id the account has on the machine it
+   *  came from, so importing it again finds it. A uuid no row here has; absent, one is made. */
+  id?: string;
+}
+
+/** What a caller adding an account that has no login yet knows (see `Vault.addPendingAccount`). */
+export interface AddPendingAccountOptions extends Pick<
+  AddAccountOptions,
+  'autoSwitchExcluded' | 'id'
+> {
+  /** The plan facts the account had where it came from, shown until its first login replaces
+   *  them. */
+  plan?: AccountPlanFacts;
+}
+
+/** What a removal that follows handing an account to another machine checks first (see
+ *  `SwitchEngine.removeAccount`). */
+export interface RemoveAccountOptions {
+  /** Refuse while the account is live on this machine's main login. */
+  refuseIfGloballyLive?: boolean;
+  /** Refuse while the account is live in a folder slot that sessions run in: the removal clears that
+   *  slot's login, which those sessions refresh from, and they would go on spending a token the
+   *  account's new machine now holds. */
+  refuseIfRunning?: boolean;
+  /** Refuse unless the vault still holds this refresh token for the account. */
+  expectRefreshToken?: string;
+  /** The label a person typed to confirm the removal; refused when the account is called something
+   *  else by the time the lock is held. */
+  expectedLabel?: string;
+}
+
+/** One rule an import asks {@link SwitchEngine.importRules} for: one rule of the machine the file
+ *  came from, applied whole or not at all. */
+export interface ImportRuleSpec {
+  /** Every scope of the ONE rule this makes (or grows), as the operator would name them. */
+  scopes: RuleScopeRef[];
+  /** Scopes of the same rule that cannot be used here (a folder that does not exist here, a
+   *  network folder), as the file names them. Nothing is made on them, but a rule here that holds
+   *  one still keeps the rule from landing: made on the rest, it would be split in two. */
+  absent?: RuleScopeRef[];
+  include: string[];
+  exclude: string[];
+  /** The display name of a rule this creates. */
+  label?: string;
+  /** The rule's identity across machines (see {@link FolderRule.origin}). The rule here carrying it
+   *  (an earlier import of the same rule), or whose own id it is, is grown rather than a second one
+   *  made; a rule this creates stores it. A spec without one can only create. */
+  origin?: string;
+}
+
+/** An account an import has not stored yet, which {@link SwitchEngine.planImportRules} counts as
+ *  stored (shared, under this id) when it decides what the rules would do. It has no tokens here
+ *  yet, so it is live in a slot only when the login it names runs there unrecognized. */
+export interface PendingImportAccount {
+  /** The id rule specs name it by; any string no stored account has. */
+  id: string;
+  label: string;
+  /** Its login, by which a slot already running that login recognizes it once it is stored. */
+  accountUuid?: string;
+  /** Whether it arrives with tokens; without, it is stored quarantined (no slot can move to it). */
+  withTokens: boolean;
+  autoSwitchExcluded?: boolean;
+}
+
+/** What a {@link SwitchEngine.importRules} batch is told beyond its specs. */
+export interface ImportRulesOptions {
+  /** Accounts no slot may be moved to or seated with unless their own rule includes them. */
+  keepOut?: readonly string[];
+}
+
+/** What {@link SwitchEngine.planImportRules} is told about the import around the rules. */
+export interface PlanImportRulesOptions extends ImportRulesOptions {
+  /** The accounts the import stores before it writes the rules. */
+  pending?: readonly PendingImportAccount[];
+  /** Logins the import gives accounts already stored that record none yet: a slot running such a
+   *  login unrecognized holds that account once the import has run. */
+  logins?: ReadonlyArray<{ id: string; accountUuid: string }>;
+  /** Accounts stored here quarantined that the import gives new tokens before it writes the rules
+   *  (a replaced login is always taken over a quarantined one): usable once it has run. */
+  revived?: readonly string[];
+}
+
+/** A member of a rule an import leaves out, and why: the rule here it grows excludes (or
+ *  includes) the account already, or another rule here reserves an account to be excluded (only a
+ *  shared account can be excluded), or a parallel session runs on it, which holds it out of the
+ *  shared pool only until it ends. */
+export interface ImportLeftOut {
+  id: string;
+  why: 'excluded-here' | 'included-here' | 'reserved-here' | 'leased-here';
+}
+
+/** The scope that keeps a rule of the file from landing whole: held by a rule of this machine (a
+ *  different rule from the file's, or one with no identity), or by an earlier rule of the same
+ *  batch (`rule` absent). */
+export interface ImportConflict {
+  scope: RuleScopeRef;
+  /** The rule here holding it, with every scope it holds (all of which a by-hand merge removes). */
+  rule?: { id: string; label: string; scopes: RuleScopeRef[] };
+}
+
+/**
+ * What an import does with one {@link ImportRuleSpec}, decided before anything is written:
+ * `create` a new rule on every scope, `grow` the rule here that carries its identity (with the
+ * scopes and members it lacks), leave it `unchanged` (the rule here already has all of it), or
+ * `refused` with the engine's own refusal. Never a rule on part of the spec's scopes.
+ */
+export type ImportRuleVerdict =
+  | {
+      kind: 'create';
+      scopes: RuleScopeRef[];
+      include: string[];
+      exclude: string[];
+      leftOut: ImportLeftOut[];
+    }
+  | {
+      kind: 'grow';
+      /** The rule grown, as it stands before the import. */
+      rule: FolderRule;
+      /** The scopes it gains. */
+      scopes: RuleScopeRef[];
+      /** The members it gains. */
+      include: string[];
+      exclude: string[];
+      leftOut: ImportLeftOut[];
+    }
+  | { kind: 'unchanged'; reason: string; rule?: FolderRule; leftOut: ImportLeftOut[] }
+  | { kind: 'refused'; message: string; conflict?: ImportConflict };
+
+/** Everything an import of rules would do: the verdict on each spec, in spec order, every slot it
+ *  would move off an account it reserves, and every rule's slot holding a login that the rules it
+ *  writes would put on another account (or none). */
+export interface ImportRulesPlan {
+  rules: ImportRuleVerdict[];
+  handOffs: SlotHandOff[];
+  seats: SlotSeat[];
+}
+
+/** A rule's slot that held a login and that an import put on another account, or on none: its
+ *  occupant left the rule's pool, another slot took the account, the batch newly includes an
+ *  account there, or a quarantined occupant was replaced. */
+export interface SlotSeat {
+  slot: SlotId;
+  /** The account the slot held, or null for a login no stored account is. */
+  from: string | null;
+  /** The account it holds now, or null when it was cleared. */
+  to: string | null;
+}
+
+/** What {@link SwitchEngine.importRules} did with one spec it wrote (a `create` or `grow`). */
+export type ImportRuleOutcome =
+  | {
+      ok: true;
+      rule: FolderRule;
+      /** True when the rule was created, false when the members were added to an existing one. */
+      created: boolean;
+      /** The outcome of making the rule's slot live, or null when that failed (the rule stands). */
+      live: RuleLiveResult | null;
+      runningSessions: RunningSession[];
+    }
+  | {
+      ok: false;
+      message: string;
+      /** Set when part of the rule was written before the failure. */
+      partial?: FolderRule;
+    };
+
+/** What {@link SwitchEngine.importRules} decided (`plan`, the same decision
+ *  {@link SwitchEngine.planImportRules} reports), what it then did with each spec it wrote
+ *  (`outcomes`, undefined for one it did not write), the slots it moved off accounts its rules now
+ *  reserve, and the rules' slots it put on other accounts (see {@link ImportRulesPlan.seats}). */
+export interface ImportRulesResult {
+  plan: ImportRulesPlan;
+  outcomes: Array<ImportRuleOutcome | undefined>;
+  handedOff: SlotHandOff[];
+  seated: SlotSeat[];
+}
+
+/** What {@link SwitchEngine.importBundle} did with a credential bundle brought from another
+ *  machine for an account already stored here. */
+export interface ImportBundleResult {
+  /** True when the brought bundle was written over the stored one. */
+  replaced: boolean;
+  /** Why it was or was not written:
+   *  - `newer`: the brought grant was minted after the stored one (its access token expires later),
+   *    so the stored refresh token is the one that has been spent.
+   *  - `quarantined`: the stored login is known dead, so anything is better.
+   *  - `missing`: the account has no stored bundle at all here.
+   *  - `stored_newer`: the copy here (after adopting any live rotation) is as new or newer, so its
+   *    tokens were kept. The login the brought identity names is still recorded on a row that
+   *    recorded none, so a slot running that login is known to run this account. */
+  reason: 'newer' | 'quarantined' | 'missing' | 'stored_newer';
+  /** True when the account was live in a slot here and the brought credentials were written there
+   *  too (verified by read-back), as a re-login does. */
   healedLiveLogin: boolean;
 }
 
@@ -454,6 +742,11 @@ export interface RuleLiveResult {
    *  repair/doctor report the eviction (an eviction leaves `activated` false, so it would otherwise
    *  be silent). */
   clearedSquatter?: boolean;
+  /** Set by an import's seat step when it left the slot as it was although the slot should have
+   *  moved (a slot holding a login no account here is): sessions run under the rule (this many),
+   *  and the move the import decided on could not be made, so it moved the slot nowhere else and
+   *  cleared nothing. */
+  heldForSessions?: number;
 }
 
 /** A slot moved off an account because the account could no longer be live there (see
@@ -590,4 +883,144 @@ export interface RepairResult {
   repaired: SlotViolation[];
   remaining: SlotViolation[];
   actions: string[];
+}
+
+/** One row of the Windows process table, as `readProcessTable` reads it in one query: the parent
+ *  link survives the parent's death, which is how a dead launcher's live child is still found. */
+export interface ProcessRow {
+  pid: number;
+  ppid: number;
+  /** Creation time, epoch ms (from an absolute FILETIME, so a wall-clock step does not move it). */
+  startMs: number;
+  /** The image name (`claude.exe`, `node.exe`), when the query gave one. */
+  name?: string;
+  /** The command line, when the query could read it (another user's process gives none). */
+  commandLine?: string;
+}
+
+/** The Linux `/proc` reads a parallel session's checks use: synchronous file reads, no spawn. */
+export interface ProcFs {
+  /** Fields 3 (state), 4 (ppid) and 22 (start, clock ticks since boot) of `/proc/<pid>/stat`. A
+   *  zombie (`Z`) still answers kill-0 and keeps its start: only its state says it exited. */
+  stat(pid: number): { ppid: number; startTicks: number; state?: string } | undefined;
+  /** `/proc/sys/kernel/random/boot_id`. */
+  bootId(): string | undefined;
+  /** This process's pid namespace (`readlink /proc/self/ns/pid`). */
+  pidNs(): string | undefined;
+  /** The CLAUDE_CONFIG_DIR in a process's environment (same user only; others are unreadable). */
+  configDirOf(pid: number): string | undefined;
+  /** Every pid listed under `/proc`. */
+  pids(): number[];
+  /** `/etc/machine-id`: what identifies this machine across a rename and a reboot. */
+  machineId?(): string | undefined;
+  /** A process's pid namespace (`readlink /proc/<pid>/ns/pid`). */
+  pidNsOf?(pid: number): string | undefined;
+  /** A process's arguments (`/proc/<pid>/cmdline`), undefined when they cannot be read. */
+  cmdlineOf?(pid: number): string[] | undefined;
+}
+
+/** Whether a holder's process still runs, judged from this process (see `holderState`):
+ *  `unverifiable` and `foreign` both keep a lease, since every doubt counts as alive. */
+export type LeaseHolderState = 'alive' | 'dead' | 'unverifiable' | 'foreign';
+
+/** The background workers a profile's service hosts, as holders, or `'unreadable'` when its roster
+ *  cannot be read right now. `verify` false reads the roster file only (every listed worker counts as
+ *  alive); true also checks each worker's start, as the background host's own listing does. */
+export type LeaseOccupancyProbe = (
+  profileDir: string,
+  opts: { verify: boolean },
+) => Promise<LeaseHolder[] | 'unreadable'>;
+
+/** Where `cctl claude --account <id>` would run, read without the lock (see
+ *  `SwitchEngine.planSessionSlot`):
+ *  - `global`: live in the global slot; `overrides` when the rule this launch runs under would refuse
+ *    the account there (the launch then outranks it for this session);
+ *  - `rule`: live in this launch's rule slot, or reserved and live in a rule that includes it;
+ *  - `lease`: a parallel-session slot of its own, new or `join`ing one that exists;
+ *  - `refused`: why it cannot run anywhere from here. */
+export type SessionSlotPlan =
+  | { kind: 'global'; overrides: boolean }
+  | { kind: 'rule'; ruleId: string }
+  | { kind: 'lease'; ruleId: string; profileDir: string; join: boolean }
+  | {
+      kind: 'refused';
+      code: 'quarantined' | 'session_slot_unsupported' | 'live_twice' | 'live_in_other_rule';
+      message: string;
+    };
+
+/** What `SwitchEngine.claimSessionSlot` did. `global` and `rule` claim nothing: the account turned
+ *  out to be live there by the time the lock was held. */
+export type SessionSlotClaim =
+  | { kind: 'global' }
+  | { kind: 'rule'; ruleId: string }
+  | {
+      kind: 'lease';
+      ruleId: string;
+      profileDir: string;
+      joined: boolean;
+      /** Holders recorded after the claim. */
+      holders: number;
+      /** Other terminals still running on the session when this one joined (see `leaseOccupants`). */
+      otherTerminals: number;
+      /** Background sessions its profile's service hosts, still running when this one joined. */
+      otherBackground?: number;
+      /** Claude Code processes left running on it after earlier terminals exited. */
+      otherLeftover?: number;
+    };
+
+/** Why a parallel session that has no live holder left was not ended yet:
+ *  - `roster_unreadable` / `no_probe`: its background-session roster could not be read;
+ *  - `processes_unreadable`: the process table that shows what still runs on its profile could not
+ *    be read (Windows);
+ *  - `slot_untrusted`: its slot has a switch that cannot be settled;
+ *  - `login_unadopted`: its slot holds a login that could not be read or adopted into the vault, and
+ *    clearing it would lose the only copy of that token (a re-login of the account heals it);
+ *  - `teardown_failed`: ending it failed part-way (the sweep retries it). */
+export type LeaseDeferReason =
+  | 'roster_unreadable'
+  | 'no_probe'
+  | 'processes_unreadable'
+  | 'slot_untrusted'
+  | 'login_unadopted'
+  | 'teardown_failed';
+
+/** What `SwitchEngine.releaseLease` did. */
+export interface LeaseRelease {
+  ended: boolean;
+  adoptedRotation: boolean;
+  /** Holders left on the lease after this release. */
+  remaining: number;
+  /** The lease outlived its terminals because its profile's background service still hosts workers. */
+  deferredToBackground: boolean;
+  /** The lease outlived its terminals because these processes still run on its profile (started from
+   *  the session, outliving its Claude Code); they now hold it, and it ends when they exit. */
+  heldBy?: number[];
+  /** Set when nothing was ended although no holder of this release is left: the sweep finishes it. */
+  deferred?: LeaseDeferReason;
+}
+
+/** What `SwitchEngine.sweepLeases` did. */
+export interface LeaseSweepReport {
+  droppedHolders: number;
+  adoptedHolders: number;
+  ended: Array<{ accountId: string; label: string; adoptedRotation: boolean }>;
+  deferred: Array<{ accountId: string; label: string; reason: LeaseDeferReason }>;
+  /** Processes found running on a lease profile and recorded as holders. */
+  adopted: Array<{ accountId: string; label: string; pid: number }>;
+}
+
+/** One parallel session as doctor, status and the TUI show it. */
+export interface LeaseView {
+  ruleId: string;
+  accountId: string;
+  label: string;
+  profileDir: string;
+  startedAtMs: number;
+  holders: Array<LeaseHolder & { state: LeaseHolderState; reused?: boolean }>;
+  /** Full mode, when no recorded holder runs: processes running on the profile that no holder
+   *  records (the next full sweep records them). */
+  unrecorded?: number[];
+  /** Full mode, when no recorded holder runs: the process table that would show such processes could
+   *  not be read, so the sweep defers ending the session. */
+  processesUnreadable?: true;
 }

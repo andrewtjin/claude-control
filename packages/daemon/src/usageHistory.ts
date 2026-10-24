@@ -64,7 +64,11 @@ export function predictWeeklyReset(
       anchor = observation.resetsAtMs; // ascending order, so the last hit is the newest
     }
   }
-  if (anchor === undefined) return undefined;
+  return anchor === undefined ? undefined : nextResetFrom(anchor, nowMs);
+}
+
+/** The last observed reset `anchor`, advanced by whole weeks until it lies after `nowMs`. */
+function nextResetFrom(anchor: number, nowMs: number): number {
   if (anchor > nowMs) return anchor;
   // Advance by whole cadences in one step rather than looping: an anchor months stale is a
   // arithmetic problem, not a reason to iterate.
@@ -195,4 +199,33 @@ export function readFleetHistory(
     predictedResetByAccount,
     ...(burnUnitsPerDay !== undefined ? { burnUnitsPerDay } : {}),
   };
+}
+
+/** The slice of the store a reset prediction alone needs: the newest reset a reading reported
+ *  in a window, without the readings around it. */
+export interface WeeklyResetReader {
+  latestWeeklyResetSince(accountId: string, sinceMs: number): number | undefined;
+}
+
+/**
+ * Each account's predicted next weekly reset, the same prediction {@link readFleetHistory} makes,
+ * without the burn measurement. That measurement needs every reading of the last days turned
+ * into objects; the prediction needs only the newest reported reset, one indexed row per account.
+ * For a caller that never shows a burn rate and reads every couple of seconds (the full-screen
+ * view), that is the difference between an idle process and one whose memory climbs by hundreds
+ * of megabytes on a large history.
+ */
+export function readFleetResets(
+  reader: WeeklyResetReader,
+  accountIds: readonly string[],
+  nowMs: number,
+): Map<string, number> {
+  const predicted = new Map<string, number>();
+  for (const accountId of accountIds) {
+    const anchor = reader.latestWeeklyResetSince(accountId, nowMs - RESET_LOOKBACK_MS);
+    if (anchor !== undefined && Number.isFinite(anchor)) {
+      predicted.set(accountId, nextResetFrom(anchor, nowMs));
+    }
+  }
+  return predicted;
 }

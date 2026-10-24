@@ -280,6 +280,8 @@ describe('queryDaemonUnit', () => {
       registered: true,
       state: 'active',
       enabled: 'enabled',
+      // The shim it runs, read back out of ExecStart=: what an install check versions.
+      execute: shimPath,
     });
   });
 
@@ -293,13 +295,17 @@ describe('queryDaemonUnit', () => {
       registered: false,
       state: 'active',
       enabled: 'disabled',
+      execute: shimPath,
     });
   });
 
   it('keeps the registration standing when the manager cannot be asked', () => {
     const { fs } = memFs({ [UNIT]: renderDaemonUnit(shimPath) });
     const { run } = fakeSystemd({ failOn: () => new Error('Failed to connect to bus') });
-    expect(queryDaemonUnit({ run, fs, unitPath: UNIT })).toEqual({ registered: true });
+    expect(queryDaemonUnit({ run, fs, unitPath: UNIT })).toEqual({
+      registered: true,
+      execute: shimPath,
+    });
   });
 });
 

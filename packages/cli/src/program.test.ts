@@ -4,8 +4,14 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  CadenceError,
+  QuarantineError,
   RefreshError,
+  SharedTokenError,
+  SlotError,
   SwitchFailedError,
+  UnknownAccountError,
+  UnsettledSwitchError,
   VaultError,
   type ActivateResult,
   type DedupeReport,
@@ -126,11 +132,31 @@ vi.mock('./daemonControl.js', async (importOriginal) => ({
   startDaemon: controlIo.startDaemon,
   restartDaemon: controlIo.restartDaemon,
 }));
+// The full-screen view takes over the terminal; here only whether the entry opens it is asserted,
+// so it is stubbed (its own runtime tests drive it on fake streams).
+const tuiIo = vi.hoisted(() => ({
+  runTui: vi.fn((): Promise<{ code: number }> => Promise.resolve({ code: 0 })),
+}));
+vi.mock('./tui/run.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./tui/run.js')>()),
+  runTui: tuiIo.runTui,
+}));
+// Whether the console answers the cursor query the view's gate asks on Windows. The test's stdin is
+// no console, so the gate is handed the answer instead (its own tests drive the query itself).
+const consoleIo = vi.hoisted(() => ({ answers: true }));
+vi.mock('./terminalSupport.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./terminalSupport.js')>();
+  return {
+    ...real,
+    fullScreenBlocker: (env?: NodeJS.ProcessEnv, platform: NodeJS.Platform = 'win32') =>
+      real.fullScreenBlocker(env, platform, () => Promise.resolve(consoleIo.answers)),
+  };
+});
 
 /** Run one command through commander with stdout/stderr captured. `fail()` throws a CliFailure
  *  that the entry point turns into an error line and exit 1, so a refusal comes back here as
  *  `exited` with that line in `err`; a stray `process.exit` is turned into a throw as well. */
-async function runCli(args: string[]) {
+async function runCli(args: string[], opts: { asEntry?: boolean } = {}) {
   const out: string[] = [];
   const err: string[] = [];
   const stdout = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
@@ -148,7 +174,12 @@ async function runCli(args: string[]) {
     await buildProgram().parseAsync(args, { from: 'user' });
     return { out: out.join(''), err: err.join(''), exited: false };
   } catch (e) {
-    if (e instanceof CliFailure) {
+    // With `asEntry`, any escaped error is reported the way bin.ts reports it, so a fault the
+    // command lets escape can be compared byte for byte with a refusal it prints itself.
+    if (
+      e instanceof CliFailure ||
+      (opts.asEntry && !(e instanceof Error && /^exit /.test(e.message)))
+    ) {
       // The entry point's own reporter, so the line comes back exactly as a terminal or a
       // redirected stderr would see it (color included); the exit code it asks for is reset.
       reportFatal(e);
@@ -275,10 +306,24 @@ describe('buildProgram', () => {
 
     it('turns a vault refusal (collision, empty label) into an error line and exit 1', async () => {
       engine.listAccounts.mockResolvedValueOnce([work]);
-      engine.renameAccount.mockRejectedValueOnce(new VaultError('"home" already refers to x'));
+      engine.renameAccount.mockRejectedValueOnce(
+        new VaultError('"home" already refers to x', { code: 'label_taken' }),
+      );
       const r = await rename(['work', 'home']);
       expect(r.exited).toBe(true);
       expect(r.err).toBe('error: "home" already refers to x\n');
+    });
+
+    it('prints a vault fault in its own words, the same line as before', async () => {
+      engine.listAccounts.mockResolvedValueOnce([work]);
+      engine.renameAccount.mockRejectedValueOnce(
+        new VaultError('the account registry is malformed; fix the file or move it aside'),
+      );
+      expect(await runCli(['accounts', 'rename', 'work', 'home'], { asEntry: true })).toEqual({
+        out: '',
+        err: 'error: the account registry is malformed; fix the file or move it aside\n',
+        exited: true,
+      });
     });
 
     it('fails on an unknown ref before touching the engine', async () => {
@@ -475,6 +520,7 @@ describe('buildProgram', () => {
     engine.captureCurrentLogin.mockRejectedValueOnce(
       new VaultError(
         '"work-2" already refers to account abc ("work-2"); two accounts answering to one name could not be told apart on switch',
+        { code: 'label_taken' },
       ),
     );
     const r = await runCli(['accounts', 'add', 'work-2']);
@@ -1718,6 +1764,87 @@ describe('the banner and the plan agree with the running daemon', () => {
     ];
   };
 
+  it('usage and timeline show the account a parallel session holds, apart from the pool', async () => {
+    const now = Date.now();
+    // Reserved to its session's rule, as the vault lists it.
+    const vee = {
+      id: 'v1',
+      label: 'vee',
+      quarantined: false,
+      createdAtMs: 0,
+      updatedAtMs: 0,
+      ruleIds: ['session-v1'],
+    };
+    engine.listAllAccounts.mockImplementation(async () => [...(await engine.listAccounts()), vee]);
+    engine.listRules.mockImplementation(() =>
+      Promise.resolve([
+        {
+          id: 'session-v1',
+          label: 'vee',
+          folders: [],
+          include: ['v1'],
+          exclude: [],
+          activeId: 'v1',
+          createdAtMs: 0,
+          updatedAtMs: 0,
+          lease: {
+            holders: [{ pid: 1, start: 1, host: 'h', platform: 'win32', role: 'launcher' }],
+            startedAtMs: 0,
+          },
+        },
+      ]),
+    );
+    try {
+      await seedUsage([
+        {
+          id: 'v1',
+          label: 'vee',
+          limits: [{ kind: 'session', percent: 85, resetsAt: now + 2 * H }],
+        },
+      ]);
+      const usage = await runCli(['usage']);
+      const at = usage.out.indexOf('In use by a parallel session (out of the pool until it ends');
+      expect(at).toBeGreaterThan(0);
+      expect(usage.out.slice(at)).toContain('vee');
+      // Only there: not a row of the pool, not a folder's account, not in the pacing.
+      expect(usage.out.slice(0, at)).not.toContain('vee');
+      expect(usage.out).not.toContain('(folder)');
+      const timeline = await runCli(['timeline']);
+      const heading = 'In use by a parallel session (out of the pool until it ends): vee';
+      expect(timeline.out).toContain(heading);
+      expect(timeline.out.slice(0, timeline.out.indexOf(heading))).not.toContain('vee');
+    } finally {
+      engine.listAllAccounts.mockImplementation(() => engine.listAccounts());
+      engine.listRules.mockImplementation(() => Promise.resolve([]));
+    }
+  });
+
+  it('an account a folder rule includes too stays with the folder accounts, not the parallel section', async () => {
+    const now = Date.now();
+    const both = {
+      id: 'b1',
+      label: 'bee',
+      quarantined: false,
+      createdAtMs: 0,
+      updatedAtMs: 0,
+      ruleIds: ['r1', 'session-b1'],
+    };
+    engine.listAllAccounts.mockImplementation(async () => [...(await engine.listAccounts()), both]);
+    try {
+      await seedUsage([
+        { id: 'b1', label: 'bee', limits: [{ kind: 'session', percent: 40, resetsAt: now + H }] },
+      ]);
+      const usage = await runCli(['usage']);
+      expect(usage.out).toContain('bee (folder)');
+      expect(usage.out).not.toContain('In use by a parallel session');
+      const timeline = await runCli(['timeline']);
+      expect(timeline.out).toContain('bee (folder)');
+      expect(timeline.out).not.toContain('In use by a parallel session');
+    } finally {
+      engine.listAllAccounts.mockImplementation(() => engine.listAccounts());
+    }
+  });
+
   it('a Fable-cap opt-out saved since the daemon started does not hide its outage', async () => {
     // The running daemon counts the cap (its report), and has an outage open on it.
     await seedHeartbeat('alive');
@@ -1909,5 +2036,318 @@ describe('the banner and the plan agree with the running daemon', () => {
     const r = await runCli(['outages']);
     expect(r.exited).toBe(false);
     expect(r.out).toContain('ongoing');
+  });
+});
+
+// Exact bytes for every account-command outcome, success lines and refusals alike. These commands
+// are thin wrappers over accountActions.ts, and a full-screen UI calls the same actions, so what a
+// terminal user reads must not drift when the action behind it changes shape.
+describe('account commands print exactly what they always have', () => {
+  const work: StoredAccount = {
+    id: 'id-1',
+    label: 'Work',
+    quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+  };
+
+  beforeEach(() => {
+    engine.listAccounts.mockImplementation(() => Promise.resolve([work]));
+    engine.listRules.mockResolvedValue([]);
+    engine.liveSlots.mockResolvedValue(new Map());
+    engine.setAutoSwitchExcluded.mockClear();
+    engine.removeAccount.mockClear();
+  });
+
+  afterEach(() => {
+    engine.listAccounts.mockImplementation(() => Promise.resolve([]));
+  });
+
+  it('switch: the activated line names what the engine did', async () => {
+    engine.activate.mockResolvedValueOnce({
+      wroteCredentials: true,
+      refreshed: true,
+      adoptedPreviousRotation: true,
+    } as ActivateResult);
+    expect(await runCli(['switch', 'work'])).toEqual({
+      out: 'Activated Work (credentials written, token refreshed, adopted previous rotation).\n',
+      err: '',
+      exited: false,
+    });
+    engine.activate.mockResolvedValueOnce({ wroteCredentials: false } as ActivateResult);
+    expect((await runCli(['switch', 'id-1'])).out).toBe('Activated Work (no change).\n');
+  });
+
+  it('switch: --folder with no rule there names the global slot', async () => {
+    engine.activate.mockResolvedValueOnce({ wroteCredentials: true } as ActivateResult);
+    const r = await runCli(['switch', 'Work', '--folder', tmpdir()]);
+    expect(r.out).toBe(
+      `Activated Work in the global slot (no folder rule applies to ${tmpdir()}) (credentials written).\n`,
+    );
+  });
+
+  it('switch: every refusal is one error line', async () => {
+    const cases: Array<[Error, string]> = [
+      [new QuarantineError('dead'), 'error: Work is quarantined; re-login required.\n'],
+      [
+        new CadenceError('switched 5s ago', 1000),
+        'error: switched 5s ago. Use --force to override.\n',
+      ],
+      [new UnknownAccountError('id-1'), 'error: no account with id "id-1"\n'],
+      [
+        new SlotError('Work is live in another slot', 'live_elsewhere'),
+        'error: Work is live in another slot. Nothing was changed - switch that slot to another ' +
+          'account first, or pick an account that is free (cctl folders shows who is live where).\n',
+      ],
+      [
+        new UnsettledSwitchError('an earlier switch is unsettled'),
+        'error: an earlier switch is unsettled\n',
+      ],
+      [new SharedTokenError('login stored twice'), 'error: login stored twice\n'],
+    ];
+    for (const [thrown, line] of cases) {
+      engine.activate.mockRejectedValueOnce(thrown);
+      expect(await runCli(['switch', 'Work'])).toEqual({ out: '', err: line, exited: true });
+    }
+  });
+
+  it('switch: an unknown or ambiguous ref is refused before anything is activated', async () => {
+    engine.activate.mockClear();
+    expect((await runCli(['switch', 'nope'])).err).toBe('error: No account matches "nope".\n');
+    engine.listAccounts.mockImplementation(() => Promise.resolve([work, { ...work, id: 'id-2' }]));
+    expect((await runCli(['switch', 'Work'])).err).toBe(
+      'error: "Work" matches 2 accounts; use the id.\n',
+    );
+    expect(engine.activate).not.toHaveBeenCalled();
+  });
+
+  it('switch: an unexpected engine failure still escapes as itself', async () => {
+    engine.activate.mockRejectedValueOnce(new Error('disk on fire'));
+    await expect(runCli(['switch', 'Work'])).rejects.toThrow('disk on fire');
+  });
+
+  it('exclude / include: the four outcomes, word for word', async () => {
+    expect((await runCli(['accounts', 'exclude', 'Work'])).out).toBe(
+      'Excluded Work from auto-switch (manual switches still work).\n',
+    );
+    expect((await runCli(['accounts', 'include', 'Work'])).out).toBe(
+      'Work is already available to auto-switch.\n',
+    );
+    engine.listAccounts.mockImplementation(() =>
+      Promise.resolve([{ ...work, autoSwitchExcluded: true }]),
+    );
+    expect((await runCli(['accounts', 'exclude', 'Work'])).out).toBe(
+      'Work is already excluded from auto-switch.\n',
+    );
+    expect((await runCli(['accounts', 'include', 'Work'])).out).toBe(
+      'Work is available to auto-switch again.\n',
+    );
+    expect((await runCli(['accounts', 'include', 'ghost'])).err).toBe(
+      'error: No account matches "ghost".\n',
+    );
+  });
+
+  it('remove: the removed line, and an unknown ref refused', async () => {
+    expect(await runCli(['accounts', 'remove', 'Work'])).toEqual({
+      out: 'Removed Work.\n',
+      err: '',
+      exited: false,
+    });
+    expect((await runCli(['accounts', 'rm', 'ghost'])).err).toBe(
+      'error: No account matches "ghost".\n',
+    );
+    expect(engine.removeAccount).toHaveBeenCalledTimes(1);
+  });
+
+  it('add: the added line and each refusal', async () => {
+    engine.captureCurrentLogin.mockResolvedValueOnce({ ...work, label: 'new' });
+    expect((await runCli(['accounts', 'add', 'new'])).out).toBe(
+      'Added new (id-1) and set it active.\n',
+    );
+    engine.captureCurrentLogin.mockRejectedValueOnce(
+      new RefreshError('cannot capture inside a folder profile', 'capture_in_profile'),
+    );
+    expect((await runCli(['accounts', 'add', 'new'])).err).toBe(
+      'error: cannot capture inside a folder profile. Onboard a new account from a normal ' +
+        '(non-folder-bound) shell, or use: cctl accounts add <label> --fresh.\n',
+    );
+    // The plain add has always read every other capture failure as a missing login, whether the
+    // engine found no login or something else broke.
+    for (const thrown of [
+      new Error('nothing there'),
+      new RefreshError('no live credentials to capture; log in first', 'no_live_login'),
+    ]) {
+      engine.captureCurrentLogin.mockRejectedValueOnce(thrown);
+      expect(await runCli(['accounts', 'add', 'new'])).toEqual({
+        out: '',
+        err: 'error: no live login to capture. Run `claude` and log in first, then retry.\n',
+        exited: true,
+      });
+    }
+    // A vault fault and a vault refusal both read in the vault's own words, as they always have.
+    for (const thrown of [
+      new VaultError('the account registry is malformed; fix the file or move it aside'),
+      new VaultError('the account registry is malformed; fix the file or move it aside', {
+        code: 'label_taken',
+      }),
+    ]) {
+      engine.captureCurrentLogin.mockRejectedValueOnce(thrown);
+      expect(await runCli(['accounts', 'add', 'new'], { asEntry: true })).toEqual({
+        out: '',
+        err: 'error: the account registry is malformed; fix the file or move it aside\n',
+        exited: true,
+      });
+    }
+  });
+});
+
+// Bare `cctl` opens the full-screen view only when a person is at both ends of the terminal; every
+// other caller (a pipe, a file, CI) gets the plain output it always got.
+describe('where bare `cctl` and `cctl tui` go', () => {
+  let root: string;
+  const tty = { stdin: process.stdin.isTTY, stdout: process.stdout.isTTY };
+  /** Make stdin and stdout report themselves as terminals, or not. */
+  function setTty(stdin: boolean, stdout: boolean): void {
+    Object.defineProperty(process.stdin, 'isTTY', { value: stdin, configurable: true });
+    Object.defineProperty(process.stdout, 'isTTY', { value: stdout, configurable: true });
+  }
+  const acct = (label: string): StoredAccount => ({
+    id: `id-${label}`,
+    label,
+    quarantined: false,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+  });
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'cctl-entry-'));
+    pathsIo.dataRoot = root;
+    settingsIo.heartbeatPath = join(root, 'daemon-heartbeat.json');
+    vi.stubEnv('LOCALAPPDATA', root);
+    vi.stubEnv('XDG_DATA_HOME', root);
+    vi.stubEnv('CLAUDE_CONFIG_DIR', join(root, 'claude'));
+    vi.stubEnv('NO_COLOR', '1');
+    tuiIo.runTui.mockClear();
+    tuiIo.runTui.mockResolvedValue({ code: 0 });
+  });
+  afterEach(async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: tty.stdin, configurable: true });
+    Object.defineProperty(process.stdout, 'isTTY', { value: tty.stdout, configurable: true });
+    engine.listAccounts.mockReset().mockResolvedValue([]);
+    pathsIo.dataRoot = '';
+    settingsIo.heartbeatPath = '';
+    process.exitCode = undefined;
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('opens the view on a terminal at both ends, once there are accounts', async () => {
+    setTty(true, true);
+    engine.listAccounts.mockResolvedValue([acct('work')]);
+    const r = await runCli([]);
+    expect(r).toEqual({ out: '', err: '', exited: false });
+    expect(tuiIo.runTui).toHaveBeenCalledTimes(1);
+  });
+
+  it('says to run setup instead, on a terminal with no accounts', async () => {
+    setTty(true, true);
+    expect(await runCli([])).toEqual({
+      out: 'Not set up yet. Run: cctl setup\n',
+      err: '',
+      exited: false,
+    });
+    expect(tuiIo.runTui).not.toHaveBeenCalled();
+  });
+
+  it('refuses a stray word on a terminal exactly as before, without opening anything', async () => {
+    setTty(true, true);
+    engine.listAccounts.mockResolvedValue([acct('work')]);
+    const r = await runCli(['nope']);
+    expect(r.exited).toBe(true);
+    expect(r.err).toContain("error: unknown command 'nope' - run cctl help for the command list");
+    expect(tuiIo.runTui).not.toHaveBeenCalled();
+  });
+
+  it(
+    'prints the same summary whichever end is redirected, and never opens the view',
+    { timeout: 120_000 },
+    async () => {
+      engine.listAccounts.mockResolvedValue([acct('work'), acct('home')]);
+      const outputs: string[] = [];
+      for (const [stdin, stdout] of [
+        [true, false],
+        [false, true],
+        [false, false],
+      ] as const) {
+        setTty(stdin, stdout);
+        const r = await runCli([]);
+        expect(r.exited).toBe(false);
+        outputs.push(r.out);
+      }
+      expect(tuiIo.runTui).not.toHaveBeenCalled();
+      expect(new Set(outputs).size).toBe(1);
+      expect(outputs[0]).toContain('work');
+      expect(outputs[0]).toMatch(
+        /\n\nCommands: cctl usage · cctl timeline · cctl switch <account> · cctl setup\n$/,
+      );
+    },
+  );
+
+  it('prints the setup line when redirected with no accounts', async () => {
+    setTty(false, false);
+    expect((await runCli([])).out).toBe('Not set up yet. Run: cctl setup\n');
+  });
+
+  it.each([
+    [true, false],
+    [false, true],
+    [false, false],
+  ])('refuses `cctl tui` without a terminal at both ends (stdin %s, stdout %s)', async (i, o) => {
+    setTty(i, o);
+    expect(await runCli(['tui'])).toEqual({
+      out: '',
+      err:
+        'error: cctl tui needs an interactive terminal (neither input nor output redirected). ' +
+        'For plain output use: cctl usage\n',
+      exited: true,
+    });
+    expect(tuiIo.runTui).not.toHaveBeenCalled();
+  });
+
+  it('opens the view for `cctl tui` on a terminal, even with no accounts yet', async () => {
+    setTty(true, true);
+    expect(await runCli(['tui'])).toEqual({ out: '', err: '', exited: false });
+    expect(tuiIo.runTui).toHaveBeenCalledTimes(1);
+  });
+
+  it('exits with the code the view ended with (a signal), and 0 otherwise', async () => {
+    setTty(true, true);
+    tuiIo.runTui.mockResolvedValueOnce({ code: 143 });
+    await runCli(['tui']);
+    expect(process.exitCode).toBe(143);
+    process.exitCode = undefined;
+    await runCli(['tui']);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it('prints the summary, and `cctl tui` refuses, on a console that does not answer', async () => {
+    setTty(true, true);
+    engine.listAccounts.mockResolvedValue([acct('work')]);
+    consoleIo.answers = false;
+    try {
+      const bare = await runCli([]);
+      expect(bare.exited).toBe(false);
+      expect(bare.out).toContain('work');
+      const tui = await runCli(['tui']);
+      expect(tui.exited).toBe(true);
+      expect(tui.err).toContain('open a new console window');
+      expect(tuiIo.runTui).not.toHaveBeenCalled();
+    } finally {
+      consoleIo.answers = true;
+    }
+  });
+
+  it('lists `tui` in the help', async () => {
+    expect((await runCli(['help'])).out).toMatch(/\n {2}tui {2,}full-screen view/);
   });
 });

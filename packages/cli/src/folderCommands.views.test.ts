@@ -19,6 +19,7 @@ import {
   describeReset,
   describeSlotRefusal,
   parseAccountList,
+  relaxationBannerLine,
   resolveAccountRefOrEmail,
   slotName,
   switchSlotOf,
@@ -218,6 +219,7 @@ describe('buildReservedViews', () => {
         billing: '~Mar 20 (est.)',
         quarantined: false,
         live: true,
+        reservedToRules: true,
         includedBy: [F('r1'), F('r2')],
       },
       {
@@ -229,6 +231,7 @@ describe('buildReservedViews', () => {
         billing: 'unknown',
         quarantined: false,
         live: false,
+        reservedToRules: true,
         includedBy: [F('r2')],
       },
     ]);
@@ -342,7 +345,7 @@ describe('describeInclude', () => {
       },
     );
     expect(out).toContain('no working account');
-    expect(out).toContain('the login of E expired; re-login one: cctl accounts relogin E');
+    expect(out).toContain("the login of E expired; re-login one: cctl accounts relogin 'E'");
   });
 
   it('flags a quarantined account kept live for want of another', () => {
@@ -562,5 +565,72 @@ describe('switchSlotOf', () => {
 
   it('asserts nothing for an account several rules include, leaving the engine to pick or refuse', () => {
     expect(switchSlotOf(account('e', { ruleIds: ['r1', 'r2'] }))).toBeUndefined();
+  });
+});
+
+describe('reports name a parallel session for what it is', () => {
+  const v = account('v', { ruleIds: ['f1', 'session-v'] });
+  const f1 = rule('f1', { include: ['v'] });
+  const lease: FolderRule = {
+    ...rule('session-v', { label: 'V', folders: [], include: ['v'], activeId: 'v' }),
+    lease: {
+      holders: [{ pid: 1, start: 1, host: 'h', platform: 'win32', role: 'launcher' }],
+      startedAtMs: 0,
+    },
+  };
+
+  it('a reset that leaves an account only to its parallel session does not call that a folder', () => {
+    const out = describeReset(
+      {
+        folder: F('f1'),
+        dissolved: true,
+        released: [],
+        adoptedRotation: false,
+        runningSessions: [],
+      },
+      f1,
+      null,
+      ctx([v], [lease]),
+      undefined,
+    );
+    expect(out).not.toContain('still reserved to other folders');
+    expect(out).toContain('still in use by a parallel session: V');
+  });
+
+  it('an include of an account a parallel session holds says it is in use there, not a folder sharing it', () => {
+    const out = describeInclude(
+      {
+        rule: f1,
+        created: false,
+        reserved: [],
+        unexcluded: [],
+        handedOff: [],
+        live: liveResult(null),
+        runningSessions: [],
+      },
+      ['v'],
+      ctx([v], [f1, lease]),
+    );
+    expect(out).toContain('V is in use by its parallel session');
+    expect(out).not.toContain('those folders share it');
+  });
+
+  it('accounts list keeps an account only a parallel session holds out of the folder-rules table', () => {
+    const w = account('w', { ruleIds: ['session-w'] });
+    const leaseW: FolderRule = { ...lease, id: 'session-w', label: 'W', include: ['w'] };
+    const views = buildReservedViews([v, w], [f1, lease, leaseW], new Map());
+    expect(views.find((x) => x.id === 'v')?.reservedToRules).toBe(true);
+    expect(views.find((x) => x.id === 'w')?.reservedToRules).toBe(false);
+  });
+});
+
+describe('the --account banner for a named session', () => {
+  it('quotes the alias and the label in the command it gives, so a pasted line keeps them whole', () => {
+    const line = relaxationBannerLine('account', 'my acct', 'C:/repo', 'folders', {
+      via: 'alias',
+      folder: 'C:/repo',
+      alias: 'auth work',
+    });
+    expect(line).toContain("run: cctl session include 'auth work' 'my acct'");
   });
 });

@@ -6,6 +6,7 @@
 
 export {
   Store,
+  STORE_BUSY_TIMEOUT_MS,
   slotBySessionMap,
   type StoreOptions,
   type UsageSnapshotRow,
@@ -39,10 +40,20 @@ export {
   type AccountPollResult,
   type PollCycleResult,
   type SnapshotResult,
+  type PollReadiness,
 } from './usagePoller.js';
 
 export {
+  planUsageRepoll,
+  type HookReceiverUsageHandlers,
+  type UsageRepollResult,
+  type UsageRepollSkipReason,
+  type UsageRepollVerdict,
+} from './usageRepoll.js';
+
+export {
   readFleetHistory,
+  readFleetResets,
   measureBurnUnitsPerDay,
   predictWeeklyReset,
   extractWeeklyReading,
@@ -52,6 +63,7 @@ export {
   type ExtractedWeeklyReading,
   type FleetHistory,
   type UsageHistoryReader,
+  type WeeklyResetReader,
   type WeeklyObservation,
 } from './usageHistory.js';
 

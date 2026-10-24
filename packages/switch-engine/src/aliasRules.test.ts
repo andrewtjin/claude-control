@@ -718,7 +718,7 @@ describe('alias scopes in groups.json', () => {
     }
     await writeFile(
       join(h.paths.vaultDir, 'groups.json'),
-      JSON.stringify({ ...good, schemaVersion: 4 }),
+      JSON.stringify({ ...good, schemaVersion: 5 }),
     );
     await expect(h.vault.listRules()).rejects.toThrow('unsupported schemaVersion');
   });

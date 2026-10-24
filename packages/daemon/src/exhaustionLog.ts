@@ -24,6 +24,7 @@
 import { appendFile, mkdir, open, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
+  operatorRules,
   ruleIdOfSlot,
   ruleSlotId,
   slotMayHold,
@@ -164,9 +165,12 @@ export function outageScopes(fleet: {
     }
     return { scope, key: scopeKey(scope), accountIds: members, liveElsewhere };
   };
+  // A parallel session is no scope: its slot running out is its terminal's own choice of account,
+  // not "no account can take work".
+  const scoped = operatorRules(rules);
   return [
-    view('global', rules.length > 0 ? { kind: 'global', ruled: true } : GLOBAL_SCOPE, []),
-    ...rules.map((r) => view(ruleSlotId(r.id), folderScope(r), r.include)),
+    view('global', scoped.length > 0 ? { kind: 'global', ruled: true } : GLOBAL_SCOPE, []),
+    ...scoped.map((r) => view(ruleSlotId(r.id), folderScope(r), r.include)),
   ];
 }
 

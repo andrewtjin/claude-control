@@ -51,7 +51,9 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
 - **The remote link survives the switch.** Changing accounts doesn't cost you the
   session or the phone connection.
 - **Every limit in one view.** 5-hour, weekly, and per-model limits across all
-  accounts at once, with the reset clocks that make them actionable.
+  accounts at once, with the reset clocks that make them actionable. Run `cctl` on its own
+  in a terminal for a live full-screen view: switch, rename, add or exclude accounts and refresh usage
+  with single keys.
 - **A record of every time you ran out.** When every account is spent, the daemon logs
   when, why each account was out, and the switches that led there, then how long it
   lasted. `cctl outages` lists them; the phone gets a card at the start and the end.
@@ -71,6 +73,20 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
   sessions started on the global account move onto the folder's own account between turns.
   `cctl session include <alias> <account>` gives one named session (its `/rename` title) a
   rule of its own, ahead of its folder's. Windows and Linux; see `docs/CLI.md`.
+- **Take your accounts to a new machine.** `cctl export <file>` seals every account, its
+  folder rules and your settings under a passphrase; `cctl import <file>` on the other machine
+  adds them (`--dry-run` shows what it would do first). `--move` removes them here once the
+  file is written, since a login works on one machine at a time.
+- **Run one account in one terminal.** `claude --account work` (through the shell wrapper)
+  runs Claude Code on `work` in that terminal only, without switching any other session.
+  Where `work` is already live in the global slot, the slot of the rule this launch runs
+  under, or that of a folder or named session it is reserved to, it runs there and follows
+  that slot's switches. Live in any other folder's or named session's slot, it is refused
+  until that slot switches away. Live in none, it gets a slot of its own, and while it
+  runs `work` is out of every pool; when the terminal exits (and any
+  Claude Code it started on that account), its refreshed login returns and `work` rejoins
+  the pool. Windows and Linux; not yet macOS;
+  see "Parallel sessions" in `docs/CLI.md`.
 
 ## Local-only (no Discord)
 

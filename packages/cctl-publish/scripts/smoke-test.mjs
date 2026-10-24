@@ -66,6 +66,32 @@ const cleanDir = mkdtempSync(join(tmpdir(), 'cctl-smoke-'));
 const modulesDir = join(cleanDir, 'node_modules');
 const stagedBundle = join(cleanDir, 'bin.js');
 
+/**
+ * The environment every run of the bundle gets: a throwaway home inside the staged tree, with
+ * every variable a home, data or Claude config path is derived from pointing into it. The machine
+ * running a publish is often one cctl manages for real, with a live Claude login, a vault and a
+ * running daemon; with only the Claude config dir moved, the bundle would still find the real
+ * data folder (and through it the real daemon). Nothing a smoke check does may reach those.
+ */
+const sandboxEnv = (() => {
+  const home = join(cleanDir, 'home');
+  const dirs = {
+    HOME: home,
+    USERPROFILE: home,
+    LOCALAPPDATA: join(home, 'AppData', 'Local'),
+    APPDATA: join(home, 'AppData', 'Roaming'),
+    XDG_DATA_HOME: join(home, '.local', 'share'),
+    XDG_CONFIG_HOME: join(home, '.config'),
+    XDG_STATE_HOME: join(home, '.local', 'state'),
+    XDG_CACHE_HOME: join(home, '.cache'),
+  };
+  for (const dir of Object.values(dirs)) mkdirSync(dir, { recursive: true });
+  const env = { ...process.env, ...dirs, CCTL_PROBE_UNKNOWN: '0', CCTL_COMMAND_OUTPUT: '0' };
+  // Variables that name real cctl or Claude state directly.
+  for (const name of ['CLAUDE_CONFIG_DIR', 'CCTL_BOT_STATE_DIR', 'CCTL_LOG_FILE']) delete env[name];
+  return env;
+})();
+
 let failed = false;
 const fail = (message) => {
   failed = true;
@@ -174,9 +200,9 @@ const CHANNEL_PROBE_TIMEOUT_MS = 30_000;
 /**
  * Drive `cctl channel serve` over a real stdio pipe, exactly the way Claude Code does.
  *
- * Hermetic by construction: `CLAUDE_CONFIG_DIR` points at an empty directory inside the staged
- * tree, so there is no session registry to read, no daemon to find and nothing on the real machine
- * to touch. That absence is also the second half of the check — with no registry the server cannot
+ * Hermetic by construction: it runs in the throwaway home, and `CLAUDE_CONFIG_DIR` points at an
+ * empty directory inside the staged tree, so there is no session registry to read, no daemon to
+ * find and nothing on the real machine to touch. That absence is also the second half of the check — with no registry the server cannot
  * establish which session it belongs to, and the rule is that it keeps serving the protocol while
  * accepting nothing. A server that answered `reply` here would be one that attaches to a guess,
  * which delivers one operator's message into a different session's terminal.
@@ -187,7 +213,7 @@ async function probeChannelServe() {
   const child = spawn(process.execPath, [stagedBundle, 'channel', 'serve'], {
     cwd: cleanDir,
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CLAUDE_CONFIG_DIR: configDir },
+    env: { ...sandboxEnv, CLAUDE_CONFIG_DIR: configDir },
   });
 
   const frames = [];
@@ -301,6 +327,7 @@ try {
   for (const args of [['--version'], ['--help']]) {
     const result = spawnSync(process.execPath, [stagedBundle, ...args], {
       cwd: cleanDir,
+      env: sandboxEnv,
       encoding: 'utf8',
     });
     const label = `bin.js ${args.join(' ')}`;
@@ -327,6 +354,7 @@ try {
     );
     const probe = spawnSync(process.execPath, [probePath, stagedBundle], {
       cwd: cleanDir,
+      env: sandboxEnv,
       encoding: 'utf8',
     });
     if (probe.status !== 0) {

@@ -18,6 +18,7 @@
 // rule edit is refused while a live daemon's report lacks that row too.
 
 import type { HeartbeatReading } from '@claude-control/daemon';
+import { defaultInstallLookup } from './installLookup.js';
 import type { SettingsReport } from './settings.js';
 
 /** The settings-report row a daemon that honors folder rules writes. */
@@ -42,24 +43,16 @@ export function reportSupportsFolderRules(report: SettingsReport | undefined): b
 
 /** Whether the report comes from a daemon that honors session alias rules. */
 export function reportSupportsAliasRules(report: SettingsReport | undefined): boolean {
-  return reportSupports(report, SESSION_ALIAS_RULES_REPORT_ROW);
+  return reportSupportsScope(report, 'alias');
 }
 
-/** Why the running daemon cannot be trusted with session alias rules, as one sentence ending in the
- *  fix, or undefined when it can (or when no daemon is running). A live daemon with no readable
- *  report is treated as older, for the reason {@link olderDaemonReason} gives. */
+/** Why the running daemon cannot be trusted with session alias rules (see
+ *  {@link olderDaemonScopeReason}). */
 export function olderDaemonAliasReason(
   report: SettingsReport | undefined,
   heartbeat: HeartbeatReading,
 ): string | undefined {
-  if (heartbeat.state !== 'alive') return undefined;
-  if (reportSupportsAliasRules(report)) return undefined;
-  const build = report?.settings.find((r) => r.name === 'daemon build')?.value;
-  return (
-    `the running daemon${build !== undefined ? ` (${build})` : ''} predates session alias rules: ` +
-    'it cannot read a rules file that holds one, and would route a named session by its folder ' +
-    'alone. Restart it on this build first: cctl daemon restart'
-  );
+  return olderDaemonScopeReason('alias', report, heartbeat);
 }
 
 /** Why the running daemon cannot be trusted with folder rules, as one sentence ending in the fix, or
@@ -78,5 +71,147 @@ export function olderDaemonReason(
     `the running daemon${build !== undefined ? ` (${build})` : ''} predates folder rules: it could ` +
     'put an account live in a folder and in the global slot at once. Restart it on this build ' +
     'first: cctl daemon restart'
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Parallel sessions (`cctl claude --account`)
+// ---------------------------------------------------------------------------
+//
+// A rules file holding a parallel session is stamped with a schema no older build reads: an older
+// daemon would stop maintaining every slot, and an older CLI would fail every command that reads the
+// rules — including the `claude` the shell wrapper runs, in every terminal. So a parallel session is
+// refused while a live daemon's report lacks the row below, and while an install older than parallel
+// sessions is one that would next touch this vault: the `cctl` on PATH, the cctl the PowerShell
+// wrapper runs, or the install the autostart registration starts (whether or not a daemon runs now:
+// the next logon starts that one).
+
+/** The settings-report row a daemon that reads parallel sessions writes. */
+export const SESSION_LEASES_REPORT_ROW = 'parallel sessions';
+
+/** The kinds of rule an older daemon may not be able to read. */
+export type GatedScope = 'alias' | 'lease';
+
+/** The report row of each gated kind, and how its refusal names it. */
+const GATED: Record<GatedScope, { row: string; name: string; harm: string }> = {
+  alias: {
+    row: SESSION_ALIAS_RULES_REPORT_ROW,
+    name: 'session alias rules',
+    harm: 'and would route a named session by its folder alone',
+  },
+  lease: {
+    row: SESSION_LEASES_REPORT_ROW,
+    name: 'parallel sessions',
+    harm: 'and would stop maintaining every slot until restarted on this build',
+  },
+};
+
+/** Whether the report comes from a daemon that reads this kind of rule. */
+export function reportSupportsScope(report: SettingsReport | undefined, kind: GatedScope): boolean {
+  return reportSupports(report, GATED[kind].row);
+}
+
+/** Why the running daemon cannot be trusted with this kind of rule, as one sentence ending in the
+ *  fix, or undefined when it can (or when no daemon runs). A live daemon with no readable report is
+ *  treated as older, as {@link olderDaemonReason} treats it. */
+export function olderDaemonScopeReason(
+  kind: GatedScope,
+  report: SettingsReport | undefined,
+  heartbeat: HeartbeatReading,
+): string | undefined {
+  if (heartbeat.state !== 'alive') return undefined;
+  if (reportSupportsScope(report, kind)) return undefined;
+  const build = report?.settings.find((r) => r.name === 'daemon build')?.value;
+  const { name, harm } = GATED[kind];
+  if (kind === 'alias') {
+    return (
+      `the running daemon${build !== undefined ? ` (${build})` : ''} predates ${name}: it cannot ` +
+      `read a rules file that holds one, ${harm}. Restart it on this build first: cctl daemon restart`
+    );
+  }
+  return (
+    `the running daemon${build !== undefined ? ` (${build})` : ''} predates ${name}: it cannot ` +
+    `read a rules file that holds one, ${harm}. Restart it first: cctl daemon restart`
+  );
+}
+
+/** The first cctl version that reads a rules file holding a parallel session. An install at or past
+ *  it is no risk, whatever this build's own version is. */
+export const PARALLEL_SESSIONS_SINCE = '1.1.0';
+
+/** Where the cctl installs that could next touch this vault are, and what version each is. */
+export interface InstallLookup {
+  /** The `cctl` a shell runs (the first on PATH), or undefined when none is there. */
+  onPath(): string | undefined;
+  /** The cctl entry scripts the PowerShell `claude` wrappers run (each names one by path, not by
+   *  PATH): the wrapper each PowerShell profile defines last, which is the one that runs there. */
+  wrapperEntries?(): string[];
+  /** What the autostart registration starts, and what to call it, or undefined for none. */
+  autostart(): { noun: string; execute: string } | undefined;
+  /** The version of the cctl install a shim or entry script belongs to; undefined when it cannot
+   *  be read. */
+  versionOf(path: string): string | undefined;
+}
+
+/** A version as numbers, or undefined when it is not `major.minor.patch`. */
+function versionParts(version: string): number[] | undefined {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(version.trim());
+  return m === null ? undefined : [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+/** Whether `version` is older than `build`. An unreadable version is no evidence: false. */
+function olderThan(version: string | undefined, build: string): boolean {
+  const a = version === undefined ? undefined : versionParts(version);
+  const b = versionParts(build);
+  if (a === undefined || b === undefined) return false;
+  for (let i = 0; i < 3; i += 1) {
+    if (a[i]! !== b[i]!) return a[i]! < b[i]!;
+  }
+  return false;
+}
+
+/**
+ * Why an install older than parallel sessions would break while one exists, as one sentence ending
+ * in the fix, or undefined: the `cctl` on PATH (what a typed `cctl` runs), the cctl the PowerShell
+ * `claude` wrapper runs (it names its own install by path), and the install the autostart
+ * registration starts. That last one is asked even while a daemon runs: the running daemon's report
+ * says what runs now, not what the next logon starts. A version that cannot be read refuses
+ * nothing.
+ */
+export function olderInstallReason(
+  lookup: InstallLookup = defaultInstallLookup(),
+): string | undefined {
+  const tail =
+    'while one runs it cannot read the rules file, so every command it runs would fail. Update ' +
+    'that install first (npm i -g @andrewtjin/cctl)';
+  const version = (path: string): string | undefined => {
+    const v = lookup.versionOf(path);
+    return olderThan(v, PARALLEL_SESSIONS_SINCE) ? v!.replace(/^v/, '') : undefined;
+  };
+  const onPath = lookup.onPath();
+  const pathOld = onPath === undefined ? undefined : version(onPath);
+  if (pathOld !== undefined) {
+    return `the cctl at ${onPath} (v${pathOld}) predates parallel sessions: ${tail}`;
+  }
+  // Every profile's wrapper: Windows PowerShell and PowerShell 7 each load their own, and any of
+  // them may be the one a terminal runs.
+  const entries = lookup.wrapperEntries?.() ?? [];
+  const entry = entries.find((e) => version(e) !== undefined);
+  const entryOld = entry === undefined ? undefined : version(entry);
+  if (entry !== undefined && entryOld !== undefined) {
+    return (
+      `the PowerShell claude wrapper runs the cctl at ${entry} (v${entryOld}), which predates ` +
+      `parallel sessions: ${tail}, then point the wrapper at it (replace the old one in your ` +
+      'profile with the output of: cctl shell-init powershell)'
+    );
+  }
+  const auto = lookup.autostart();
+  if (auto === undefined) return undefined;
+  const autoOld = version(auto.execute);
+  if (autoOld === undefined) return undefined;
+  return (
+    `the ${auto.noun} starts the cctl at ${auto.execute} (v${autoOld}), which predates parallel ` +
+    'sessions: while one runs, the daemon it starts cannot read the rules file and would maintain ' +
+    'no slot at all. Update that install first (npm i -g @andrewtjin/cctl), then cctl daemon install'
   );
 }

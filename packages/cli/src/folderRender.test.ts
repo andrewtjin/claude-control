@@ -127,7 +127,7 @@ describe('describeSlotLive', () => {
   it('flags a quarantined or out-of-pool live account', () => {
     expect(
       describeSlotLive({ label: 'B', source: 'include', quarantined: true }, [], 'rule'),
-    ).toContain('quarantined; re-login it: cctl accounts relogin B');
+    ).toContain("quarantined; re-login it: cctl accounts relogin 'B'");
     expect(
       describeSlotLive({ label: 'D', source: 'outside', quarantined: false }, [], 'rule'),
     ).toContain('not in this pool any more');

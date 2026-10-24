@@ -17,6 +17,7 @@
 import {
   canonicalizeFolder,
   exactAliasRule,
+  isLeaseRule,
   ruleSlotId,
   type SwitchEngine,
 } from '@claude-control/switch-engine';
@@ -34,6 +35,7 @@ import {
   resolveAccountArg,
 } from './folderCommands.js';
 import { resumeSessionCommand } from './folderRender.js';
+import { sweepBeforeLeaseRefusal } from './leaseCli.js';
 import { SESSION_ID_ENV, type SessionAliasDeps } from './sessionAliases.js';
 
 export interface SessionRuleOptions {
@@ -130,6 +132,10 @@ async function currentSessionNote(
   const requiredSlot = required === null ? 'global' : ruleSlotId(required.ruleId);
   const slot = await engine.recognizedSlotForConfigDir(deps.env.CLAUDE_CONFIG_DIR ?? null);
   if (slot === null || slot === requiredSlot) return null;
+  // A parallel session (`cctl claude --account`) runs wherever it was started, on purpose: the
+  // guard lets it through, so there is nothing to move.
+  const sessionRule = (await engine.listRules()).find((r) => ruleSlotId(r.id) === slot);
+  if (sessionRule !== undefined && isLeaseRule(sessionRule)) return null;
   const resume =
     title === null
       ? 'start it again here with: cctl claude'
@@ -196,6 +202,9 @@ export async function runSessionExclude(
   const engine = deps.engine ?? buildEngine(deps.paths);
   const target = await resolveAliasTarget(alias, options.cwd, deps);
   const ids = await resolveAccountArg(engine, 'exclude', accountsArg, 'session');
+  // A parallel session refuses the exclude while it holds an account: one whose processes are
+  // gone is ended first, as cctl switch does.
+  for (const id of ids) await sweepBeforeLeaseRefusal(engine, deps.paths, id);
   const result = await engineCall(() =>
     engine.excludeInAlias(target.folder, target.alias, ids, {
       ...(options.label !== undefined ? { label: options.label } : {}),

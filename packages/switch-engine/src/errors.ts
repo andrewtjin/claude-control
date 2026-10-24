@@ -1,6 +1,8 @@
 // Typed errors so callers can branch on failure mode rather than string-matching.
 // Each carries a stable `code` for logs and protocol mapping.
 
+import type { ImportRuleOutcome, ImportRulesPlan, SlotHandOff, SlotSeat } from './types.js';
+
 export class SwitchEngineError extends Error {
   constructor(
     message: string,
@@ -97,11 +99,57 @@ export class SharedTokenError extends SwitchEngineError {
   }
 }
 
-/** DPAPI protect/unprotect failed, or the vault is structurally corrupt. */
-export class VaultError extends SwitchEngineError {
-  constructor(message: string, options?: { cause?: unknown }) {
-    super(message, 'vault_error', options);
+/** A removal confirmed by the account's label found, once it held the credential lock, that the
+ *  account no longer has that label (`currentLabel`), or is gone (`null`): another process renamed
+ *  or removed it while the removal waited. Nothing was removed, since the person confirmed a name
+ *  the account no longer answers to. */
+export class AccountLabelChangedError extends SwitchEngineError {
+  constructor(
+    readonly accountId: string,
+    readonly expectedLabel: string,
+    readonly currentLabel: string | null,
+  ) {
+    super(
+      currentLabel === null
+        ? `account ${accountId} (${expectedLabel}) is no longer stored`
+        : `account ${accountId} is now called ${currentLabel}, not ${expectedLabel}`,
+      'label_changed',
+    );
   }
+}
+
+/** Why the vault refused an account write that was asked of it in error, as opposed to a vault
+ *  that could not do its job:
+ *  - `label_empty`: the label is empty once stripped;
+ *  - `label_taken`: another account already answers to the label (or the label spells an id);
+ *  - `login_stored`: the login being added is already stored under an account. */
+export type VaultRefusalCode = 'label_empty' | 'label_taken' | 'login_stored';
+
+/** DPAPI protect/unprotect failed, or the vault is structurally corrupt — code `vault_error`. Or,
+ *  with one of the {@link VaultRefusalCode}s, the vault refused a write the caller should not have
+ *  asked for; {@link isVaultRefusal} tells the two apart. One class for both, so every existing
+ *  `instanceof VaultError` keeps catching what it always caught. */
+export class VaultError extends SwitchEngineError {
+  constructor(message: string, options?: { cause?: unknown; code?: VaultRefusalCode }) {
+    super(
+      message,
+      options?.code ?? 'vault_error',
+      options && 'cause' in options ? { cause: options.cause } : undefined,
+    );
+  }
+}
+
+const VAULT_REFUSAL_CODES: ReadonlySet<string> = new Set<VaultRefusalCode>([
+  'label_empty',
+  'label_taken',
+  'login_stored',
+]);
+
+/** True for a vault refusal of a mistaken request (a label taken or empty, a login stored
+ *  already): words for the person who asked. False for every vault fault (a registry it cannot
+ *  read or parse, a key it cannot unwrap), which callers must let escape as itself. */
+export function isVaultRefusal(err: unknown): err is VaultError & { code: VaultRefusalCode } {
+  return err instanceof VaultError && VAULT_REFUSAL_CODES.has(err.code);
 }
 
 /** Why an activation was refused for its slot (see {@link SlotError}):
@@ -112,9 +160,16 @@ export class VaultError extends SwitchEngineError {
  *  - `rule_gone`: the folder rule whose slot was to be written no longer exists;
  *  - `live_elsewhere`: the target is live in another slot, and no account is live in two;
  *  - `slot_ambiguous`: no slot was named and the target could legitimately go to more than one (an
- *    account several rules include, live in none of them). */
+ *    account several rules include, live in none of them);
+ *  - `leased`: the account runs a parallel session (`cctl claude --account`), so nothing else may
+ *    seat it, place a session on it or remove it until that session exits. */
 export type SlotErrorCode =
-  'slot_mismatch' | 'not_slot_candidate' | 'rule_gone' | 'live_elsewhere' | 'slot_ambiguous';
+  | 'slot_mismatch'
+  | 'not_slot_candidate'
+  | 'rule_gone'
+  | 'live_elsewhere'
+  | 'slot_ambiguous'
+  | 'leased';
 
 /** An activation was refused because its target may not be live in the slot it was headed for.
  *  Always raised BEFORE anything live is written, so a refused switch changes nothing. */
@@ -138,5 +193,102 @@ export class UnknownAccountError extends SwitchEngineError {
 export class ProfileError extends SwitchEngineError {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, 'profile_error', options);
+  }
+}
+
+/**
+ * An import of rules that stopped part-way, after it had started writing: what it got done is
+ * carried here, because the caller has to report it and bring the guard up to date even though the
+ * batch did not finish. `plan` is the decision it was carrying out; `outcomes` what each rule it
+ * wrote and seated came to (undefined for the rest); `allWritten` whether every write of the batch
+ * had landed (each rule the plan creates or grows is then in place, seated or not); `handedOff` and
+ * `seated` the slots it moved. `cause` is what stopped it (the lock taken over, a file that could
+ * not be read).
+ */
+export class ImportInterruptedError extends SwitchEngineError {
+  readonly plan: ImportRulesPlan;
+  readonly outcomes: ReadonlyArray<ImportRuleOutcome | undefined>;
+  readonly allWritten: boolean;
+  readonly handedOff: readonly SlotHandOff[];
+  readonly seated: readonly SlotSeat[];
+
+  constructor(
+    done: {
+      plan: ImportRulesPlan;
+      outcomes: ReadonlyArray<ImportRuleOutcome | undefined>;
+      allWritten: boolean;
+      handedOff: readonly SlotHandOff[];
+      seated: readonly SlotSeat[];
+    },
+    cause: unknown,
+  ) {
+    super(
+      `the import stopped part-way (${cause instanceof Error ? cause.message : String(cause)})`,
+      'import_interrupted',
+      { cause },
+    );
+    this.plan = done.plan;
+    this.outcomes = done.outcomes;
+    this.allWritten = done.allWritten;
+    this.handedOff = done.handedOff;
+    this.seated = done.seated;
+  }
+}
+
+/** A parallel session's holder list was about to be written empty. Ending a parallel session is
+ *  removing its rule in one write; an empty list on disk is a file every reader refuses, so asking for
+ *  one is a programming error, refused before anything is written. */
+export class LeaseHoldersEmptyError extends SwitchEngineError {
+  constructor(ruleId: string) {
+    super(`the parallel session ${ruleId} would be left with no holder`, 'lease_holders_empty');
+  }
+}
+
+/** A parallel session already holds as many processes as a rules file may record. Refused before
+ *  anything is written. */
+export class LeaseHolderCapError extends SwitchEngineError {
+  constructor(
+    message: string,
+    /** The cap that was reached. */
+    readonly max: number,
+  ) {
+    super(message, 'lease_holders_full');
+  }
+}
+
+/** A write of `groups.json` was refused because the file it would produce does not pass this
+ *  build's own reader. Readers fail closed, so writing it would stop every command and the daemon;
+ *  refusing the write keeps the file on disk as it was. */
+export class RulesWriteRefusedError extends SwitchEngineError {
+  constructor(
+    /** What the reader would have refused. */
+    readonly reason: string,
+  ) {
+    super(
+      `refused to write a rules file this build could not read back (${reason})`,
+      'rules_write_refused',
+    );
+  }
+}
+
+/** Why `cctl claude --account` cannot run an account from here (see `SwitchEngine.claimSessionSlot`):
+ *  - `live_twice`: the account is live in two slots at once (a breach the doctor reports);
+ *  - `live_in_other_rule`: a shared account live in a rule slot this launch does not run under;
+ *  - `session_slot_unsupported`: a parallel session would be needed, and macOS has none yet;
+ *  - `lease_unsettled`: the parallel-session slot holds an interrupted switch that cannot be settled;
+ *  - `lease_seat_failed`: joining a parallel session needed its slot seated, and that failed;
+ *  - `rules_full`: the rules registry has no room for another rule. */
+export type SessionSlotErrorCode =
+  | 'live_twice'
+  | 'live_in_other_rule'
+  | 'session_slot_unsupported'
+  | 'lease_unsettled'
+  | 'lease_seat_failed'
+  | 'rules_full';
+
+/** A refusal of `cctl claude --account`, raised before anything is written (or after a rollback). */
+export class SessionSlotError extends SwitchEngineError {
+  constructor(message: string, code: SessionSlotErrorCode, options?: { cause?: unknown }) {
+    super(message, code, options);
   }
 }

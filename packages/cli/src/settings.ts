@@ -50,6 +50,7 @@ import {
   FOLDER_RULES_REPORT_ROW,
   FOLDER_RULES_SUPPORTED,
   SESSION_ALIAS_RULES_REPORT_ROW,
+  SESSION_LEASES_REPORT_ROW,
 } from './folderRulesSupport.js';
 
 export type { SettingRow } from '@claude-control/shared-protocol';
@@ -132,7 +133,7 @@ function envSource(overridden: boolean): SettingSource {
 /** A blank or whitespace-only override is an ABSENT one. Without this, `CCTL_RELAY_URL=` in a
  *  shell profile or an unsubstituted `--relay "$UNSET"` wins a `??` chain with '' and the
  *  daemon dials nothing — the same typo-tolerance envNumber applies to numbers. */
-function blankAsUnset(value: string | undefined): string | undefined {
+export function blankAsUnset(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed === undefined || trimmed === '' ? undefined : trimmed;
 }
@@ -167,7 +168,21 @@ export interface DaemonEnvSetting {
    *  equal to any env var name, so a ref can only ever mean one setting. */
   alias: string;
   kind: SettingKind;
+  /** For a setting that guards something: how strongly a value (undefined: none set, so the
+   *  default) guards it, higher being safer, and what a weaker value does. An import never takes a
+   *  value from a file that guards less than the one in force here. */
+  guard?: { strength: (value: string | undefined) => number; what: string };
 }
+
+/** A guard's strength for a bool setting whose safe side is `safe` (and its default): 1 unless the
+ *  value reads as the other side (see envBool). */
+const boolGuard =
+  (safe: boolean) =>
+  (value: string | undefined): number =>
+    envBool({ value }, 'value') === !safe ? 0 : 1;
+
+/** The folder guard's modes, weakest first. */
+const BIND_ENFORCE_STRENGTH = ['off', 'warn', 'block'] as const;
 
 /** Every daemon knob `cctl settings set` may persist. Names match the `detail` column of the
  *  daemon rows one for one (a test holds the two lists together), so `cctl settings` doubles
@@ -188,8 +203,24 @@ export const DAEMON_ENV_SETTINGS: readonly DaemonEnvSetting[] = [
   { name: 'CCTL_PERMISSION_HOLD_MS', alias: 'permission-hold', kind: 'number' },
   { name: 'CCTL_QUESTION_HOLD_MS', alias: 'question-hold', kind: 'number' },
   { name: 'CCTL_COMMAND_OUTPUT', alias: 'command-output', kind: 'bool' },
-  { name: 'CCTL_IDENTITY_CHECK', alias: 'identity-check', kind: 'bool' },
-  { name: 'CCTL_TOOL_OUTPUT_FULL', alias: 'full-output', kind: 'bool' },
+  {
+    name: 'CCTL_IDENTITY_CHECK',
+    alias: 'identity-check',
+    kind: 'bool',
+    guard: {
+      strength: boolGuard(true),
+      what: 'it turns off the check that each stored token belongs to its account',
+    },
+  },
+  {
+    name: 'CCTL_TOOL_OUTPUT_FULL',
+    alias: 'full-output',
+    kind: 'bool',
+    guard: {
+      strength: boolGuard(false),
+      what: "it sends each tool's complete output to the phone, not an excerpt",
+    },
+  },
   { name: RELAY_ENV_NAME, alias: 'relay', kind: 'url' },
   { name: 'CCTL_LOG_LEVEL', alias: 'log-level', kind: 'log-level' },
   { name: 'CCTL_PROBE_UNKNOWN', alias: 'probe-unknown', kind: 'bool' },
@@ -198,7 +229,15 @@ export const DAEMON_ENV_SETTINGS: readonly DaemonEnvSetting[] = [
   { name: 'CCTL_AUTO_CONTINUE_MAX', alias: 'auto-continue-max', kind: 'number' },
   { name: 'CCTL_LOG_FORMAT', alias: 'log-format', kind: 'log-format' },
   { name: 'CCTL_LOG_FILE', alias: 'log-file', kind: 'path' },
-  { name: 'CCTL_BIND_ENFORCE', alias: 'bind-enforce', kind: 'bind-enforce' },
+  {
+    name: 'CCTL_BIND_ENFORCE',
+    alias: 'bind-enforce',
+    kind: 'bind-enforce',
+    guard: {
+      strength: (value) => BIND_ENFORCE_STRENGTH.indexOf(parseBindEnforce(value) ?? 'block'),
+      what: 'it weakens the folder guard, which blocks a session on an account its rule rules out',
+    },
+  },
 ];
 
 /** Look a setting up by alias or env var name, case-insensitively and with `_`/`-` read as
@@ -216,6 +255,9 @@ export function settableSettingsSummary(): string {
   return DAEMON_ENV_SETTINGS.map((s) => `${s.alias} (${s.name})`).join(', ');
 }
 
+/** Why a saved setting may not be the one the daemon runs with: the environment is read first. */
+export const ENV_WINS_NOTE = 'A value set in the environment still wins over the file.';
+
 /** The lines `cctl settings set` prints once the value is on disk. The assignment is the
  *  outcome, so it alone is painted (green: done, nothing further owed); the path says where to
  *  look and the caveat what to do next, and both stay plain so the eye lands on the result.
@@ -228,8 +270,7 @@ export function renderSettingSaved(
 ): string {
   return (
     `${palette.green(`Saved ${setting.name}=${value}`)} to ${filePath}.\n` +
-    'Applies when the daemon next starts: cctl daemon restart. A value set in the ' +
-    'environment still wins over the file.\n'
+    `Applies when the daemon next starts: cctl daemon restart. ${ENV_WINS_NOTE}\n`
   );
 }
 
@@ -730,6 +771,15 @@ export function resolveDaemonConfig(
       value: FOLDER_RULES_SUPPORTED,
       source: 'default',
       detail: 'cctl session include / exclude: account pools for a named session',
+    },
+    {
+      // A capability too: a daemon whose report carries this row reads a rules file holding a
+      // parallel session (`cctl claude --account`). The CLI refuses to start one while a running
+      // daemon's report lacks it, since that daemon would stop maintaining every slot.
+      name: SESSION_LEASES_REPORT_ROW,
+      value: FOLDER_RULES_SUPPORTED,
+      source: 'default',
+      detail: 'cctl claude --account: one account per terminal',
     },
     {
       name: 'auto-switch',

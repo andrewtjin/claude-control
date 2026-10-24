@@ -995,6 +995,26 @@ describe('Store migration', () => {
       second.close();
     }
   });
+
+  it('takes no write lock to open when the remainder has nothing to fill', () => {
+    const dbPath = join(dir, 'daemon.db');
+    writeLegacySnapshotDb(dbPath, [{ accountId: 'a', fetchedAtMs: 200, json: '{}' }]);
+    new Store(dbPath).close();
+
+    // Another connection holds the write lock (the daemon mid-commit, its checkpointer's sync).
+    // A reader opening now has nothing to write, so it must not queue behind that lock.
+    const holder = new DatabaseSync(dbPath);
+    holder.exec('BEGIN IMMEDIATE');
+    try {
+      const started = Date.now();
+      const reader = new Store(dbPath);
+      reader.close();
+      expect(Date.now() - started).toBeLessThan(2_000);
+    } finally {
+      holder.exec('ROLLBACK');
+      holder.close();
+    }
+  });
 });
 
 describe('Store on a file that is not a database', () => {

@@ -10,7 +10,7 @@ import {
   Vault,
 } from './vault.js';
 import { InsecurePassthroughProtector } from './dpapi.js';
-import { UnknownAccountError, VaultError } from './errors.js';
+import { UnknownAccountError, VaultError, isVaultRefusal } from './errors.js';
 import { noopLogger, type Logger } from './logger.js';
 import type { CredentialBundle, Registry, StoredAccount } from './types.js';
 
@@ -727,7 +727,7 @@ describe('one name, one login: addAccount refusals', () => {
       oauthAccount: { accountUuid: 'uuid-a', emailAddress: 'a@x.com' },
     };
     await expect(v.addAccount('work-2-again', again)).rejects.toThrow(
-      `this login is account ${first.id} ("work-2"), which is already stored; run \`cctl accounts relogin work-2\``,
+      `this login is account ${first.id} ("work-2"), which is already stored; run \`cctl accounts relogin 'work-2'\``,
     );
     expect(await v.listAccounts()).toHaveLength(1);
   });
@@ -743,6 +743,65 @@ describe('one name, one login: addAccount refusals', () => {
   it('refuses an empty label', async () => {
     const v = await vault();
     await expect(v.addAccount('   ', bundle('a'))).rejects.toThrow('a label cannot be empty');
+  });
+});
+
+describe('a refusal is told apart from a vault fault', () => {
+  /** The error a promise rejects with, for asserting its code and class. */
+  async function caught(p: Promise<unknown>): Promise<unknown> {
+    try {
+      await p;
+    } catch (err) {
+      return err;
+    }
+    throw new Error('expected a rejection');
+  }
+
+  it('codes each mistaken request as a refusal, on add and on rename', async () => {
+    const v = await vault();
+    const first = await v.addAccount('jina25', bundle('a'));
+    const second = await v.addAccount('debate', bundle('b'));
+    const sameLogin: CredentialBundle = {
+      claudeAiOauth: { accessToken: 'a2', refreshToken: 'r-a2', expiresAt: 999 },
+      oauthAccount: { accountUuid: 'uuid-a', emailAddress: 'a@x.com' },
+    };
+    const cases: Array<[() => Promise<unknown>, string]> = [
+      [() => v.addAccount('  ', bundle('c')), 'label_empty'],
+      [() => v.addAccount('JINA25', bundle('c')), 'label_taken'],
+      [() => v.addAccount(first.id, bundle('c')), 'label_taken'],
+      [() => v.addAccount('again', sameLogin), 'login_stored'],
+      [() => v.renameAccount(second.id, ' '), 'label_empty'],
+      [() => v.renameAccount(second.id, 'Jina25'), 'label_taken'],
+      [() => v.renameAccount(second.id, first.id), 'label_taken'],
+    ];
+    for (const [attempt, code] of cases) {
+      const err = await caught(attempt());
+      expect(err).toBeInstanceOf(VaultError);
+      expect((err as VaultError).code).toBe(code);
+      expect(isVaultRefusal(err)).toBe(true);
+    }
+  });
+
+  it('keeps a damaged registry a fault, whatever the write asked for', async () => {
+    const { v, registryPath } = await vaultAt();
+    const keep = await v.addAccount('Keep', bundle('keep'));
+    await writeFile(registryPath, JSON.stringify({ activeId: null, accounts: {} }), 'utf8');
+    for (const attempt of [
+      () => v.addAccount('new', bundle('n')),
+      () => v.renameAccount(keep.id, 'other'),
+      () => v.listAllAccounts(),
+    ]) {
+      const err = await caught(attempt());
+      expect(err).toBeInstanceOf(VaultError);
+      expect((err as VaultError).code).toBe('vault_error');
+      expect(isVaultRefusal(err)).toBe(false);
+    }
+  });
+
+  it('is false for anything that is not a coded refusal', () => {
+    expect(isVaultRefusal(new Error('label_taken'))).toBe(false);
+    expect(isVaultRefusal(undefined)).toBe(false);
+    expect(isVaultRefusal(new VaultError('DPAPI operation failed'))).toBe(false);
   });
 });
 

@@ -86,6 +86,7 @@ import {
   MEMORY_BASE_ENV,
   acquireLock,
   profilesRoot,
+  readProcessStarts,
   withProfileMemoryBase,
   type Paths,
 } from '@claude-control/switch-engine';
@@ -126,6 +127,14 @@ export interface ClaudeBackgroundHost extends BackgroundSessionHost {
   /** The recovery a committed move saved for a conversation and has not dropped (see the daemon's
    *  saveRecovery), or undefined for none or one that cannot be read. */
   recoveryOf(sessionId: string): Promise<ResumeRecovery | undefined>;
+  /** The processes the background workers of a config dir's service run as, from its roster: each
+   *  live worker's pid and the start Claude Code recorded for it. `verify` also requires the process
+   *  to be the one recorded (its start read now matches), as `listHosted` does. Throws when the
+   *  roster cannot be read right now: an unreadable roster is never nothing hosted. */
+  hostedWorkerProcesses(
+    configDir: string,
+    opts: { verify: boolean },
+  ): Promise<Array<{ pid: number; procStart?: string }>>;
 }
 
 /** How a host reaches the main config dir, from the paths cctl resolved: the dir itself, and
@@ -233,8 +242,7 @@ export const MOVE_LOCK_REFRESH_MS = 20_000;
 const MOVE_LOCK_POLL_MS = 250;
 /** How long a process's start time is taken as read (Claude Code keeps its own reads a minute). */
 const START_TIME_TTL_MS = 60_000;
-/** How long the start-time query may take before every start it was to read counts as unknown. */
-const START_QUERY_TIMEOUT_MS = 10_000;
+
 /** How much of each end of a conversation a title search reads. */
 const TITLE_WINDOW_BYTES = 64 * 1024;
 /** How long a committed move's recovery is kept. A move cut off is brought back within days if at
@@ -478,65 +486,6 @@ export function sameProcessStart(
   return Number.isFinite(r) && Number.isFinite(a) && r > 3e17 !== a > 3e17;
 }
 
-/** Read live processes' start times in one call: `Get-Process` on Windows (each a FILETIME, as
- *  Claude Code records it there), `ps -o lstart` elsewhere (as Claude Code reads it, in UTC and the
- *  C locale). A process that cannot be read, or a query that fails, is left out. */
-function defaultProcessStarts(
-  platform: NodeJS.Platform,
-): (pids: readonly number[]) => Promise<Map<number, string>> {
-  return (pids) =>
-    new Promise((resolve) => {
-      const out = new Map<number, string>();
-      const list = pids.filter((pid) => Number.isInteger(pid) && pid > 0).join(',');
-      if (list === '') {
-        resolve(out);
-        return;
-      }
-      const [command, args, env]: [string, string[], NodeJS.ProcessEnv] =
-        platform === 'win32'
-          ? [
-              'powershell.exe',
-              [
-                '-NoProfile',
-                '-NonInteractive',
-                '-Command',
-                `Get-Process -Id ${list} -ErrorAction SilentlyContinue | ` +
-                  'ForEach-Object { "$($_.Id) $($_.StartTime.ToFileTimeUtc())" }',
-              ],
-              process.env,
-            ]
-          : ['ps', ['-o', 'pid=,lstart=', '-p', list], { ...process.env, LC_ALL: 'C', TZ: 'UTC' }];
-      let text = '';
-      let child;
-      try {
-        child = nodeSpawn(command, args, {
-          env,
-          stdio: ['ignore', 'pipe', 'ignore'],
-          shell: false,
-          windowsHide: true,
-          detached: true,
-        });
-      } catch {
-        resolve(out);
-        return;
-      }
-      const timer = setTimeout(() => child.kill(), START_QUERY_TIMEOUT_MS);
-      child.stdout.setEncoding('utf8').on('data', (c: string) => (text += c));
-      child.on('error', () => {
-        clearTimeout(timer);
-        resolve(out);
-      });
-      child.on('close', () => {
-        clearTimeout(timer);
-        for (const line of text.split(/\r?\n/)) {
-          const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
-          if (m !== null) out.set(Number(m[1]), m[2]!);
-        }
-        resolve(out);
-      });
-    });
-}
-
 /** The `projects/` dir name Claude Code files a folder's conversations under: every character that
  *  is not a letter or digit becomes `-`. Past 200 characters Claude Code keeps the first 200 and
  *  adds a hash of the rest, which is not reproduced here: such a folder is matched by that prefix. */
@@ -707,7 +656,7 @@ export function createClaudeBackgroundHost(
     options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const clock = options.clock ?? (() => performance.now());
   const stopExitTimeoutMs = options.stopExitTimeoutMs ?? DEFAULT_STOP_EXIT_TIMEOUT_MS;
-  const processStarts = options.processStarts ?? defaultProcessStarts(platform);
+  const processStarts = options.processStarts ?? readProcessStarts(platform);
   const lockRefreshMs = options.lockRefreshMs ?? MOVE_LOCK_REFRESH_MS;
   const wallClock = options.now ?? Date.now;
   const mainInEnv = options.mainConfigDirInEnv ?? baseEnv.CLAUDE_CONFIG_DIR !== undefined;
@@ -913,7 +862,18 @@ export function createClaudeBackgroundHost(
   const readHosted = async (
     configDir: string | null,
     verified: boolean,
-  ): Promise<BackgroundSession[]> => {
+  ): Promise<BackgroundSession[]> =>
+    (await hostedWorkers(configDir, verified)).map(({ short, sessionId, cwd }) => ({
+      short,
+      sessionId,
+      cwd,
+    }));
+
+  /** The workers of {@link readHosted} with the process each runs as (see the header). */
+  const hostedWorkers = async (
+    configDir: string | null,
+    verified: boolean,
+  ): Promise<Array<BackgroundSession & { pid: number; procStart?: string }>> => {
     const path = join(home(configDir), 'daemon', 'roster.json');
     let text: string;
     try {
@@ -952,11 +912,7 @@ export function createClaudeBackgroundHost(
       const procStart = recordedStart(w);
       found.push({ short, sessionId, cwd, pid: w.pid, ...(procStart ? { procStart } : {}) });
     }
-    return (await stillTheirs(found, verified)).map(({ short, sessionId, cwd }) => ({
-      short,
-      sessionId,
-      cwd,
-    }));
+    return stillTheirs(found, verified);
   };
 
   /** The live entries of the shared session registry (see the header). It sits in the main config
@@ -1222,6 +1178,13 @@ export function createClaudeBackgroundHost(
 
     listHosted(configDir, opts) {
       return readHosted(configDir, opts?.verified === true);
+    },
+
+    async hostedWorkerProcesses(configDir, opts) {
+      return (await hostedWorkers(configDir, opts.verify)).map(({ pid, procStart }) => ({
+        pid,
+        ...(procStart !== undefined ? { procStart } : {}),
+      }));
     },
 
     async activity(configDir) {

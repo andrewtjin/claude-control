@@ -63,6 +63,7 @@ import type { AdvisorOptions, AutoSwitchPolicy } from '@claude-control/usage-adv
 import type { AgentSdkClient, CreateAgentSdkClientDeps } from '@claude-control/session-runtime';
 import { buildEngine, daemonDbPath, fail, resolveBindEnforce } from './context.js';
 import { backgroundHostOptions, createClaudeBackgroundHost } from './backgroundHost.js';
+import { createLeaseOccupancyProbe } from './leaseProbe.js';
 import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
 import {
@@ -76,7 +77,7 @@ import {
   writeSettingsReport,
 } from './settings.js';
 import { crashLogPath, installCrashLogging } from './daemonSupervise.js';
-import { resolveGuardProfileSettingsPaths } from './guardProfiles.js';
+import { hasGuardedRules, resolveGuardProfileSettingsPaths } from './guardProfiles.js';
 import {
   acquireInstanceLock,
   probePredecessorEndpoint,
@@ -564,6 +565,16 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   // CLI actually reads settings from. The Daemon calls this AFTER binding the receiver, with
   // the real port, and swallows any failure (unwritable settings.json) so startup never dies.
   const settingsPath = join(paths.claudeDir, 'settings.json');
+  // Claude Code's background services, as `cctl claude` reads them. Not on macOS, where folder rules
+  // and parallel sessions are refused: a session there could not be hosted under a profile's login
+  // anyway (the CLI keeps one Keychain login for every config dir). The daemon's own environment,
+  // not the logging one: a service this starts hands its environment to every session it hosts, and
+  // the daemon's log file is not theirs. Built with the very options `cctl claude` builds its host
+  // with (see backgroundHostOptions).
+  const backgroundHost =
+    process.platform !== 'darwin'
+      ? createClaudeBackgroundHost(backgroundHostOptions(paths))
+      : undefined;
 
   const daemon = new Daemon({
     store,
@@ -581,15 +592,12 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     // path through the same helper.
     exhaustionLog: new ExhaustionLog(exhaustionLogPath(dataDir)),
     // Moves background sessions in a ruled folder off the global slot onto the folder's own slot,
-    // through the operator's own `claude`. Not on macOS, where folder rules are refused: a session
-    // there could not be hosted under a folder profile's login anyway (the CLI keeps one Keychain
-    // login for every config dir).
-    ...(process.platform !== 'darwin'
+    // through the operator's own `claude`; and reads a parallel session's background workers, so
+    // the cycle's sweep never ends a session whose service still hosts one.
+    ...(backgroundHost !== undefined
       ? {
-          // The daemon's own environment, not the logging one: a service this starts hands its
-          // environment to every session it hosts, and the daemon's log file is not theirs. Built
-          // with the very options `cctl claude` builds its host with (see backgroundHostOptions).
-          backgroundSessionHost: createClaudeBackgroundHost(backgroundHostOptions(paths)),
+          backgroundSessionHost: backgroundHost,
+          leaseOccupancyProbe: createLeaseOccupancyProbe(backgroundHost),
         }
       : {}),
     installHooks: async () => {
@@ -615,7 +623,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
       // restart always leaves the guard consistent with the live registry. Fail-open with the rest of
       // this closure: a settings.json we cannot write only degrades enforcement, never daemon startup.
       const rules = await engine.listRules();
-      const hasBindings = rules.length > 0;
+      const hasBindings = hasGuardedRules(rules);
       await ensureBindGuard({
         settingsPath,
         guardPath: bindGuardPath(dataDir),

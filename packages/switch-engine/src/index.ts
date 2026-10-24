@@ -79,6 +79,10 @@ export {
   MAX_RULE_ALIASES,
   MAX_ALIAS_LENGTH,
   MAX_RESERVED_ACCOUNTS,
+  ACCOUNT_ID_PATTERN,
+  MAX_LEASE_HOLDERS,
+  RULES_SCHEMA_VERSIONS_READ,
+  assertReadableRulesSchema,
   needsMetadataBackfill,
   type DedupeReport,
   type NewRuleOptions,
@@ -87,8 +91,18 @@ export {
 // Folder rules: the effective pool of every slot, and folder -> rule resolution. Pure, so the CLI
 // and the daemon decide with exactly the engine's rules.
 export {
+  LEASE_RULE_PREFIX,
+  isLeaseRule,
+  leaseRuleId,
+  operatorRules,
+  sameHolder,
+  sameHolderProcess,
+  withHolders,
+  withoutHolders,
   allSlots,
+  assignDistinct,
   availableInOrder,
+  withoutKeptOut,
   exactFolderRule,
   exactAliasRule,
   describeRuleScopes,
@@ -101,9 +115,15 @@ export {
   ruleScopes,
   scopedRuleOf,
   rulesIncluding,
+  leaseOccupants,
+  leaseSessionPids,
+  occupantCount,
+  occupantsPhrase,
   slotMayHold,
   slotMembers,
+  slotPhrase,
   slotPool,
+  slotWordsOf,
   withRule,
   type RulesPicture,
   type SessionRuleMatch,
@@ -166,6 +186,31 @@ export {
   type BuildSnapshotInput,
 } from './folderBindings.js';
 export { resolveAccountRef, type ResolveResult } from './resolveAccount.js';
+// Process identity for parallel sessions (`cctl claude --account`): who holds one and whether it runs.
+export {
+  LEASE_START_TOLERANCE_MS,
+  childHolder,
+  createProcFs,
+  INITIAL_PID_NS,
+  claudeCodeIdentity,
+  holderState,
+  isClaudeCodeProcess,
+  isExitedState,
+  linuxTags,
+  parseConfigDirLines,
+  parseProcessTable,
+  pidAlive,
+  procFs,
+  readProcessConfigDirs,
+  readProcessStarts,
+  readProcessTable,
+  selfHolder,
+  windowsStartMs,
+  type HolderEvidence,
+  type HolderSource,
+  type ProcessIdentity,
+  type ProcFsIo,
+} from './processStarts.js';
 export {
   CredentialStore,
   FileCredentialChannel,
@@ -177,12 +222,14 @@ export { AuditLog, type AuditEntry, type SwitchOrigin } from './audit.js';
 export {
   SwitchEngine,
   DEFAULT_MIN_SWITCH_INTERVAL_MS,
+  importIdentityRefusal,
   type SwitchEngineOptions,
   type ActivateOptions,
   type BindFs,
   type RefreshFn,
   type ExchangeFn,
   type ReauthResult,
+  type LeaseSweepOptions,
 } from './switchEngine.js';
 // Not switch-engine domain logic, but the workspace's only fsync'd atomic writer. Exposed so
 // other packages replace a state file the way this one already does, instead of hand-rolling a

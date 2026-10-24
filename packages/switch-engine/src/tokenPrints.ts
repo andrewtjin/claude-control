@@ -62,6 +62,12 @@ export class StoredTokens {
     return out;
   }
 
+  /** Whether `accountId`'s bundle holds `oauth`'s refresh token. */
+  holdsRefresh(accountId: string, oauth: Pick<ClaudeOauth, 'refreshToken'>): boolean {
+    const own = this.byAccount.get(accountId);
+    return own !== undefined && own.refresh === sha256(oauth.refreshToken);
+  }
+
   /** Ids of the stored accounts whose bundle holds `oauth`'s refresh token or its access token. A
    *  token is issued to one account, so more than one id here is itself a contamination. */
   holdersOf(oauth: Pick<ClaudeOauth, 'accessToken' | 'refreshToken'>): string[] {

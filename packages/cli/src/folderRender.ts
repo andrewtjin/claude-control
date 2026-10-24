@@ -10,9 +10,17 @@ import {
   CLAUDE_CODE_TITLE_MAX_LENGTH,
   aliasFitsSessionTitle,
   shellQuoteArg,
+  slotPhrase,
+  type FolderRule,
+  type SlotId,
 } from '@claude-control/switch-engine';
 import { PLAIN_PALETTE, sanitizeForTerminal, type Palette } from './ansi.js';
 import { MEMORY_BASE_ENV } from '@claude-control/switch-engine';
+
+/** A slot in words, as the engine's messages name it (see slotPhrase). */
+export function slotName(slot: SlotId, rules: readonly FolderRule[]): string {
+  return slotPhrase(slot, rules);
+}
 
 /** Where an account of a folder's pool comes from: the rule's own included accounts, or the shared
  *  pool every folder inherits. */
@@ -29,6 +37,9 @@ export interface PoolEntryView {
   liveElsewhere: string | null;
   /** A dead login: never used until re-logged in. */
   quarantined: boolean;
+  /** A quarantined account that was never logged in here (an import stored it without tokens), as
+   *  opposed to a login that expired. */
+  awaitsLogin?: true;
   /** False for a shared account excluded from auto-switch: usable by hand, never picked unattended. */
   autoTarget: boolean;
 }
@@ -109,8 +120,8 @@ function emptyPoolWords(slot: 'global' | 'rule'): string {
 
 /**
  * Why a slot has no account it can use, from its pool, ending in the fix that applies: a pool that
- * is empty, accounts live in another slot (free that slot), or logins that expired (re-login one).
- * A re-login is suggested only for a login that actually expired.
+ * is empty, accounts live in another slot (free that slot), logins that expired (re-login one), or
+ * accounts never logged in here (log one in). A login is called expired only when it did.
  */
 export function nothingUsableReason(
   pool: readonly PoolEntryView[],
@@ -131,11 +142,20 @@ export function nothingUsableReason(
     );
     parts.push(`${where.join(', ')}; switch that slot to another account to free it`);
   }
-  const dead = pool.filter((e) => e.quarantined);
-  if (dead.length > 0) {
-    const names = dead.map((e) => sanitizeForTerminal(e.label));
+  const expired = pool.filter((e) => e.quarantined && e.awaitsLogin !== true);
+  if (expired.length > 0) {
+    const names = expired.map((e) => sanitizeForTerminal(e.label));
     parts.push(
-      `the login of ${names.join(', ')} expired; re-login one: cctl accounts relogin ${names[0]}`,
+      `the login of ${names.join(', ')} expired; re-login one: ` +
+        `cctl accounts relogin ${shellQuote(names[0]!)}`,
+    );
+  }
+  const waiting = pool.filter((e) => e.quarantined && e.awaitsLogin === true);
+  if (waiting.length > 0) {
+    const names = waiting.map((e) => sanitizeForTerminal(e.label));
+    parts.push(
+      `${names.join(', ')} came without tokens and ${names.length > 1 ? 'are' : 'is'} not ` +
+        `logged in here yet; log one in: cctl accounts relogin ${shellQuote(names[0]!)}`,
     );
   }
   return parts.join('; ');
@@ -205,7 +225,9 @@ export function describeSlotLive(
   }
   const name = sanitizeForTerminal(live.label);
   if (live.quarantined) {
-    return palette.red(`${name} (quarantined; re-login it: cctl accounts relogin ${name})`);
+    return palette.red(
+      `${name} (quarantined; re-login it: cctl accounts relogin ${shellQuote(name)})`,
+    );
   }
   if (live.source === 'outside') {
     return palette.yellow(`${name} (not in this pool any more; the daemon moves the slot off it)`);
@@ -248,7 +270,9 @@ function aliasScopeLines(view: Pick<FolderRuleView, 'aliases'>, palette: Palette
         ? ''
         : '  ' +
           palette.yellow(
-            `(never matches: no session title can carry it — longer than ` +
+            // ASCII only: a dash or dot outside ASCII is ambiguous width, two columns on a
+            // terminal set up for CJK text, and the full-screen view draws this line.
+            `(never matches: no session title can carry it - longer than ` +
               `${CLAUDE_CODE_TITLE_MAX_LENGTH} characters, or not well-formed text; reset it)`,
           )),
   );
@@ -319,11 +343,15 @@ export const ADD_FOLDER_RULE_HINT =
   '          or: cctl folder exclude <folder> <account>[,<account>...]\n' +
   'For one named session: cctl session include <alias> <account>[,<account>...]';
 
+/** Everything the full `cctl folders` view renders. */
+export interface FoldersView {
+  rules: FolderRuleView[];
+  global: GlobalSlotView;
+  footer: FolderGuardFooterView;
+}
+
 /** The full `cctl folders` view: every rule, the global slot, then the guard footer. */
-export function renderFolders(
-  input: { rules: FolderRuleView[]; global: GlobalSlotView; footer: FolderGuardFooterView },
-  palette: Palette = PLAIN_PALETTE,
-): string {
+export function renderFolders(input: FoldersView, palette: Palette = PLAIN_PALETTE): string {
   if (input.rules.length === 0) {
     return (
       'No folder rules: every folder uses the global slot and the shared pool.\n' +
@@ -373,6 +401,8 @@ export interface ReservedAccountView {
   quarantined: boolean;
   /** Live in one of its folders' slots right now. */
   live: boolean;
+  /** Included by a folder or session rule, not only held by a parallel session. */
+  reservedToRules?: boolean;
   /** The folders of each rule that includes it, one string per rule. */
   includedBy: string[];
 }
@@ -380,10 +410,12 @@ export interface ReservedAccountView {
 /** The reserved accounts as an aligned table: they are not in the shared table above it, and each
  *  is usable only in the folders that include it, which the last-but-one column names. Its first
  *  columns match the shared table's, so a reserved account shows its plan and billing as any other
- *  account does. '' when no account is reserved. */
+ *  account does. '' when no account is reserved. `heading` names what the rows are out of the pool
+ *  for: folder rules by default, a parallel session for the accounts only one holds. */
 export function renderReservedAccounts(
   rows: readonly ReservedAccountView[],
   palette: Palette = PLAIN_PALETTE,
+  heading = 'Reserved to folder rules (used only in the folders that include them; * = live there):',
 ): string {
   if (rows.length === 0) return '';
   const cells = rows.map((r) => ({
@@ -427,11 +459,9 @@ export function renderReservedAccounts(
       .join('  ')
       .trimEnd();
   };
-  return [
-    'Reserved to folder rules (used only in the folders that include them; * = live there):',
-    palette.dim(padded(headers).join('  ').trimEnd()),
-    ...cells.map(line),
-  ].join('\n');
+  return [heading, palette.dim(padded(headers).join('  ').trimEnd()), ...cells.map(line)].join(
+    '\n',
+  );
 }
 
 /** What `cctl where` explains for a folder: the rule that applies (longest match, no merging) or,

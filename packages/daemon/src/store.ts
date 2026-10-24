@@ -273,6 +273,10 @@ export interface StoreOptions {
  */
 const BUSY_TIMEOUT_MS = 10_000;
 
+/** {@link BUSY_TIMEOUT_MS}, for a client of the daemon that must not give up on a request the
+ *  daemon is still allowed to be waiting on this lock for. */
+export const STORE_BUSY_TIMEOUT_MS = BUSY_TIMEOUT_MS;
+
 export class Store {
   private readonly db: DatabaseSync;
   private checkpointer: WalCheckpointer | undefined;
@@ -538,23 +542,34 @@ export class Store {
    * to describe — the wrong trade for a cost this small.
    *
    * One transaction, so an interrupted start leaves the columns either wholly filled or wholly
-   * unfilled, and the next start simply redoes it.
+   * unfilled, and the next start simply redoes it. Taken only when there is something to write:
+   * the remainder never has, and every open is not a writer. A reader (a CLI command, the
+   * full-screen view re-reading every couple of seconds) that took the write lock anyway would
+   * wait out any other writer's commit on its own thread, up to the busy timeout, and make the
+   * daemon's writes wait on it in turn.
    */
   private backfillWeeklyColumns(): void {
     const rows = this.db
       .prepare(`SELECT id, json FROM usage_snapshots WHERE weeklyPercent IS NULL`)
       .all();
-    if (rows.length === 0) return;
+    const fills: Array<{ id: number; percent: number; resetsAtMs: number | null }> = [];
+    for (const row of rows) {
+      const reading = extractWeeklyReading(requireString(row, 'json'));
+      if (reading.weeklyPercent === null) continue; // no weekly reading to record
+      fills.push({
+        id: requireNumber(row, 'id'),
+        percent: reading.weeklyPercent,
+        resetsAtMs: reading.weeklyResetsAtMs,
+      });
+    }
+    if (fills.length === 0) return;
     const update = this.db.prepare(
       `UPDATE usage_snapshots SET weeklyPercent = ?, weeklyResetsAtMs = ? WHERE id = ?`,
     );
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      for (const row of rows) {
-        const reading = extractWeeklyReading(requireString(row, 'json'));
-        if (reading.weeklyPercent === null) continue; // no weekly reading to record
-        update.run(reading.weeklyPercent, reading.weeklyResetsAtMs, requireNumber(row, 'id'));
-      }
+      // Rows another connection filled since the read above get the same values again.
+      for (const fill of fills) update.run(fill.percent, fill.resetsAtMs, fill.id);
       this.db.exec('COMMIT');
     } catch (err) {
       this.db.exec('ROLLBACK');
@@ -648,6 +663,25 @@ export class Store {
         ...(typeof resetsAtMs === 'number' ? { resetsAtMs } : {}),
       };
     });
+  }
+
+  /**
+   * The weekly reset the newest reading from `sinceMs` onward reported, among the readings that
+   * reported one: the anchor a reset prediction needs, and nothing else. One row from the same
+   * covering index {@link listWeeklyObservationsSince} reads, scanned from the newest end, so a
+   * caller that predicts resets every couple of seconds (the full-screen view) never turns ten
+   * days of readings into objects to keep only the last.
+   */
+  latestWeeklyResetSince(accountId: string, sinceMs: number): number | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT weeklyResetsAtMs FROM usage_snapshots
+         WHERE accountId = ? AND fetchedAtMs >= ? AND weeklyPercent IS NOT NULL
+           AND weeklyResetsAtMs IS NOT NULL
+         ORDER BY fetchedAtMs DESC LIMIT 1`,
+      )
+      .get(accountId, sinceMs);
+    return row ? requireNumber(row, 'weeklyResetsAtMs') : undefined;
   }
 
   latestUsageSnapshot(accountId: string): UsageSnapshotRow | undefined {

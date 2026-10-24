@@ -47,6 +47,9 @@
 //     re-parsing $MyInvocation.Line, which cannot map expressions and variables back to their
 //     values — so the wrapper states the quirk and its fix: quote such arguments, or run claude.exe.
 
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 export type SupportedShell = 'powershell' | 'bash' | 'zsh' | 'fish';
 
 export const SUPPORTED_SHELLS: readonly SupportedShell[] = ['powershell', 'bash', 'zsh', 'fish'];
@@ -235,5 +238,107 @@ export function parsePowerShellWrapper(profileText: string): ParsedPowerShellWra
   }
   // The fallback body just calls the `cctl` shim — no embedded absolute paths to go stale.
   if (/(?:^|\s)cctl\s+claude\s+@args/m.test(profileText)) return { kind: 'shim' };
+  return undefined;
+}
+
+/** The current user's profiles each PowerShell edition loads, per host: every host loads
+ *  `profile.ps1`, then its own. `$PROFILE` names the host's own one, so that is where
+ *  `cctl shell-init powershell | Out-File -Append $PROFILE` puts the wrapper: the console's, VS
+ *  Code's PowerShell extension's (either edition), or the Windows PowerShell ISE's. */
+const POWERSHELL_PROFILE_FILES: Readonly<Record<'WindowsPowerShell' | 'PowerShell', string[]>> = {
+  WindowsPowerShell: [
+    'Microsoft.PowerShell_profile.ps1',
+    'profile.ps1',
+    'Microsoft.VSCode_profile.ps1',
+    'Microsoft.PowerShellISE_profile.ps1',
+  ],
+  PowerShell: ['Microsoft.PowerShell_profile.ps1', 'profile.ps1', 'Microsoft.VSCode_profile.ps1'],
+};
+
+/** Candidate PowerShell profile locations on Windows — Windows PowerShell 5.1 and PowerShell 7, each
+ *  host's own (see POWERSHELL_PROFILE_FILES), plus a OneDrive-redirected Documents (the common case
+ *  where `$PROFILE` does not live under `%USERPROFILE%\Documents`). Best-effort; used only by the
+ *  wrapper checks. Pure over `env`. */
+export function powerShellProfilePaths(env: NodeJS.ProcessEnv = process.env): string[] {
+  const home = env.USERPROFILE;
+  if (!home || home.length === 0) return [];
+  const docRoots = [join(home, 'Documents')];
+  if (env.OneDrive && env.OneDrive.length > 0) docRoots.push(join(env.OneDrive, 'Documents'));
+  if (env.OneDriveCommercial && env.OneDriveCommercial.length > 0) {
+    docRoots.push(join(env.OneDriveCommercial, 'Documents'));
+  }
+  const paths: string[] = [];
+  for (const root of docRoots) {
+    // Windows PowerShell 5.1 uses the WindowsPowerShell folder; PowerShell 7+ uses PowerShell.
+    for (const dir of ['WindowsPowerShell', 'PowerShell'] as const) {
+      for (const file of POWERSHELL_PROFILE_FILES[dir]) paths.push(join(root, dir, file));
+    }
+  }
+  return paths;
+}
+
+/**
+ * A PowerShell profile's text, decoded the way PowerShell decodes a script: by its byte-order mark
+ * (UTF-16LE, UTF-16BE or UTF-8), and as UTF-8 without one. Windows PowerShell 5.1 writes a profile
+ * that `Out-File -Append` creates in UTF-16LE with a mark, so a plain UTF-8 read of it would never
+ * find the wrapper PowerShell loads from it.
+ */
+export function readPowerShellProfile(path: string): string {
+  const bytes = readFileSync(path);
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return bytes.subarray(2).toString('utf16le');
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+    // Node has no UTF-16BE decoder: swap each pair into little-endian order. A stray odd last byte
+    // is no character in either order, so it is dropped.
+    const le = Buffer.from(bytes.subarray(2, 2 + ((bytes.length - 2) & ~1)));
+    return le.swap16().toString('utf16le');
+  }
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return bytes.subarray(3).toString('utf8');
+  }
+  return bytes.toString('utf8');
+}
+
+/**
+ * The cctl wrapper in effect in each candidate PowerShell profile that carries one: the LAST one it
+ * defines, since PowerShell runs the last `function claude` it loads, and `cctl shell-init
+ * powershell | Out-File -Append $PROFILE` run again (after an upgrade, from another install) stacks
+ * definitions. Every profile is read: Windows PowerShell and PowerShell 7 load their own, and a
+ * OneDrive-redirected Documents can sit beside a local one, so any of them may be what a terminal
+ * runs. `read` is a seam for tests.
+ */
+export function readPowerShellWrappers(
+  env: NodeJS.ProcessEnv = process.env,
+  read: (path: string) => string = readPowerShellProfile,
+): Array<{ profile: string; wrapper: ParsedPowerShellWrapper }> {
+  const out: Array<{ profile: string; wrapper: ParsedPowerShellWrapper }> = [];
+  for (const profile of powerShellProfilePaths(env)) {
+    let text: string;
+    try {
+      text = read(profile);
+    } catch {
+      // Absent or unreadable profile: nothing runs from it.
+      continue;
+    }
+    if (!text.includes(POWERSHELL_WRAPPER_MARKER)) continue;
+    const last = text.slice(text.lastIndexOf(POWERSHELL_WRAPPER_MARKER));
+    const wrapper = parsePowerShellWrapper(last);
+    if (wrapper !== undefined) out.push({ profile, wrapper });
+  }
+  return out;
+}
+
+/** Read the first PowerShell profile that carries a cctl wrapper (by its marker), for the wrapper
+ *  check. Returns undefined when none of the candidate profiles exist or carry the wrapper. */
+export function readPowerShellWrapperProfile(
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  for (const p of powerShellProfilePaths(env)) {
+    try {
+      const text = readPowerShellProfile(p);
+      if (text.includes(POWERSHELL_WRAPPER_MARKER)) return text;
+    } catch {
+      // Absent or unreadable profile: skip and try the next candidate.
+    }
+  }
   return undefined;
 }

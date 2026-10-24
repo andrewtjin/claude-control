@@ -12,16 +12,46 @@ import { LockTimeoutError } from './errors.js';
 // is empty except during the reclaim-contention test, so every other test sees the real rmSync.
 // `writes` records the path of every writeFileSync, which still writes through: it shows whether a
 // file was written in place or under another name and renamed into place.
-const rmState = vi.hoisted(() => ({ failFor: new Set<string>() }));
+//
+// `renames` makes the next renames onto an owner record fail with a code of its choosing, the way
+// Windows refuses to replace a file a contender has open just then.
+//
+// `claimedWhenEmptied` makes the next delete of a path find a successor's lock there once it has
+// emptied it, the way POSIX lets a contender's claim (a rename) replace an empty directory.
+const rmState = vi.hoisted(() => ({
+  failFor: new Set<string>(),
+  claimedWhenEmptied: new Set<string>(),
+}));
 const writes = vi.hoisted(() => ({ paths: [] as string[] }));
+const renames = vi.hoisted(() => ({ failures: 0, code: 'EPERM' }));
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
   return {
     ...actual,
+    renameSync: ((from: PathLike, to: PathLike): void => {
+      if (renames.failures > 0 && String(to).endsWith('owner.json')) {
+        renames.failures -= 1;
+        const err: NodeJS.ErrnoException = new Error(`${renames.code}: operation not permitted`);
+        err.code = renames.code;
+        throw err;
+      }
+      return actual.renameSync(from, to);
+    }) as typeof actual.renameSync,
     rmSync: ((target: PathLike, options?: RmOptions): void => {
       if (rmState.failFor.has(String(target))) {
         const err: NodeJS.ErrnoException = new Error('EBUSY: resource busy or locked');
         err.code = 'EBUSY';
+        throw err;
+      }
+      if (rmState.claimedWhenEmptied.delete(String(target))) {
+        actual.rmSync(target, options);
+        actual.mkdirSync(target);
+        actual.writeFileSync(
+          `${String(target)}/owner.json`,
+          JSON.stringify({ token: 'successor' }),
+        );
+        const err: NodeJS.ErrnoException = new Error('ENOTEMPTY: directory not empty');
+        err.code = 'ENOTEMPTY';
         throw err;
       }
       return actual.rmSync(target, options);
@@ -59,6 +89,29 @@ describe('acquireLock', () => {
     const lock = await acquireLock(join(root, '.lock'));
     lock.release();
     expect(() => lock.release()).not.toThrow();
+  });
+
+  it("releases without throwing when a contender claims the lock the moment it is emptied, leaving the successor's", async () => {
+    const root = await sandbox();
+    const dir = join(root, '.lock');
+    const lock = await acquireLock(dir);
+    rmState.claimedWhenEmptied.add(dir);
+    expect(() => lock.release()).not.toThrow();
+    expect(JSON.parse(await readFile(join(dir, 'owner.json'), 'utf8'))).toEqual({
+      token: 'successor',
+    });
+  });
+
+  it('still throws a release that fails for any other reason', async () => {
+    const root = await sandbox();
+    const dir = join(root, '.lock');
+    const lock = await acquireLock(dir);
+    rmState.failFor.add(dir);
+    try {
+      expect(() => lock.release()).toThrow(/EBUSY/);
+    } finally {
+      rmState.failFor.delete(dir);
+    }
   });
 
   it('times out when a live holder keeps the lock', async () => {
@@ -178,6 +231,43 @@ describe('acquireLock', () => {
     const next = await acquireLock(lockDir, clock, { staleMs: 100, timeoutMs: 1_000 });
     expect(held.refresh()).toBe(false);
     next.release();
+  });
+
+  it('a refresh waits out a contender reading the owner record as it is replaced', async () => {
+    // On Windows a rename over a file another process has open just then fails, and clears as soon
+    // as the reader is done: that is no sign the claim was taken over.
+    const real = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      const lockDir = join(await sandbox(), '.lock');
+      let now = 1_000;
+      const held = await acquireLock(lockDir, () => now, { staleMs: 100 });
+      now = 1_050;
+      renames.failures = 3;
+      expect(held.refresh()).toBe(true);
+      const record = JSON.parse(await readFile(join(lockDir, 'owner.json'), 'utf8')) as {
+        startedAtMs: number;
+      };
+      expect(record.startedAtMs).toBe(1_050);
+      held.release();
+    } finally {
+      renames.failures = 0;
+      Object.defineProperty(process, 'platform', real);
+    }
+  });
+
+  it('a refresh that cannot replace the owner record for good reports the claim not renewed', async () => {
+    const lockDir = join(await sandbox(), '.lock');
+    const held = await acquireLock(lockDir, () => 1_000, { staleMs: 100 });
+    renames.code = 'EACCES';
+    renames.failures = 1;
+    try {
+      expect(held.refresh()).toBe(false);
+    } finally {
+      renames.failures = 0;
+      renames.code = 'EPERM';
+    }
+    held.release();
   });
 
   it('a refresh never writes the live owner record in place, so no contender reads it torn', async () => {
