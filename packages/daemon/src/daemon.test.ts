@@ -39,6 +39,7 @@ import type {
   QuestionRequest,
   QuestionAnswer,
   ResumeOrphanOptions,
+  SpawnManagedOptions,
 } from '@claude-control/session-runtime';
 import { SessionBusyError } from '@claude-control/session-runtime';
 import { Store } from './store.js';
@@ -319,10 +320,10 @@ function fakeSessionManager(): SessionManager & {
     records,
     resumeOrphanCalls,
     pruneCalls,
-    spawnManaged: vi.fn((opts) => {
-      void opts;
+    spawnManaged: vi.fn((opts: SpawnManagedOptions) => {
       const handle = makeFakeHandle('spawned-session');
       handles.set(handle.id, handle);
+      opts.onStart?.(handle);
       return Promise.resolve(handle);
     }),
     attachObserved: vi.fn(() => {
@@ -336,6 +337,7 @@ function fakeSessionManager(): SessionManager & {
       // Mirror the real manager: the resumed handle comes live under the SAME id.
       const handle = makeFakeHandle(sessionId);
       handles.set(sessionId, handle);
+      opts.onStart?.(handle);
       return Promise.resolve(handle);
     },
     prune: (): Promise<SessionRecord[]> => {

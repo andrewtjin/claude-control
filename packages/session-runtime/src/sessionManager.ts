@@ -99,6 +99,11 @@ export interface SpawnManagedOptions {
   /** Ride out transient API failures instead of going `failed` — passed through to
    *  {@link startManagedSession}; omitted = failures stay terminal. */
   autoContinue?: AutoContinuePolicy;
+  /** Called synchronously with the new handle, before its first turn can run. The manager
+   *  persists the registry before it resolves, and a turn that fails at once (a missing CLI,
+   *  a transport that throws on the first query) is over by then: a caller that subscribes
+   *  only after the await never hears why. Subscribing here sees every event. */
+  onStart?: (handle: SessionHandle) => void;
 }
 
 /** Re-attach ONE crashed/orphaned managed session by resuming its underlying SDK session.
@@ -117,6 +122,8 @@ export interface ResumeOrphanOptions {
   /** Auto-continue policy for the resumed session (see SpawnManagedOptions) — a resumed
    *  session deserves the same transient-failure cover as a fresh one. */
   autoContinue?: AutoContinuePolicy;
+  /** Subscribe to the resumed handle before its turn can run (see SpawnManagedOptions). */
+  onStart?: (handle: SessionHandle) => void;
 }
 
 export interface AttachObservedOptions {
@@ -323,6 +330,7 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
     };
     // Subscribe before any further await so no early status event can be missed.
     trackHandle(handle, resumedRecord);
+    resumeOpts.onStart?.(handle);
     await persist();
     return handle;
   }
@@ -358,6 +366,7 @@ export function createSessionManager(opts: SessionManagerOptions): SessionManage
       };
       // Subscribe before any further await so no early status event can be missed.
       trackHandle(handle, record);
+      spawnOpts.onStart?.(handle);
       await persist();
       return handle;
     },

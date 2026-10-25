@@ -223,6 +223,7 @@ export function fakeSessionManager(): FakeSessionManager {
         ...(opts.accountId !== undefined ? { accountId: opts.accountId } : {}),
         ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
       });
+      opts.onStart?.(handle);
       return Promise.resolve(handle);
     },
     attachObserved() {
@@ -236,6 +237,7 @@ export function fakeSessionManager(): FakeSessionManager {
       // Mirror the real manager: the resumed handle comes live under the SAME id.
       const handle = fakeManagedHandle(sessionId);
       handles.set(sessionId, handle);
+      opts.onStart?.(handle);
       return Promise.resolve(handle);
     },
     prune: () => Promise.resolve([]),

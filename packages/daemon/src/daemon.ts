@@ -3350,23 +3350,28 @@ export class Daemon {
         record.accountId !== undefined && this.switchEngine.configDirForAccount !== undefined
           ? await this.switchEngine.configDirForAccount(record.accountId).catch(() => undefined)
           : undefined;
-      const resumed = await this.sessionManager.resumeOrphan(sessionId, {
+      // Resolved before the resume: the pipes attach the moment the handle exists, and every
+      // frame they forward carries the slot.
+      const slot =
+        configDir !== undefined && this.switchEngine.slotForConfigDir !== undefined
+          ? await this.switchEngine.slotForConfigDir(configDir)
+          : undefined;
+      await this.sessionManager.resumeOrphan(sessionId, {
         client: this.createAgentSdkClient(configDir),
         prompt: text,
         permissionMode: MANAGED_SESSION_PERMISSION_MODE,
         ...(this.autoContinue !== undefined ? { autoContinue: this.autoContinue } : {}),
+        // Attached before the resumed turn can run: a turn that fails at once reaches the phone
+        // with the error that explains it, not as a bare failed state.
+        onStart: (resumed) => {
+          if (slot !== undefined) this.sessionSlots.set(resumed.id, slot);
+          const onEvent = this.attachSessionPipes(resumed, record.accountId);
+          // The runtime only emits on a change, so without this frame the phone keeps the
+          // crashed run's last state (usually waiting_input) until the first SDK event, and a
+          // stop in that window would read as waiting_input -> done with no outcome line.
+          onEvent({ kind: 'status', state: resumed.getState() });
+        },
       });
-      if (configDir !== undefined && this.switchEngine.slotForConfigDir !== undefined) {
-        this.sessionSlots.set(resumed.id, await this.switchEngine.slotForConfigDir(configDir));
-      }
-      const onEvent = this.attachSessionPipes(resumed, record.accountId);
-      // The runtime only emits on a change, so without this frame the phone keeps the crashed
-      // run's last state (usually waiting_input) until the first SDK event, and a stop in that
-      // window would read as waiting_input -> done with no outcome line. The handle's CURRENT
-      // state is replayed, not an assumed `starting`: its first turn begins while the resume is
-      // still being persisted, before these pipes existed, so a turn that failed at once is
-      // already terminal and must be reported (and cleaned up) as such.
-      onEvent({ kind: 'status', state: resumed.getState() });
       this.logger.info({ sessionId }, 'orphaned session re-attached for an operator prompt');
     } catch (err) {
       // Un-resumable (e.g. no persisted resumeId): logged, the record stays 'orphaned' on
@@ -4250,7 +4255,6 @@ export class Daemon {
     // group's live member the resolver chose, not the (absent) payload account.
     const spawnAccountId = spawnSlot.accountId;
 
-    let handle: SessionHandle;
     try {
       const resumeAnchor = this.resolveSpawnResumeAnchor(resumeSessionId ?? undefined);
       // A global spawn (no bound config dir) must not silently run on a group profile that a
@@ -4261,7 +4265,18 @@ export class Daemon {
         spawnSlot.configDir === undefined &&
         (await this.slotForSessionConfigDir(process.env.CLAUDE_CONFIG_DIR)) !== 'global';
       const client = this.createAgentSdkClient(spawnSlot.configDir, scrubInheritedConfigDir);
-      handle = await this.sessionManager.spawnManaged({
+      // The spawn origin rides every status frame the new session emits (see
+      // forwardSessionEvent): a spawn mints a sessionId the requester has no other way to
+      // learn, and the bot needs the link to keep a resumed conversation in the thread the
+      // user typed into. `resumedFrom` echoes the CALLER'S ref (the wire id it knows), never
+      // the resolved SDK anchor.
+      const origin = {
+        requestId,
+        ...(resumeSessionId !== undefined && resumeSessionId !== null
+          ? { resumedFrom: resumeSessionId }
+          : {}),
+      };
+      await this.sessionManager.spawnManaged({
         client,
         prompt,
         // Always 'default' so remote approve/deny actually works — see the constant's decision
@@ -4271,6 +4286,29 @@ export class Daemon {
         ...(cwd !== undefined && cwd !== null ? { cwd } : {}),
         ...(spawnAccountId !== undefined ? { accountId: spawnAccountId } : {}),
         ...(this.autoContinue !== undefined ? { autoContinue: this.autoContinue } : {}),
+        // Attached before the first turn can run, so a turn that fails at once still reaches
+        // the requester with its error and its failed state.
+        onStart: (handle) => {
+          // Record the session's slot (fixed at spawn) so its status frames carry it and the
+          // post-switch resume scopes to it. Only non-global is stored; an absent entry reads
+          // as global.
+          if (spawnSlot.slot !== 'global') this.sessionSlots.set(handle.id, spawnSlot.slot);
+          this.attachSessionPipes(handle, spawnAccountId, origin);
+          // Announce the session NOW, before its first turn produces anything. The session
+          // runtime only emits on a state CHANGE, and the first SDK event of a turn emits its
+          // output BEFORE the starting→running transition — so without this frame the
+          // requester would meet the new sessionId through an anonymous output chunk it cannot
+          // yet route (the bot would mint a stray thread for it). The outbox preserves send
+          // order, so this status is guaranteed to arrive ahead of every event the pipes
+          // forward.
+          this.forwardSessionEvent(
+            handle.id,
+            spawnAccountId,
+            { kind: 'status', state: 'starting' },
+            origin,
+            spawnSlot.slot,
+          );
+        },
       });
     } catch (err) {
       this.logger.error({ err, requestId }, 'session.spawn failed to start');
@@ -4284,37 +4322,7 @@ export class Daemon {
           relatesTo: msg.id,
         },
       });
-      return;
     }
-    // Record the session's slot (fixed at spawn) so its status frames carry it and the post-switch
-    // resume scopes to it. Only non-global is stored; an absent entry reads as global.
-    if (spawnSlot.slot !== 'global') this.sessionSlots.set(handle.id, spawnSlot.slot);
-
-    // The spawn origin rides every status frame the new session emits (see
-    // forwardSessionEvent): a spawn mints a sessionId the requester has no other way to
-    // learn, and the bot needs the link to keep a resumed conversation in the thread the
-    // user typed into. `resumedFrom` echoes the CALLER'S ref (the wire id it knows), never
-    // the resolved SDK anchor.
-    const origin = {
-      requestId,
-      ...(resumeSessionId !== undefined && resumeSessionId !== null
-        ? { resumedFrom: resumeSessionId }
-        : {}),
-    };
-    this.attachSessionPipes(handle, spawnAccountId, origin);
-    // Announce the session NOW, before its first turn produces anything. The session
-    // runtime only emits on a state CHANGE, and the first SDK event of a turn emits its
-    // output BEFORE the starting→running transition — so without this frame the requester
-    // would meet the new sessionId through an anonymous output chunk it cannot yet route
-    // (the bot would mint a stray thread for it). The outbox preserves send order, so this
-    // status is guaranteed to arrive ahead of every event the pipes forward.
-    this.forwardSessionEvent(
-      handle.id,
-      spawnAccountId,
-      { kind: 'status', state: 'starting' },
-      origin,
-      spawnSlot.slot,
-    );
   }
 
   /**

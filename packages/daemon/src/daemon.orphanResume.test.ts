@@ -5,7 +5,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { SessionRecord, SessionState } from '@claude-control/session-runtime';
+import type { SessionEvent, SessionRecord, SessionState } from '@claude-control/session-runtime';
 import {
   createHarness,
   fakeSessionManager,
@@ -15,6 +15,7 @@ import {
   type FakeSessionManager,
   type Harness,
 } from './testing/sessionDaemonHarness.js';
+import type { QuietControl } from './quietMode.js';
 
 let harness: Harness | undefined;
 const tempDirs: string[] = [];
@@ -44,16 +45,30 @@ function orphanRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
   };
 }
 
-/** Make the manager's resumed handle come back in `state`, as if it got there before the daemon
- *  subscribed (emitting with no listener only moves the state). */
-function resumeIn(manager: FakeSessionManager, state: SessionState): void {
+/** Make the manager's resumed handle reach `state` before the resume resolves, the way the real
+ *  one's first turn runs while the registry is still being written. `before` events go first. */
+function resumeIn(
+  manager: FakeSessionManager,
+  state: SessionState,
+  before: SessionEvent[] = [],
+): void {
   const resume = manager.resumeOrphan.bind(manager);
-  manager.resumeOrphan = async (sessionId, opts) => {
-    const handle = (await resume(sessionId, opts)) as FakeManagedHandle;
-    handle.emit({ kind: 'status', state });
-    return handle;
-  };
+  manager.resumeOrphan = (sessionId, opts) =>
+    resume(sessionId, {
+      ...opts,
+      onStart: (handle) => {
+        opts.onStart?.(handle);
+        for (const event of before) (handle as FakeManagedHandle).emit(event);
+        (handle as FakeManagedHandle).emit({ kind: 'status', state });
+      },
+    });
 }
+
+/** Quiet mode held on, as the default leaves it; never changed from these tests. */
+const quietOn = (): QuietControl => ({
+  isQuiet: () => true,
+  set: () => Promise.reject(new Error('not used in these tests')),
+});
 
 /** Every session.status state the phone was sent for `sessionId`, in order. */
 function statesSent(h: Harness, sessionId: string): Array<string | undefined> {
@@ -123,18 +138,26 @@ describe('Daemon: re-attaching an orphaned session', () => {
     await waitFor(() => statesSent(h, 's1').includes('starting'));
   });
 
-  it('reports a resumed turn that already failed as failed, not as starting', async () => {
+  it('reports a resumed turn that fails at once with the error that explains it', async () => {
     const manager = fakeSessionManager();
-    // The resumed turn died before the daemon subscribed, e.g. a missing CLI binary.
-    resumeIn(manager, 'failed');
+    // The resumed turn dies before the resume resolves, e.g. a missing CLI binary.
+    resumeIn(manager, 'failed', [{ kind: 'error', text: 'Error: CLI binary not found' }]);
     manager.records.push(orphanRecord({ cwd: await sandbox() }));
-    harness = await createHarness({ sessionManager: manager });
+    harness = await createHarness({ sessionManager: manager, quiet: quietOn() });
     const h = harness;
     await h.daemon.start();
 
     inject(h, 's1', 'pick it up');
     await waitFor(() => statesSent(h, 's1').includes('failed'));
-    expect(statesSent(h, 's1')).not.toContain('starting');
+    // Quiet mode keeps the error as the failed turn's one outcome line, sent ahead of the status.
+    const frames = h.sent.flatMap((e) =>
+      e.type === 'session.output'
+        ? [`output:${e.payload.text}`]
+        : e.type === 'session.status'
+          ? [`status:${e.payload.state}`]
+          : [],
+    );
+    expect(frames.slice(-2)).toEqual(['output:Error: CLI binary not found', 'status:failed']);
     expect(h.store.getSession('s1')?.state).toBe('failed');
   });
 });

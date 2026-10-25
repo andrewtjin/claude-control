@@ -204,6 +204,33 @@ describe('Daemon quiet mode: a phone-started session', () => {
     expect(outputs(h).map((o) => o.text)).toEqual(['Session failed: out of budget']);
   });
 
+  it('posts the reason a first turn failed before the spawn resolved', async () => {
+    const manager = fakeSessionManager();
+    // The real manager writes its registry before it resolves; a first turn that throws at once
+    // (a missing CLI binary) is over by then.
+    const spawn = manager.spawnManaged.bind(manager);
+    manager.spawnManaged = (opts) =>
+      spawn({
+        ...opts,
+        onStart: (handle) => {
+          opts.onStart?.(handle);
+          const fake = handle as FakeManagedHandle;
+          fake.emit({ kind: 'error', text: 'Error: CLI binary not found' });
+          fake.emit({ kind: 'status', state: 'failed' });
+        },
+      });
+    harness = await createHarness({ quiet: fakeQuiet(true), sessionManager: manager });
+    const h = harness;
+    await h.daemon.start();
+    await spawnSession(h);
+    await waitFor(sawStatus(h, 'failed'));
+
+    expect(outputs(h).map((o) => [o.kind, o.text])).toEqual([
+      ['error', 'Error: CLI binary not found'],
+    ]);
+    expect(statuses(h)).toEqual(['starting', 'failed']);
+  });
+
   it('still posts a held failure reason when quiet mode was turned off before the turn failed', async () => {
     const quiet = fakeQuiet(true);
     harness = await createHarness({ quiet });

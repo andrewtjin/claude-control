@@ -658,15 +658,17 @@ function mintingSessionManager(): SessionManager & { handles: Map<string, Sessio
         ...(opts.accountId !== undefined ? { accountId: opts.accountId } : {}),
         ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
       });
+      opts.onStart?.(handle);
       return Promise.resolve(handle);
     },
     attachObserved: () => Promise.reject(new Error('unused')),
     get: (id: string) => handles.get(id),
     list: () => records,
     recover: () => Promise.resolve([]),
-    resumeOrphan: (sessionId) => {
+    resumeOrphan: (sessionId, opts) => {
       const handle = fakeManagedHandle(sessionId);
       handles.set(sessionId, handle);
+      opts.onStart?.(handle);
       return Promise.resolve(handle);
     },
     prune: () => Promise.resolve([]),
