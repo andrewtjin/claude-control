@@ -448,13 +448,27 @@ export type FileEnv = Record<string, string>;
  *  without a file — so "the environment always wins" holds with no exceptions to learn.
  *  Returns a fresh object; `env` is left alone. */
 export function layerFileEnv(env: NodeJS.ProcessEnv, fileEnv: FileEnv = {}): NodeJS.ProcessEnv {
-  return applyFileEnv({ ...env }, fileEnv);
+  return overlayFileEnv({ ...env }, fileEnv);
 }
 
 /** The in-place form of `layerFileEnv`, for the daemon's own `process.env`: every module that
  *  reads the environment directly (the logger, the engine's cadence guard) then sees the
- *  persisted overrides too, not only the knobs `resolveDaemonConfig` wires by hand. */
+ *  persisted overrides too, not only the knobs `resolveDaemonConfig` wires by hand.
+ *
+ *  Quiet mode is left out. No module reads it from the environment (every gate asks the live
+ *  control), its value changes while the daemon runs so a copy here would go stale, and every
+ *  process the daemon starts inherits this environment: a daemon restarted from inside one of its
+ *  own sessions would find the copy in its shell environment and treat quiet mode as pinned there,
+ *  refusing every live change over a variable nobody set. */
 export function applyFileEnv(env: NodeJS.ProcessEnv, fileEnv: FileEnv = {}): NodeJS.ProcessEnv {
+  return overlayFileEnv(
+    env,
+    Object.fromEntries(Object.entries(fileEnv).filter(([name]) => name !== QUIET_ENV_NAME)),
+  );
+}
+
+/** Lay `fileEnv` under `env` in place: the one rule both forms above share. */
+function overlayFileEnv(env: NodeJS.ProcessEnv, fileEnv: FileEnv): NodeJS.ProcessEnv {
   for (const [name, value] of Object.entries(fileEnv)) {
     if (blankAsUnset(env[name]) === undefined) env[name] = value;
   }

@@ -24,6 +24,7 @@ import {
   layerFileEnv,
   markPendingRestart,
   persistDaemonSetting,
+  quietPinnedByEnv,
   readDaemonConfigFile,
   readSettingsReport,
   renderSettingApplied,
@@ -910,6 +911,20 @@ describe('config.json env block', () => {
     expect(env).toEqual({ OTHER: 'x' });
     expect(applyFileEnv(env, file)).toBe(env);
     expect(env).toEqual({ OTHER: 'x', ...file });
+  });
+
+  it("keeps the file's quiet mode out of the daemon's own environment, which children inherit", () => {
+    const file = { CCTL_AUTOSWITCH: 'off', CCTL_DISCORD_QUIET: 'off' };
+    const env: NodeJS.ProcessEnv = {};
+    applyFileEnv(env, file);
+    // A daemon restarted from one of its sessions must not read this copy as a shell pin.
+    expect(env).toEqual({ CCTL_AUTOSWITCH: 'off' });
+    expect(quietPinnedByEnv(env)).toBe(false);
+    // The resolver still layers it, and a value the shell really set is left in place.
+    expect(layerFileEnv({}, file).CCTL_DISCORD_QUIET).toBe('off');
+    const pinned: NodeJS.ProcessEnv = { CCTL_DISCORD_QUIET: 'on' };
+    applyFileEnv(pinned, file);
+    expect(pinned.CCTL_DISCORD_QUIET).toBe('on');
   });
 
   it('is read one known entry at a time, dropping blank, non-string and unknown ones', async () => {
