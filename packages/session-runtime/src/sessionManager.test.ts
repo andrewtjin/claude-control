@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { createSessionManager } from './sessionManager.js';
 import type { AgentSdkClient, AgentSdkEvent, AgentSdkQueryOptions } from './managedSession.js';
 import type { PtyFactory, PtyHandle, PtyExitInfo } from './observedSession.js';
-import type { SessionRecord } from './types.js';
+import type { SessionEvent, SessionRecord } from './types.js';
 
 let dirs: string[] = [];
 async function sandbox(): Promise<string> {
@@ -529,6 +529,52 @@ describe('createSessionManager', () => {
       expect(record?.startedAtMs).toBe(111); // original start preserved, not re-clocked
       expect(record?.resumeId).toBe('sdk-abc');
       expect(record?.state).not.toBe('orphaned'); // now live again
+    });
+
+    /** A client whose first query throws before yielding anything, like a missing CLI binary. */
+    const throwingClient: AgentSdkClient = {
+      query() {
+        throw new Error('CLI binary not found');
+      },
+      interrupt: () => Promise.resolve(),
+      end: () => Promise.resolve(),
+    };
+    const describeEvent = (e: SessionEvent): string =>
+      e.kind === 'status' ? `status:${e.state}` : `${e.kind}:${e.text}`;
+
+    it('hands onStart the spawned handle before a turn that fails at once can be missed', async () => {
+      const manager = createSessionManager({ stateDir: await sandbox() });
+      const seen: string[] = [];
+      const handle = await manager.spawnManaged({
+        client: throwingClient,
+        prompt: 'go',
+        onStart: (h) => h.onEvent((e) => seen.push(describeEvent(e))),
+      });
+
+      expect(handle.getState()).toBe('failed');
+      expect(seen).toEqual(['error:Error: CLI binary not found', 'status:failed']);
+    });
+
+    it('hands onStart the resumed handle before a turn that fails at once can be missed', async () => {
+      const dir = await sandbox();
+      const orphan: SessionRecord = {
+        id: 'crashed-2',
+        kind: 'managed',
+        state: 'orphaned',
+        startedAtMs: 1,
+        resumeId: 'sdk-def',
+      };
+      await writeFile(join(dir, 'sessions.json'), JSON.stringify([orphan]));
+      const manager = createSessionManager({ stateDir: dir });
+      const seen: string[] = [];
+      const handle = await manager.resumeOrphan!('crashed-2', {
+        client: throwingClient,
+        prompt: 'continue',
+        onStart: (h) => h.onEvent((e) => seen.push(describeEvent(e))),
+      });
+
+      expect(handle.getState()).toBe('failed');
+      expect(seen).toEqual(['error:Error: CLI binary not found', 'status:failed']);
     });
 
     it('resumeOrphan throws for an unknown session', async () => {

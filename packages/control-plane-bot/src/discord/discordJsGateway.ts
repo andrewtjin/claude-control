@@ -71,7 +71,7 @@ import {
   buildStatsEmbed,
 } from './embeds.js';
 import { PermissionCardRegistry, type CardRef } from './permissionCards.js';
-import { PendingStatsScans } from './pendingStatsScans.js';
+import { PendingReplies, PendingStatsScans } from './pendingStatsScans.js';
 import {
   QuestionCardRegistry,
   QuestionAnswerCollector,
@@ -219,6 +219,11 @@ interface SessionMessagePayload {
  *  written explanation rather than an interaction that silently expires. */
 const STATS_SCAN_TIMEOUT_MS = 120_000;
 
+/** How long a `/quiet action:on|off` reply waits for the daemon. The daemon only writes one small
+ *  file, so an answer that has not come by now is not coming: the daemon went offline mid-request,
+ *  or the relay dropped the frame. */
+const QUIET_SET_TIMEOUT_MS = 15_000;
+
 // Where the committed progress-bar sprites live, relative to this compiled file
 // (dist/discord/discordJsGateway.js → ../../assets/progress-bar → the package's assets dir).
 const PROGRESS_ASSETS_DIR = join(
@@ -253,6 +258,7 @@ export const PAIRING_PRIMER_MESSAGE = [
   '`/switch <account>` — switch the active account',
   '`/status` — daemon connection status',
   '`/settings` — effective settings and where each came from',
+  '`/quiet` — only permission and question cards (on by default), or every card',
   '`/approve <request>` · `/deny <request>` — answer a pending permission request',
   '`/reauth <account>` — re-authenticate an account that can no longer refresh its login',
   '',
@@ -534,6 +540,8 @@ export class DiscordJsGateway implements DiscordGateway {
   /** requestId -> the `/stats days:N` interaction waiting on a host transcript scan. The only
    *  command whose answer does not exist at reply time (see {@link runStatsScan}). */
   private readonly pendingStats = new PendingStatsScans();
+  /** `/quiet action:on|off` interactions waiting on their `settings.quiet.result`. */
+  private readonly pendingQuiet = new PendingReplies<PayloadOf<'settings.quiet.result'>>();
 
   constructor(options: DiscordJsGatewayOptions) {
     // One predicate, three consumers: the intents below, the planner's state lines, and
@@ -689,6 +697,16 @@ export class DiscordJsGateway implements DiscordGateway {
         this.logger.debug(
           { requestId: envelope.payload.requestId },
           'discord: stats.result with no waiting interaction (timed out, or a restart since)',
+        );
+      }
+      return;
+    }
+    if (isType(envelope, 'settings.quiet.result')) {
+      // Same contract as stats.result: it answers one waiting interaction, never a DM.
+      if (!this.pendingQuiet.settle(envelope.payload.requestId, envelope.payload)) {
+        this.logger.debug(
+          { requestId: envelope.payload.requestId },
+          'discord: settings.quiet.result with no waiting interaction (timed out, or a restart since)',
         );
       }
       return;
@@ -960,7 +978,13 @@ export class DiscordJsGateway implements DiscordGateway {
       if (isType(envelope, 'session.status')) {
         await this.runPlan(
           route,
-          this.planner.onStatus(route, envelope.payload, this.clock(), mode),
+          this.planner.onStatus(
+            route,
+            envelope.payload,
+            this.clock(),
+            mode,
+            this.quietFor(route, envelope.payload),
+          ),
         );
         this.scheduleForget(route, envelope.payload.state);
         return;
@@ -968,12 +992,27 @@ export class DiscordJsGateway implements DiscordGateway {
       if (isType(envelope, 'session.output')) {
         await this.runPlan(
           route,
-          this.planner.onOutput(route, envelope.payload, this.clock(), mode),
+          this.planner.onOutput(
+            route,
+            envelope.payload,
+            this.clock(),
+            mode,
+            this.quietFor(route, envelope.payload),
+          ),
         );
       }
     } catch (err) {
       this.logger.warn({ err, route }, 'discord: session envelope processing failed');
     }
+  }
+
+  /** The quiet mode a session frame is planned under: the one the daemon stamped on it when it
+   *  sent it, since that mode decided which lines it sent — a frame replayed after a reconnect may
+   *  predate a later change. A daemon that stamps nothing falls back to its last settings
+   *  snapshot; one predating quiet mode reports neither, which reads as off: that daemon still
+   *  sends every line, and dropping them here would leave its sessions with no surface at all. */
+  private quietFor(route: SessionRoute, frame: { quiet?: boolean | null | undefined }): boolean {
+    return frame.quiet ?? this.cache.getSettings(route.discordUserId)?.quiet === true;
   }
 
   /** Execute a plan's ops in order, then (re)schedule its coalesced-flush timer. The single entry
@@ -1752,6 +1791,19 @@ export class DiscordJsGateway implements DiscordGateway {
       case 'settings':
         result = commands.handleSettings(this.deps, userId);
         break;
+      case 'quiet': {
+        // Parsed against the known values rather than cast, like /thread-here's action: an
+        // unrecognised string from a stale registered definition can only ever mean `show`.
+        const raw = interaction.options.getString('action');
+        if (raw === 'on' || raw === 'off') {
+          // A round trip to the host, so the reply is deferred; `show` answers from the cache.
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          result = await this.onQuietSet(userId, raw === 'on', requestId);
+        } else {
+          result = commands.handleQuietShow(this.deps, userId);
+        }
+        break;
+      }
       case 'status':
         result = commands.handleStatus(this.deps, userId);
         break;
@@ -1914,6 +1966,27 @@ export class DiscordJsGateway implements DiscordGateway {
       return;
     }
     await interaction.editReply({ embeds: [buildStatsEmbed(snapshot)] });
+  }
+
+  /** `/quiet action:on|off` — ask this user's daemon to change quiet mode and wait for its answer.
+   *  The wait is registered BEFORE the frame is sent (the answer can arrive first), and abandoned
+   *  when nothing was sent, so every path ends in exactly one reply. A full registry refuses before
+   *  sending: the daemon would apply a change the reply then tells the user to retry. */
+  private async onQuietSet(
+    userId: string,
+    quiet: boolean,
+    requestId: string,
+  ): Promise<CommandResult> {
+    if (this.pendingQuiet.isFull()) {
+      return commands.buildQuietSetResult({ kind: 'busy' }, QUIET_SET_TIMEOUT_MS);
+    }
+    const waiting = this.pendingQuiet.awaitResult(requestId, QUIET_SET_TIMEOUT_MS);
+    const sent = commands.handleQuietSet(this.deps, userId, quiet, requestId);
+    if (sent.kind === 'error') {
+      this.pendingQuiet.abandon(requestId);
+      return sent;
+    }
+    return commands.buildQuietSetResult(await waiting, QUIET_SET_TIMEOUT_MS);
   }
 
   /** `/thread-here` — where this user's future session threads are created, chosen by the user.
@@ -2690,6 +2763,22 @@ export function commandDefinitions() {
             { name: 'pin this channel', value: 'pin' },
             { name: 'clear — send my session threads back to my DMs', value: 'clear' },
             { name: 'show — where do my session threads go right now?', value: 'show' },
+          ),
+      ),
+    // One command with an action option, like /thread-here, so on, off and show read as the same
+    // setting. Required: there is no safe guess between turning cards off and on.
+    new SlashCommandBuilder()
+      .setName('quiet')
+      .setDescription('Quiet mode: only permission and question cards reach Discord')
+      .addStringOption((o) =>
+        o
+          .setName('action')
+          .setDescription('Turn quiet mode on or off, or show it')
+          .setRequired(true)
+          .addChoices(
+            { name: 'on — only permission and question cards', value: 'on' },
+            { name: 'off — every card', value: 'off' },
+            { name: 'show — is quiet mode on right now?', value: 'show' },
           ),
       ),
     new SlashCommandBuilder().setName('status').setDescription('Show daemon connection status'),

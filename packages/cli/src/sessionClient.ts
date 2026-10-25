@@ -253,20 +253,21 @@ export async function callDaemonSession(
   };
 }
 
-/** The words a daemon from before the usage refresh answers the route with: it reads it as a
- *  session command and refuses the missing session. Kept as a literal on purpose, since it
+/** The words a daemon from before a non-session CLI route answers it with: it reads the route as
+ *  a session command and refuses the missing session. Kept as a literal on purpose, since it
  *  identifies what already-shipped daemons say, whatever the current receiver says later. */
-const PRE_REPOLL_SESSION_REFUSAL = 'sessionId and idempotencyKey are required';
+const PRE_ROUTE_SESSION_REFUSAL = 'sessionId and idempotencyKey are required';
 
 /**
- * Whether a refusal of `/cli/usage/repoll` comes from a daemon that predates the route. Such a
- * daemon answers 404 (an unknown CLI endpoint) or a 400 complaining about the session fields; a
- * current daemon never answers 404 here, and its own 400s (a body over its size cap, a malformed
- * id list) and a 401 for a stale secret are not cured by a restart, so they keep their own words.
+ * Whether a refusal of a non-session CLI route (`/cli/usage/repoll`, `/cli/settings/quiet`) comes
+ * from a daemon that predates the route. Such a daemon answers 404 (an unknown CLI endpoint) or a
+ * 400 complaining about the session fields; a current daemon never answers 404 on these, and its
+ * own 400s (a body over its size cap, a malformed field) and a 401 for a stale secret are not cured
+ * by a restart, so they keep their own words.
  */
-function predatesUsageRepoll(status: number, reply: DaemonReply | undefined): boolean {
+function predatesCliRoute(status: number, reply: DaemonReply | undefined): boolean {
   if (status === 404) return true;
-  return status === 400 && reply?.error === PRE_REPOLL_SESSION_REFUSAL;
+  return status === 400 && reply?.error === PRE_ROUTE_SESSION_REFUSAL;
 }
 
 /**
@@ -289,7 +290,7 @@ export async function callDaemonUsageRepoll(
     ids === undefined ? {} : { ids: [...ids] },
     deps,
     (status, reply) =>
-      predatesUsageRepoll(status, reply)
+      predatesCliRoute(status, reply)
         ? new SessionClientError(
             'the running daemon is older than this cctl and cannot refresh usage on demand - ' +
               'restart it with `cctl daemon restart`',
@@ -301,4 +302,55 @@ export async function callDaemonUsageRepoll(
     throw new SessionClientError(body?.message ?? body?.error ?? 'unexpected daemon response');
   }
   return { ok: true, results: body.results as UsageRepollVerdict[] };
+}
+
+/** The running daemon's answer to a quiet-mode change: the value now in force, and whether it
+ *  moved (false for a repeat of the value already set). For an unset, `removed` says whether
+ *  config.json held a value, and `pinned` that the daemon's environment sets the variable, so its
+ *  value stays in force; a daemon that does not report them leaves them out. */
+export interface DaemonQuietResult {
+  quiet: boolean;
+  changed: boolean;
+  removed?: boolean;
+  pinned?: boolean;
+}
+
+/**
+ * Change quiet mode on the running daemon, which applies it at once and persists it to config.json
+ * itself (`undefined` forgets the persisted value, as `cctl settings unset` does). Fails with a
+ * {@link SessionClientError} like every other daemon call: `down` when no daemon is running (the
+ * caller then persists the value for the next start), `older_daemon` when the running daemon
+ * predates live changes, and `refused` with the daemon's own sentence for anything it said no to —
+ * a value pinned by its environment, or a file it could not write.
+ */
+export async function callDaemonQuietSetting(
+  value: boolean | undefined,
+  deps: SessionClientDeps = {},
+): Promise<DaemonQuietResult> {
+  const body = await postToDaemon(
+    '/cli/settings/quiet',
+    { quiet: value ?? null },
+    deps,
+    (status, reply) =>
+      predatesCliRoute(status, reply)
+        ? new SessionClientError(
+            'the running daemon is older than this cctl and cannot change quiet mode while it runs',
+            'older_daemon',
+          )
+        : undefined,
+  );
+  if (
+    !body ||
+    body.ok !== true ||
+    typeof body.quiet !== 'boolean' ||
+    typeof body.changed !== 'boolean'
+  ) {
+    throw new SessionClientError(body?.message ?? body?.error ?? 'unexpected daemon response');
+  }
+  return {
+    quiet: body.quiet,
+    changed: body.changed,
+    ...(typeof body.removed === 'boolean' ? { removed: body.removed } : {}),
+    ...(typeof body.pinned === 'boolean' ? { pinned: body.pinned } : {}),
+  };
 }

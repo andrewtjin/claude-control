@@ -56,10 +56,13 @@ run `npm prefix -g` and add the printed path (or its `bin` subfolder) to `PATH`.
   with single keys.
 - **A record of every time you ran out.** When every account is spent, the daemon logs
   when, why each account was out, and the switches that led there, then how long it
-  lasted. `cctl outages` lists them; the phone gets a card at the start and the end.
-- **Approve from anywhere.** Permission prompts, questions, and "done / waiting" notices reach
-  your phone; approve or deny from Discord. Send live prompts or start a fresh
-  session and watch milestones stream back.
+  lasted. `cctl outages` lists them; with quiet mode off, the phone gets a card at the start
+  and the end.
+- **Approve from anywhere.** Permission prompts and questions reach your phone; approve,
+  deny or answer from Discord. Send live prompts or start a fresh session and get Claude's
+  reply back after each turn. Quiet mode (on by default) keeps Discord to just that;
+  `/quiet action:off` or `cctl settings set quiet off` adds done and waiting notices,
+  command output and live session progress.
 - **Reach a session that's sitting idle.** A prompt from Discord normally waits for the
   session to finish a turn — which never happens while you're away. Turn on
   `cctl channel enable` and it lands immediately instead, on a session nobody is

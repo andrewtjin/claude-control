@@ -164,9 +164,11 @@ import {
   type SessionStatusRow,
 } from './sessionRender.js';
 import {
+  callDaemonQuietSetting,
   callDaemonSession,
   resolveSessionId,
   SessionClientError,
+  type DaemonQuietResult,
   type SessionCommandSuccess,
   type SessionVerb,
 } from './sessionClient.js';
@@ -207,10 +209,14 @@ import {
   persistDaemonSetting,
   daemonHeartbeatPath,
   daemonSectionTitle,
+  envBool,
   fileSettingNames,
   markPendingRestart,
+  QUIET_ENV_NAME,
   readDaemonConfigFile,
   readSettingsReport,
+  renderSettingApplied,
+  renderSettingClearedLive,
   renderSettingForgotten,
   renderSettingSaved,
   renderSettings,
@@ -248,6 +254,29 @@ async function refreshSnapshotIfBindEnforce(settingName: string): Promise<void> 
   } catch {
     // The setting is already persisted; a failed snapshot rewrite heals on the next daemon poll or
     // bind. Never turn a successful settings change into a command failure over it.
+  }
+}
+
+/** `cctl settings set|unset quiet` against a running daemon, which applies the change at once and
+ *  saves it to config.json itself (`undefined`: unset). Resolves to the daemon's answer when it
+ *  took it, and undefined when there is no daemon to ask or it is too old to change quiet mode
+ *  live — the caller then saves the value for the next start, exactly as for any other setting. Anything the daemon
+ *  refused (a value pinned by its environment, a file it could not write) or a daemon that does not
+ *  answer ends the command with the daemon's own words: saving the file behind its back would
+ *  report a change that is not in force. */
+async function setQuietOnRunningDaemon(
+  value: boolean | undefined,
+): Promise<DaemonQuietResult | undefined> {
+  try {
+    return await callDaemonQuietSetting(value);
+  } catch (err) {
+    if (
+      err instanceof SessionClientError &&
+      (err.failure === 'down' || err.failure === 'older_daemon')
+    ) {
+      return undefined;
+    }
+    fail(err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -605,6 +634,20 @@ export function buildProgram(): Command {
       const checked = checkSettingValue(setting, value ?? '');
       if (!checked.ok) fail(checked.message);
       const filePath = daemonConfigPath();
+      // Quiet mode changes the running daemon too; the daemon saves the value itself when it can.
+      const live =
+        setting.name === QUIET_ENV_NAME
+          ? // The checked value always parses, so this reads it as on or off (never as an unset).
+            await setQuietOnRunningDaemon(envBool({ value: checked.value }, 'value') === true)
+          : undefined;
+      if (live !== undefined) {
+        // The daemon writes its own spelling (on/off), not the `yes`/`1` the user may have typed,
+        // so the confirmation names what is in the file.
+        process.stdout.write(
+          renderSettingApplied(setting, live.quiet ? 'on' : 'off', filePath, detectPalette()),
+        );
+        return;
+      }
       try {
         await persistDaemonSetting(filePath, setting, checked.value);
       } catch (err) {
@@ -625,6 +668,12 @@ export function buildProgram(): Command {
       const setting = findDaemonEnvSetting(name);
       if (!setting) fail(unknownSetting(name));
       const filePath = daemonConfigPath();
+      const live =
+        setting.name === QUIET_ENV_NAME ? await setQuietOnRunningDaemon(undefined) : undefined;
+      if (live !== undefined) {
+        process.stdout.write(renderSettingClearedLive(setting, filePath, live, detectPalette()));
+        return;
+      }
       let removed: boolean;
       try {
         removed = await forgetDaemonSetting(filePath, setting);

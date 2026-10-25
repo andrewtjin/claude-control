@@ -24,6 +24,7 @@ import type { EnvelopeDraft, PayloadOf } from '@claude-control/shared-protocol';
 import { classifyStopFailureType, isStopFailureType } from '@claude-control/session-runtime';
 import { type Logger, noopLogger } from '@claude-control/switch-engine';
 import { CHANNEL_POLL_MS, type TakeSource } from './channelRegistry.js';
+import type { QuietRefusal, QuietSetResult } from './quietMode.js';
 import type { Store } from './store.js';
 import type { HookReceiverUsageHandlers } from './usageRepoll.js';
 
@@ -103,6 +104,13 @@ export interface HookReceiverOptions {
    *  hand-started session has. CCTL_AUTO_CONTINUE=0 turns it off along with the managed
    *  sessions' retry loop (one umbrella switch: both are "survive API errors" behavior). */
   apiErrorCards?: boolean;
+  /** Whether Discord is in quiet mode right now (see quietMode.ts), read on every hook because the
+   *  setting can change on the running daemon. In quiet mode the receiver still sends permission and
+   *  question cards and their lapses, and drops the cards that would post on their own: Stop/done
+   *  cards, Notification nags, tool output (blanket and remotely approved alike) and API-error
+   *  cards. Quiet wins over forwardNotificationCards, commandOutputCards and fullToolOutput.
+   *  Default: never quiet, so a receiver built without it behaves as before. */
+  quiet?: () => boolean;
   /** Answers "does this hook session_id belong to a session this daemon manages?" A managed
    *  session already reaches the phone through session.status/session.output (live card,
    *  milestone lines, summary card) and decides permissions through the SDK's canUseTool
@@ -231,6 +239,15 @@ export interface HookReceiverCliHandlers {
   /** Drop a registered session from tracking entirely (the undo for `register` — also the
    *  cleanup path for a registration made with a mistyped/garbage id). */
   unregisterSession(input: SessionCommandBase): Promise<SessionCommandResult>;
+}
+
+/** The live-settings logic the daemon installs via {@link HookReceiver.setSettingsHandlers}, behind
+ *  `POST /cli/settings/quiet` — the route `cctl settings set|unset quiet` uses so the running daemon
+ *  applies the change at once. Same split as {@link HookReceiverCliHandlers}: the receiver owns
+ *  the route and its validation, the daemon owns the setting. */
+export interface HookReceiverSettingsHandlers {
+  /** `undefined` forgets the persisted value, so the default applies. */
+  setQuiet(value: boolean | undefined): Promise<QuietSetResult>;
 }
 
 /** One injection as the channel server sees it on the wire. */
@@ -497,6 +514,7 @@ export class HookReceiver {
   private readonly commandOutputCards: boolean;
   private readonly fullToolOutput: boolean;
   private readonly apiErrorCards: boolean;
+  private readonly quiet: () => boolean;
   /** Last StopFailure card time per session — the cooldown that keeps a session flapping
    *  against a hard outage from turning the phone into a pager. Pruned opportunistically on
    *  insert, so it stays bounded by the number of RECENTLY-failing sessions. */
@@ -521,6 +539,9 @@ export class HookReceiver {
   /** Installed by the daemon — see {@link setUsageHandlers}. Undefined until then, so a refresh
    *  that races daemon startup gets the same clean 503 a `cctl session` command would. */
   private usageHandlers: HookReceiverUsageHandlers | undefined;
+  /** Installed by the daemon — see {@link setSettingsHandlers}. Undefined until then, so a settings
+   *  change that races daemon startup gets the same clean 503 a `cctl session` command would. */
+  private settingsHandlers: HookReceiverSettingsHandlers | undefined;
   /** `/cli/channel/next` polls currently held open, keyed by attachId.
    *
    *  These are open connections exactly like {@link heldPermissions}, and they carry the same
@@ -610,6 +631,7 @@ export class HookReceiver {
     this.commandOutputCards = options.commandOutputCards ?? true;
     this.fullToolOutput = options.fullToolOutput ?? false;
     this.apiErrorCards = options.apiErrorCards ?? true;
+    this.quiet = options.quiet ?? (() => false);
     this.isManagedSession = options.isManagedSession ?? (() => false);
     this.onSessionSeen = options.onSessionSeen;
     this.channelPollMs = options.channelPollMs ?? DEFAULT_CHANNEL_POLL_MS;
@@ -632,6 +654,11 @@ export class HookReceiver {
    *  the receiver owns the route and its validation, the daemon owns the poller it asks. */
   setUsageHandlers(handlers: HookReceiverUsageHandlers): void {
     this.usageHandlers = handlers;
+  }
+
+  /** Install the live-settings logic (same late-binding contract as {@link setCliHandlers}). */
+  setSettingsHandlers(handlers: HookReceiverSettingsHandlers): void {
+    this.settingsHandlers = handlers;
   }
 
   /**
@@ -1269,6 +1296,11 @@ export class HookReceiver {
       await this.handleUsageRepoll(body, res);
       return;
     }
+    // And for a live setting: it names a value, not a session.
+    if (path === '/cli/settings/quiet') {
+      await this.handleQuietSetting(body, res);
+      return;
+    }
     if (!this.cliHandlers) {
       // Raced daemon startup (handlers installed just before listen); tell the CLI to retry.
       this.respond(res, 503, { ok: false, error: 'daemon is starting; retry in a moment' });
@@ -1382,6 +1414,51 @@ export class HookReceiver {
       return;
     }
     this.respond(res, 200, answer);
+  }
+
+  /** `POST /cli/settings/quiet { quiet: true | false | null }`: change quiet mode on this daemon and
+   *  persist it; `null` forgets the persisted value. A boolean or null, strictly — a missing field
+   *  is a client bug, not "unset", since set and unset are opposite intents. The 200 body carries
+   *  the value now in force and whether it moved (and, for an unset, whether config.json held a
+   *  value and whether the environment still pins it); a refusal carries the daemon's own sentence, at a
+   *  status that says whether retrying could help (409: change the environment first; 500: the
+   *  file could not be written; 501: this daemon cannot change it live). */
+  private async handleQuietSetting(
+    body: Record<string, unknown>,
+    res: ServerResponse,
+  ): Promise<void> {
+    if (!this.settingsHandlers) {
+      this.respond(res, 503, { ok: false, error: 'daemon is starting; retry in a moment' });
+      return;
+    }
+    if (typeof body.quiet !== 'boolean' && body.quiet !== null) {
+      this.respond(res, 400, { ok: false, error: 'quiet must be true, false or null' });
+      return;
+    }
+    const result = await this.settingsHandlers.setQuiet(body.quiet ?? undefined);
+    if (result.ok) {
+      // `removed` and `pinned` let the CLI say what an unset actually did to the file and whether
+      // the environment still decides; absent fields mean a set, or a daemon that says no more.
+      this.respond(res, 200, {
+        ok: true,
+        quiet: result.quiet,
+        changed: result.changed,
+        ...(result.removed !== undefined ? { removed: result.removed } : {}),
+        ...(result.pinned !== undefined ? { pinned: result.pinned } : {}),
+      });
+      return;
+    }
+    const status: Record<QuietRefusal, number> = {
+      env_pinned: 409,
+      persist_failed: 500,
+      unsupported: 501,
+    };
+    this.respond(res, status[result.reason], {
+      ok: false,
+      code: result.reason,
+      quiet: result.quiet,
+      error: result.message,
+    });
   }
 
   /** Map a {@link SessionCommandResult} onto an HTTP response: success → 200 (with the echoed
@@ -1631,17 +1708,9 @@ export class HookReceiver {
         expiresAt: now + this.permissionHoldMs,
       },
     });
-    this.emit({
-      daemonId: this.daemonId(),
-      type: 'hook.notification',
-      payload: {
-        event: 'permission',
-        sessionId,
-        title: 'Permission requested',
-        body: summary,
-        level: 'info',
-      },
-    });
+    // No companion `hook.notification` beside the card: the card already names the tool and its
+    // summary, and nothing reads a companion (the bot's state cache ignores notifications), so a
+    // second envelope could only ever render as a duplicate message under the card.
 
     // THE round-trip: hold this HTTP response open. A phone Approve/Deny lands in
     // `resolvePermission`, which answers it with the CLI's decision schema; the hold lapsing
@@ -1715,9 +1784,10 @@ export class HookReceiver {
         expiresAt: now + this.questionHoldMs,
       },
     });
-    // Companion card, mirroring the permission path's own `hook.notification` companion — event
-    // 'permission' so it groups with permission cards, but tagged `question_prompt` and titled
-    // with the first question so the phone can render it as a "Claude has a question" card.
+    // Companion notification — event 'permission' so it groups with permission cards, tagged
+    // `question_prompt` and titled with the first question. Every bot that renders question cards
+    // suppresses it (the card is the answerable surface); an older bot without question cards shows
+    // it as a plain "Claude has a question" note, which is why it is still sent.
     const firstQuestion = questions[0]?.question;
     this.emit({
       daemonId: this.daemonId(),
@@ -1791,8 +1861,15 @@ export class HookReceiver {
     // one-shot bookkeeping exact and the card count at one.
     const watched = matchIndex !== -1;
     if (watched) this.outputWatches.splice(matchIndex, 1);
-    // An explicitly-armed watch always forwards — the operator tapped Approve and asked to
-    // see the result. Blanket shell cards skip managed sessions: their output already streams
+    // Quiet mode carries no output cards at all, a remotely approved run's included: checked after
+    // the watch is consumed, so the one-shot bookkeeping stays exact whatever the mode.
+    if (this.quiet()) {
+      this.logger.info({ sessionId, tool, watched }, 'tool output card suppressed (quiet mode)');
+      this.respond(res, 200, { ok: true });
+      return;
+    }
+    // Outside quiet mode an explicitly-armed watch always forwards — the operator tapped Approve
+    // and asked to see the result. Blanket shell cards skip managed sessions: their output already streams
     // into the session thread, so a DM card would show the same run twice.
     if (
       !watched &&
@@ -1878,6 +1955,14 @@ export class HookReceiver {
         return;
       }
     }
+    // Quiet mode sends neither the done card nor a nag: both post on their own, and the cards that
+    // need the operator (permissions, questions) arrive through their own paths. Checked after the
+    // steering branch above, which answers the hook rather than posting anything.
+    if (this.quiet()) {
+      this.logger.info({ event, sessionId }, `${event} card suppressed (quiet mode)`);
+      this.respond(res, 200, { ok: true });
+      return;
+    }
     // Notification events are the CLI mirroring its terminal nags ("Claude is waiting for your
     // input", "Claude needs your permission") — with real permission/done cards in place they
     // are duplicate noise, so forwarding them is opt-in.
@@ -1946,6 +2031,13 @@ export class HookReceiver {
         { sessionId },
         'StopFailure card suppressed (auto-continue off - CCTL_AUTO_CONTINUE enables)',
       );
+      this.respond(res, 200, { ok: true });
+      return;
+    }
+    // Ahead of the cooldown, so a card dropped in quiet mode does not start a window that would
+    // then hold back the first card after quiet mode is turned off.
+    if (this.quiet()) {
+      this.logger.info({ sessionId }, 'StopFailure card suppressed (quiet mode)');
       this.respond(res, 200, { ok: true });
       return;
     }

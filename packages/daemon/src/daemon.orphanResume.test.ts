@@ -5,14 +5,17 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { SessionRecord } from '@claude-control/session-runtime';
+import type { SessionEvent, SessionRecord, SessionState } from '@claude-control/session-runtime';
 import {
   createHarness,
   fakeSessionManager,
   fakeSwitchEngine,
   waitFor,
+  type FakeManagedHandle,
+  type FakeSessionManager,
   type Harness,
 } from './testing/sessionDaemonHarness.js';
+import type { QuietControl } from './quietMode.js';
 
 let harness: Harness | undefined;
 const tempDirs: string[] = [];
@@ -40,6 +43,40 @@ function orphanRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
     resumeId: 'sdk-1',
     ...overrides,
   };
+}
+
+/** Make the manager's resumed handle reach `state` before the resume resolves, the way the real
+ *  one's first turn runs while the registry is still being written. `before` events go first. */
+function resumeIn(
+  manager: FakeSessionManager,
+  state: SessionState,
+  before: SessionEvent[] = [],
+): void {
+  const resume = manager.resumeOrphan.bind(manager);
+  manager.resumeOrphan = (sessionId, opts) =>
+    resume(sessionId, {
+      ...opts,
+      onStart: (handle) => {
+        opts.onStart?.(handle);
+        for (const event of before) (handle as FakeManagedHandle).emit(event);
+        (handle as FakeManagedHandle).emit({ kind: 'status', state });
+      },
+    });
+}
+
+/** Quiet mode held on, as the default leaves it; never changed from these tests. */
+const quietOn = (): QuietControl => ({
+  isQuiet: () => true,
+  set: () => Promise.reject(new Error('not used in these tests')),
+});
+
+/** Every session.status state the phone was sent for `sessionId`, in order. */
+function statesSent(h: Harness, sessionId: string): Array<string | undefined> {
+  return h.sent
+    .filter((e) => e.type === 'session.status')
+    .map((e) => e.payload as { sessionId?: string; state?: string })
+    .filter((p) => p.sessionId === sessionId)
+    .map((p) => p.state);
 }
 
 function inject(h: Harness, sessionId: string, text: string): void {
@@ -85,6 +122,43 @@ describe('Daemon: re-attaching an orphaned session', () => {
     await waitFor(() => manager.resumeOrphanCalls.length === 1);
     expect(manager.resumeOrphanCalls[0]?.opts.prompt).toBe('pick it up');
     expect(h.sent.filter((e) => e.type === 'error')).toEqual([]);
+  });
+
+  it('announces the re-attached session as starting before its first event', async () => {
+    const manager = fakeSessionManager();
+    resumeIn(manager, 'starting');
+    manager.records.push(orphanRecord({ cwd: await sandbox() }));
+    harness = await createHarness({ sessionManager: manager });
+    const h = harness;
+    await h.daemon.start();
+
+    inject(h, 's1', 'pick it up');
+    // The phone still holds the crashed run's state; a stop before the resumed turn's first
+    // event must read as starting -> done, not as a stale idle state -> done.
+    await waitFor(() => statesSent(h, 's1').includes('starting'));
+  });
+
+  it('reports a resumed turn that fails at once with the error that explains it', async () => {
+    const manager = fakeSessionManager();
+    // The resumed turn dies before the resume resolves, e.g. a missing CLI binary.
+    resumeIn(manager, 'failed', [{ kind: 'error', text: 'Error: CLI binary not found' }]);
+    manager.records.push(orphanRecord({ cwd: await sandbox() }));
+    harness = await createHarness({ sessionManager: manager, quiet: quietOn() });
+    const h = harness;
+    await h.daemon.start();
+
+    inject(h, 's1', 'pick it up');
+    await waitFor(() => statesSent(h, 's1').includes('failed'));
+    // Quiet mode keeps the error as the failed turn's one outcome line, sent ahead of the status.
+    const frames = h.sent.flatMap((e) =>
+      e.type === 'session.output'
+        ? [`output:${e.payload.text}`]
+        : e.type === 'session.status'
+          ? [`status:${e.payload.state}`]
+          : [],
+    );
+    expect(frames.slice(-2)).toEqual(['output:Error: CLI binary not found', 'status:failed']);
+    expect(h.store.getSession('s1')?.state).toBe('failed');
   });
 });
 

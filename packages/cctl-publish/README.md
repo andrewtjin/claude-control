@@ -40,8 +40,11 @@ LaunchAgent, or a Linux systemd user unit; see `docs/PLATFORM.md`).
 - **Switches before you hit the wall.** When the active account runs low, the
   daemon moves to an account with real headroom on its own. Or, manually switch
   from your phone.
-- **Approve from anywhere.** Permission prompts and "done / waiting" notices
-  reach Discord; approve or deny from there.
+- **Approve from anywhere.** Permission prompts and questions reach Discord;
+  approve, deny or answer from there, and get Claude's reply back after each turn
+  of a session you started from your phone. Quiet mode (on by default) keeps
+  Discord to just that; `/quiet action:off` or `cctl settings set quiet off` adds
+  done and waiting notices, command output and live session progress.
 - **Answer Claude's questions from your phone.** When a session asks you to
   choose, the Discord card carries a select menu per question, multi-select and a
   free-text "Other…" included. Your answers land back in the running session.

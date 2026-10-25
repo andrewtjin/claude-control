@@ -18,6 +18,7 @@ import {
   negotiateVersion,
   type Envelope,
   type EnvelopeDraft,
+  type SettingsSnapshot,
 } from '@claude-control/shared-protocol';
 import type {
   ActivateResult,
@@ -43,6 +44,7 @@ import { AttributionJournal } from '../attributionJournal.js';
 import { HookReceiver } from '../hookReceiver.js';
 import { ControlPlaneClient, type DaemonIdentity } from '../controlPlaneClient.js';
 import { Daemon, type AutoSwitcherLike, type SwitchEngineLike } from '../daemon.js';
+import type { QuietControl } from '../quietMode.js';
 
 /** A minimal steady-state relay: accepts `hello`, answers `ping`, collects everything the
  *  daemon sends, and can push envelopes down to it. Enough wire protocol to drive the daemon's
@@ -52,7 +54,9 @@ export class TestRelay {
   private socket: WebSocket | undefined;
   readonly received: Envelope[] = [];
 
-  constructor() {
+  /** `quietFrames: false` answers like a bot from before quiet mode, which never advertises it. */
+  constructor(opts: { quietFrames?: boolean } = {}) {
+    const quietFrames = opts.quietFrames ?? true;
     this.wss = new WebSocketServer({ port: 0 });
     this.wss.on('connection', (socket) => {
       this.socket = socket;
@@ -70,6 +74,7 @@ export class TestRelay {
                 payload: {
                   ok: negotiated !== null,
                   ...(negotiated !== null ? { negotiatedVersion: negotiated } : {}),
+                  ...(negotiated !== null && quietFrames ? { quietFrames: true } : {}),
                 },
               }),
             ),
@@ -188,6 +193,8 @@ export interface FakeSessionManager extends SessionManager {
   resumeOrphanCalls: Array<{ sessionId: string; opts: ResumeOrphanOptions }>;
   /** Every spawnManaged call's options, for asserting what the daemon threads into a spawn. */
   spawnCalls: unknown[];
+  /** Always implemented here, so a test can wrap it to shape the handle it returns. */
+  resumeOrphan: NonNullable<SessionManager['resumeOrphan']>;
 }
 
 export function fakeSessionManager(): FakeSessionManager {
@@ -216,6 +223,7 @@ export function fakeSessionManager(): FakeSessionManager {
         ...(opts.accountId !== undefined ? { accountId: opts.accountId } : {}),
         ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
       });
+      opts.onStart?.(handle);
       return Promise.resolve(handle);
     },
     attachObserved() {
@@ -229,6 +237,7 @@ export function fakeSessionManager(): FakeSessionManager {
       // Mirror the real manager: the resumed handle comes live under the SAME id.
       const handle = fakeManagedHandle(sessionId);
       handles.set(sessionId, handle);
+      opts.onStart?.(handle);
       return Promise.resolve(handle);
     },
     prune: () => Promise.resolve([]),
@@ -327,6 +336,12 @@ export interface HarnessOptions {
   /** Effectively off by default: most tests drive exactly one cycle via start(). */
   pollIntervalMs?: number;
   logger?: Logger;
+  /** Discord quiet mode (see DaemonOptions.quiet); absent = never quiet. */
+  quiet?: QuietControl;
+  /** The settings report the daemon pushes (see DaemonOptions.settingsReport). */
+  settingsReport?: SettingsSnapshot;
+  /** Whether the relay's bot plans quiet frames (see TestRelay); absent = it does. */
+  botQuietFrames?: boolean;
 }
 
 export interface Harness {
@@ -335,6 +350,8 @@ export interface Harness {
   store: Store;
   switchEngine: FakeSwitchEngine;
   sessionManager: SessionManager;
+  /** The daemon's loopback receiver, for driving its CLI routes once the daemon has started. */
+  hookReceiver: HookReceiver;
   /** Envelopes the daemon has sent, newest last. */
   sent: Envelope[];
   dispose: () => Promise<void>;
@@ -344,7 +361,7 @@ export interface Harness {
  *  Store, a token-less UsagePoller, a real HookReceiver) and fakes for everything a session
  *  test needs to control. */
 export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
-  const relay = new TestRelay();
+  const relay = new TestRelay({ quietFrames: options.botQuietFrames ?? true });
   const relayPort = await relay.listen();
   const store = new Store(':memory:');
   const vaultDir = await mkdtemp(join(tmpdir(), 'daemon-sessions-'));
@@ -390,6 +407,8 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
       : {}),
     ...(options.autoSwitcher !== undefined ? { autoSwitcher: options.autoSwitcher } : {}),
     ...(options.logger !== undefined ? { logger: options.logger } : {}),
+    ...(options.quiet !== undefined ? { quiet: options.quiet } : {}),
+    ...(options.settingsReport !== undefined ? { settingsReport: options.settingsReport } : {}),
     pollIntervalMs: options.pollIntervalMs ?? 100_000,
   });
   return {
@@ -398,6 +417,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
     store,
     switchEngine,
     sessionManager,
+    hookReceiver,
     sent: relay.received,
     async dispose() {
       await daemon.stop().catch(() => undefined);

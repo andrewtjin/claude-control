@@ -255,9 +255,9 @@ it excludes. Global exclusions and quarantined logins are honored as everywhere 
 When every included account is out, the folder falls back to an inherited shared account,
 and it returns to an included one as soon as that has usage again. One account is live in
 one place at a time: a shared account live in another slot is skipped, and when two
-places want the last free account, the global slot keeps it and the folder waits (the
-phone gets an alert naming the folder). Memories, settings, skills, plugins, MCP servers
-and history stay shared; only the login differs.
+places want the last free account, the global slot keeps it and the folder waits (with
+[quiet mode](#discord-quiet-mode) off, the phone gets an alert naming the folder). Memories,
+settings, skills, plugins, MCP servers and history stay shared; only the login differs.
 
 ```
 cctl folder include <folder> <account>[,<account>...]   # reserve accounts to a folder, used there first
@@ -644,8 +644,8 @@ daemon moves each background session the global slot's service hosts in that fol
    session's working directory, with every option the session was started with and Claude
    Code saved (its model, permission mode, added directories, tool restrictions, settings,
    budgets and the rest);
-4. it confirms the folder's service now hosts it, logs the move in the daemon log and sends
-   one phone notice.
+4. it confirms the folder's service now hosts it, logs the move in the daemon log and, with
+   [quiet mode](#discord-quiet-mode) off, sends one phone notice.
 
 Why every row goes: each config dir keeps a job row for a session it ran, and Claude Code
 acts on a row under its own config dir whatever runs elsewhere. A row left under the global
@@ -674,9 +674,9 @@ one), and the daemon leaves a session alone while `cctl claude` holds it.
 A session moves at most once an hour, so one woken back onto the global slot by hand is not
 bounced every cycle. If a move fails, the session is resumed back on the global slot with its
 saved options (tried a few times, since Claude Code can count a session it just stopped as
-still open), the daemon logs it and sends one phone notice, and it does not try that session
-again until it restarts. When even that fails, the notice gives the command that brings it
-back as it was: `cctl claude --resume <id>`, in any shell, from any folder. A move saves how
+still open), the daemon logs it and (with [quiet mode](#discord-quiet-mode) off) sends one phone
+notice, and it does not try that session again until it restarts. When even that fails, the
+notice gives the command that brings it back as it was: `cctl claude --resume <id>`, in any shell, from any folder. A move saves how
 to bring the session back (where it ran, its folder and its saved options) before it touches
 anything; that command runs the move's own way back from it, then opens the session as below.
 The move drops what it saved once the session runs again, moved or put back; `cctl claude`
@@ -1026,8 +1026,8 @@ account out changes (it hits another limit, its login expires, a reset moves by 
 minutes, or an account joins), so a daemon restarted mid-outage judges every account by what was
 last seen, not only by what was true at the start.
 
-The phone gets a card when it starts and when it ends. The log is
-`exhaustion-log.jsonl` in the daemon's data folder (beside `daemon.db`), one JSON line per
+With [quiet mode](#discord-quiet-mode) off, the phone gets a card when it starts and when it
+ends. The log is `exhaustion-log.jsonl` in the daemon's data folder (beside `daemon.db`), one JSON line per
 start, per end and per `walls` change, starts and ends each with a plain-English `summary`;
 `cctl outages` prints its path. A
 write that fails (the file held open by a scanner, a full disk) is retried every cycle and on
@@ -1055,8 +1055,9 @@ never part of the global pool. A pool with nothing in it at all (a folder that e
 shared account, or whose last one another folder reserved) is out too, and says its pool is
 empty; it ends once an account that can work joins it.
 
-The phone card names the folder (`<folder>: every account in its pool is out`, then `Usage is
-back in <folder>`), and the `usage` / `timeline` banner adds one line per folder that is out.
+The phone card (sent with [quiet mode](#discord-quiet-mode) off) names the folder (`<folder>:
+every account in its pool is out`, then `Usage is back in <folder>`), and the `usage` /
+`timeline` banner adds one line per folder that is out.
 While folder rules exist the global pool is not every account, so its card, log lines and banner
 name it too (`Every account in the global pool is out`, `No account in the global pool can take
 work`); with none they read as before. `cctl outages` labels each entry `[global]` or
@@ -1074,9 +1075,10 @@ before scopes existed carry no scope and read as the global pool's. A folder's l
 as version 2, so an older cctl that knows only the global pool skips them rather than reading a
 folder's outage as the whole machine's.
 
-Separately from the log, the daemon alerts once (per episode, not per hour) when a folder's slot
-cannot move: its live account is out of usage and nothing else in its pool is free to take over,
-or its slot has no working account at all. A folder whose outage card has already gone out is not
+Separately from the log, the daemon alerts once (per episode, not per hour; with
+[quiet mode](#discord-quiet-mode) off) when a folder's slot cannot move: its live account is out
+of usage and nothing else in its pool is free to take over, or its slot has no working account
+at all. A folder whose outage card has already gone out is not
 alerted on twice.
 
 ## Token stats
@@ -1133,6 +1135,8 @@ cctl settings set <name> <value>    # persist a daemon setting by alias or env v
                                     # daemon next starts: `cctl daemon restart`;
                                     # aliases listed below)
 cctl settings unset <name>          # remove a persisted daemon setting
+cctl settings set quiet on|off      # Discord quiet mode; unlike the rest, a running daemon
+                                    # applies it at once (and saves it itself)
 cctl doctor     # environment checks: Node version, vault crypto round-trip, vault dir,
                 # live login, ~/.claude.json, and whether the daemon has autostart;
                 # with folder rules or parallel sessions also slots, rule-scopes,
@@ -1329,6 +1333,49 @@ cctl run   # (needs the running daemon + hosted bot) start a remote session
 Until the daemon is connected to the bot, `cctl run` fails with a pointer to
 `docs/VERIFICATION.md` rather than doing nothing silently.
 
+## Discord quiet mode
+
+Quiet mode is **on by default**: Discord gets the cards that need you and little else.
+
+- **Kept:** permission and question cards (from terminal and phone-started sessions alike),
+  their expiry edits, and the Approve/Deny/answer round trip; the replies to your own commands
+  (`/usage`, `/switch`, the cards that answer a `/say`, error replies); the alert that an
+  account needs a re-login; and, for a session started from the phone, one message per turn
+  with Claude's final reply (or why the turn failed, or a line saying the session ended before
+  it replied). A reply too long for one message is split across several, or attached whole
+  when it is very long. In a DM, where sessions share one conversation and no live card is
+  posted, each of those messages starts with the first eight characters of the session's id,
+  so two sessions' replies stay apart and each matches its row in `/sessions`.
+- **Dropped:** the done card after every terminal turn, command output cards (including the
+  output of a tool you approved from the phone), "Claude is waiting" nags, API-error cards; a
+  phone-started session's tool lines, progress lines, retry and usage-limit notes, waiting
+  lines and end-of-session summary card; and the daemon's own fleet notices (auto-switch
+  results, outage start and end, folder slot alerts, moved and parked sessions).
+
+Quiet mode wins over `command-output`, `waiting-cards` and `full-output`: with it on, those
+settings change nothing. Turn it off to get every card back:
+
+```
+cctl settings set quiet off    # or /quiet action:off on the phone
+cctl settings unset quiet      # back to the default (on)
+```
+
+Both apply to the running daemon at once and are saved in `config.json`, so they also hold
+after a restart; `/quiet action:show` and `cctl settings` show the value in force. With no
+daemon running, `cctl settings set quiet` saves the value for the next start like any other
+setting. When `CCTL_DISCORD_QUIET` is set in the environment the daemon starts in, that
+value wins over `config.json`, so a live change is refused with the variable named: unset it
+there and restart the daemon first. (A typo there pins it too: `cctl settings` then shows the
+default value with the source `env`.) `cctl settings unset quiet` still removes the
+`config.json` entry in that case, and says the environment's value stays in force.
+
+The daemon drops its own cards and notices, so that part works with any bot. A phone-started
+session goes quiet only with a bot from this release: the daemon cuts a session down to one
+reply per turn only for a bot that says it can post a long reply in full, and gives an older
+bot the session's whole output as before, live card, waiting lines and summary card included,
+so no reply is cut short. `/quiet` itself needs that bot too. `/quiet` against a daemon older
+than this release says to update cctl on that machine instead of waiting.
+
 ## Persisted settings and override precedence
 
 Every daemon knob resolves the same way, highest precedence first: a `cctl daemon run`
@@ -1354,7 +1401,8 @@ level):
 }
 ```
 
-The daemon reads the file at start-up, so a change applies when it next starts —
+The daemon reads the file at start-up, so a change applies when it next starts (quiet
+mode is the one exception, see [Discord quiet mode](#discord-quiet-mode)) —
 `cctl daemon restart` does that now, and until then `cctl settings` shows the saved
 value beside the running one (`on (off after cctl daemon restart)`) with the restart command in the
 section title, and says whether the report belongs to a daemon that is still running. A file
@@ -1384,6 +1432,7 @@ Every setting has a short alias for the command line (case and `-`/`_` do not ma
 | `permission-hold`   | `CCTL_PERMISSION_HOLD_MS`                | milliseconds          |
 | `question-hold`     | `CCTL_QUESTION_HOLD_MS`                  | milliseconds          |
 | `command-output`    | `CCTL_COMMAND_OUTPUT`                    | on / off              |
+| `quiet`             | `CCTL_DISCORD_QUIET`                     | on / off              |
 | `identity-check`    | `CCTL_IDENTITY_CHECK`                    | on / off              |
 | `full-output`       | `CCTL_TOOL_OUTPUT_FULL`                  | on / off              |
 | `relay`             | `CCTL_RELAY_URL`                         | ws:// or wss:// url   |

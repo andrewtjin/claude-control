@@ -25,6 +25,17 @@
 // Discord's send budget) — it leaves a visible skip marker and the COMPLETE transcript is
 // attached at terminal, so every byte still reaches at least one surface, never zero.
 //
+// Quiet mode (the daemon's Discord quiet mode, as stamped on each frame): the session posts only
+// what the daemon still sends — one final-reply line per turn, or the line saying why a turn
+// failed — and the prompts, which travel outside this planner. No live card is created, no waiting
+// state lines, no restart markers and no terminal summary embed are posted, and nothing is
+// attached beyond a file owed from before quiet mode came on. A gap marker is posted only for real
+// loss, never for the stream a restarted bot joins part-way. A reply too long for one message is
+// split across several, so none of it is lost. The state lines kept are the ones that are a turn's outcome: `orphaned`, and
+// a session stopped mid-turn — neither turn got a final reply. A card posted before quiet mode was
+// turned on keeps being edited in place — an edit adds no message — so it never freezes on a
+// stale state.
+//
 // Coalescing model (≤1 emission per 1.5–4s, coalesced): after the surface is (re)rendered, a
 // further change within the window does NOT emit immediately — it marks the surface dirty and asks
 // the gateway to flush at `lastEmit + window`, so a burst of updates collapses to a SINGLE edit
@@ -173,6 +184,14 @@ const TERMINAL_STATES: ReadonlySet<SessionState> = new Set(['done', 'failed', 'o
 
 type SessionState = PayloadOf<'session.status'>['state'];
 
+/** States in which a turn is under way. A session that goes from one of these to `done` before the
+ *  turn's reply arrived was stopped mid-turn (a daemon shutdown or `/stop`). */
+const MID_TURN_STATES: ReadonlySet<SessionState> = new Set([
+  'starting',
+  'running',
+  'waiting_permission',
+]);
+
 /** Composite routing key — exported so the gateway keys its own (message-id, timer) maps
  *  identically. NUL-joined (a byte no Discord id or sessionId can contain), written as the
  *  ESCAPE sequence, never a raw byte: a literal NUL in source makes grep-family tools classify
@@ -219,11 +238,21 @@ interface SessionView {
    *  Each Discord message renders in isolation, so a fence spanning two flushes must close at
    *  the first batch's end and reopen (with this info string) at the next — see emitStream. */
   openFence: string | undefined;
+  /** Whether the daemon reported quiet mode on as of this session's latest frame (see the file
+   *  header). Refreshed on every status and output frame, since quiet mode can change mid-session. */
+  quiet: boolean;
+  /** Whether the current turn already posted its reply or failure line. Cleared when a new turn
+   *  starts; read when the session is stopped, so a stop after the reply adds no second outcome. */
+  replied: boolean;
   /** The daemon-run token last seen on this session's output (see `session.output.epoch`).
    *  `undefined` until the first epoch-bearing chunk; a CHANGE means the daemon restarted and
    *  resumed the session, so reassembly is reset. Stays `undefined` forever for a pre-epoch
    *  daemon, whose absent epoch never triggers a reset. */
   outputEpoch: string | undefined;
+  /** Whether a daemon-run change has replaced this view's reassembly. Until it has, a gap that
+   *  starts at seq 0 means this bot joined a stream already under way (it restarted mid-session),
+   *  not that the daemon lost lines; after it, seq 0 is the resumed run's first line. */
+  outputRestarted: boolean;
   /** The reassembled stdout+error transcript (with gap/truncation markers) — the attachment body. */
   fullStdout: string;
   attached: boolean;
@@ -260,17 +289,24 @@ export class SessionPlanner {
    *  session and edits it thereafter. Stream mode: posts action-worthy state changes as their own
    *  lines. On a terminal state both modes finalize: the surface flushes (final card edit / buffer
    *  drain), the standalone summary card posts, and the output attachment delivers where owed.
-   *  `mode` applies to a session's FIRST frame and is sticky thereafter (see {@link PlanMode}). */
+   *  `mode` applies to a session's FIRST frame and is sticky thereafter (see {@link PlanMode});
+   *  `quiet` is read fresh on every frame (see the file header). */
   onStatus(
     route: SessionRoute,
     payload: PayloadOf<'session.status'>,
     now: number,
     mode: PlanMode = 'card',
+    quiet = false,
   ): PlanResult {
+    // Whether an earlier frame was seen, so `prevState` is a state the session was really in rather
+    // than a fresh view's placeholder (a bot that restarted mid-session knows nothing before this).
+    const known = this.views.has(sessionRouteKey(route));
     const view = this.viewFor(route, mode);
+    view.quiet = quiet;
     const first = !view.cardPosted;
     const prevState = view.state;
     view.state = payload.state;
+    if (prevState === 'waiting_input' && MID_TURN_STATES.has(payload.state)) view.replied = false;
     view.summary = payload.summary ?? undefined;
     view.accountId = payload.accountId ?? undefined;
     // Only advance the slot on a frame that carries one: a later status frame from an older code
@@ -283,8 +319,22 @@ export class SessionPlanner {
       // The card that ensureCard just posted already reflects the new state; an EXISTING card
       // needs an edit to catch up. Terminal edits bypass the coalescing window.
       if (!first) view.dirty = true;
-    } else if (payload.state !== prevState) {
-      this.streamStateLine(view, payload.state, ops);
+    }
+    // A card shows its state itself; with no card (stream mode, or quiet mode) a line does.
+    if (payload.state !== prevState && (view.mode === 'stream' || view.quiet)) {
+      this.stateLine(view, payload.state, ops);
+    }
+    // Quiet mode posts no summary embed, so a turn stopped before it replied would otherwise end
+    // with no message at all. An idle session stopped (waiting_input → done) owes nothing: its
+    // last turn already posted its reply.
+    if (
+      view.quiet &&
+      payload.state === 'done' &&
+      known &&
+      MID_TURN_STATES.has(prevState) &&
+      !view.replied
+    ) {
+      ops.push(this.line(view, '⏹ the session ended before replying'));
     }
 
     if (TERMINAL_STATES.has(payload.state)) {
@@ -315,8 +365,10 @@ export class SessionPlanner {
     payload: PayloadOf<'session.output'>,
     now: number,
     mode: PlanMode = 'card',
+    quiet = false,
   ): PlanResult {
     const view = this.viewFor(route, mode);
+    view.quiet = quiet;
     const ops: GatewayOp[] = [];
     if (view.mode === 'card') this.ensureCard(view, ops, now);
     // A daemon-run change (crash + resume) restarts `seq` at 0 — reset reassembly first so the
@@ -399,8 +451,11 @@ export class SessionPlanner {
     if (view.outputEpoch === epoch) return; // same run: nothing to do
     view.outputEpoch = epoch;
     view.output = this.makeOrderedOutput();
+    view.outputRestarted = true;
     view.fullStdout += STREAM_RESTART_MARKER;
-    if (view.mode === 'stream') view.pendingStream += STREAM_RESTART_MARKER;
+    // Quiet mode posts only replies and prompts, and a marker in the thread would be a message of
+    // its own; the transcript still records it.
+    if (view.mode === 'stream' && !view.quiet) view.pendingStream += STREAM_RESTART_MARKER;
     view.dirty = true;
   }
 
@@ -420,7 +475,10 @@ export class SessionPlanner {
         pendingStream: '',
         streamCut: false,
         openFence: undefined,
+        quiet: false,
+        replied: false,
         outputEpoch: undefined,
+        outputRestarted: false,
         fullStdout: '',
         attached: false,
         attachedLen: -1,
@@ -441,7 +499,8 @@ export class SessionPlanner {
   /** Post the live card the first time we see any event for a session (renders current state).
    *  Card mode only — a stream session's surface is its appended messages, never a card. */
   private ensureCard(view: SessionView, ops: GatewayOp[], now: number): void {
-    if (view.mode !== 'card' || view.cardPosted) return;
+    // Quiet mode posts no live card: it would be a message per session that carries no prompt.
+    if (view.mode !== 'card' || view.cardPosted || view.quiet) return;
     ops.push({
       kind: 'sendMessage',
       route: view.route,
@@ -471,11 +530,19 @@ export class SessionPlanner {
       if (item.kind === 'gap') {
         const marker = gapMarker(item.fromSeq, item.toSeq);
         view.fullStdout += marker;
-        // Stream mode has no card to badge, so the gap marker flows into the thread itself —
-        // the same "a loss is VISIBLE where the reader is looking" rule, different surface.
-        if (view.mode === 'stream') view.pendingStream += marker;
         view.hasGap = true;
         view.dirty = true;
+        // Quiet mode skips no seq for the lines it drops, so a gap there is lost output — a reply
+        // or a failure line, trimmed from the daemon's bounded outbox in a long outage — and is
+        // shown like any other. The one exception is the gap this bot sees for joining a stream
+        // already under way after it restarted: nothing was lost, and quiet mode posts nothing
+        // for it.
+        if (view.quiet && item.fromSeq === 0 && !view.outputRestarted) continue;
+        // Stream mode has no card to badge, so the gap marker flows into the thread itself —
+        // the same "a loss is VISIBLE where the reader is looking" rule, different surface. A
+        // quiet card-mode session has no card either, so it gets the marker as a line.
+        if (view.mode === 'stream') view.pendingStream += marker;
+        else if (view.quiet && !view.cardPosted) ops.push(this.line(view, marker.trim()));
         continue;
       }
       const text = item.truncated ? `${item.text}${TRUNCATION_MARKER}` : item.text;
@@ -490,9 +557,10 @@ export class SessionPlanner {
           // Errors matter twice: they belong in the transcript AND deserve their own visible line.
           view.fullStdout += text;
           view.hadError = true;
+          view.replied = true;
           view.dirty = true;
           this.emitStream(view, ops, now); // keep seq order: buffered stdout first (no-op in card mode)
-          ops.push(this.line(view, `❗ ${formatTables(item.text)}`, item.truncated));
+          ops.push(...this.replyLines(view, `❗ ${formatTables(item.text)}`, item.truncated));
           break;
         case 'milestone':
           this.emitStream(view, ops, now);
@@ -501,15 +569,24 @@ export class SessionPlanner {
         case 'summary':
           // Standalone lines post as plain proportional-font content, where a terminal
           // table is unreadable — re-render any tables phone-width inside a code fence.
+          view.replied = true;
           this.emitStream(view, ops, now);
-          ops.push(this.line(view, `📝 ${formatTables(item.text)}`, item.truncated));
+          ops.push(...this.replyLines(view, `📝 ${formatTables(item.text)}`, item.truncated));
           break;
       }
     }
   }
 
+  /** The short session id a quiet card-mode line leads with. Card mode shares one conversation
+   *  (the DM) between sessions, and quiet mode posts no card, so without it a reply could not be
+   *  told apart from another session's or matched to its row in `/sessions`. A thread
+   *  already carries the id in its name; a posted card carries it itself. */
+  private label(view: SessionView): string {
+    return view.quiet && view.mode === 'card' ? `\`${view.route.sessionId.slice(0, 8)}\` ` : '';
+  }
+
   private line(view: SessionView, content: string, truncated = false): GatewayOp {
-    const withMarker = truncated ? `${content} ⟨truncated⟩` : content;
+    const withMarker = `${this.label(view)}${truncated ? `${content} ⟨truncated⟩` : content}`;
     return {
       kind: 'sendMessage',
       route: view.route,
@@ -523,6 +600,40 @@ export class SessionPlanner {
     };
   }
 
+  /** A turn's reply (summary) or failure (error) line. Outside quiet mode it is one clamped line:
+   *  the full text also reached the transcript as stdout. In quiet mode this line is the only place
+   *  the reply exists, so it is split across as many messages as it needs, the way a stream batch
+   *  is; one past the inline bound (where a split would flood the conversation) is attached whole
+   *  instead, as a skipped stream burst is. */
+  private replyLines(view: SessionView, content: string, truncated: boolean): GatewayOp[] {
+    if (!view.quiet) return [this.line(view, content, truncated)];
+    const label = this.label(view);
+    const body = truncated ? `${content} ⟨truncated⟩` : content;
+    const text = `${label}${body}`;
+    if (text.length > STREAM_SKIP_THRESHOLD_CHARS) {
+      return [
+        {
+          kind: 'uploadAttachment',
+          route: view.route,
+          filename: `session-${view.route.sessionId}-reply.md`,
+          text,
+          content: `${this.label(view)}The reply is too long to post here — it is attached in full.`,
+        },
+      ];
+    }
+    // Every chunk carries the label, not just the first: two sessions' split replies can
+    // interleave in a shared DM, and an unlabeled continuation could belong to either.
+    return chunkMessage(body, {
+      max: MESSAGE_CONTENT_LIMIT - label.length,
+      maxChunks: STREAM_FLUSH_MAX_CHUNKS,
+    }).map((chunk): GatewayOp => ({
+      kind: 'sendMessage',
+      route: view.route,
+      role: 'line',
+      content: `${label}${chunk}`,
+    }));
+  }
+
   /** Deliver the full output as a file once it grows past the inline threshold, and again at
    *  terminal if more arrived since — so the attachment is always the COMPLETE transcript, never a
    *  stale prefix. Re-attaches only when the length actually advanced, so it is never spammy.
@@ -531,6 +642,13 @@ export class SessionPlanner {
    *  appended messages already carry the transcript, so a routine mid-run attachment would just
    *  duplicate what the reader scrolled past. */
   private attachIfNeeded(view: SessionView, ops: GatewayOp[], final: boolean): void {
+    // Quiet mode attaches nothing: the daemon sends no transcript to attach, only reply lines. The
+    // exception is a file the session already owed from before quiet mode came on — a burst a
+    // stream thread skipped (its marker promised the transcript at the end), or a card's
+    // attachment whose later bytes have since scrolled out of the card's tail. Either way those
+    // bytes reached no other surface, and the transcript no longer grows, so this sends only the
+    // final top-up that was owed.
+    if (view.quiet && !(view.mode === 'stream' ? view.streamCut : view.attached)) return;
     const len = view.fullStdout.length;
     if (len === 0) return;
     if (view.mode === 'stream') {
@@ -578,10 +696,12 @@ export class SessionPlanner {
     view.dirty = true; // the card should now show the "full output attached" note
   }
 
-  /** Post the standalone final summary card at terminal (once). */
+  /** Post the standalone final summary card at terminal (once). Quiet mode marks the session
+   *  terminal without posting it: the turn's final reply already said how it ended. */
   private postSummary(view: SessionView, ops: GatewayOp[]): void {
     if (view.terminalPosted) return;
     view.terminalPosted = true;
+    if (view.quiet) return;
     ops.push({
       kind: 'sendMessage',
       route: view.route,
@@ -656,10 +776,13 @@ export class SessionPlanner {
     }
   }
 
-  /** Stream mode: surface the state changes the user must ACT on (or would otherwise misread as
-   *  silence) as their own lines. Starting/running transitions are noise in a thread whose content
-   *  already shows liveness, and done/failed speak through the terminal summary embed. */
-  private streamStateLine(view: SessionView, state: SessionState, ops: GatewayOp[]): void {
+  /** With no card to show it: surface the state changes the user must ACT on (or would otherwise
+   *  misread as silence) as their own lines. Starting/running transitions are noise in a thread
+   *  whose content already shows liveness, and done/failed speak through the terminal summary
+   *  embed. Quiet mode keeps only `orphaned`: a waiting line repeats what the prompt card or the
+   *  final reply already said. */
+  private stateLine(view: SessionView, state: SessionState, ops: GatewayOp[]): void {
+    if (view.quiet && state !== 'orphaned') return;
     if (state === 'waiting_permission') {
       // "in your DMs" was false wherever it mattered most: a prompt about a session that has a
       // thread is posted INTO that thread (the gateway's cardSink), which is where this line is

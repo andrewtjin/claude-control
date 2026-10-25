@@ -577,6 +577,15 @@ describe('buildSettingsEmbed', () => {
     expect(embed.footer?.text).toBe('as of daemon start');
     expect(embed.timestamp).toBe(new Date(1_700_000_000_000).toISOString());
   });
+
+  it('says the quiet row is current when the daemon reports quiet mode live', () => {
+    const embed = buildSettingsEmbed({
+      startedAtMs: 1_700_000_000_000,
+      settings: [{ name: 'discord quiet', value: 'off', source: 'config' }],
+      quiet: false,
+    }).toJSON();
+    expect(embed.footer?.text).toBe('as of daemon start; quiet mode is current');
+  });
 });
 
 describe('buildSessionListEmbed', () => {

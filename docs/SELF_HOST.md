@@ -129,6 +129,18 @@ default it needs no rebuild:
 
 See `docs/CLI.md`'s relay precedence for the full order.
 
+### `/quiet` — prompts only
+
+Quiet mode is a setting of each user's **daemon**, on by default: the daemon stops sending
+done cards, command output and its own fleet notices, so that part works whatever bot build
+the relay runs. `/quiet action:on|off|show` and quiet phone-started sessions (one reply per
+turn; no live session card, waiting lines or summary card) need this bot build, so users get
+them only after you update the bot (see [Updating](#updating)). Until then the daemon sees
+that the bot cannot post a long reply in full and sends those sessions' whole output as
+before. Against a daemon
+from before quiet mode, `/quiet` answers at once that cctl on that machine needs an update,
+rather than sending a frame that daemon would ignore.
+
 ## State and backup
 
 The bot persists four small JSON files, none of which holds a credential: `bindings.json`

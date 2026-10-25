@@ -12,7 +12,7 @@
 // since that loop's state (pending sends, resume guards, thread rebinds) is gateway-local too.
 // None touches a real Discord connection.
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1961,5 +1961,241 @@ describe('session copy agrees with where prompts go and whether replies are read
     expect(gatewayIntents(threadingConfigured(dmOnly))).not.toContain(
       GatewayIntentBits.MessageContent,
     );
+  });
+});
+
+// `/quiet` through the real command path, and the planner fed the daemon's quiet flag. The reply
+// strings and the old-daemon gate are proven in commands.test.ts and the planner's quiet path in
+// sessionPlanner.test.ts; what only the gateway holds is the round trip (defer, send, match the
+// daemon's answer back by requestId) and reading the cached snapshot per session frame.
+describe('DiscordJsGateway — /quiet', () => {
+  const USER = '111111111111111111';
+
+  class QuietGateway extends TestGateway {
+    slash(interaction: ChatInputCommandInteraction): Promise<void> {
+      return this.onSlashCommand(interaction);
+    }
+  }
+
+  /** A relay whose sends are recorded and, for settings.quiet.set, answered by `answer` the way the
+   *  daemon would: a result frame delivered back through the gateway. */
+  function quietRelay(answer?: (draft: EnvelopeDraft) => Envelope | undefined) {
+    const sent: EnvelopeDraft[] = [];
+    let gw: QuietGateway | undefined;
+    const relay = {
+      sendToUser: (_user: string, build: (daemonId: string) => EnvelopeDraft) => {
+        const draft = build('d1');
+        sent.push(draft);
+        const reply = answer?.(draft);
+        // Delivered on a later turn, like a frame arriving over the relay socket.
+        if (reply !== undefined) setTimeout(() => void gw?.deliver(USER, reply), 0);
+        return { ok: true, id: 'sent-1' };
+      },
+      isOnline: () => true,
+    } as unknown as RelaySender;
+    return {
+      sent,
+      make(): QuietGateway {
+        gw = new QuietGateway({ relay, pairing: stubPairing });
+        return gw;
+      },
+    };
+  }
+
+  const snapshot = (quiet?: boolean) =>
+    envelope('settings.snapshot', {
+      startedAtMs: 1,
+      settings: [
+        { name: 'discord quiet', value: quiet === false ? 'off' : 'on', source: 'default' },
+      ],
+      ...(quiet !== undefined ? { quiet } : {}),
+    });
+
+  function interaction(action: string) {
+    const events: string[] = [];
+    const fake = {
+      commandName: 'quiet',
+      user: { id: USER },
+      deferred: false,
+      options: { getString: () => action },
+      deferReply: () => {
+        events.push('defer');
+        fake.deferred = true;
+        return Promise.resolve(undefined);
+      },
+      editReply: (payload: { content?: string }) => {
+        events.push(`edit:${payload.content ?? ''}`);
+        return Promise.resolve(undefined);
+      },
+      reply: (payload: { content?: string }) => {
+        events.push(`reply:${payload.content ?? ''}`);
+        return Promise.resolve(undefined);
+      },
+    };
+    return { fake: fake as unknown as ChatInputCommandInteraction, events };
+  }
+
+  it('registers /quiet with a required on/off/show action, in guilds and DMs', () => {
+    const definition = commandDefinitions().find((c) => c.name === 'quiet');
+    expect(definition?.contexts).toContain(InteractionContextType.BotDM);
+    expect(definition?.contexts).toContain(InteractionContextType.Guild);
+    const option = definition?.options?.[0] as
+      { name: string; required?: boolean; choices?: { value: string }[] } | undefined;
+    expect(option?.name).toBe('action');
+    expect(option?.required).toBe(true);
+    expect(option?.choices?.map((c) => c.value)).toEqual(['on', 'off', 'show']);
+  });
+
+  it('defers, asks the daemon, and edits in its answer', async () => {
+    const r = quietRelay((draft) =>
+      draft.type === 'settings.quiet.set'
+        ? envelope('settings.quiet.result', {
+            requestId: draft.payload.requestId,
+            ok: true,
+            quiet: draft.payload.quiet,
+            message: 'Quiet mode is now off.',
+          })
+        : undefined,
+    );
+    const gw = r.make();
+    await gw.deliver(USER, snapshot(true));
+    const { fake, events } = interaction('off');
+    await gw.slash(fake);
+
+    expect(r.sent).toHaveLength(1);
+    expect(r.sent[0]).toMatchObject({ type: 'settings.quiet.set', payload: { quiet: false } });
+    expect(events[0]).toBe('defer');
+    expect(events[1]).toMatch(/^edit:Quiet mode is now off\. Discord gets every card/);
+    expect(events).toHaveLength(2);
+  });
+
+  it('answers a daemon from before quiet mode without sending it anything', async () => {
+    const r = quietRelay();
+    const gw = r.make();
+    await gw.deliver(USER, snapshot(undefined));
+    const { fake, events } = interaction('on');
+    await gw.slash(fake);
+
+    expect(r.sent).toEqual([]);
+    expect(events).toEqual([
+      'defer',
+      expect.stringMatching(/^edit:Error: .*too old for quiet mode/),
+    ]);
+  });
+
+  it('refuses a change while too many are waiting, without sending it', async () => {
+    // A relay that never answers: every wait stays open, as for daemons gone quiet after the send.
+    const r = quietRelay();
+    const gw = r.make();
+    await gw.deliver(USER, snapshot(true));
+    for (let i = 0; i < 16; i += 1) void gw.slash(interaction('off').fake);
+    await vi.waitFor(() => expect(r.sent).toHaveLength(16));
+
+    const { fake, events } = interaction('off');
+    await gw.slash(fake);
+    // The daemon was never asked, so the reply telling the user to retry is the truth.
+    expect(r.sent).toHaveLength(16);
+    expect(events).toEqual(['defer', expect.stringMatching(/^edit:Error: Too many requests/)]);
+  });
+
+  it('answers `show` straight from the cached snapshot', async () => {
+    const r = quietRelay();
+    const gw = r.make();
+    await gw.deliver(USER, snapshot(false));
+    const { fake, events } = interaction('show');
+    await gw.slash(fake);
+
+    expect(r.sent).toEqual([]);
+    expect(events).toEqual([expect.stringMatching(/^reply:Quiet mode is off/)]);
+  });
+
+  it('drops a result nobody is waiting for instead of DMing it', async () => {
+    const gw = quietRelay().make();
+    const sink = new FakeSink();
+    gw.testSink = sink;
+    await gw.deliver(
+      USER,
+      envelope('settings.quiet.result', {
+        requestId: 'stale',
+        ok: true,
+        quiet: true,
+        message: 'x',
+      }),
+    );
+    expect(sink.sends).toEqual([]);
+  });
+
+  it('feeds the cached quiet flag to the planner: a quiet session posts only its reply', async () => {
+    const gw = quietRelay().make();
+    const sink = new FakeSink();
+    gw.testSink = sink;
+    await gw.deliver(USER, snapshot(true));
+    const route = { sessionId: 's-quiet' };
+    await gw.deliver(USER, envelope('session.status', { ...route, state: 'running' }));
+    await gw.deliver(
+      USER,
+      envelope('session.output', {
+        ...route,
+        seq: 0,
+        kind: 'summary',
+        text: 'Session complete: done',
+        truncated: false,
+      }),
+    );
+    await gw.deliver(USER, envelope('session.status', { ...route, state: 'done' }));
+
+    // No live card and no summary embed: one line, the final reply, led by its session's id.
+    expect(sink.sends).toEqual([{ content: '`s-quiet` 📝 Session complete: done' }]);
+  });
+
+  it('keeps the old surface for a daemon that reports quiet mode off', async () => {
+    const gw = quietRelay().make();
+    const sink = new FakeSink();
+    gw.testSink = sink;
+    await gw.deliver(USER, snapshot(false));
+    await gw.deliver(USER, envelope('session.status', { sessionId: 's-loud', state: 'running' }));
+    // The live card is posted, as before quiet mode existed.
+    expect(sink.sends).toHaveLength(1);
+  });
+
+  it('plans a frame under the quiet mode it was sent with, not the newer snapshot', async () => {
+    // A reconnect writes the current snapshot (quiet off) ahead of rows queued while quiet was on.
+    const gw = quietRelay().make();
+    const sink = new FakeSink();
+    gw.testSink = sink;
+    await gw.deliver(USER, snapshot(false));
+    const route = { sessionId: 's-replay' };
+    const reply = 'x'.repeat(2_500);
+    await gw.deliver(USER, envelope('session.status', { ...route, state: 'running', quiet: true }));
+    await gw.deliver(
+      USER,
+      envelope('session.output', {
+        ...route,
+        seq: 0,
+        kind: 'summary',
+        text: reply,
+        truncated: false,
+        quiet: true,
+      }),
+    );
+
+    // No live card, and the reply arrives whole across messages instead of clamped to one.
+    const posted = (sink.sends as Array<{ content?: string }>).map((s) => s.content ?? '');
+    expect(posted.length).toBeGreaterThan(1);
+    expect(posted.join('').split('x').length - 1).toBe(reply.length);
+  });
+
+  it('posts the live card for a frame sent with quiet off, even after quiet came on', async () => {
+    const gw = quietRelay().make();
+    const sink = new FakeSink();
+    gw.testSink = sink;
+    await gw.deliver(USER, snapshot(true));
+    await gw.deliver(
+      USER,
+      envelope('session.status', { sessionId: 's-older', state: 'running', quiet: false }),
+    );
+    // The one send is the card itself: an embed, not a quiet text line.
+    expect(sink.sends).toHaveLength(1);
+    expect((sink.sends[0] as { content?: string }).content).toBeUndefined();
   });
 });

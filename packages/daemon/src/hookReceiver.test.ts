@@ -7,6 +7,7 @@ import {
   type HookReceiverCliHandlers,
   type SessionCommandResult,
 } from './hookReceiver.js';
+import type { QuietSetResult } from './quietMode.js';
 
 interface RawResponse {
   status: number;
@@ -165,7 +166,7 @@ describe('HookReceiver', () => {
   });
 
   describe('PermissionRequest -> emits + persists (response held)', () => {
-    it('persists a pending permission and emits permission.request + hook.notification', async () => {
+    it('persists a pending permission and emits ONLY the permission.request card', async () => {
       const held = post(
         port,
         '/',
@@ -185,13 +186,14 @@ describe('HookReceiver', () => {
       expect(row).toBeDefined();
       expect(row?.resolvedDecision).toBeNull();
 
-      expect(emitted).toHaveLength(2);
+      // One envelope: no "Permission requested" companion, which would render as a second
+      // message under the card.
+      expect(emitted).toHaveLength(1);
       expect(emitted[0]?.type).toBe('permission.request');
       if (emitted[0]?.type === 'permission.request') {
         expect(emitted[0].payload.requestId).toBe('req-1');
         expect(emitted[0].payload.cwd).toBe('/tmp');
       }
-      expect(emitted[1]?.type).toBe('hook.notification');
 
       // Complete the hold so the held socket doesn't outlive the test.
       await post(
@@ -2581,6 +2583,236 @@ describe('HookReceiver', () => {
       await other.listen(0);
       await other.close();
       expect(other.getPort()).toBeUndefined();
+    });
+  });
+});
+
+describe('HookReceiver in Discord quiet mode', () => {
+  let store: Store;
+  let receiver: HookReceiver;
+  let port: number;
+  let emitted: EnvelopeDraft[];
+  // Live, like the real control: tests flip it to prove the gates read it per hook.
+  let quiet: boolean;
+
+  beforeEach(async () => {
+    store = new Store(':memory:');
+    emitted = [];
+    quiet = true;
+    receiver = new HookReceiver({
+      store,
+      secret: SECRET,
+      emit: (draft) => emitted.push(draft),
+      daemonId: () => 'daemon-1',
+      clock: () => 1_000_000,
+      permissionHoldMs: 3000,
+      // Every card knob ON, so a suppression can only be quiet mode's doing.
+      forwardNotificationCards: true,
+      commandOutputCards: true,
+      fullToolOutput: true,
+      apiErrorCards: true,
+      quiet: () => quiet,
+    });
+    port = await receiver.listen(0);
+  });
+
+  afterEach(async () => {
+    await receiver.close();
+    store.close();
+  });
+
+  const hook = (body: Record<string, unknown>): Promise<RawResponse> =>
+    post(port, '/', body, { 'x-claude-control-secret': SECRET });
+  const notifications = () =>
+    emitted.flatMap((e) => (e.type === 'hook.notification' ? [e.payload] : []));
+
+  /** Hold a permission, approve it from the "phone", and wait for the hold to complete — the
+   *  receiver has then armed a one-shot output watch for this exact run. */
+  async function remoteAllow(requestId: string, tool: string, command: string): Promise<void> {
+    const held = hook({
+      event: 'PermissionRequest',
+      requestId,
+      session_id: 'sess-q',
+      tool_name: tool,
+      tool_input: { command },
+    });
+    await waitFor(() =>
+      emitted.find((e) => e.type === 'permission.request' && e.payload.requestId === requestId),
+    );
+    await post(
+      port,
+      '/resolve-permission',
+      { requestId, decision: 'allow' },
+      { 'x-claude-control-secret': SECRET },
+    );
+    expect((await held).status).toBe(200);
+  }
+
+  const postToolUse = (tool: string, command: string): Promise<RawResponse> =>
+    hook({
+      hook_event_name: 'PostToolUse',
+      session_id: 'sess-q',
+      tool_name: tool,
+      tool_input: { command },
+      tool_response: { stdout: 'out' },
+    });
+
+  it('keeps the permission card — and only the card — and its remote round trip', async () => {
+    await remoteAllow('req-q1', 'Bash', 'ls');
+    expect(emitted.map((e) => e.type)).toEqual(['permission.request']);
+    expect(store.getPendingPermission('req-q1')?.resolvedDecision).toBe('allow');
+  });
+
+  it('keeps the question card', async () => {
+    void hook({
+      event: 'PermissionRequest',
+      requestId: 'req-qq',
+      session_id: 'sess-q',
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [{ question: 'Which?', options: [{ label: 'A' }] }] },
+    });
+    await waitFor(() => emitted.find((e) => e.type === 'question.request'));
+    // The companion rides along for older bots; every current bot drops it (pushRender).
+    expect(emitted.map((e) => e.type)).toEqual(['question.request', 'hook.notification']);
+  });
+
+  it('still delivers queued /say steering through the Stop hook', async () => {
+    receiver.setSteeringSource((sessionId) => (sessionId === 'sess-q' ? 'keep going' : undefined));
+    const stop = await hook({
+      hook_event_name: 'Stop',
+      session_id: 'sess-q',
+      last_assistant_message: 'done',
+    });
+    // The operator asked for this text to reach the session; quiet mode only drops what posts on
+    // its own, never a delivery the operator is waiting on.
+    expect(stop.status).toBe(200);
+    expect(stop.body).toEqual({ decision: 'block', reason: 'keep going' });
+    expect(emitted).toHaveLength(0);
+  });
+
+  it('drops the Stop done card and the Notification nag, still answering 200', async () => {
+    const stop = await hook({
+      hook_event_name: 'Stop',
+      session_id: 'sess-q',
+      last_assistant_message: 'done',
+    });
+    const nag = await hook({
+      hook_event_name: 'Notification',
+      session_id: 'sess-q',
+      notification_type: 'idle_prompt',
+      message: 'Claude is waiting for your input',
+    });
+    expect(stop.status).toBe(200);
+    expect(nag.status).toBe(200);
+    expect(notifications()).toHaveLength(0);
+  });
+
+  it('drops blanket shell output cards and remotely approved ones, consuming the watch', async () => {
+    // A non-shell tool forwards ONLY through its watch, so it shows whether the watch survived.
+    await remoteAllow('req-q2', 'WebFetch', 'fetch a page');
+    expect((await postToolUse('WebFetch', 'fetch a page')).status).toBe(200);
+    expect((await postToolUse('Bash', 'dir')).status).toBe(200);
+    expect(notifications()).toHaveLength(0);
+    // The watch was consumed while quiet: once quiet is off, a repeat of the run sends nothing,
+    // while a shell run sends its blanket card again (command output is on).
+    quiet = false;
+    await postToolUse('WebFetch', 'fetch a page');
+    await postToolUse('Bash', 'dir');
+    expect(notifications().map((p) => p.title)).toEqual(['Output — dir']);
+  });
+
+  it('drops the API-error card without starting its cooldown', async () => {
+    const res = await hook({ hook_event_name: 'StopFailure', session_id: 'sess-q', error: 'x' });
+    expect(res.status).toBe(200);
+    expect(notifications()).toHaveLength(0);
+    // Had the dropped card started the 5-minute window, this first real card would be held back.
+    quiet = false;
+    await hook({ hook_event_name: 'StopFailure', session_id: 'sess-q', error: 'x' });
+    expect(notifications().filter((p) => p.notificationType === 'api_error')).toHaveLength(1);
+  });
+
+  it('reads the setting live: the same receiver sends the done card once quiet is off', async () => {
+    await hook({ hook_event_name: 'Stop', session_id: 'sess-q', last_assistant_message: 'a' });
+    expect(notifications()).toHaveLength(0);
+    quiet = false;
+    await hook({ hook_event_name: 'Stop', session_id: 'sess-q', last_assistant_message: 'b' });
+    expect(notifications()).toHaveLength(1);
+  });
+
+  describe('POST /cli/settings/quiet', () => {
+    const route = (body: unknown): Promise<RawResponse> =>
+      post(port, '/cli/settings/quiet', body, { 'x-claude-control-secret': SECRET });
+    const report = { startedAtMs: 1, settings: [] };
+
+    it('answers 503 until the daemon installs its handler', async () => {
+      expect((await route({ quiet: true })).status).toBe(503);
+    });
+
+    it('passes true, false and null (unset) through, and answers the value in force', async () => {
+      const seen: (boolean | undefined)[] = [];
+      receiver.setSettingsHandlers({
+        setQuiet: (value) => {
+          seen.push(value);
+          return Promise.resolve({ ok: true, quiet: value ?? true, changed: true, report });
+        },
+      });
+      expect(await route({ quiet: false })).toEqual({
+        status: 200,
+        body: { ok: true, quiet: false, changed: true },
+      });
+      await route({ quiet: true });
+      await route({ quiet: null });
+      expect(seen).toEqual([false, true, undefined]);
+    });
+
+    it("passes an unset's outcome through: whether the file held a value, and the env pin", async () => {
+      receiver.setSettingsHandlers({
+        setQuiet: () =>
+          Promise.resolve({
+            ok: true,
+            quiet: true,
+            changed: false,
+            report,
+            removed: true,
+            pinned: true,
+          }),
+      });
+      expect(await route({ quiet: null })).toEqual({
+        status: 200,
+        body: { ok: true, quiet: true, changed: false, removed: true, pinned: true },
+      });
+    });
+
+    it('refuses a missing or non-boolean value as a client bug, never reading it as unset', async () => {
+      let called = false;
+      receiver.setSettingsHandlers({
+        setQuiet: () => {
+          called = true;
+          return Promise.resolve({ ok: true, quiet: true, changed: false, report });
+        },
+      });
+      expect((await route({})).status).toBe(400);
+      expect((await route({ quiet: 'on' })).status).toBe(400);
+      expect(called).toBe(false);
+    });
+
+    it('maps each refusal to a status that says whether retrying can help', async () => {
+      const refusals: [QuietSetResult & { ok: false }, number][] = [
+        [{ ok: false, quiet: true, reason: 'env_pinned', message: 'pinned' }, 409],
+        [{ ok: false, quiet: true, reason: 'persist_failed', message: 'disk' }, 500],
+        [{ ok: false, quiet: false, reason: 'unsupported', message: 'no' }, 501],
+      ];
+      for (const [result, status] of refusals) {
+        receiver.setSettingsHandlers({ setQuiet: () => Promise.resolve(result) });
+        const res = await route({ quiet: false });
+        expect(res.status).toBe(status);
+        expect(res.body).toEqual({
+          ok: false,
+          code: result.reason,
+          quiet: result.quiet,
+          error: result.message,
+        });
+      }
     });
   });
 });

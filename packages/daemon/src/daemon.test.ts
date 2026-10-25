@@ -39,6 +39,7 @@ import type {
   QuestionRequest,
   QuestionAnswer,
   ResumeOrphanOptions,
+  SpawnManagedOptions,
 } from '@claude-control/session-runtime';
 import { SessionBusyError } from '@claude-control/session-runtime';
 import { Store } from './store.js';
@@ -319,10 +320,10 @@ function fakeSessionManager(): SessionManager & {
     records,
     resumeOrphanCalls,
     pruneCalls,
-    spawnManaged: vi.fn((opts) => {
-      void opts;
+    spawnManaged: vi.fn((opts: SpawnManagedOptions) => {
       const handle = makeFakeHandle('spawned-session');
       handles.set(handle.id, handle);
+      opts.onStart?.(handle);
       return Promise.resolve(handle);
     }),
     attachObserved: vi.fn(() => {
@@ -336,6 +337,7 @@ function fakeSessionManager(): SessionManager & {
       // Mirror the real manager: the resumed handle comes live under the SAME id.
       const handle = makeFakeHandle(sessionId);
       handles.set(sessionId, handle);
+      opts.onStart?.(handle);
       return Promise.resolve(handle);
     },
     prune: (): Promise<SessionRecord[]> => {
@@ -2145,6 +2147,25 @@ describe('Daemon lifecycle', () => {
     expect(handle.sent).toEqual([]);
   });
 
+  // Delivering starts the next turn, which a session may report from inside the send itself.
+  it('sends the turn boundary status before the running of the turn a queued inject starts', async () => {
+    const { handle, refused } = await spawnBusySession();
+    injectInto('spawned-session', 'next', 'k1');
+    await waitFor(() => refused.length === 1);
+
+    handle.send = (text: string) => {
+      handle.sent.push(text);
+      handle.emit({ kind: 'status', state: 'running' });
+      return Promise.resolve();
+    };
+    handle.emit({ kind: 'status', state: 'waiting_input' });
+    await waitFor(() => relay.received.filter((e) => e.type === 'session.status').length >= 3);
+    const states = relay.received.flatMap((e) =>
+      e.type === 'session.status' ? [e.payload.state] : [],
+    );
+    expect(states.slice(-2)).toEqual(['waiting_input', 'running']);
+  });
+
   // Refusing an over-full queue beats silently dropping the oldest — a full queue means nothing
   // is draining, and the sender needs to hear that rather than watch text vanish.
   it('refuses a new inject once the queue is full, naming why', async () => {
@@ -2203,6 +2224,38 @@ describe('Daemon lifecycle', () => {
       relay.received.some((e) => e.type === 'session.status' && e.payload.state === 'failed'),
     );
     expect(relay.received.some((e) => e.type === 'error')).toBe(false);
+  });
+
+  it('does not report a started spawn as failed when only its first registry write fails', async () => {
+    // The manager runs onStart before its first persist; a rejection after that leaves a live,
+    // piped session the phone already sees, so a spawn_failed would contradict it.
+    sessionManager.spawnManaged.mockImplementationOnce((opts: SpawnManagedOptions) => {
+      const handle = makeFakeHandle('spawned-session');
+      sessionManager.handles.set(handle.id, handle);
+      opts.onStart?.(handle);
+      return Promise.reject(new Error('EPERM: rename sessions.json'));
+    });
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-persist', prompt: 'go', idempotencyKey: 'k1' },
+    });
+    await waitFor(() =>
+      relay.received.some((e) => e.type === 'session.status' && e.payload.state === 'starting'),
+    );
+    // A second spawn failing before any handle exists: its error is ordered after anything the
+    // first spawn sent, so it is the proof the first sent nothing.
+    sessionManager.spawnManaged.mockRejectedValueOnce(new Error('no account available'));
+    const second = relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-pre', prompt: 'go', idempotencyKey: 'k2' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const errors = relay.received.filter((e) => e.type === 'error');
+    expect(errors).toHaveLength(1);
+    if (errors[0]?.type === 'error') expect(errors[0].payload.relatesTo).toBe(second.id);
   });
 
   it('stamps a stable per-run epoch on every session.output envelope', async () => {
@@ -2869,8 +2922,10 @@ describe('Daemon lifecycle', () => {
     const handle = sessionManager.get('orphan-1') as ReturnType<typeof makeFakeHandle> | undefined;
     expect(handle).toBeDefined();
     handle?.emit({ kind: 'status', state: 'running' });
-    await waitFor(() => relay.received.some((e) => e.type === 'session.status'));
-    const status = relay.received.find((e) => e.type === 'session.status');
+    const isRunning = (e: (typeof relay.received)[number]): boolean =>
+      e.type === 'session.status' && e.payload.state === 'running';
+    await waitFor(() => relay.received.some(isRunning));
+    const status = relay.received.find(isRunning);
     if (status?.type === 'session.status') {
       expect(status.payload).toMatchObject({
         sessionId: 'orphan-1',
@@ -3581,6 +3636,40 @@ describe('Daemon lifecycle', () => {
       expect(error.payload.code).toBe('resume_failed');
       expect(error.payload.message).toContain('no conversation on disk');
     }
+  });
+
+  it('does not report a re-attached orphan as failed when only its first registry write fails', async () => {
+    sessionManager.records.push(
+      { id: 'orphan-3', kind: 'managed', state: 'orphaned', startedAtMs: 0, resumeId: 'sdk-y' },
+      { id: 'orphan-4', kind: 'managed', state: 'orphaned', startedAtMs: 0, resumeId: 'sdk-z' },
+    );
+    sessionManager.resumeOrphan = (sessionId, opts) => {
+      // orphan-3 comes live then fails its persist; orphan-4 fails before any handle exists.
+      if (sessionId === 'orphan-4') return Promise.reject(new Error('no conversation on disk'));
+      const handle = makeFakeHandle(sessionId);
+      sessionManager.handles.set(sessionId, handle);
+      opts.onStart?.(handle);
+      return Promise.reject(new Error('EPERM: rename sessions.json'));
+    };
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'orphan-3', text: 'continue', idempotencyKey: 'k1' },
+    });
+    await waitFor(() =>
+      relay.received.some((e) => e.type === 'session.status' && e.payload.sessionId === 'orphan-3'),
+    );
+    // Ordered after anything the first re-attach sent, so it proves that one sent no error.
+    const second = relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'orphan-4', text: 'continue', idempotencyKey: 'k2' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const errors = relay.received.filter((e) => e.type === 'error');
+    expect(errors).toHaveLength(1);
+    if (errors[0]?.type === 'error') expect(errors[0].payload.relatesTo).toBe(second.id);
   });
 
   // ---- phone-initiated prune of dormant records ----

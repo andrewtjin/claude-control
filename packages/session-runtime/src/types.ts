@@ -176,7 +176,9 @@ export interface SessionHandle {
    *  nothing guarantees a subscriber added after that point sees earlier events. */
   onEvent(cb: (e: SessionEvent) => void): () => void;
   /** Feed more input into a running session (a phone-typed reply). Rejects if the
-   *  session cannot currently accept input (mid-turn, or already terminal). */
+   *  session cannot currently accept input (mid-turn, or already terminal). A session that has
+   *  reported `waiting_input` accepts it, even if the turn behind that status is still winding
+   *  down; the text then starts the next turn once it can. */
   send(text: string): Promise<void>;
   /** Best-effort cancellation of whatever the session is doing right now. Does not by
    *  itself end the session — it is the async equivalent of pressing Ctrl+C. */

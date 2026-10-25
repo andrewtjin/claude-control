@@ -297,13 +297,40 @@ const UsageSnapshotPayload = z.object({
 });
 
 /** The daemon's effective settings, resolved once at startup (flags and env are read only
- *  then, so the report is immutable for the life of the run). `startedAtMs` dates the
- *  report — the phone shows "as of daemon start", never pretending settings are live.
+ *  then). `startedAtMs` dates the report — the phone shows "as of daemon start". The one
+ *  exception is quiet mode, which `/quiet` and `cctl settings set quiet` change on the running
+ *  daemon: its row and `quiet` are rewritten and the snapshot re-sent at once.
  *  Exported (unlike the other payload schemas) because the daemon persists this exact
  *  shape to disk for `cctl settings`, which re-validates it with the same schema. */
 export const SettingsSnapshot = z.object({
   startedAtMs: z.number().int().nonnegative(),
   settings: z.array(SettingRow),
+  /** Whether Discord is in quiet mode (permission and question cards only, plus one final reply
+   *  per turn of a phone-started session). Machine-readable beside the display row because the bot
+   *  acts on it: its session planner drops state lines and summary cards, and `/quiet` reads it.
+   *  Absent from a daemon predating quiet mode — which is how `/quiet` knows that daemon cannot be
+   *  asked to change it, rather than sending a frame the older daemon would drop unanswered. */
+  quiet: z.boolean().nullish(),
+});
+
+/** Phone-initiated change of quiet mode (`/quiet on|off`). No idempotency key: the value is
+ *  absolute, so a replayed frame sets the same value again and changes nothing — and, as with
+ *  stats.request, a daemon that ignored a duplicate would strand the reply the phone is waiting on. */
+const SettingsQuietSetPayload = z.object({
+  requestId: RequestId,
+  quiet: z.boolean(),
+});
+
+/** The daemon's answer to settings.quiet.set, correlated by `requestId` because one Discord
+ *  interaction is waiting on it. `quiet` is the value in force AFTER the request — on a refusal
+ *  (the value is pinned by the daemon's environment, or could not be saved) that is the unchanged
+ *  value, so the reply can say what still holds. `message` is the daemon's own sentence for the
+ *  outcome, shown as is: only the daemon knows why it refused. */
+const SettingsQuietResultPayload = z.object({
+  requestId: RequestId,
+  ok: z.boolean(),
+  quiet: z.boolean(),
+  message: z.string(),
 });
 
 const SwitchCommandPayload = z.object({
@@ -541,6 +568,14 @@ const SessionSpawnPayload = z.object({
   idempotencyKey: IdempotencyKey,
 });
 
+/** Whether quiet mode was on when the daemon sent a session frame. That mode decided which lines
+ *  the daemon sent and which it dropped, so the bot plans each frame under it, not under the mode
+ *  in force when the frame arrives: a frame replayed from the outbox after a reconnect, or still
+ *  queued when the mode changed, was filtered under the older value. Additive + tolerant like
+ *  `epoch`: a daemon predating it omits it, and the bot falls back to that daemon's last settings
+ *  snapshot. */
+const SessionQuiet = z.boolean().nullish();
+
 /** Long output is a presentation problem, not a wire problem (decision: "no silent
  *  truncation"): the daemon streams ALL output as ordered `seq` chunks and never drops text;
  *  when accumulated output crosses its inline-display threshold the BOT re-materializes the
@@ -563,6 +598,7 @@ const SessionOutputPayload = z.object({
    *  Additive + tolerant like `permissionMode`/`notificationType`: a pre-epoch daemon omits it and
    *  a current bot must treat its absence exactly as today (no reset). */
   epoch: z.string().min(1).nullish(),
+  quiet: SessionQuiet,
 });
 
 /** Phone-initiated stop of a managed session. Deliberately minimal: escalation semantics
@@ -646,6 +682,7 @@ const SessionStatusPayload = z.object({
    *  resumed session into the original session's thread). Same additive + tolerant contract
    *  as its sibling. */
   resumedFrom: SessionId.nullish(),
+  quiet: SessionQuiet,
 });
 
 /** Widened (not split into done/waiting variants) on purpose: title/body/level stays the one
@@ -684,6 +721,10 @@ const HelloResultPayload = z.object({
   ok: z.boolean(),
   negotiatedVersion: z.number().int().positive().nullish(),
   error: z.string().nullish(),
+  /** The bot plans session frames stamped quiet: it posts a turn's whole reply from its summary
+   *  line, however long. Only then may a quiet daemon leave out the prose it streams as stdout —
+   *  an older bot clamps the summary to one message and needs that stdout for the rest. */
+  quietFrames: z.boolean().nullish(),
 });
 
 const PairClaimPayload = z.object({
@@ -741,6 +782,8 @@ export const messageSchemas = {
   'stats.request': frame('stats.request', TokenStatsRequestPayload),
   'stats.result': frame('stats.result', TokenStatsResultPayload),
   'settings.snapshot': frame('settings.snapshot', SettingsSnapshot),
+  'settings.quiet.set': frame('settings.quiet.set', SettingsQuietSetPayload),
+  'settings.quiet.result': frame('settings.quiet.result', SettingsQuietResultPayload),
   'switch.command': frame('switch.command', SwitchCommandPayload),
   'switch.result': frame('switch.result', SwitchResultPayload),
   'reauth.start': frame('reauth.start', ReauthStartPayload),
@@ -777,6 +820,8 @@ export const Envelope = z.discriminatedUnion('type', [
   messageSchemas['stats.request'],
   messageSchemas['stats.result'],
   messageSchemas['settings.snapshot'],
+  messageSchemas['settings.quiet.set'],
+  messageSchemas['settings.quiet.result'],
   messageSchemas['switch.command'],
   messageSchemas['switch.result'],
   messageSchemas['reauth.start'],

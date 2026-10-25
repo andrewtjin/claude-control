@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, link, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Paths } from '@claude-control/switch-engine';
@@ -24,8 +24,11 @@ import {
   layerFileEnv,
   markPendingRestart,
   persistDaemonSetting,
+  quietPinnedByEnv,
   readDaemonConfigFile,
   readSettingsReport,
+  renderSettingApplied,
+  renderSettingClearedLive,
   renderSettingForgotten,
   renderSettingSaved,
   renderSettings,
@@ -114,6 +117,7 @@ describe('resolveDaemonConfig', () => {
       waitingCards: false,
       permissionHoldMs: undefined,
       commandOutputCards: true,
+      discordQuiet: true,
       fullToolOutput: false,
       identityCheck: true,
       autoContinue: true,
@@ -229,6 +233,44 @@ describe('resolveDaemonConfig', () => {
     const { values, rows } = resolveDaemonConfig({ CCTL_WAITING_CARDS: '1' });
     expect(values.waitingCards).toBe(true);
     expect(row(rows, 'waiting cards')).toMatchObject({ value: 'on', source: 'env' });
+  });
+
+  it('runs Discord quiet mode by default, and says it wins over the card knobs', () => {
+    const { values, rows } = resolveDaemonConfig({});
+    expect(values.discordQuiet).toBe(true);
+    expect(row(rows, 'discord quiet')).toMatchObject({ value: 'on', source: 'default' });
+    const detail = row(rows, 'discord quiet').detail ?? '';
+    for (const knob of ['CCTL_DISCORD_QUIET', 'command-output', 'waiting-cards', 'full-output']) {
+      expect(detail).toContain(knob);
+    }
+  });
+
+  it('turns quiet mode off from the environment or the file, naming the layer', () => {
+    const fromEnv = resolveDaemonConfig({ CCTL_DISCORD_QUIET: 'off' });
+    expect(fromEnv.values.discordQuiet).toBe(false);
+    expect(row(fromEnv.rows, 'discord quiet')).toMatchObject({ value: 'off', source: 'env' });
+    const fromFile = resolveDaemonConfig({}, {}, { env: { CCTL_DISCORD_QUIET: 'off' } });
+    expect(fromFile.values.discordQuiet).toBe(false);
+    expect(row(fromFile.rows, 'discord quiet')).toMatchObject({ value: 'off', source: 'config' });
+    // The environment still wins over the file.
+    const both = resolveDaemonConfig(
+      { CCTL_DISCORD_QUIET: 'on' },
+      {},
+      { env: { CCTL_DISCORD_QUIET: 'off' } },
+    );
+    expect(row(both.rows, 'discord quiet')).toMatchObject({ value: 'on', source: 'env' });
+    // A typo in the environment falls back to the default value, but the environment still pins
+    // it (the live control refuses a change), so the row names the environment.
+    const typo = resolveDaemonConfig({ CCTL_DISCORD_QUIET: 'nope' });
+    expect(row(typo.rows, 'discord quiet')).toMatchObject({ value: 'on', source: 'env' });
+    // A typo only in the file pins nothing: the default is what is in force.
+    const fileTypo = resolveDaemonConfig({}, {}, { env: { CCTL_DISCORD_QUIET: 'nope' } });
+    expect(row(fileTypo.rows, 'discord quiet')).toMatchObject({ value: 'on', source: 'default' });
+  });
+
+  it('settles quiet mode under the short alias `quiet`', () => {
+    expect(findDaemonEnvSetting('quiet')?.name).toBe('CCTL_DISCORD_QUIET');
+    expect(findDaemonEnvSetting('CCTL_DISCORD_QUIET')?.alias).toBe('quiet');
   });
 
   it('silences command output cards via CCTL_COMMAND_OUTPUT=off (a default-on knob)', () => {
@@ -703,6 +745,25 @@ describe('settings report file', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('replaces the report whole rather than rewriting it in place', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-settings-'));
+    try {
+      const file = join(dir, 'daemon-settings.json');
+      const before = { startedAtMs: 1, settings: [], quiet: true };
+      const after = { startedAtMs: 1, settings: [], quiet: false };
+      await writeSettingsReport(file, before);
+      // A second name for the old file: an in-place rewrite (truncate, then write — the window a
+      // concurrent reader can catch empty) changes what it reads; a whole replacement does not.
+      const held = join(dir, 'held.json');
+      await link(file, held);
+      await writeSettingsReport(file, after);
+      expect(await readSettingsReport(file)).toEqual(after);
+      expect(await readSettingsReport(held)).toEqual(before);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 /** Every CCTL_ name the daemon rows tell an operator about. */
@@ -850,6 +911,20 @@ describe('config.json env block', () => {
     expect(env).toEqual({ OTHER: 'x' });
     expect(applyFileEnv(env, file)).toBe(env);
     expect(env).toEqual({ OTHER: 'x', ...file });
+  });
+
+  it("keeps the file's quiet mode out of the daemon's own environment, which children inherit", () => {
+    const file = { CCTL_AUTOSWITCH: 'off', CCTL_DISCORD_QUIET: 'off' };
+    const env: NodeJS.ProcessEnv = {};
+    applyFileEnv(env, file);
+    // A daemon restarted from one of its sessions must not read this copy as a shell pin.
+    expect(env).toEqual({ CCTL_AUTOSWITCH: 'off' });
+    expect(quietPinnedByEnv(env)).toBe(false);
+    // The resolver still layers it, and a value the shell really set is left in place.
+    expect(layerFileEnv({}, file).CCTL_DISCORD_QUIET).toBe('off');
+    const pinned: NodeJS.ProcessEnv = { CCTL_DISCORD_QUIET: 'on' };
+    applyFileEnv(pinned, file);
+    expect(pinned.CCTL_DISCORD_QUIET).toBe('on');
   });
 
   it('is read one known entry at a time, dropping blank, non-string and unknown ones', async () => {
@@ -1356,5 +1431,59 @@ describe('fileSettingNames', () => {
       }),
     ).toEqual(['CCTL_AUTOSWITCH_ON_FABLE_CAP', 'CCTL_AUTOSWITCH_TRIGGER_PCT']);
     expect(fileSettingNames({ relayUrl: 'wss://a.example' })).toEqual(['CCTL_RELAY_URL']);
+  });
+});
+
+describe('renderSettingApplied', () => {
+  const quiet = findDaemonEnvSetting('quiet') as DaemonEnvSetting;
+
+  it('says a live set is in force now and saved, with no restart to suggest', () => {
+    const text = renderSettingApplied(quiet, 'off', 'cfg.json');
+    expect(text).toBe(
+      'Saved CCTL_DISCORD_QUIET=off to cfg.json; the running daemon applied it now.\n',
+    );
+    expect(text).not.toContain('restart');
+  });
+});
+
+describe('renderSettingClearedLive', () => {
+  const quiet = findDaemonEnvSetting('quiet') as DaemonEnvSetting;
+
+  it('says a live unset puts the running daemon back on the default', () => {
+    const cleared =
+      'Cleared CCTL_DISCORD_QUIET from cfg.json; the running daemon is back on the default now.\n';
+    expect(renderSettingClearedLive(quiet, 'cfg.json', { removed: true, pinned: false })).toBe(
+      cleared,
+    );
+    // A daemon that does not say what it removed is taken at its word.
+    expect(renderSettingClearedLive(quiet, 'cfg.json', {})).toBe(cleared);
+  });
+
+  it('reads an unset with nothing to remove exactly as it does with no daemon running', () => {
+    expect(renderSettingClearedLive(quiet, 'cfg.json', { removed: false, pinned: false })).toBe(
+      renderSettingForgotten(quiet, 'cfg.json', false),
+    );
+  });
+
+  it('says the default is in force when the entry was already gone but the daemon moved', () => {
+    expect(
+      renderSettingClearedLive(quiet, 'cfg.json', { removed: false, pinned: false, changed: true }),
+    ).toBe(
+      'CCTL_DISCORD_QUIET is not set in cfg.json; the running daemon is back on the default now.\n',
+    );
+    expect(
+      renderSettingClearedLive(quiet, 'cfg.json', {
+        removed: false,
+        pinned: false,
+        changed: false,
+      }),
+    ).toBe(renderSettingForgotten(quiet, 'cfg.json', false));
+  });
+
+  it('names the environment as what stays in force when it pins the value', () => {
+    expect(renderSettingClearedLive(quiet, 'cfg.json', { removed: true, pinned: true })).toBe(
+      "Removed CCTL_DISCORD_QUIET from cfg.json; the daemon's environment still sets " +
+        'CCTL_DISCORD_QUIET, so that value stays in force.\n',
+    );
   });
 });

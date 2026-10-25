@@ -27,6 +27,10 @@ import {
   handleReauthSubmit,
   rejectThreadHereChannel,
   buildThreadHereResult,
+  buildQuietSetResult,
+  handleQuietSet,
+  handleQuietShow,
+  QUIET_OLD_DAEMON_MESSAGE,
   type CommandDeps,
   type ThreadHereChannelFacts,
   type ThreadHereRejection,
@@ -958,5 +962,159 @@ describe('buildThreadHereResult — a deployment that cannot read thread replies
     const result = buildThreadHereResult({ kind: 'pinned', channelId: CHANNEL }, true);
     expect(result.kind === 'text' && result.text).not.toContain('not read');
     expect(result).toEqual(buildThreadHereResult({ kind: 'pinned', channelId: CHANNEL }));
+  });
+});
+
+describe('/quiet', () => {
+  /** Deps for one user whose daemon is online, with its last settings snapshot cached when given:
+   *  `quiet` undefined models a daemon from before quiet mode (no field at all). */
+  function quietDeps(snapshot?: { quiet?: boolean; source?: 'default' | 'config' | 'env' }) {
+    const { relay, sent } = createFakeRelay({ online: { 'user-a': 'daemon-1' } });
+    const deps = makeDeps(relay);
+    if (snapshot !== undefined) {
+      deps.cache.record('user-a', {
+        v: 1,
+        id: 'x',
+        ts: 0,
+        daemonId: 'daemon-1',
+        type: 'settings.snapshot',
+        payload: {
+          startedAtMs: 1,
+          settings: [
+            {
+              name: 'discord quiet',
+              value: snapshot.quiet === false ? 'off' : 'on',
+              source: snapshot.source ?? 'default',
+            },
+          ],
+          ...(snapshot.quiet !== undefined ? { quiet: snapshot.quiet } : {}),
+        },
+      });
+    }
+    return { deps, sent };
+  }
+
+  describe('show', () => {
+    it('reports the value the daemon last sent, what it means, and how to flip it', () => {
+      const on = handleQuietShow(quietDeps({ quiet: true }).deps, 'user-a');
+      expect(on).toMatchObject({ kind: 'text' });
+      if (on.kind === 'text') {
+        expect(on.text).toMatch(/^Quiet mode is on: Discord gets only permission and question/);
+        expect(on.text).toContain('`/quiet action:off` turns it off.');
+      }
+      const off = handleQuietShow(quietDeps({ quiet: false }).deps, 'user-a');
+      if (off.kind === 'text') {
+        expect(off.text).toMatch(/^Quiet mode is off: Discord gets every card/);
+        expect(off.text).toContain('`/quiet action:on` turns it on.');
+      }
+    });
+
+    it('says when the daemon environment pins it, instead of offering a change that would fail', () => {
+      const r = handleQuietShow(quietDeps({ quiet: true, source: 'env' }).deps, 'user-a');
+      if (r.kind !== 'text') throw new Error('expected text');
+      expect(r.text).toContain('can only be changed there');
+      expect(r.text).not.toContain('/quiet action');
+    });
+
+    it('says the daemon has not reported in when there is no snapshot', () => {
+      expect(handleQuietShow(quietDeps().deps, 'user-a')).toEqual({
+        kind: 'error',
+        message: 'No settings yet — the daemon has not reported in.',
+      });
+    });
+
+    it('tells the user to update cctl when the daemon predates quiet mode', () => {
+      expect(handleQuietShow(quietDeps({}).deps, 'user-a')).toEqual({
+        kind: 'error',
+        message: QUIET_OLD_DAEMON_MESSAGE,
+      });
+    });
+  });
+
+  describe('on / off', () => {
+    it("sends settings.quiet.set to the user's own daemon", () => {
+      const { deps, sent } = quietDeps({ quiet: true });
+      expect(handleQuietSet(deps, 'user-a', false, 'req-1')).toEqual({
+        kind: 'text',
+        text: 'Turning quiet mode off…',
+      });
+      expect(sent).toEqual([
+        {
+          discordUserId: 'user-a',
+          daemonId: 'daemon-1',
+          draft: {
+            daemonId: 'daemon-1',
+            type: 'settings.quiet.set',
+            payload: { requestId: 'req-1', quiet: false },
+          },
+        },
+      ]);
+    });
+
+    it('never sends to a daemon that predates quiet mode — nothing would ever answer', () => {
+      const { deps, sent } = quietDeps({});
+      expect(handleQuietSet(deps, 'user-a', false, 'req-1')).toEqual({
+        kind: 'error',
+        message: QUIET_OLD_DAEMON_MESSAGE,
+      });
+      expect(sent).toEqual([]);
+    });
+
+    it('never sends before the daemon has reported in', () => {
+      const { deps, sent } = quietDeps();
+      expect(handleQuietSet(deps, 'user-a', true, 'req-1').kind).toBe('error');
+      expect(sent).toEqual([]);
+    });
+
+    it('reports a daemon that went offline as the relay error', () => {
+      const { relay } = createFakeRelay({ online: {} });
+      const deps = makeDeps(relay);
+      deps.cache.record('user-a', {
+        v: 1,
+        id: 'x',
+        ts: 0,
+        daemonId: 'daemon-1',
+        type: 'settings.snapshot',
+        payload: { startedAtMs: 1, settings: [], quiet: true },
+      });
+      expect(handleQuietSet(deps, 'user-a', false, 'req-1')).toEqual({
+        kind: 'error',
+        message: 'no daemon is paired to this account',
+      });
+    });
+  });
+
+  describe('buildQuietSetResult', () => {
+    const result = (ok: boolean, quiet: boolean, message: string) =>
+      ({ kind: 'result', payload: { requestId: 'r', ok, quiet, message } }) as const;
+
+    it("shows the daemon's sentence and what the new value means", () => {
+      expect(buildQuietSetResult(result(true, false, 'Quiet mode is now off.'), 15_000)).toEqual({
+        kind: 'text',
+        text:
+          'Quiet mode is now off. Discord gets every card: done cards, command output, session ' +
+          'progress lines and daemon notices.',
+      });
+    });
+
+    it("shows a refusal in the daemon's own words, with the value that still holds", () => {
+      expect(buildQuietSetResult(result(false, true, 'It is pinned.'), 15_000)).toEqual({
+        kind: 'error',
+        message: 'It is pinned. Quiet mode is still on.',
+      });
+    });
+
+    it('turns a timeout into an honest "may not have changed", never a hang', () => {
+      const r = buildQuietSetResult({ kind: 'timeout' }, 15_000);
+      expect(r.kind).toBe('error');
+      if (r.kind === 'error') {
+        expect(r.message).toContain('within 15s');
+        expect(r.message).toContain('/quiet action:show');
+      }
+    });
+
+    it('turns a full waiter into try-again', () => {
+      expect(buildQuietSetResult({ kind: 'busy' }, 15_000).kind).toBe('error');
+    });
   });
 });

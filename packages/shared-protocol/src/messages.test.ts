@@ -1046,3 +1046,133 @@ describe('session.status slot (additive, N/N-1 tolerant)', () => {
     expect(decode(rawFrame('session.status', { ...base, slot: '' })).ok).toBe(false);
   });
 });
+
+describe('quiet mode (settings.snapshot.quiet, settings.quiet.set / .result)', () => {
+  const snapshot = {
+    startedAtMs: 1,
+    settings: [{ name: 'x', value: 'on', source: 'default' as const }],
+  };
+
+  it('parses a snapshot without quiet: a daemon predating quiet mode stays valid', () => {
+    const result = decode(rawFrame('settings.snapshot', snapshot));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'settings.snapshot')) {
+      // Absence is the signal /quiet reads to tell an older daemon apart, so it must survive.
+      expect(result.envelope.payload.quiet ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('carries quiet through a snapshot round-trip', () => {
+    const env = stamp({
+      daemonId: 'daemon-1',
+      type: 'settings.snapshot',
+      payload: { ...snapshot, quiet: true },
+    });
+    const result = decode(encode(env));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'settings.snapshot')) {
+      expect(result.envelope.payload.quiet).toBe(true);
+    }
+  });
+
+  it('round-trips a set and its result', () => {
+    const set = decode(rawFrame('settings.quiet.set', { requestId: 'req-1', quiet: false }));
+    expect(set.ok).toBe(true);
+    const result = decode(
+      rawFrame('settings.quiet.result', {
+        requestId: 'req-1',
+        ok: false,
+        quiet: true,
+        message: 'pinned',
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'settings.quiet.result')) {
+      expect(result.envelope.payload).toEqual({
+        requestId: 'req-1',
+        ok: false,
+        quiet: true,
+        message: 'pinned',
+      });
+    }
+  });
+
+  it('rejects a set without a boolean value — "toggle" is not a wire meaning', () => {
+    expect(decode(rawFrame('settings.quiet.set', { requestId: 'req-1' })).ok).toBe(false);
+    expect(decode(rawFrame('settings.quiet.set', { requestId: 'req-1', quiet: 'on' })).ok).toBe(
+      false,
+    );
+  });
+
+  it('rejects a result without the value in force — the reply must say what holds', () => {
+    expect(
+      decode(rawFrame('settings.quiet.result', { requestId: 'req-1', ok: true, message: 'ok' })).ok,
+    ).toBe(false);
+  });
+
+  it('both are registered in the schema map and the Envelope union', () => {
+    expect(isMessageType('settings.quiet.set')).toBe(true);
+    expect(isMessageType('settings.quiet.result')).toBe(true);
+    const set = Envelope.safeParse({
+      v: PROTOCOL_VERSION,
+      id: 'msg-1',
+      ts: 1,
+      daemonId: 'daemon-1',
+      type: 'settings.quiet.set',
+      payload: { requestId: 'req-1', quiet: true },
+    });
+    expect(set.success).toBe(true);
+  });
+});
+
+describe('session frame quiet flag (additive, N/N-1 tolerant)', () => {
+  const output = { sessionId: 's1', seq: 0, kind: 'summary', text: 'done', truncated: false };
+  const status = { sessionId: 's1', state: 'running' };
+
+  it('parses session frames without it: a daemon predating the flag stays valid', () => {
+    for (const [type, payload] of [
+      ['session.output', output],
+      ['session.status', status],
+    ] as const) {
+      const result = decode(rawFrame(type, payload));
+      expect(result.ok).toBe(true);
+      if (
+        result.ok &&
+        (isType(result.envelope, 'session.output') || isType(result.envelope, 'session.status'))
+      ) {
+        expect(result.envelope.payload.quiet ?? undefined).toBeUndefined();
+      }
+    }
+  });
+
+  it('carries the flag through both frame types', () => {
+    const out = decode(rawFrame('session.output', { ...output, quiet: true }));
+    const st = decode(rawFrame('session.status', { ...status, quiet: false }));
+    expect(out.ok && isType(out.envelope, 'session.output') && out.envelope.payload.quiet).toBe(
+      true,
+    );
+    expect(st.ok && isType(st.envelope, 'session.status') && st.envelope.payload.quiet).toBe(false);
+  });
+
+  it('rejects a non-boolean flag', () => {
+    expect(decode(rawFrame('session.output', { ...output, quiet: 'on' })).ok).toBe(false);
+  });
+});
+
+describe('hello.result quietFrames (additive, N/N-1 tolerant)', () => {
+  it('parses a result without it: a bot predating quiet frames stays valid and reads as unable', () => {
+    const result = decode(rawFrame('hello.result', { ok: true, negotiatedVersion: 1 }));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'hello.result')) {
+      expect(result.envelope.payload.quietFrames ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('carries the flag, and rejects a non-boolean one', () => {
+    const result = decode(rawFrame('hello.result', { ok: true, quietFrames: true }));
+    expect(
+      result.ok && isType(result.envelope, 'hello.result') && result.envelope.payload.quietFrames,
+    ).toBe(true);
+    expect(decode(rawFrame('hello.result', { ok: true, quietFrames: 'yes' })).ok).toBe(false);
+  });
+});

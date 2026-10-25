@@ -566,6 +566,8 @@ export class RelayServer implements RelaySender {
     if (result.negotiatedVersion !== undefined)
       payload.negotiatedVersion = result.negotiatedVersion;
     if (result.error !== undefined) payload.error = result.error;
+    // This bot's planner splits a quiet turn's reply across messages (see sessionPlanner).
+    if (result.ok) payload.quietFrames = true;
     socket.send(encode(stamp({ daemonId, type: 'hello.result', payload })));
   }
 

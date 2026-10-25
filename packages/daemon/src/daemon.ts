@@ -106,6 +106,7 @@ import {
   type ScopeView,
 } from './exhaustionLog.js';
 import { folderNameOf, globalSlotAccountIds, rulesPictureOf } from './folderSlots.js';
+import { quietDropsNotice, type QuietControl, type QuietSetResult } from './quietMode.js';
 import type { Store } from './store.js';
 import { slotBySessionMap } from './store.js';
 import {
@@ -251,9 +252,13 @@ export interface DaemonOptions {
    *  executor; absent everywhere = the executor's own defaults. */
   autoSwitchPolicy?: AutoSwitchPolicy;
   /** The effective-settings report resolved at startup (see cli/settings.ts). When present
-   *  it is re-pushed with every poll cycle — settings never change mid-run, but the bot's
-   *  cache is in-memory, so the repeat is what survives a bot restart. */
+   *  it is re-pushed with every poll cycle — the bot's cache is in-memory, so the repeat is what
+   *  survives a bot restart — and at once whenever quiet mode changes (see {@link quiet}). */
   settingsReport?: PayloadOf<'settings.snapshot'>;
+  /** Discord quiet mode, live (see quietMode.ts). Read on every managed-session event and every
+   *  fleet notice, and changed by the phone's `settings.quiet.set` and the CLI's
+   *  `/cli/settings/quiet`. Absent: never quiet, and a request to change it is refused. */
+  quiet?: QuietControl;
   /** Real Agent SDK adapter (live boundary), overridable so tests never touch a real SDK. The
    *  optional `configDir` binds the spawned session's `CLAUDE_CONFIG_DIR` to a folder-bound group's
    *  profile dir; absent, the session runs in the shared/global config dir (the historical model).
@@ -788,7 +793,15 @@ export class Daemon {
   private leaseSweep: Promise<void> | undefined;
   private readonly accountProbe: AccountProbeLike | undefined;
   private readonly autoSwitchPolicy: AutoSwitchPolicy;
-  private readonly settingsReport: PayloadOf<'settings.snapshot'> | undefined;
+  /** Not readonly: a quiet-mode change replaces it with the report the control rewrote. */
+  private settingsReport: PayloadOf<'settings.snapshot'> | undefined;
+  private readonly quiet: QuietControl | undefined;
+  /** Quiet mode only: the latest error line of each managed session's turn, held back instead of
+   *  posted. A turn that dies of an error event or a thrown stream reports its reason as an error
+   *  line and then goes `failed`; that line is the turn's outcome, so it is posted when the session
+   *  fails — and dropped when the turn ends any other way (prose lines that merely mention an
+   *  error are classified the same, and must stay off the phone). */
+  private readonly quietHeldErrors = new Map<string, string>();
   private readonly createAgentSdkClient: (
     configDir?: string,
     scrubInheritedConfigDir?: boolean,
@@ -1003,6 +1016,7 @@ export class Daemon {
     // is reading the executor's policy, not a second one that can drift from it.
     this.autoSwitchPolicy = options.autoSwitchPolicy ?? options.poller.autoSwitchPolicy ?? {};
     this.settingsReport = options.settingsReport;
+    this.quiet = options.quiet;
     // The default adapter binds the config dir when one is given (a folder-bound spawn), else runs
     // in the shared config dir. The composition root's factory (makeAgentSdkClientFactory) does the
     // same; this fallback keeps a bare `new Daemon` working in tests.
@@ -1137,6 +1151,9 @@ export class Daemon {
     this.hookReceiver.setChannelHandlers(this.channelHandlers());
     // …and for an on-demand usage refresh: the receiver owns the route, this class owns the poller.
     this.hookReceiver.setUsageHandlers({ repollUsage: (ids) => this.repollUsage(ids) });
+    // …and for a live quiet-mode change from `cctl settings set|unset quiet`: one path with the
+    // phone's, so both re-send the settings snapshot the same way.
+    this.hookReceiver.setSettingsHandlers({ setQuiet: (value) => this.setQuiet(value) });
 
     const hookPort = await this.hookReceiver.listen(0);
 
@@ -1235,6 +1252,25 @@ export class Daemon {
           this.logger.error({ err }, 'error handling stats.request');
         });
       },
+      onQuietSet: (msg) => {
+        this.handleQuietSet(msg).catch((err: unknown) => {
+          this.logger.error({ err }, 'error handling settings.quiet.set');
+        });
+      },
+      // The bot holds the settings report in memory only, and `/settings` and `/quiet` read it — so
+      // every new connection opens with it rather than leaving a restarted bot without it until
+      // the next poll cycle. Session frames do not depend on its order: each carries the quiet
+      // mode it was sent under.
+      onOpen: () =>
+        this.settingsReport
+          ? [
+              {
+                type: 'settings.snapshot',
+                payload: this.settingsReport,
+                daemonId: this.controlPlaneClient.getIdentity()?.daemonId ?? 'unknown',
+              },
+            ]
+          : [],
     });
 
     // Kicked off NOW (so identity load and the socket come up concurrently with the local
@@ -1612,12 +1648,9 @@ export class Daemon {
       });
     });
 
-    // Piggyback the (static) effective-settings report on the usage cadence: a tiny frame,
-    // and re-sending keeps `/settings` answerable even after the bot restarts and loses its
-    // in-memory cache.
-    if (this.settingsReport) {
-      this.sendEnvelope({ type: 'settings.snapshot', payload: this.settingsReport });
-    }
+    // Piggyback the effective-settings report on the usage cadence: a tiny frame, and re-sending
+    // keeps `/settings` answerable even after the bot restarts and loses its in-memory cache.
+    this.sendSettingsSnapshot();
 
     // Auto-switch runs AFTER the snapshot ships, so the phone always sees the usage state
     // that triggered a hop before the hop's own switch.result arrives. AutoSwitcher absorbs
@@ -2281,6 +2314,90 @@ export class Daemon {
     } finally {
       this.statsScanInFlight = false;
     }
+  }
+
+  /** Whether Discord is in quiet mode right now (see quietMode.ts). */
+  private isQuiet(): boolean {
+    return this.quiet?.isQuiet() ?? false;
+  }
+
+  /** Whether a session's frames go out quiet: quiet mode is on AND the bot can plan them. An older
+   *  bot clamps the summary that is a quiet turn's only reply to one message, so it gets the full
+   *  stream instead — frames stamped not quiet, which it would plan that way anyway. The daemon's
+   *  own notices need no bot support to be left out, so they follow quiet mode alone. */
+  private quietSessionFrames(): boolean {
+    return this.isQuiet() && this.controlPlaneClient.botPlansQuietFrames();
+  }
+
+  /** Push the current settings report, when there is one. Shared by the poll cycle's repeat and a
+   *  live quiet-mode change, so `/settings` and the bot's planner read the same report either way. */
+  private sendSettingsSnapshot(): void {
+    if (this.settingsReport) {
+      this.sendEnvelope({ type: 'settings.snapshot', payload: this.settingsReport });
+    }
+  }
+
+  /**
+   * Change quiet mode on this daemon — the one path behind the phone's `/quiet` and the CLI's
+   * `cctl settings set|unset quiet`. The control persists the value and rewrites the report; on a
+   * change this re-sends the report at once, so the phone reflects it without waiting for the next
+   * poll cycle. Never throws: a control that rejects is reported as a failed save, because the
+   * caller is a person waiting on a reply.
+   */
+  private async setQuiet(value: boolean | undefined): Promise<QuietSetResult> {
+    const control = this.quiet;
+    if (control === undefined) {
+      return {
+        ok: false,
+        quiet: false,
+        reason: 'unsupported',
+        message: 'this daemon cannot change quiet mode while it runs',
+      };
+    }
+    let result: QuietSetResult;
+    try {
+      result = await control.set(value);
+    } catch (err) {
+      this.logger.warn({ err }, 'quiet mode change failed');
+      return {
+        ok: false,
+        quiet: control.isQuiet(),
+        reason: 'persist_failed',
+        message: 'quiet mode could not be saved on the host; nothing changed',
+      };
+    }
+    if (result.ok) {
+      // Re-sent even when the value held: the row's source still moves (default to config, or
+      // back), and the bot's /settings must read the same as `cctl settings` now.
+      this.settingsReport = result.report;
+      this.sendSettingsSnapshot();
+      this.logger.info({ quiet: result.quiet, changed: result.changed }, 'quiet mode set');
+    } else {
+      this.logger.info({ reason: result.reason }, 'quiet mode change refused');
+    }
+    return result;
+  }
+
+  /** Phone-initiated `/quiet on|off`. A request/reply like stats.request: one Discord interaction
+   *  is waiting, so every path ends in exactly one `settings.quiet.result` carrying the requestId.
+   *  The snapshot (re-sent by setQuiet) goes out first, so the bot's cache is current
+   *  by the time it renders the reply. */
+  private async handleQuietSet(msg: MessageOf<'settings.quiet.set'>): Promise<void> {
+    const { requestId, quiet } = msg.payload;
+    const result = await this.setQuiet(quiet);
+    this.sendEnvelope({
+      type: 'settings.quiet.result',
+      payload: result.ok
+        ? {
+            requestId,
+            ok: true,
+            quiet: result.quiet,
+            message: result.changed
+              ? `Quiet mode is now ${result.quiet ? 'on' : 'off'}.`
+              : `Quiet mode was already ${result.quiet ? 'on' : 'off'}.`,
+          }
+        : { requestId, ok: false, quiet: result.quiet, message: result.message },
+    });
   }
 
   /** One transcript scan turned into a wire-ready snapshot — the single place a window becomes
@@ -3225,6 +3342,9 @@ export class Daemon {
         return;
       }
     }
+    // Set once the resumed handle's pipes are attached: from then on the session reports itself,
+    // so a later failure (its first registry write) must not also reach the phone as an error.
+    let attached = false;
     try {
       // Re-attach on the SAME slot the session ran on: bind its account's config dir (a group
       // profile for a reserved member, else the shared config dir) so a resumed folder-bound
@@ -3233,18 +3353,37 @@ export class Daemon {
         record.accountId !== undefined && this.switchEngine.configDirForAccount !== undefined
           ? await this.switchEngine.configDirForAccount(record.accountId).catch(() => undefined)
           : undefined;
-      const resumed = await this.sessionManager.resumeOrphan(sessionId, {
+      // Resolved before the resume: the pipes attach the moment the handle exists, and every
+      // frame they forward carries the slot.
+      const slot =
+        configDir !== undefined && this.switchEngine.slotForConfigDir !== undefined
+          ? await this.switchEngine.slotForConfigDir(configDir)
+          : undefined;
+      await this.sessionManager.resumeOrphan(sessionId, {
         client: this.createAgentSdkClient(configDir),
         prompt: text,
         permissionMode: MANAGED_SESSION_PERMISSION_MODE,
         ...(this.autoContinue !== undefined ? { autoContinue: this.autoContinue } : {}),
+        // Attached before the resumed turn can run: a turn that fails at once reaches the phone
+        // with the error that explains it, not as a bare failed state.
+        onStart: (resumed) => {
+          if (slot !== undefined) this.sessionSlots.set(resumed.id, slot);
+          const onEvent = this.attachSessionPipes(resumed, record.accountId);
+          attached = true;
+          // The runtime only emits on a change, so without this frame the phone keeps the
+          // crashed run's last state (usually waiting_input) until the first SDK event, and a
+          // stop in that window would read as waiting_input -> done with no outcome line.
+          onEvent({ kind: 'status', state: resumed.getState() });
+        },
       });
-      if (configDir !== undefined && this.switchEngine.slotForConfigDir !== undefined) {
-        this.sessionSlots.set(resumed.id, await this.switchEngine.slotForConfigDir(configDir));
-      }
-      this.attachSessionPipes(resumed, record.accountId);
       this.logger.info({ sessionId }, 'orphaned session re-attached for an operator prompt');
     } catch (err) {
+      // The session is live and on the phone; the manager's next state-changing write retries
+      // the registry, so this is only worth a log line.
+      if (attached) {
+        this.logger.warn({ sessionId, err }, 're-attached session failed its first registry write');
+        return;
+      }
       // Un-resumable (e.g. no persisted resumeId): logged, the record stays 'orphaned' on
       // disk, and the phone is told — degraded but honest, never a crashed dispatch loop.
       this.logger.warn({ sessionId, err }, 'orphaned session could not be re-attached');
@@ -3380,14 +3519,14 @@ export class Daemon {
     });
   }
 
-  /** Forget a dead session's queued text. Nothing can deliver it once the handle is gone, and a
-   *  queue that outlives its session is just a leak wearing a promise. */
+  /** Forget a dead or stopping session's queued text. Nothing can deliver it once the handle is
+   *  gone, and a queue that outlives its session is just a leak wearing a promise. */
   private dropManagedInjects(sessionId: string): void {
     const dropped = this.pendingManagedInjects.get(sessionId)?.length ?? 0;
     if (dropped === 0) return;
     this.pendingManagedInjects.delete(sessionId);
     this.store.deletePendingSteeringForSession(sessionId, MANAGED_STEERING_KIND);
-    this.logger.warn({ sessionId, dropped }, 'dropped queued prompt.inject for an ended session');
+    this.logger.warn({ sessionId, dropped }, 'dropped queued prompt.inject for an ending session');
   }
 
   private queueSteering(msg: MessageOf<'prompt.inject'>, tracked: TrackedInteractiveSession): void {
@@ -4064,13 +4203,14 @@ export class Daemon {
    * whatever happens next. Everything that goes wrong AFTER a handle exists already reaches the
    * phone — the session's own event stream carries it as text plus a `failed` status, which is
    * how an unauthenticated spawn surfaces "Not logged in · Please run /login". Everything that
-   * goes wrong BEFORE one exists (the registry failing to load, its first persist failing, the
-   * SDK adapter refusing to construct) had no channel at all and died in the daemon's log,
-   * leaving the phone on that ack forever with nothing to retry and nothing to read.
+   * goes wrong BEFORE one exists (the registry failing to load, the SDK adapter refusing to
+   * construct) had no channel at all and died in the daemon's log, leaving the phone on that ack
+   * forever with nothing to retry and nothing to read.
    *
    * So this window gets an explicit envelope, exactly like the un-resumable orphan above. It
-   * stays a NARROW catch — once `attachSessionPipes` has run, the handle owns its own reporting
-   * and a second channel would double-report the same failure.
+   * stays NARROW — once `attachSessionPipes` has run, the handle owns its own reporting and a
+   * second channel would double-report or contradict it. The manager's first registry write
+   * runs after that point, so its failure is logged, never sent.
    */
   private async handleSessionSpawn(msg: MessageOf<'session.spawn'>): Promise<void> {
     const { requestId, prompt, resumeSessionId, cwd, accountId } = msg.payload;
@@ -4126,7 +4266,8 @@ export class Daemon {
     // group's live member the resolver chose, not the (absent) payload account.
     const spawnAccountId = spawnSlot.accountId;
 
-    let handle: SessionHandle;
+    // Set once the handle's pipes are attached — the line the catch below must not cross.
+    let attached = false;
     try {
       const resumeAnchor = this.resolveSpawnResumeAnchor(resumeSessionId ?? undefined);
       // A global spawn (no bound config dir) must not silently run on a group profile that a
@@ -4137,7 +4278,18 @@ export class Daemon {
         spawnSlot.configDir === undefined &&
         (await this.slotForSessionConfigDir(process.env.CLAUDE_CONFIG_DIR)) !== 'global';
       const client = this.createAgentSdkClient(spawnSlot.configDir, scrubInheritedConfigDir);
-      handle = await this.sessionManager.spawnManaged({
+      // The spawn origin rides every status frame the new session emits (see
+      // forwardSessionEvent): a spawn mints a sessionId the requester has no other way to
+      // learn, and the bot needs the link to keep a resumed conversation in the thread the
+      // user typed into. `resumedFrom` echoes the CALLER'S ref (the wire id it knows), never
+      // the resolved SDK anchor.
+      const origin = {
+        requestId,
+        ...(resumeSessionId !== undefined && resumeSessionId !== null
+          ? { resumedFrom: resumeSessionId }
+          : {}),
+      };
+      await this.sessionManager.spawnManaged({
         client,
         prompt,
         // Always 'default' so remote approve/deny actually works — see the constant's decision
@@ -4147,8 +4299,38 @@ export class Daemon {
         ...(cwd !== undefined && cwd !== null ? { cwd } : {}),
         ...(spawnAccountId !== undefined ? { accountId: spawnAccountId } : {}),
         ...(this.autoContinue !== undefined ? { autoContinue: this.autoContinue } : {}),
+        // Attached before the first turn can run, so a turn that fails at once still reaches
+        // the requester with its error and its failed state.
+        onStart: (handle) => {
+          // Record the session's slot (fixed at spawn) so its status frames carry it and the
+          // post-switch resume scopes to it. Only non-global is stored; an absent entry reads
+          // as global.
+          if (spawnSlot.slot !== 'global') this.sessionSlots.set(handle.id, spawnSlot.slot);
+          this.attachSessionPipes(handle, spawnAccountId, origin);
+          attached = true;
+          // Announce the session NOW, before its first turn produces anything. The session
+          // runtime only emits on a state CHANGE, and the first SDK event of a turn emits its
+          // output BEFORE the starting→running transition — so without this frame the
+          // requester would meet the new sessionId through an anonymous output chunk it cannot
+          // yet route (the bot would mint a stray thread for it). The outbox preserves send
+          // order, so this status is guaranteed to arrive ahead of every event the pipes
+          // forward.
+          this.forwardSessionEvent(
+            handle.id,
+            spawnAccountId,
+            { kind: 'status', state: 'starting' },
+            origin,
+            spawnSlot.slot,
+          );
+        },
       });
     } catch (err) {
+      // The session is running and on the phone; the manager's next state-changing write
+      // retries the registry, so this is only worth a log line.
+      if (attached) {
+        this.logger.warn({ err, requestId }, 'spawned session failed its first registry write');
+        return;
+      }
       this.logger.error({ err, requestId }, 'session.spawn failed to start');
       this.sendEnvelope({
         type: 'error',
@@ -4160,37 +4342,7 @@ export class Daemon {
           relatesTo: msg.id,
         },
       });
-      return;
     }
-    // Record the session's slot (fixed at spawn) so its status frames carry it and the post-switch
-    // resume scopes to it. Only non-global is stored; an absent entry reads as global.
-    if (spawnSlot.slot !== 'global') this.sessionSlots.set(handle.id, spawnSlot.slot);
-
-    // The spawn origin rides every status frame the new session emits (see
-    // forwardSessionEvent): a spawn mints a sessionId the requester has no other way to
-    // learn, and the bot needs the link to keep a resumed conversation in the thread the
-    // user typed into. `resumedFrom` echoes the CALLER'S ref (the wire id it knows), never
-    // the resolved SDK anchor.
-    const origin = {
-      requestId,
-      ...(resumeSessionId !== undefined && resumeSessionId !== null
-        ? { resumedFrom: resumeSessionId }
-        : {}),
-    };
-    this.attachSessionPipes(handle, spawnAccountId, origin);
-    // Announce the session NOW, before its first turn produces anything. The session
-    // runtime only emits on a state CHANGE, and the first SDK event of a turn emits its
-    // output BEFORE the starting→running transition — so without this frame the requester
-    // would meet the new sessionId through an anonymous output chunk it cannot yet route
-    // (the bot would mint a stray thread for it). The outbox preserves send order, so this
-    // status is guaranteed to arrive ahead of every event the pipes forward.
-    this.forwardSessionEvent(
-      handle.id,
-      spawnAccountId,
-      { kind: 'status', state: 'starting' },
-      origin,
-      spawnSlot.slot,
-    );
   }
 
   /**
@@ -4474,6 +4626,10 @@ export class Daemon {
     // synchronous, so nothing has yielded since the duplicate-CHECK above; the "suppress before the
     // first await" invariant that protects the grace window from a double-tap is preserved.
     this.rememberStopKey(idempotencyKey);
+    // Text queued for a session being stopped must not start a turn: the stop's own interrupt can
+    // settle it idle, and delivering there would hand the grace window to work the operator is
+    // ending.
+    this.dropManagedInjects(sessionId);
 
     const result = await escalateStop(handle, {
       ...(this.stopGraceMs !== undefined ? { graceMs: this.stopGraceMs } : {}),
@@ -4623,17 +4779,19 @@ export class Daemon {
    * envelopes, and STRUCTURED permission requests → the pending-permission pipeline. Also
    * sweeps the session's permission routes on terminal status — which is what keeps
    * `managedPermissionRoutes` bounded (a session's requests never outlive the session).
+   * Returns the event listener so a caller can replay a state the handle reached before it was
+   * subscribed through the same path, terminal cleanup included.
    */
   private attachSessionPipes(
     handle: SessionHandle,
     accountId: string | undefined,
     spawnOrigin?: SpawnOrigin,
-  ): void {
+  ): (event: SessionEvent) => void {
     // The account is looked up per event rather than closed over, because it can change under a
     // live session (see {@link sessionAccounts}). This is where it is seeded: a spawn's payload
     // or a re-attached record's account is the truth until a switch says otherwise.
     if (accountId !== undefined) this.sessionAccounts.set(handle.id, accountId);
-    handle.onEvent((event) => {
+    const onEvent = (event: SessionEvent): void => {
       const runningAs = this.sessionAccounts.get(handle.id) ?? accountId;
       // Captured before any terminal delete so the terminal frame still carries the slot.
       const slot = this.sessionSlots.get(handle.id) ?? 'global';
@@ -4646,7 +4804,8 @@ export class Daemon {
         this.sessionSlots.delete(handle.id);
       }
       this.forwardSessionEvent(handle.id, runningAs, event, spawnOrigin, slot);
-    });
+    };
+    handle.onEvent(onEvent);
     // Optional on SessionHandle (observed terminals have no structured permission seam);
     // managed handles always implement it.
     handle.onPermissionRequest?.((req) => {
@@ -4657,6 +4816,7 @@ export class Daemon {
     handle.onQuestionRequest?.((req) => {
       this.handleManagedQuestionRequest(handle.id, req);
     });
+    return onEvent;
   }
 
   /**
@@ -4704,9 +4864,9 @@ export class Daemon {
         ...(req.permissionMode !== undefined ? { permissionMode: req.permissionMode } : {}),
       },
     });
-    // Deliberately NO companion hook.notification (the hook path sends one): a managed
-    // session's own event stream already surfaces the "Permission required: …" milestone as
-    // session.output, so a notification here would be a duplicate card on the phone.
+    // Deliberately NO companion hook.notification, the same as the hook path: the card is the
+    // message, and a managed session's own event stream already carries the "Permission
+    // required: …" milestone outside quiet mode.
   }
 
   /** Drop every permission route owned by `sessionId` once it ends, mirroring the runtime's
@@ -4792,11 +4952,16 @@ export class Daemon {
       // so `cctl session status` reflects the same state the phone just saw. Failure to mirror
       // must never block the live envelope — see mirrorManagedSession.
       this.mirrorManagedSession(sessionId, accountId, event.state);
-      // The turn boundary queued injects have been waiting for. Terminal states instead end the
-      // wait: nothing will deliver, so the queue is dropped rather than left to look pending.
-      if (event.state === 'waiting_input') this.drainManagedInjects(sessionId);
-      else if (event.state === 'done' || event.state === 'failed')
-        this.dropManagedInjects(sessionId);
+      // A held error line is the reason a quiet-mode turn failed: posted just ahead of the failed
+      // status, as that turn's one outcome line. Any other transition means the turn ended some
+      // other way, so the held line was only prose and is dropped. Not gated on quiet mode being
+      // on NOW: a line is only ever held while it was, so quiet mode turned off mid-turn must not
+      // lose the one reason the phone never saw.
+      const heldError = this.quietHeldErrors.get(sessionId);
+      this.quietHeldErrors.delete(sessionId);
+      if (event.state === 'failed' && heldError !== undefined) {
+        this.sendSessionOutput(sessionId, 'error', heldError);
+      }
       this.sendEnvelope({
         type: 'session.status',
         payload: {
@@ -4808,25 +4973,55 @@ export class Daemon {
           ...(spawnOrigin?.resumedFrom !== undefined
             ? { resumedFrom: spawnOrigin.resumedFrom }
             : {}),
+          quiet: this.quietSessionFrames(),
         },
       });
+      // The turn boundary queued injects have been waiting for. Terminal states instead end the
+      // wait: nothing will deliver, so the queue is dropped rather than left to look pending.
+      // Only after this status has gone out: delivering can start the next turn from inside this
+      // call, and its `running` must reach the phone after the `waiting_input` that preceded it.
+      if (event.state === 'waiting_input') this.drainManagedInjects(sessionId);
+      else if (event.state === 'done' || event.state === 'failed')
+        this.dropManagedInjects(sessionId);
       return;
     }
 
     const kind = event.kind === 'output' ? 'stdout' : event.kind;
+    // Quiet mode sends one message per turn: the turn's summary, which carries Claude's final reply
+    // (or why the turn failed). Prose, tool and milestone lines (retry, park and resume notes
+    // included) stay off the phone; an error line is held as the possible failure reason (see
+    // quietHeldErrors). Skipped lines take no seq, so the bot sees no gap where there is no loss.
+    if (this.quietSessionFrames() && kind !== 'summary') {
+      if (kind === 'error') this.quietHeldErrors.set(sessionId, event.text);
+      return;
+    }
+    // A summary or an error line that reaches the phone is the turn's reason already, so a line
+    // held before quiet mode went off must not follow it at the failed transition.
+    if (kind === 'summary' || kind === 'error') this.quietHeldErrors.delete(sessionId);
+    this.sendSessionOutput(sessionId, kind, event.text);
+  }
+
+  /** Ship one `session.output` chunk under the session's next seq. */
+  private sendSessionOutput(
+    sessionId: string,
+    kind: PayloadOf<'session.output'>['kind'],
+    text: string,
+  ): void {
     const seq = this.outputSeq.get(sessionId) ?? 0;
     this.outputSeq.set(sessionId, seq + 1);
     this.sendEnvelope({
       type: 'session.output',
       // `epoch` is this run's token so the bot can tell a restart-induced seq reset (which
-      // re-numbers from 0) apart from real output loss — see {@link outputEpoch}.
+      // re-numbers from 0) apart from real output loss — see {@link outputEpoch}. `quiet` is the
+      // mode this line was filtered under, which the bot plans it by even when it arrives later.
       payload: {
         sessionId,
         seq,
         kind,
-        text: event.text,
+        text,
         truncated: false,
         epoch: this.outputEpoch,
+        quiet: this.quietSessionFrames(),
       },
     });
   }
@@ -5241,6 +5436,16 @@ export class Daemon {
   // ---- outbound ----
 
   private sendEnvelope(draft: EnvelopeDraftSansDaemonId): void {
+    // The one gate for the daemon's own fleet notices in quiet mode: every one of them leaves
+    // through here, so a notice site cannot forget it. The kept ones (quarantine, the replies to a
+    // `/say`) are simply not on the dropped list.
+    if (draft.type === 'hook.notification' && this.isQuiet() && quietDropsNotice(draft.payload)) {
+      this.logger.info(
+        { notificationType: draft.payload.notificationType },
+        'fleet notice suppressed (quiet mode)',
+      );
+      return;
+    }
     const daemonId = this.controlPlaneClient.getIdentity()?.daemonId ?? 'unknown';
     this.controlPlaneClient.send({ ...draft, daemonId });
   }

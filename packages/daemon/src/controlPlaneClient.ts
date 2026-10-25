@@ -73,6 +73,15 @@ export interface ControlPlaneHandlers {
    *  only, as with every other inbound command — the scan, the day bound, and the result reply
    *  live in the daemon's handler. */
   onStatsRequest?: (msg: MessageOf<'stats.request'>) => void;
+  /** Phone-initiated quiet-mode change (`/quiet on|off`). Routing only, as with every other
+   *  inbound command — the env-pin refusal, the save and the result reply live in the daemon. */
+  onQuietSet?: (msg: MessageOf<'settings.quiet.set'>) => void;
+  /** Envelopes the bot should hold before anything else this connection carries — the daemon's
+   *  current settings. Asked for each time the handshake completes and written ahead of the outbox
+   *  replay: the bot keeps that state in memory only, so a bot that restarted would otherwise be
+   *  without it until the next periodic re-send. Nothing here may change how an older queued row
+   *  is read, since it lands before rows that were queued under earlier state. */
+  onOpen?: () => EnvelopeDraft[];
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +184,11 @@ export class ControlPlaneClient {
    *  identity, and the rows may be a previous paired run's backlog that a healthy restart
    *  should still deliver. */
   private undeliverable = false;
+  /** Whether the bot of the latest completed handshake plans quiet frames (see the hello.result
+   *  `quietFrames` field). Kept across a disconnect, so lines queued meanwhile are filtered for
+   *  the bot last seen; false until a first handshake, which only costs a queued line its
+   *  filtering — never its delivery. */
+  private quietFrames = false;
   /** Resolves the in-flight `connect()` promise once hello succeeds (or pairing completes and
    *  the follow-up hello succeeds) — lets tests/daemon.ts `await client.connect()`. */
   private connectedResolvers: { resolve: () => void; reject: (err: Error) => void }[] = [];
@@ -206,6 +220,12 @@ export class ControlPlaneClient {
 
   getIdentity(): DaemonIdentity | undefined {
     return this.identity;
+  }
+
+  /** Whether the bot can plan quiet frames — whether a quiet daemon may leave out a turn's
+   *  streamed prose (see {@link quietFrames}). */
+  botPlansQuietFrames(): boolean {
+    return this.quietFrames;
   }
 
   /** Replace the inbound-dispatch handlers. Lets a composing owner (daemon.ts) construct this
@@ -387,6 +407,7 @@ export class ControlPlaneClient {
     else if (isType(envelope, 'session.stop')) this.opts.handlers.onSessionStop?.(envelope);
     else if (isType(envelope, 'session.prune')) this.opts.handlers.onSessionPrune?.(envelope);
     else if (isType(envelope, 'stats.request')) this.opts.handlers.onStatsRequest?.(envelope);
+    else if (isType(envelope, 'settings.quiet.set')) this.opts.handlers.onQuietSet?.(envelope);
     // Any other type (usage.snapshot, session.output, etc.) is bot->phone traffic the daemon
     // itself never receives from the relay; silently ignored rather than treated as an error.
   }
@@ -434,7 +455,13 @@ export class ControlPlaneClient {
     }
     this.state = 'open';
     this.reconnectAttempt = 0;
+    this.quietFrames = envelope.payload.quietFrames === true;
     this.startHeartbeat();
+    // Straight to the socket, not through send(): with rows queued, send() would put these behind
+    // the very frames they have to precede.
+    for (const draft of this.opts.handlers.onOpen?.() ?? []) {
+      this.liveSocket()?.send(encode(stamp(draft)));
+    }
     this.flushOutbox();
     this.resolveConnect();
   }

@@ -16,7 +16,7 @@
 // `config.json` is INPUT an operator writes (`readDaemonConfigFile`), and only it can change
 // behavior; `daemon-settings.json` is OUTPUT the daemon writes (`writeSettingsReport`).
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
   SettingsSnapshot,
@@ -154,6 +154,37 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  *  ways that could disagree. */
 const RELAY_ENV_NAME = 'CCTL_RELAY_URL';
 
+/** Discord quiet mode's env var. Named once because, unlike every other knob, its value can change
+ *  on a running daemon (`/quiet`, `cctl settings set quiet`): the live path persists it and checks
+ *  whether the environment pins it by this same name. */
+export const QUIET_ENV_NAME = 'CCTL_DISCORD_QUIET';
+
+/** Quiet mode is ON by default: Discord carries the cards that need the operator, not a running
+ *  commentary of every turn. */
+export const DEFAULT_DISCORD_QUIET = true;
+
+/** Whether the daemon's own environment pins quiet mode, so a live change would revert at its next
+ *  start. Non-blank, not merely parseable: the environment shadows config.json even with a value
+ *  it cannot read (see layerFileEnv), so a typo there pins the default just as firmly. One
+ *  predicate for the row's source and the live control's refusal, so the two always agree. */
+export function quietPinnedByEnv(env: NodeJS.ProcessEnv): boolean {
+  return blankAsUnset(env[QUIET_ENV_NAME]) !== undefined;
+}
+
+/** The settings row for quiet mode — one builder for the startup resolution and the live change,
+ *  so the row a running daemon rewrites reads exactly like the one it started with. */
+export function discordQuietRow(quiet: boolean, source: SettingSource): SettingRow {
+  return {
+    name: 'discord quiet',
+    value: quiet ? 'on' : 'off',
+    source,
+    detail:
+      `${QUIET_ENV_NAME} (Discord gets only permission and question cards, plus one final reply ` +
+      'per turn of a phone-started session; wins over command-output, waiting-cards and ' +
+      'full-output; /quiet or cctl settings set quiet changes the running daemon)',
+  };
+}
+
 /** How a value is checked before it is persisted. Each kind uses the SAME parser the daemon
  *  reads with, so `cctl settings set` can only store what the daemon will honor — a value the
  *  daemon would silently treat as unset is the one typo the file exists to protect from. */
@@ -203,6 +234,7 @@ export const DAEMON_ENV_SETTINGS: readonly DaemonEnvSetting[] = [
   { name: 'CCTL_PERMISSION_HOLD_MS', alias: 'permission-hold', kind: 'number' },
   { name: 'CCTL_QUESTION_HOLD_MS', alias: 'question-hold', kind: 'number' },
   { name: 'CCTL_COMMAND_OUTPUT', alias: 'command-output', kind: 'bool' },
+  { name: QUIET_ENV_NAME, alias: 'quiet', kind: 'bool' },
   {
     name: 'CCTL_IDENTITY_CHECK',
     alias: 'identity-check',
@@ -272,6 +304,47 @@ export function renderSettingSaved(
     `${palette.green(`Saved ${setting.name}=${value}`)} to ${filePath}.\n` +
     `Applies when the daemon next starts: cctl daemon restart. ${ENV_WINS_NOTE}\n`
   );
+}
+
+/** What `cctl settings set` prints when the running daemon took the change itself (quiet mode):
+ *  it is in force now and saved for the next start, so there is no restart to suggest. Painted
+ *  like a save — the change is done. */
+export function renderSettingApplied(
+  setting: DaemonEnvSetting,
+  value: string,
+  filePath: string,
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  return (
+    `${palette.green(`Saved ${setting.name}=${value}`)} to ${filePath}; the running daemon ` +
+    'applied it now.\n'
+  );
+}
+
+/** What `cctl settings unset` prints when the running daemon carried the unset out itself (quiet
+ *  mode). Told apart by what happened to the file and to the daemon: nothing to remove and nothing
+ *  moved reads exactly as it does with no daemon running; nothing to remove but a running value
+ *  that moved (the entry left the file behind the daemon's back) says the default is in force now;
+ *  and a removal says which value is in force now — the default, or the daemon's environment when
+ *  that sets the variable. A daemon that does not say whether it removed anything is reported as
+ *  having cleared the entry, which is what it was asked to do. */
+export function renderSettingClearedLive(
+  setting: DaemonEnvSetting,
+  filePath: string,
+  outcome: { removed?: boolean; pinned?: boolean; changed?: boolean },
+  palette: Palette = PLAIN_PALETTE,
+): string {
+  if (outcome.removed === false) {
+    return outcome.changed === true
+      ? `${setting.name} is not set in ${filePath}; the running daemon is back on the default ` +
+          'now.\n'
+      : renderSettingForgotten(setting, filePath, false, palette);
+  }
+  return outcome.pinned === true
+    ? `${palette.green(`Removed ${setting.name}`)} from ${filePath}; the daemon's environment ` +
+        `still sets ${setting.name}, so that value stays in force.\n`
+    : `${palette.green(`Cleared ${setting.name}`)} from ${filePath}; the running daemon is back ` +
+        'on the default now.\n';
 }
 
 /** The line `cctl settings unset` prints. A removal is painted like a save — the file changed
@@ -375,13 +448,27 @@ export type FileEnv = Record<string, string>;
  *  without a file — so "the environment always wins" holds with no exceptions to learn.
  *  Returns a fresh object; `env` is left alone. */
 export function layerFileEnv(env: NodeJS.ProcessEnv, fileEnv: FileEnv = {}): NodeJS.ProcessEnv {
-  return applyFileEnv({ ...env }, fileEnv);
+  return overlayFileEnv({ ...env }, fileEnv);
 }
 
 /** The in-place form of `layerFileEnv`, for the daemon's own `process.env`: every module that
  *  reads the environment directly (the logger, the engine's cadence guard) then sees the
- *  persisted overrides too, not only the knobs `resolveDaemonConfig` wires by hand. */
+ *  persisted overrides too, not only the knobs `resolveDaemonConfig` wires by hand.
+ *
+ *  Quiet mode is left out. No module reads it from the environment (every gate asks the live
+ *  control), its value changes while the daemon runs so a copy here would go stale, and every
+ *  process the daemon starts inherits this environment: a daemon restarted from inside one of its
+ *  own sessions would find the copy in its shell environment and treat quiet mode as pinned there,
+ *  refusing every live change over a variable nobody set. */
 export function applyFileEnv(env: NodeJS.ProcessEnv, fileEnv: FileEnv = {}): NodeJS.ProcessEnv {
+  return overlayFileEnv(
+    env,
+    Object.fromEntries(Object.entries(fileEnv).filter(([name]) => name !== QUIET_ENV_NAME)),
+  );
+}
+
+/** Lay `fileEnv` under `env` in place: the one rule both forms above share. */
+function overlayFileEnv(env: NodeJS.ProcessEnv, fileEnv: FileEnv): NodeJS.ProcessEnv {
   for (const [name, value] of Object.entries(fileEnv)) {
     if (blankAsUnset(env[name]) === undefined) env[name] = value;
   }
@@ -587,6 +674,9 @@ export interface DaemonConfig {
     permissionHoldMs: number | undefined;
     questionHoldMs: number | undefined;
     commandOutputCards: boolean;
+    /** Discord quiet mode at startup (see {@link discordQuietRow}); the running daemon's value can
+     *  move from here, which is why daemonRun hands it to a live control rather than to the gates. */
+    discordQuiet: boolean;
     fullToolOutput: boolean;
     identityCheck: boolean;
     autoContinue: boolean;
@@ -720,6 +810,10 @@ export function resolveDaemonConfig(
   // pushed as a card in every permission mode; `off` silences chatty sessions.
   const commandOutputEnv = envBool(layered, 'CCTL_COMMAND_OUTPUT');
   const commandOutputCards = commandOutputEnv ?? true;
+  // Default ON (see DEFAULT_DISCORD_QUIET). Attributed like every other row; the source matters
+  // more here than elsewhere, since an `env` source is what refuses a live change.
+  const discordQuietEnv = envBool(layered, QUIET_ENV_NAME);
+  const discordQuiet = discordQuietEnv ?? DEFAULT_DISCORD_QUIET;
   // Default OFF: cards ship a phone-sized excerpt; full output arrives as a file attachment.
   const fullToolOutput = envFlag(layered, 'CCTL_TOOL_OUTPUT_FULL');
   // Default ON: each poll verifies the vault token's OWNER against the OAuth profile
@@ -890,6 +984,12 @@ export function resolveDaemonConfig(
       source: sourceOf('CCTL_COMMAND_OUTPUT', commandOutputEnv !== undefined),
       detail: "CCTL_COMMAND_OUTPUT (every shell command's output as a phone card; off silences)",
     },
+    // Named `env` whenever the environment pins it, an unreadable value included: that is what the
+    // live control refuses on, and `/quiet` reads the source to say whether a change can work.
+    discordQuietRow(
+      discordQuiet,
+      quietPinnedByEnv(env) ? 'env' : sourceOf(QUIET_ENV_NAME, discordQuietEnv !== undefined),
+    ),
     {
       name: 'identity check',
       value: identityCheck ? 'on' : 'off',
@@ -974,6 +1074,7 @@ export function resolveDaemonConfig(
       permissionHoldMs,
       questionHoldMs,
       commandOutputCards,
+      discordQuiet,
       fullToolOutput,
       identityCheck,
       autoContinue,
@@ -1280,8 +1381,10 @@ export function daemonSettingsPath(paths: Paths = defaultPaths()): string {
   return join(dirname(paths.vaultDir), 'daemon-settings.json');
 }
 
+/** Atomic: a live quiet change rewrites the report while other commands read it, and a reader
+ *  that caught a half-written file would take the daemon for one too old to write a report. */
 export async function writeSettingsReport(filePath: string, report: SettingsReport): Promise<void> {
-  await writeFile(filePath, JSON.stringify(report, null, 2) + '\n', 'utf8');
+  await atomicWriteFile(filePath, JSON.stringify(report, null, 2) + '\n');
 }
 
 /** Whether the report says greedy auto-switch was ACTIVE at the last daemon start (both the

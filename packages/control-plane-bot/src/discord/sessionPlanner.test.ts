@@ -577,3 +577,267 @@ describe('SessionPlanner — folder-bound slot on the card', () => {
     expect(embedFields(card).some((f) => f.name === 'Slot')).toBe(false);
   });
 });
+
+describe('SessionPlanner — quiet mode', () => {
+  /** Every content string the ops would post, in order (embeds by title). */
+  const posted = (ops: GatewayOp[]): (string | undefined)[] =>
+    ops.map((o) => (o.kind === 'sendMessage' ? (o.content ?? embedTitle(o)) : o.kind));
+
+  for (const mode of ['card', 'stream'] as const) {
+    describe(`${mode} mode`, () => {
+      // Card mode shares the DM between sessions and posts no card, so its lines lead with the id.
+      const tag = mode === 'card' ? '`s1` ' : '';
+      it("posts one line per turn — the daemon's summary — and nothing else", () => {
+        const p = new SessionPlanner();
+        const ops: GatewayOp[] = [];
+        ops.push(...p.onStatus(ROUTE, status('starting'), 0, mode, true).ops);
+        ops.push(...p.onStatus(ROUTE, status('running'), 10, mode, true).ops);
+        ops.push(...p.onStatus(ROUTE, status('waiting_permission'), 20, mode, true).ops);
+        ops.push(...p.onStatus(ROUTE, status('running'), 30, mode, true).ops);
+        ops.push(
+          ...p.onOutput(ROUTE, output(0, 'summary', 'Session complete: done'), 40, mode, true).ops,
+        );
+        ops.push(...p.onStatus(ROUTE, status('waiting_input'), 50, mode, true).ops);
+        // No live card, no waiting lines: just the final reply.
+        expect(posted(ops)).toEqual([`${tag}📝 Session complete: done`]);
+      });
+
+      it('posts no summary embed and no attachment when the session ends', () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        p.onOutput(ROUTE, output(0, 'error', 'Error: ' + 'x'.repeat(3000)), 10, mode, true);
+        const end = p.onStatus(ROUTE, status('failed'), 20, mode, true);
+        expect(cardSends(end.ops)).toHaveLength(0);
+        expect(lineSends(end.ops)).toHaveLength(0);
+        expect(uploads(end.ops)).toHaveLength(0);
+      });
+
+      it("posts the failure line the daemon sends as that turn's outcome", () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        const r = p.onOutput(
+          ROUTE,
+          output(0, 'error', 'Error: the connection dropped'),
+          10,
+          mode,
+          true,
+        );
+        expect(posted(r.ops)).toEqual([`${tag}❗ Error: the connection dropped`]);
+      });
+
+      it('keeps the orphaned line: the interrupted turn has no other outcome', () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        const r = p.onStatus(ROUTE, status('orphaned'), 10, mode, true);
+        expect(posted(r.ops)).toHaveLength(1);
+        expect(posted(r.ops)[0]).toMatch(new RegExp(`^${tag}🪦`));
+      });
+
+      for (const cutOff of ['starting', 'running', 'waiting_permission'] as const) {
+        it(`says the session ended when a stop cuts off a turn (${cutOff} → done)`, () => {
+          const p = new SessionPlanner();
+          p.onStatus(ROUTE, status('starting'), 0, mode, true);
+          p.onStatus(ROUTE, status(cutOff), 10, mode, true);
+          const r = p.onStatus(ROUTE, status('done'), 20, mode, true);
+          expect(posted(r.ops)).toEqual([`${tag}⏹ the session ended before replying`]);
+        });
+      }
+
+      it('posts no second outcome when the stop lands after the reply', () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        p.onOutput(ROUTE, output(0, 'summary', 'Session complete: done'), 10, mode, true);
+        expect(posted(p.onStatus(ROUTE, status('done'), 20, mode, true).ops)).toEqual([]);
+      });
+
+      it('a new turn that is cut off still says so, after an earlier turn replied', () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        p.onOutput(ROUTE, output(0, 'summary', 'Session complete: one'), 10, mode, true);
+        p.onStatus(ROUTE, status('waiting_input'), 20, mode, true);
+        p.onStatus(ROUTE, status('running'), 30, mode, true);
+        const r = p.onStatus(ROUTE, status('done'), 40, mode, true);
+        expect(posted(r.ops)).toEqual([`${tag}⏹ the session ended before replying`]);
+      });
+
+      it('posts nothing when an idle session is stopped: its last turn already replied', () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        p.onStatus(ROUTE, status('waiting_input'), 10, mode, true);
+        expect(posted(p.onStatus(ROUTE, status('done'), 20, mode, true).ops)).toEqual([]);
+      });
+
+      it('posts nothing for a first-seen done: a restarted bot cannot know it was mid-turn', () => {
+        const p = new SessionPlanner();
+        expect(posted(p.onStatus(ROUTE, status('done'), 0, mode, true).ops)).toEqual([]);
+      });
+
+      it('splits a reply longer than one message across several, losing none of it', () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        const reply = Array.from({ length: 100 }, (_, i) => `line ${i} ${'y'.repeat(40)}`).join(
+          '\n',
+        );
+        const r = p.onOutput(ROUTE, output(0, 'summary', reply), 10, mode, true);
+        const lines = lineSends(r.ops).map((o) => (o.kind === 'sendMessage' ? o.content : ''));
+        expect(lines.length).toBeGreaterThan(1);
+        for (const l of lines) {
+          expect(l!.length).toBeLessThanOrEqual(2000);
+          expect(l!.startsWith(tag)).toBe(true);
+        }
+        expect(lines.map((l) => l!.slice(tag.length)).join('\n')).toBe(`📝 ${reply}`);
+        expect(uploads(r.ops)).toHaveLength(0);
+      });
+
+      it('attaches a reply too long to split into messages, whole', () => {
+        const p = new SessionPlanner();
+        p.onStatus(ROUTE, status('running'), 0, mode, true);
+        const reply = 'z'.repeat(20_000);
+        const r = p.onOutput(ROUTE, output(0, 'summary', reply), 10, mode, true);
+        expect(lineSends(r.ops)).toHaveLength(0);
+        const files = uploads(r.ops);
+        expect(files).toHaveLength(1);
+        expect(files[0]!.kind === 'uploadAttachment' && files[0]!.text).toBe(`${tag}📝 ${reply}`);
+      });
+    });
+  }
+
+  it('posts no restart or gap marker into a quiet thread, only the reply', () => {
+    const p = new SessionPlanner({ gapGraceMs: 100 });
+    p.onStatus(ROUTE, status('running'), 0, 'stream', true);
+    p.onOutput(ROUTE, output(0, 'summary', 'first', false, 'run-a'), 10, 'stream', true);
+    // A daemon restart resumes the session: new epoch, seq back at 0.
+    const resumed = p.onOutput(
+      ROUTE,
+      output(0, 'summary', 'second', false, 'run-b'),
+      20,
+      'stream',
+      true,
+    );
+    expect(posted(resumed.ops)).toEqual(['📝 second']);
+    // A bot that restarted mid-session first sees a seq above 0: a gap, but no marker message.
+    const q = new SessionPlanner({ gapGraceMs: 100 });
+    q.onStatus(ROUTE, status('running'), 0, 'stream', true);
+    const held = q.onOutput(ROUTE, output(3, 'summary', 'late reply'), 10, 'stream', true);
+    const ops = [...held.ops, ...q.flush(ROUTE, 500).ops];
+    expect(posted(ops)).toEqual(['📝 late reply']);
+  });
+
+  for (const mode of ['card', 'stream'] as const) {
+    it(`shows a real gap in a quiet ${mode} session: the lost seqs were replies`, () => {
+      const p = new SessionPlanner({ gapGraceMs: 100 });
+      p.onStatus(ROUTE, status('running'), 0, mode, true);
+      p.onOutput(ROUTE, output(0, 'summary', 'first'), 10, mode, true);
+      // Seqs 1-2 were trimmed from the daemon's outbox during an outage.
+      const held = p.onOutput(ROUTE, output(3, 'summary', 'fourth'), 20, mode, true);
+      const shown = posted([...held.ops, ...p.flush(ROUTE, 500).ops]).join('|');
+      expect(shown).toMatch(/⟨gap: output seq 1–2 lost⟩.*📝 fourth/s);
+    });
+
+    it(`shows a gap from seq 0 after a daemon restart in a quiet ${mode} session`, () => {
+      const p = new SessionPlanner({ gapGraceMs: 100 });
+      p.onStatus(ROUTE, status('running'), 0, mode, true);
+      p.onOutput(ROUTE, output(0, 'summary', 'first', false, 'run-a'), 10, mode, true);
+      // The resumed run's seq 0 never arrived: that is lost output, not a late join.
+      const held = p.onOutput(
+        ROUTE,
+        output(1, 'summary', 'second', false, 'run-b'),
+        20,
+        mode,
+        true,
+      );
+      const shown = posted([...held.ops, ...p.flush(ROUTE, 500).ops]).join('|');
+      expect(shown).toMatch(/⟨gap: output seq 0–0 lost⟩.*📝 second/s);
+      expect(shown).not.toContain('output stream restarted');
+    });
+  }
+
+  it('tops up a card attachment that was owed before quiet mode came on', () => {
+    const p = new SessionPlanner();
+    p.onStatus(ROUTE, status('running'), 0, 'card', false);
+    const first = 'a'.repeat(20_000);
+    const crossing = p.onOutput(ROUTE, output(0, 'stdout', first), 10, 'card', false);
+    expect(uploads(crossing.ops)).toHaveLength(1);
+    const more = 'c'.repeat(5_000);
+    p.onOutput(ROUTE, output(1, 'stdout', more), 20, 'card', false);
+    // Quiet mode comes on; the session ends. Bytes past the first upload left the card's tail.
+    const end = p.onStatus(ROUTE, status('done'), 5000, 'card', true);
+    const files = uploads(end.ops);
+    expect(files).toHaveLength(1);
+    expect(files[0]!.kind === 'uploadAttachment' && files[0]!.text).toBe(first + more);
+  });
+
+  it('keeps editing a card posted before quiet mode was turned on, adding no message', () => {
+    const p = new SessionPlanner({ coalesceWindowMs: 1000 });
+    expect(cardSends(p.onStatus(ROUTE, status('running'), 0, 'card', false).ops)).toHaveLength(1);
+    p.onStatus(ROUTE, status('waiting_input'), 10, 'card', true);
+    const later = p.onStatus(ROUTE, status('done'), 5000, 'card', true);
+    // The terminal edit lands, so the card never freezes on "running"; nothing new is sent.
+    expect(edits(later.ops)).toHaveLength(1);
+    expect(cardSends(later.ops)).toHaveLength(0);
+    expect(lineSends(later.ops)).toHaveLength(0);
+  });
+
+  it('labels each quiet card-mode reply with its session, so two in one DM stay apart', () => {
+    const p = new SessionPlanner();
+    const a: SessionRoute = { discordUserId: 'u1', sessionId: 'aaaaaaaa-1111' };
+    const b: SessionRoute = { discordUserId: 'u1', sessionId: 'bbbbbbbb-2222' };
+    const reply = (route: SessionRoute) =>
+      p.onOutput(
+        route,
+        { ...output(0, 'summary', 'Session complete: done'), sessionId: route.sessionId },
+        10,
+        'card',
+        true,
+      ).ops;
+    expect(lineSends(reply(a)).map((o) => o.kind === 'sendMessage' && o.content)).toEqual([
+      '`aaaaaaaa` 📝 Session complete: done',
+    ]);
+    expect(lineSends(reply(b)).map((o) => o.kind === 'sendMessage' && o.content)).toEqual([
+      '`bbbbbbbb` 📝 Session complete: done',
+    ]);
+  });
+
+  it('labels every chunk of a split quiet card-mode reply, each within the message limit', () => {
+    const p = new SessionPlanner();
+    const route: SessionRoute = { discordUserId: 'u1', sessionId: 'aaaaaaaa-1111' };
+    const long = Array.from({ length: 70 }, (_, i) => `line ${i} ${'x'.repeat(60)}`).join('\n');
+    expect(long.length).toBeGreaterThan(4_800);
+    const ops = p.onOutput(
+      route,
+      { ...output(0, 'summary', long), sessionId: route.sessionId },
+      10,
+      'card',
+      true,
+    ).ops;
+    const chunks = lineSends(ops).map((o) => (o.kind === 'sendMessage' ? (o.content ?? '') : ''));
+    expect(chunks.length).toBeGreaterThan(2);
+    for (const chunk of chunks) {
+      expect(chunk.startsWith('`aaaaaaaa` ')).toBe(true);
+      expect(chunk.length).toBeLessThanOrEqual(2000);
+    }
+  });
+
+  it('still attaches a burst a thread skipped before quiet mode came on, as its marker promised', () => {
+    const p = new SessionPlanner();
+    p.onStatus(ROUTE, status('running'), 5000, 'stream', false);
+    const burst = 'b'.repeat(20_000);
+    const skipped = p.onOutput(ROUTE, output(0, 'stdout', burst), 5010, 'stream', false);
+    expect(
+      lineSends(skipped.ops).some((o) => o.kind === 'sendMessage' && o.content?.includes('⏩')),
+    ).toBe(true);
+    const end = p.onStatus(ROUTE, status('done'), 6000, 'stream', true);
+    const files = uploads(end.ops);
+    expect(files.length).toBeGreaterThan(0);
+    expect(files.map((f) => (f.kind === 'uploadAttachment' ? f.text : '')).join('')).toBe(burst);
+  });
+
+  it('reads quiet per frame: turning it off brings the state lines and summary card back', () => {
+    const p = new SessionPlanner();
+    p.onStatus(ROUTE, status('running'), 0, 'stream', true);
+    const waiting = p.onStatus(ROUTE, status('waiting_input'), 10, 'stream', false);
+    expect(posted(waiting.ops)[0]).toContain('⌨️ waiting for input');
+    const end = p.onStatus(ROUTE, status('done'), 20, 'stream', false);
+    expect(lineSends(end.ops)).toHaveLength(1); // the summary embed
+  });
+});

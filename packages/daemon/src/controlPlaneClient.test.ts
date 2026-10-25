@@ -43,6 +43,8 @@ class FakeRelay {
   private readonly silentHello: boolean;
   private nextDaemonSeq = 1;
   readonly tokensByDaemonId = new Map<string, string>();
+  /** Whether a successful hello.result advertises quiet frames; an older bot sends no field. */
+  quietFrames = false;
   /** Every envelope any connected socket has sent us, in receipt order — lets tests assert on
    *  what the client actually put on the wire (e.g. outbox replay order). */
   readonly received: Envelope[] = [];
@@ -171,7 +173,11 @@ class FakeRelay {
         stamp({
           daemonId: envelope.daemonId,
           type: 'hello.result',
-          payload: { ok: true, negotiatedVersion: negotiated },
+          payload: {
+            ok: true,
+            negotiatedVersion: negotiated,
+            ...(this.quietFrames ? { quietFrames: true } : {}),
+          },
         }),
       ),
     );
@@ -529,6 +535,78 @@ describe('ControlPlaneClient', () => {
     if (notifications[2]?.type === 'hook.notification')
       expect(notifications[2].payload.title).toBe('n3');
     expect(store.countOutbox()).toBe(0);
+  });
+
+  it('opens every connection with the onOpen envelopes, ahead of the outbox replay', async () => {
+    const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
+    relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
+    let opens = 0;
+    client = new ControlPlaneClient({
+      url: relay.url(),
+      identityStore: memoryIdentityStore(identity),
+      store,
+      hostLabel: 'h',
+      heartbeatMs: 100_000,
+      reconnectBaseMs: 10,
+      reconnectCapMs: 50,
+      handlers: {
+        onOpen: () => {
+          opens += 1;
+          return [
+            {
+              daemonId: identity.daemonId,
+              type: 'hook.notification',
+              payload: { event: 'notification', title: `open-${opens}`, body: 'x', level: 'info' },
+            },
+          ];
+        },
+      },
+    });
+    await client.connect();
+    const notes = () => relay.received.filter((e) => e.type === 'hook.notification');
+    // Let the first connection's frame land before cutting the link, or it dies in flight.
+    await waitFor(() => notes().length === 1);
+    relay.disconnectAll();
+    await waitFor(() => client!.getState() !== 'open');
+    // Queued while the link is down: on reconnect these replay, and the open frame must lead them.
+    client.send({
+      daemonId: identity.daemonId,
+      type: 'hook.notification',
+      payload: { event: 'notification', title: 'queued', body: 'x', level: 'info' },
+    });
+    await waitFor(() => notes().length >= 3, 5000);
+    const titles = relay.received.flatMap((e) =>
+      e.type === 'hook.notification' ? [e.payload.title] : [],
+    );
+    expect(titles).toEqual(['open-1', 'open-2', 'queued']);
+    expect(store.countOutbox()).toBe(0);
+  });
+
+  it("reports the latest handshake's quiet-frames support, and keeps it while disconnected", async () => {
+    const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
+    relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
+    client = new ControlPlaneClient({
+      url: relay.url(),
+      identityStore: memoryIdentityStore(identity),
+      store,
+      hostLabel: 'h',
+      heartbeatMs: 100_000,
+      reconnectBaseMs: 10,
+      reconnectCapMs: 50,
+    });
+    // No handshake yet, then a bot that sends no field: both read as an older bot.
+    expect(client.botPlansQuietFrames()).toBe(false);
+    await client.connect();
+    expect(client.botPlansQuietFrames()).toBe(false);
+    // The bot is upgraded behind the same relay: the next handshake says so.
+    relay.quietFrames = true;
+    relay.disconnectAll();
+    await waitFor(() => client!.getState() !== 'open');
+    await waitFor(() => client!.getState() === 'open', 5000);
+    expect(client.botPlansQuietFrames()).toBe(true);
+    relay.disconnectAll();
+    await waitFor(() => client!.getState() !== 'open');
+    expect(client.botPlansQuietFrames()).toBe(true);
   });
 
   it('bounds the outbox by dropping the oldest entries past the configured limit', () => {

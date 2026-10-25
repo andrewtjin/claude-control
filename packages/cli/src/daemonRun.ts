@@ -14,7 +14,7 @@
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';
-import { createLogger } from '@claude-control/shared-protocol';
+import { createLogger, type PayloadOf } from '@claude-control/shared-protocol';
 import {
   Vault,
   defaultPaths,
@@ -66,6 +66,7 @@ import { backgroundHostOptions, createClaudeBackgroundHost } from './backgroundH
 import { createLeaseOccupancyProbe } from './leaseProbe.js';
 import { createCachedUsageReader } from './cachedUsageReader.js';
 import { createPollTokenGetter } from './pollTokenGetter.js';
+import { createQuietControl } from './quietControl.js';
 import {
   daemonConfigPath,
   daemonHeartbeatPath,
@@ -268,6 +269,23 @@ export async function runShutdownSequence(steps: ShutdownSequence): Promise<void
   await steps.flushHeartbeat().catch(() => undefined);
 }
 
+/** The auto-switcher's report of each hop to the phone. A hop is news, not a request, so quiet
+ *  mode keeps it off the phone, read at each hop since quiet mode can change while the daemon
+ *  runs. A phone `/switch` answers through the daemon's own reply, which this does not touch. */
+export function autoSwitchNotifier(deps: {
+  isQuiet: () => boolean;
+  send: (payload: PayloadOf<'switch.result'>) => void;
+  logger: Logger;
+}): (payload: PayloadOf<'switch.result'>) => void {
+  return (payload) => {
+    if (deps.isQuiet()) {
+      deps.logger.info({ ok: payload.ok }, 'auto-switch result card suppressed (quiet mode)');
+      return;
+    }
+    deps.send(payload);
+  };
+}
+
 /** Assemble and start the daemon; resolves once the process-level guards (crash log, instance
  *  lock) and the heartbeat are up and `daemon.start()` has been launched. Local readiness —
  *  receiver bind, endpoint publish, hook install — completes asynchronously inside start(),
@@ -384,11 +402,27 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   });
   const protector = defaultProtector();
 
-  const settingsReport = { startedAtMs: Date.now(), settings: config.rows };
+  const settingsReport = {
+    startedAtMs: Date.now(),
+    settings: config.rows,
+    quiet: config.values.discordQuiet,
+  };
   // Best-effort: the report is purely informational, so a write failure must not stop the
   // daemon from starting.
   await writeSettingsReport(daemonSettingsPath(paths), settingsReport).catch((err: unknown) => {
     logger.warn({ err }, 'could not persist the effective-settings report');
+  });
+  // Quiet mode is the one setting that changes while the daemon runs, so every gate reads it from
+  // this control rather than from `config.values`. It is checked against the shell's own
+  // environment (before the file overlay), the layer a live change cannot outrank.
+  const quietControl = createQuietControl({
+    quiet: config.values.discordQuiet,
+    shellEnv,
+    configPath: daemonConfigPath(paths),
+    report: settingsReport,
+    reportPath: daemonSettingsPath(paths),
+    onReportWriteError: (err) =>
+      logger.warn({ err }, 'could not rewrite the effective-settings report after a quiet change'),
   });
 
   // An explicit --pair means "adopt a NEW identity", so any previously adopted one is
@@ -498,6 +532,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     // StopFailure warn cards ride the same umbrella switch as the managed sessions' retry
     // loop: both are "survive transient API errors" behavior (CCTL_AUTO_CONTINUE).
     apiErrorCards: config.values.autoContinue,
+    quiet: () => quietControl.isQuiet(),
     // A managed session is recognized by either its record id or the SDK session id its hooks
     // report (persisted as the record's resume anchor on session_init).
     isManagedSession: (sessionId) =>
@@ -519,12 +554,16 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
   const autoSwitcher = autoSwitch
     ? new AutoSwitcher({
         activate: (accountId, options) => engine.activate(accountId, options),
-        notify: (payload) =>
-          controlPlaneClient.send({
-            type: 'switch.result',
-            payload,
-            daemonId: controlPlaneClient.getIdentity()?.daemonId ?? 'unpaired',
-          }),
+        notify: autoSwitchNotifier({
+          isQuiet: () => quietControl.isQuiet(),
+          send: (payload) =>
+            controlPlaneClient.send({
+              type: 'switch.result',
+              payload,
+              daemonId: controlPlaneClient.getIdentity()?.daemonId ?? 'unpaired',
+            }),
+          logger,
+        }),
         policy: autoSwitchPolicy,
         ...(cooldownMs !== undefined ? { cooldownMs } : {}),
         logger,
@@ -668,6 +707,7 @@ export async function runDaemon(options: DaemonRunOptions): Promise<void> {
     ...(autoSwitcher ? { autoSwitcher } : {}),
     ...(accountProbe ? { accountProbe } : {}),
     settingsReport,
+    quiet: quietControl,
     logger,
   });
 

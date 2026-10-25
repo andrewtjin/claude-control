@@ -172,7 +172,7 @@ describe('RelayServer', () => {
   }
 
   describe('handshake', () => {
-    it('accepts a hello with a valid token and negotiated version', async () => {
+    it('accepts a hello with a valid token and negotiated version, advertising quiet frames', async () => {
       const token = await bindDaemon('user-a', 'daemon-1');
       const ws = await connect(port);
       sendEnvelope(ws, {
@@ -183,7 +183,12 @@ describe('RelayServer', () => {
       const result = await nextMessage(ws);
       expect(result.type).toBe('hello.result');
       if (result.type !== 'hello.result') throw new Error('unreachable');
-      expect(result.payload).toEqual({ ok: true, negotiatedVersion: PROTOCOL_VERSION });
+      // quietFrames: this bot posts a quiet turn's whole reply, so the daemon may drop its prose.
+      expect(result.payload).toEqual({
+        ok: true,
+        negotiatedVersion: PROTOCOL_VERSION,
+        quietFrames: true,
+      });
       ws.close();
     });
 
