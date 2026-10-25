@@ -2,9 +2,9 @@
 // config.json and to the settings report, and the refusals that keep a change honest.
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createQuietControl, type QuietControlOptions } from './quietControl.js';
 import {
   discordQuietRow,
@@ -150,10 +150,10 @@ describe('createQuietControl', () => {
 
   it('keeps a change whose report file could not be rewritten, and says so', async () => {
     const errors: unknown[] = [];
-    const options = await setup({
-      reportPath: join(tmpdir(), 'cctl-quiet-missing-dir', 'nested', 'daemon-settings.json'),
-      onReportWriteError: (err) => errors.push(err),
-    });
+    const options = await setup({ onReportWriteError: (err) => errors.push(err) });
+    // A directory where the report belongs: nothing can be written over it.
+    options.reportPath = join(dirname(options.configPath), 'report-is-a-dir');
+    await mkdir(join(options.reportPath, 'nested'), { recursive: true });
     const control = createQuietControl(options);
     expect(await control.set(false)).toMatchObject({ ok: true, quiet: false });
     expect(control.isQuiet()).toBe(false);

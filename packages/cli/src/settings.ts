@@ -16,7 +16,7 @@
 // `config.json` is INPUT an operator writes (`readDaemonConfigFile`), and only it can change
 // behavior; `daemon-settings.json` is OUTPUT the daemon writes (`writeSettingsReport`).
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
   SettingsSnapshot,
@@ -322,17 +322,24 @@ export function renderSettingApplied(
 }
 
 /** What `cctl settings unset` prints when the running daemon carried the unset out itself (quiet
- *  mode). Told apart by what happened to the file: nothing to remove reads exactly as it does with
- *  no daemon running, and a removal says which value is in force now — the default, or the
- *  daemon's environment when that sets the variable. A daemon that does not say whether it removed
- *  anything is reported as having cleared the entry, which is what it was asked to do. */
+ *  mode). Told apart by what happened to the file and to the daemon: nothing to remove and nothing
+ *  moved reads exactly as it does with no daemon running; nothing to remove but a running value
+ *  that moved (the entry left the file behind the daemon's back) says the default is in force now;
+ *  and a removal says which value is in force now — the default, or the daemon's environment when
+ *  that sets the variable. A daemon that does not say whether it removed anything is reported as
+ *  having cleared the entry, which is what it was asked to do. */
 export function renderSettingClearedLive(
   setting: DaemonEnvSetting,
   filePath: string,
-  outcome: { removed?: boolean; pinned?: boolean },
+  outcome: { removed?: boolean; pinned?: boolean; changed?: boolean },
   palette: Palette = PLAIN_PALETTE,
 ): string {
-  if (outcome.removed === false) return renderSettingForgotten(setting, filePath, false, palette);
+  if (outcome.removed === false) {
+    return outcome.changed === true
+      ? `${setting.name} is not set in ${filePath}; the running daemon is back on the default ` +
+          'now.\n'
+      : renderSettingForgotten(setting, filePath, false, palette);
+  }
   return outcome.pinned === true
     ? `${palette.green(`Removed ${setting.name}`)} from ${filePath}; the daemon's environment ` +
         `still sets ${setting.name}, so that value stays in force.\n`
@@ -1360,8 +1367,10 @@ export function daemonSettingsPath(paths: Paths = defaultPaths()): string {
   return join(dirname(paths.vaultDir), 'daemon-settings.json');
 }
 
+/** Atomic: a live quiet change rewrites the report while other commands read it, and a reader
+ *  that caught a half-written file would take the daemon for one too old to write a report. */
 export async function writeSettingsReport(filePath: string, report: SettingsReport): Promise<void> {
-  await writeFile(filePath, JSON.stringify(report, null, 2) + '\n', 'utf8');
+  await atomicWriteFile(filePath, JSON.stringify(report, null, 2) + '\n');
 }
 
 /** Whether the report says greedy auto-switch was ACTIVE at the last daemon start (both the

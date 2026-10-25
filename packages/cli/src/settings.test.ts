@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, link, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Paths } from '@claude-control/switch-engine';
@@ -744,6 +744,25 @@ describe('settings report file', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('replaces the report whole rather than rewriting it in place', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cctl-settings-'));
+    try {
+      const file = join(dir, 'daemon-settings.json');
+      const before = { startedAtMs: 1, settings: [], quiet: true };
+      const after = { startedAtMs: 1, settings: [], quiet: false };
+      await writeSettingsReport(file, before);
+      // A second name for the old file: an in-place rewrite (truncate, then write — the window a
+      // concurrent reader can catch empty) changes what it reads; a whole replacement does not.
+      const held = join(dir, 'held.json');
+      await link(file, held);
+      await writeSettingsReport(file, after);
+      expect(await readSettingsReport(file)).toEqual(after);
+      expect(await readSettingsReport(held)).toEqual(before);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 /** Every CCTL_ name the daemon rows tell an operator about. */
@@ -1429,6 +1448,21 @@ describe('renderSettingClearedLive', () => {
     expect(renderSettingClearedLive(quiet, 'cfg.json', { removed: false, pinned: false })).toBe(
       renderSettingForgotten(quiet, 'cfg.json', false),
     );
+  });
+
+  it('says the default is in force when the entry was already gone but the daemon moved', () => {
+    expect(
+      renderSettingClearedLive(quiet, 'cfg.json', { removed: false, pinned: false, changed: true }),
+    ).toBe(
+      'CCTL_DISCORD_QUIET is not set in cfg.json; the running daemon is back on the default now.\n',
+    );
+    expect(
+      renderSettingClearedLive(quiet, 'cfg.json', {
+        removed: false,
+        pinned: false,
+        changed: false,
+      }),
+    ).toBe(renderSettingForgotten(quiet, 'cfg.json', false));
   });
 
   it('names the environment as what stays in force when it pins the value', () => {
