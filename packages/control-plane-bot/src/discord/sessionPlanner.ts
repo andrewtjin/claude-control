@@ -564,8 +564,16 @@ export class SessionPlanner {
     }
   }
 
+  /** The short session id a quiet card-mode line leads with. Card mode shares one conversation
+   *  (the DM) between sessions, and quiet mode posts no card, so without it a reply could not be
+   *  told apart from another session's or matched to its row in `/sessions`. A thread
+   *  already carries the id in its name; a posted card carries it itself. */
+  private label(view: SessionView): string {
+    return view.quiet && view.mode === 'card' ? `\`${view.route.sessionId.slice(0, 8)}\` ` : '';
+  }
+
   private line(view: SessionView, content: string, truncated = false): GatewayOp {
-    const withMarker = truncated ? `${content} ⟨truncated⟩` : content;
+    const withMarker = `${this.label(view)}${truncated ? `${content} ⟨truncated⟩` : content}`;
     return {
       kind: 'sendMessage',
       route: view.route,
@@ -586,7 +594,7 @@ export class SessionPlanner {
    *  instead, as a skipped stream burst is. */
   private replyLines(view: SessionView, content: string, truncated: boolean): GatewayOp[] {
     if (!view.quiet) return [this.line(view, content, truncated)];
-    const text = truncated ? `${content} ⟨truncated⟩` : content;
+    const text = `${this.label(view)}${truncated ? `${content} ⟨truncated⟩` : content}`;
     if (text.length > STREAM_SKIP_THRESHOLD_CHARS) {
       return [
         {
@@ -594,7 +602,7 @@ export class SessionPlanner {
           route: view.route,
           filename: `session-${view.route.sessionId}-reply.md`,
           text,
-          content: 'The reply is too long to post here — it is attached in full.',
+          content: `${this.label(view)}The reply is too long to post here — it is attached in full.`,
         },
       ];
     }
@@ -614,8 +622,10 @@ export class SessionPlanner {
    *  appended messages already carry the transcript, so a routine mid-run attachment would just
    *  duplicate what the reader scrolled past. */
   private attachIfNeeded(view: SessionView, ops: GatewayOp[], final: boolean): void {
-    // Quiet mode attaches nothing: the daemon sends no transcript to attach, only reply lines.
-    if (view.quiet) return;
+    // Quiet mode attaches nothing: the daemon sends no transcript to attach, only reply lines. The
+    // one exception is a burst a stream thread skipped before quiet mode came on: its marker
+    // promised the transcript at the end, and those bytes reached no other surface.
+    if (view.quiet && !(view.mode === 'stream' && view.streamCut)) return;
     const len = view.fullStdout.length;
     if (len === 0) return;
     if (view.mode === 'stream') {

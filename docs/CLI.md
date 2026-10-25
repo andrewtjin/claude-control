@@ -1343,7 +1343,9 @@ Quiet mode is **on by default**: Discord gets the cards that need you and little
   account needs a re-login; and, for a session started from the phone, one message per turn
   with Claude's final reply (or why the turn failed, or a line saying the session ended before
   it replied). A reply too long for one message is split across several, or attached whole
-  when it is very long.
+  when it is very long. In a DM, where sessions share one conversation and no live card is
+  posted, each of those messages starts with the first eight characters of the session's id,
+  so two sessions' replies stay apart and each matches its row in `/sessions`.
 - **Dropped:** the done card after every terminal turn, command output cards (including the
   output of a tool you approved from the phone), "Claude is waiting" nags, API-error cards; a
   phone-started session's tool lines, progress lines, retry and usage-limit notes, waiting

@@ -2144,8 +2144,8 @@ describe('DiscordJsGateway — /quiet', () => {
     );
     await gw.deliver(USER, envelope('session.status', { ...route, state: 'done' }));
 
-    // No live card and no summary embed: one line, the final reply.
-    expect(sink.sends).toEqual([{ content: '📝 Session complete: done' }]);
+    // No live card and no summary embed: one line, the final reply, led by its session's id.
+    expect(sink.sends).toEqual([{ content: '`s-quiet` 📝 Session complete: done' }]);
   });
 
   it('keeps the old surface for a daemon that reports quiet mode off', async () => {

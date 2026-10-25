@@ -585,6 +585,8 @@ describe('SessionPlanner — quiet mode', () => {
 
   for (const mode of ['card', 'stream'] as const) {
     describe(`${mode} mode`, () => {
+      // Card mode shares the DM between sessions and posts no card, so its lines lead with the id.
+      const tag = mode === 'card' ? '`s1` ' : '';
       it("posts one line per turn — the daemon's summary — and nothing else", () => {
         const p = new SessionPlanner();
         const ops: GatewayOp[] = [];
@@ -597,7 +599,7 @@ describe('SessionPlanner — quiet mode', () => {
         );
         ops.push(...p.onStatus(ROUTE, status('waiting_input'), 50, mode, true).ops);
         // No live card, no waiting lines: just the final reply.
-        expect(posted(ops)).toEqual(['📝 Session complete: done']);
+        expect(posted(ops)).toEqual([`${tag}📝 Session complete: done`]);
       });
 
       it('posts no summary embed and no attachment when the session ends', () => {
@@ -620,7 +622,7 @@ describe('SessionPlanner — quiet mode', () => {
           mode,
           true,
         );
-        expect(posted(r.ops)).toEqual(['❗ Error: the connection dropped']);
+        expect(posted(r.ops)).toEqual([`${tag}❗ Error: the connection dropped`]);
       });
 
       it('keeps the orphaned line: the interrupted turn has no other outcome', () => {
@@ -628,7 +630,7 @@ describe('SessionPlanner — quiet mode', () => {
         p.onStatus(ROUTE, status('running'), 0, mode, true);
         const r = p.onStatus(ROUTE, status('orphaned'), 10, mode, true);
         expect(posted(r.ops)).toHaveLength(1);
-        expect(posted(r.ops)[0]).toContain('🪦');
+        expect(posted(r.ops)[0]).toMatch(new RegExp(`^${tag}🪦`));
       });
 
       for (const cutOff of ['starting', 'running', 'waiting_permission'] as const) {
@@ -637,7 +639,7 @@ describe('SessionPlanner — quiet mode', () => {
           p.onStatus(ROUTE, status('starting'), 0, mode, true);
           p.onStatus(ROUTE, status(cutOff), 10, mode, true);
           const r = p.onStatus(ROUTE, status('done'), 20, mode, true);
-          expect(posted(r.ops)).toEqual(['⏹ the session ended before replying']);
+          expect(posted(r.ops)).toEqual([`${tag}⏹ the session ended before replying`]);
         });
       }
 
@@ -655,7 +657,7 @@ describe('SessionPlanner — quiet mode', () => {
         p.onStatus(ROUTE, status('waiting_input'), 20, mode, true);
         p.onStatus(ROUTE, status('running'), 30, mode, true);
         const r = p.onStatus(ROUTE, status('done'), 40, mode, true);
-        expect(posted(r.ops)).toEqual(['⏹ the session ended before replying']);
+        expect(posted(r.ops)).toEqual([`${tag}⏹ the session ended before replying`]);
       });
 
       it('posts nothing when an idle session is stopped: its last turn already replied', () => {
@@ -680,7 +682,7 @@ describe('SessionPlanner — quiet mode', () => {
         const lines = lineSends(r.ops).map((o) => (o.kind === 'sendMessage' ? o.content : ''));
         expect(lines.length).toBeGreaterThan(1);
         for (const l of lines) expect(l!.length).toBeLessThanOrEqual(2000);
-        expect(lines.join('\n')).toBe(`📝 ${reply}`);
+        expect(lines.join('\n')).toBe(`${tag}📝 ${reply}`);
         expect(uploads(r.ops)).toHaveLength(0);
       });
 
@@ -692,7 +694,7 @@ describe('SessionPlanner — quiet mode', () => {
         expect(lineSends(r.ops)).toHaveLength(0);
         const files = uploads(r.ops);
         expect(files).toHaveLength(1);
-        expect(files[0]!.kind === 'uploadAttachment' && files[0]!.text).toBe(`📝 ${reply}`);
+        expect(files[0]!.kind === 'uploadAttachment' && files[0]!.text).toBe(`${tag}📝 ${reply}`);
       });
     });
   }
@@ -727,6 +729,40 @@ describe('SessionPlanner — quiet mode', () => {
     expect(edits(later.ops)).toHaveLength(1);
     expect(cardSends(later.ops)).toHaveLength(0);
     expect(lineSends(later.ops)).toHaveLength(0);
+  });
+
+  it('labels each quiet card-mode reply with its session, so two in one DM stay apart', () => {
+    const p = new SessionPlanner();
+    const a: SessionRoute = { discordUserId: 'u1', sessionId: 'aaaaaaaa-1111' };
+    const b: SessionRoute = { discordUserId: 'u1', sessionId: 'bbbbbbbb-2222' };
+    const reply = (route: SessionRoute) =>
+      p.onOutput(
+        route,
+        { ...output(0, 'summary', 'Session complete: done'), sessionId: route.sessionId },
+        10,
+        'card',
+        true,
+      ).ops;
+    expect(lineSends(reply(a)).map((o) => o.kind === 'sendMessage' && o.content)).toEqual([
+      '`aaaaaaaa` 📝 Session complete: done',
+    ]);
+    expect(lineSends(reply(b)).map((o) => o.kind === 'sendMessage' && o.content)).toEqual([
+      '`bbbbbbbb` 📝 Session complete: done',
+    ]);
+  });
+
+  it('still attaches a burst a thread skipped before quiet mode came on, as its marker promised', () => {
+    const p = new SessionPlanner();
+    p.onStatus(ROUTE, status('running'), 5000, 'stream', false);
+    const burst = 'b'.repeat(20_000);
+    const skipped = p.onOutput(ROUTE, output(0, 'stdout', burst), 5010, 'stream', false);
+    expect(
+      lineSends(skipped.ops).some((o) => o.kind === 'sendMessage' && o.content?.includes('⏩')),
+    ).toBe(true);
+    const end = p.onStatus(ROUTE, status('done'), 6000, 'stream', true);
+    const files = uploads(end.ops);
+    expect(files.length).toBeGreaterThan(0);
+    expect(files.map((f) => (f.kind === 'uploadAttachment' ? f.text : '')).join('')).toBe(burst);
   });
 
   it('reads quiet per frame: turning it off brings the state lines and summary card back', () => {
