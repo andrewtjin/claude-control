@@ -30,7 +30,8 @@ const REPORT: SettingsSnapshot = {
 };
 
 /** A stand-in for the composition root's control: an in-memory value, every set recorded, and
- *  an optional scripted refusal or throw in place of a save. */
+ *  an optional scripted refusal or throw in place of a save. Like the real one, a set moves the
+ *  row's source to config and an unset back to default, whether or not the value moved. */
 function fakeQuiet(
   initial: boolean,
   behaviour: { refuse?: QuietSetResult; throws?: boolean } = {},
@@ -50,7 +51,17 @@ function fakeQuiet(
         ok: true,
         quiet: next,
         changed,
-        report: { ...REPORT, quiet: next },
+        report: {
+          ...REPORT,
+          settings: [
+            {
+              name: 'discord quiet',
+              value: next ? 'on' : 'off',
+              source: value === undefined ? 'default' : 'config',
+            },
+          ],
+          quiet: next,
+        },
       });
     },
   };
@@ -153,6 +164,26 @@ describe('Daemon quiet mode: a phone-started session', () => {
     await waitFor(sawStatus(h, 'failed'));
 
     // Held while quiet, so it never went out live: the failed status is its one chance.
+    expect(outputs(h).map((o) => [o.kind, o.text])).toEqual([
+      ['error', 'Error: the API connection dropped'],
+    ]);
+  });
+
+  it('posts no stale held line after an error that went out once quiet mode was off', async () => {
+    const quiet = fakeQuiet(true);
+    harness = await createHarness({ quiet });
+    const h = harness;
+    await h.daemon.start();
+    const handle = await spawnSession(h);
+
+    handle.emit({ kind: 'status', state: 'running' });
+    handle.emit({ kind: 'error', text: 'a prose line about an error' });
+    quiet.value = false;
+    handle.emit({ kind: 'error', text: 'Error: the API connection dropped' });
+    handle.emit({ kind: 'status', state: 'failed' });
+    await waitFor(sawStatus(h, 'failed'));
+
+    // The phone already has this turn's reason; the older held line must not follow it.
     expect(outputs(h).map((o) => [o.kind, o.text])).toEqual([
       ['error', 'Error: the API connection dropped'],
     ]);
@@ -325,12 +356,15 @@ describe('Daemon quiet mode: changing it live', () => {
     ]);
   });
 
-  it('answers a repeat without re-sending the snapshot', async () => {
+  it('re-sends the snapshot for a repeat too, since the source moved to config', async () => {
     const h = await started(fakeQuiet(true));
     setFromPhone(h, true);
     await waitFor(() => results(h).length === 1);
     expect(results(h)[0]?.message).toBe('Quiet mode was already on.');
-    expect(snapshots(h)).toHaveLength(2);
+    expect(snapshots(h)).toHaveLength(3);
+    expect(snapshots(h)[2]?.settings).toEqual([
+      { name: 'discord quiet', value: 'on', source: 'config' },
+    ]);
   });
 
   it("relays the control's refusal in its own words, leaving everything as it was", async () => {
@@ -377,7 +411,7 @@ describe('Daemon quiet mode: changing it live', () => {
       headers: { 'content-type': 'application/json', 'x-claude-control-secret': 'shh' },
       body: JSON.stringify({ quiet: false }),
     });
-    await waitFor(() => snapshots(h).length === 3);
-    expect(snapshots(h)[2]?.quiet).toBe(false);
+    await waitFor(() => snapshots(h).length === 4);
+    expect(snapshots(h)[3]?.quiet).toBe(false);
   });
 });

@@ -2358,8 +2358,10 @@ export class Daemon {
       };
     }
     if (result.ok) {
+      // Re-sent even when the value held: the row's source still moves (default to config, or
+      // back), and the bot's /settings must read the same as `cctl settings` now.
       this.settingsReport = result.report;
-      if (result.changed) this.sendSettingsSnapshot();
+      this.sendSettingsSnapshot();
       this.logger.info({ quiet: result.quiet, changed: result.changed }, 'quiet mode set');
     } else {
       this.logger.info({ reason: result.reason }, 'quiet mode change refused');
@@ -2369,7 +2371,7 @@ export class Daemon {
 
   /** Phone-initiated `/quiet on|off`. A request/reply like stats.request: one Discord interaction
    *  is waiting, so every path ends in exactly one `settings.quiet.result` carrying the requestId.
-   *  The snapshot (re-sent by setQuiet on a change) goes out first, so the bot's cache is current
+   *  The snapshot (re-sent by setQuiet) goes out first, so the bot's cache is current
    *  by the time it renders the reply. */
   private async handleQuietSet(msg: MessageOf<'settings.quiet.set'>): Promise<void> {
     const { requestId, quiet } = msg.payload;
@@ -4938,7 +4940,9 @@ export class Daemon {
       if (kind === 'error') this.quietHeldErrors.set(sessionId, event.text);
       return;
     }
-    if (kind === 'summary') this.quietHeldErrors.delete(sessionId);
+    // A summary or an error line that reaches the phone is the turn's reason already, so a line
+    // held before quiet mode went off must not follow it at the failed transition.
+    if (kind === 'summary' || kind === 'error') this.quietHeldErrors.delete(sessionId);
     this.sendSessionOutput(sessionId, kind, event.text);
   }
 
