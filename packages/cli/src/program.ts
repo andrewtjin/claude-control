@@ -635,14 +635,16 @@ export function buildProgram(): Command {
       if (!checked.ok) fail(checked.message);
       const filePath = daemonConfigPath();
       // Quiet mode changes the running daemon too; the daemon saves the value itself when it can.
-      if (
-        setting.name === QUIET_ENV_NAME &&
-        // The checked value always parses, so this reads it as on or off (never as an unset).
-        (await setQuietOnRunningDaemon(envBool({ value: checked.value }, 'value') === true)) !==
-          undefined
-      ) {
+      const live =
+        setting.name === QUIET_ENV_NAME
+          ? // The checked value always parses, so this reads it as on or off (never as an unset).
+            await setQuietOnRunningDaemon(envBool({ value: checked.value }, 'value') === true)
+          : undefined;
+      if (live !== undefined) {
+        // The daemon writes its own spelling (on/off), not the `yes`/`1` the user may have typed,
+        // so the confirmation names what is in the file.
         process.stdout.write(
-          renderSettingApplied(setting, checked.value, filePath, detectPalette()),
+          renderSettingApplied(setting, live.quiet ? 'on' : 'off', filePath, detectPalette()),
         );
         return;
       }

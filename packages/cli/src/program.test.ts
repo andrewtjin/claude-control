@@ -400,6 +400,14 @@ describe('buildProgram', () => {
       await expect(readFile(settingsIo.configPath, 'utf8')).rejects.toThrow();
     });
 
+    it('confirms a live set with the spelling the daemon saved, not the one typed', async () => {
+      quietIo.call = (value) => Promise.resolve({ quiet: value ?? true, changed: true });
+      const r = await runCli(['settings', 'set', 'quiet', 'yes']);
+      expect(r.exited).toBe(false);
+      expect(r.out).toContain('Saved CCTL_DISCORD_QUIET=on to');
+      expect(r.out).not.toContain('=yes');
+    });
+
     it('reports a live unset by what it did to the file', async () => {
       quietIo.call = () => Promise.resolve({ quiet: true, changed: false, removed: false });
       const nothing = await runCli(['settings', 'unset', 'quiet']);
