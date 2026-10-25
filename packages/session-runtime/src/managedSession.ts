@@ -306,6 +306,11 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
   // waits for that turn's teardown instead of running beside it (see startRetry). Cancelled
   // by the same callers that cancel the timer — once due, a retry is no less stale.
   let pendingRetry: PendingRetry | undefined;
+  // Text sent after a turn reported its end but while its stream was still closing. The turn is
+  // over, so the text is accepted rather than refused as busy, but it waits for that stream's
+  // teardown for the same reason a due retry does (see startRetry). It outranks a held retry, as
+  // a send() does at any other time.
+  let heldSend: string | undefined;
   // ---- usage-limit stall (rides the same autoContinue umbrella) ----
   // True while the session is PARKED on a usage-limit death: not failed (a different
   // account fixes it), not retrying on a timer (waiting doesn't help within the window) —
@@ -596,11 +601,17 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
       // closing late must never advertise an idle session while its successor is mid-query.
       if (turn.id === latestTurnId) {
         busy = false;
-        // The session is idle for the first time since a due retry was held back — this is
-        // the moment it was waiting for (see startRetry).
+        // The session is idle for the first time since a send or a due retry was held back —
+        // this is the moment both were waiting for (see send and startRetry).
+        const held = heldSend;
         const due = pendingRetry;
-        if (due !== undefined) {
-          pendingRetry = undefined;
+        heldSend = undefined;
+        pendingRetry = undefined;
+        if (held !== undefined) {
+          // The closing stream may still have failed the session; a held send is not a reason to
+          // revive it.
+          if (state !== 'done' && state !== 'failed') void runTurn(held);
+        } else if (due !== undefined) {
           startRetry(due);
         }
       }
@@ -646,6 +657,14 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
     // implicit microtask hop, so the check-then-kick sequence stays a single atomic tick.
     send(text: string): Promise<void> {
       if (busy) {
+        // A turn that already reported its end is only waiting for its stream to close. Refusing
+        // here would bounce text sent at the very moment the session says it is ready for more,
+        // so it is held for that teardown instead. One at a time: a second send is still busy.
+        if (state === 'waiting_input' && heldSend === undefined) {
+          cancelPendingRetry();
+          heldSend = text;
+          return Promise.resolve();
+        }
         return Promise.reject(new SessionBusyError(opts.id));
       }
       if (state === 'done' || state === 'failed') {
@@ -672,6 +691,9 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
       return true;
     },
     async interrupt(): Promise<void> {
+      // A held send is work queued behind the turn being interrupted, not work in flight. Left in
+      // place it would start the moment that turn's stream closes, undoing the interrupt.
+      heldSend = undefined;
       const hadRetry = cancelPendingRetry();
       // During a backoff wait there is no in-flight turn — the interrupt's meaning is
       // "stop the pending auto-continue". The session settles idle awaiting input, the
@@ -686,7 +708,8 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
     },
     async stop(): Promise<void> {
       // A pending retry must die with the session — a timer firing after teardown would
-      // start a turn on a client that has already been end()ed.
+      // start a turn on a client that has already been end()ed. A held send likewise.
+      heldSend = undefined;
       cancelPendingRetry();
       // Client teardown is best-effort: end() can reject when the transport is already dead
       // (the SDK subprocess died out from under us), and the session is no less over for it.

@@ -2145,6 +2145,25 @@ describe('Daemon lifecycle', () => {
     expect(handle.sent).toEqual([]);
   });
 
+  // Delivering starts the next turn, which a session may report from inside the send itself.
+  it('sends the turn boundary status before the running of the turn a queued inject starts', async () => {
+    const { handle, refused } = await spawnBusySession();
+    injectInto('spawned-session', 'next', 'k1');
+    await waitFor(() => refused.length === 1);
+
+    handle.send = (text: string) => {
+      handle.sent.push(text);
+      handle.emit({ kind: 'status', state: 'running' });
+      return Promise.resolve();
+    };
+    handle.emit({ kind: 'status', state: 'waiting_input' });
+    await waitFor(() => relay.received.filter((e) => e.type === 'session.status').length >= 3);
+    const states = relay.received.flatMap((e) =>
+      e.type === 'session.status' ? [e.payload.state] : [],
+    );
+    expect(states.slice(-2)).toEqual(['waiting_input', 'running']);
+  });
+
   // Refusing an over-full queue beats silently dropping the oldest — a full queue means nothing
   // is draining, and the sender needs to hear that rather than watch text vanish.
   it('refuses a new inject once the queue is full, naming why', async () => {

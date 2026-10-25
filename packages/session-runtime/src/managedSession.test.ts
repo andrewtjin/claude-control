@@ -1065,6 +1065,50 @@ describe('startManagedSession turn identity', () => {
     expect(calls).toHaveLength(2);
   });
 
+  it('a send() made from the turn-end status is held for the stream teardown, then runs', async () => {
+    const closing = openTurn();
+    const { client, calls } = fakeClient([
+      closing.turn,
+      [{ type: 'turn_result', ok: true, summary: 'second' }],
+    ]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    const sent: Array<Promise<void>> = [];
+    // The same reaction a caller delivering queued text has: send the moment the session
+    // reports it is waiting for input, while the reporting turn's stream is still open.
+    handle.onEvent((e) => {
+      if (e.kind === 'status' && e.state === 'waiting_input' && sent.length === 0) {
+        sent.push(handle.send('queued follow-up'));
+      }
+    });
+    await tick();
+    await closing.push({ type: 'turn_result', ok: true, summary: 'first' });
+
+    await expect(sent[0]).resolves.toBeUndefined();
+    // Held, not run beside the open stream, and a second send is still refused as busy.
+    expect(calls).toHaveLength(1);
+    await expect(handle.send('another')).rejects.toThrow(SessionBusyError);
+    await closing.close();
+    await tick();
+    expect(calls.map((c) => c.prompt)).toEqual(['go', 'queued follow-up']);
+    expect(handle.getState()).toBe('waiting_input');
+  });
+
+  it('interrupt() and stop() drop a held send instead of starting it at teardown', async () => {
+    for (const end of ['interrupt', 'stop'] as const) {
+      const closing = openTurn();
+      const { client, calls } = fakeClient([closing.turn]);
+      const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+      await tick();
+      await closing.push({ type: 'turn_result', ok: true, summary: 'first' });
+      await handle.send('queued follow-up');
+
+      await (end === 'interrupt' ? handle.interrupt() : handle.stop());
+      await closing.close();
+      await tick();
+      expect(calls).toHaveLength(1);
+    }
+  });
+
   it('stop() cancels a retry that is already due but waiting on the stream', async () => {
     const dying = openTurn();
     const { client, calls } = fakeClient([

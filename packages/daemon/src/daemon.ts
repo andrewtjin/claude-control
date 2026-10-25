@@ -3497,14 +3497,14 @@ export class Daemon {
     });
   }
 
-  /** Forget a dead session's queued text. Nothing can deliver it once the handle is gone, and a
-   *  queue that outlives its session is just a leak wearing a promise. */
+  /** Forget a dead or stopping session's queued text. Nothing can deliver it once the handle is
+   *  gone, and a queue that outlives its session is just a leak wearing a promise. */
   private dropManagedInjects(sessionId: string): void {
     const dropped = this.pendingManagedInjects.get(sessionId)?.length ?? 0;
     if (dropped === 0) return;
     this.pendingManagedInjects.delete(sessionId);
     this.store.deletePendingSteeringForSession(sessionId, MANAGED_STEERING_KIND);
-    this.logger.warn({ sessionId, dropped }, 'dropped queued prompt.inject for an ended session');
+    this.logger.warn({ sessionId, dropped }, 'dropped queued prompt.inject for an ending session');
   }
 
   private queueSteering(msg: MessageOf<'prompt.inject'>, tracked: TrackedInteractiveSession): void {
@@ -4591,6 +4591,10 @@ export class Daemon {
     // synchronous, so nothing has yielded since the duplicate-CHECK above; the "suppress before the
     // first await" invariant that protects the grace window from a double-tap is preserved.
     this.rememberStopKey(idempotencyKey);
+    // Text queued for a session being stopped must not start a turn: the stop's own interrupt can
+    // settle it idle, and delivering there would hand the grace window to work the operator is
+    // ending.
+    this.dropManagedInjects(sessionId);
 
     const result = await escalateStop(handle, {
       ...(this.stopGraceMs !== undefined ? { graceMs: this.stopGraceMs } : {}),
@@ -4909,11 +4913,6 @@ export class Daemon {
       // so `cctl session status` reflects the same state the phone just saw. Failure to mirror
       // must never block the live envelope — see mirrorManagedSession.
       this.mirrorManagedSession(sessionId, accountId, event.state);
-      // The turn boundary queued injects have been waiting for. Terminal states instead end the
-      // wait: nothing will deliver, so the queue is dropped rather than left to look pending.
-      if (event.state === 'waiting_input') this.drainManagedInjects(sessionId);
-      else if (event.state === 'done' || event.state === 'failed')
-        this.dropManagedInjects(sessionId);
       // A held error line is the reason a quiet-mode turn failed: posted just ahead of the failed
       // status, as that turn's one outcome line. Any other transition means the turn ended some
       // other way, so the held line was only prose and is dropped. Not gated on quiet mode being
@@ -4938,6 +4937,13 @@ export class Daemon {
           quiet: this.quietSessionFrames(),
         },
       });
+      // The turn boundary queued injects have been waiting for. Terminal states instead end the
+      // wait: nothing will deliver, so the queue is dropped rather than left to look pending.
+      // Only after this status has gone out: delivering can start the next turn from inside this
+      // call, and its `running` must reach the phone after the `waiting_input` that preceded it.
+      if (event.state === 'waiting_input') this.drainManagedInjects(sessionId);
+      else if (event.state === 'done' || event.state === 'failed')
+        this.dropManagedInjects(sessionId);
       return;
     }
 
