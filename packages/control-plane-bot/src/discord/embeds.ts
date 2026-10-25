@@ -817,6 +817,15 @@ export function buildSessionListEmbed(sessions: SessionStatus[]): EmbedBuilder {
   return fitEmbed(embed);
 }
 
+/** The context a permission or question card's footer ends with: a non-default mode, then the
+ *  card's origin tag (folder · session prefix). The origin is what tells one session's card from
+ *  another's when several share a conversation and nothing else nearby names the session. */
+function footerContext(permissionMode?: string, origin?: string): string {
+  const mode =
+    permissionMode !== undefined && permissionMode !== 'default' ? ` · ${permissionMode} mode` : '';
+  return origin !== undefined && origin !== '' ? `${mode} · ${origin}` : mode;
+}
+
 /** Rendered for an incoming permission.request push — actionable in EVERY permission mode.
  *  This card only exists while the daemon is holding the hook's HTTP response open for a
  *  remote decision, and the CLI only fires that hook when it is actually blocking on a prompt
@@ -830,9 +839,9 @@ export function buildPermissionRequestEmbed(
   summary: string,
   detail?: string,
   permissionMode?: string,
+  origin?: string,
 ): EmbedBuilder {
-  const modeNote =
-    permissionMode !== undefined && permissionMode !== 'default' ? ` · ${permissionMode} mode` : '';
+  const context = footerContext(permissionMode, origin);
   const embed = new EmbedBuilder()
     .setTitle('Permission requested')
     .setColor(COLOR_WARN)
@@ -840,7 +849,7 @@ export function buildPermissionRequestEmbed(
     // this builder throw on the push path — no card, no buttons, and the session stays blocked
     // until the hold lapses. Truncated-but-delivered beats correct-but-absent.
     .setDescription(clampDescription(summary))
-    .setFooter({ text: `Approve or Deny below · or /approve /deny${modeNote}` });
+    .setFooter({ text: `Approve or Deny below · or /approve /deny${context}` });
   // Detail is hook-supplied tool input — unbounded (a long Bash command, a big diff).
   if (detail) addClampedField(embed, 'Detail', detail);
   return fitEmbed(embed);
@@ -868,14 +877,14 @@ const MAX_QUESTION_FIELDS = 4;
 export function buildQuestionEmbed(
   questions: PayloadOf<'question.request'>['questions'],
   permissionMode?: string,
+  origin?: string,
 ): EmbedBuilder {
   const shown = questions.slice(0, MAX_QUESTION_FIELDS);
-  const modeNote =
-    permissionMode !== undefined && permissionMode !== 'default' ? ` · ${permissionMode} mode` : '';
+  const context = footerContext(permissionMode, origin);
   const embed = new EmbedBuilder()
     .setTitle(shown.length <= 1 ? 'Claude has a question' : 'Claude has questions')
     .setColor(COLOR_WARN)
-    .setFooter({ text: `Answer with the menus below${modeNote}` });
+    .setFooter({ text: `Answer with the menus below${context}` });
   shown.forEach((q, i) => {
     const name = q.header != null && q.header.length > 0 ? q.header : `Question ${i + 1}`;
     // The question is verbatim model text and a "which of these?" question is exactly the shape

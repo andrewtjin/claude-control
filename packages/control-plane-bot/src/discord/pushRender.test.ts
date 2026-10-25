@@ -50,6 +50,33 @@ describe('renderPush — permission.request', () => {
     }
   });
 
+  // Two sessions sharing a DM can ask for the same tool; the card has to say which one a tap frees.
+  it('names the session (and its folder) on permission and question cards', () => {
+    const origin = { sessionId: '1a2b3c4d-0000-4000-8000-000000000000', cwd: '/work/sample-app' };
+    const permission = renderPush(
+      env('permission.request', {
+        requestId: 'r',
+        tool: 'Bash',
+        summary: 'npm test',
+        permissionMode: 'plan',
+        ...origin,
+      }),
+    );
+    expect(permission?.embeds?.[0]?.toJSON().footer?.text).toBe(
+      'Approve or Deny below · or /approve /deny · plan mode · sample-app · 1a2b3c4d',
+    );
+    const question = renderPush(
+      env('question.request', {
+        requestId: 'q',
+        questions: [{ question: 'Which?', multiSelect: false, options: [{ label: 'A' }] }],
+        ...origin,
+      }),
+    );
+    expect(question?.embeds?.[0]?.toJSON().footer?.text).toBe(
+      'Answer with the menus below · sample-app · 1a2b3c4d',
+    );
+  });
+
   it('keeps the buttons when the mode is absent', () => {
     const push = renderPush(
       env('permission.request', { requestId: 'r', sessionId: 's', tool: 'Bash', summary: 'x' }),

@@ -76,7 +76,7 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
     const p = envelope.payload;
     const detail = p.detail ?? undefined;
     const mode = p.permissionMode ?? undefined;
-    const embed = buildPermissionRequestEmbed(p.summary, detail, mode);
+    const embed = buildPermissionRequestEmbed(p.summary, detail, mode, sessionTag(p));
     // Buttons ship in every permission mode: this envelope only exists while the daemon holds
     // the hook response open for a remote decision (see permissionButtons), so a tap always
     // takes effect honestly; the mode is context on the embed, not a gate.
@@ -85,7 +85,7 @@ export function renderPush(envelope: Envelope): RenderedPush | undefined {
   if (isType(envelope, 'question.request')) {
     const p = envelope.payload;
     const mode = p.permissionMode ?? undefined;
-    const embed = buildQuestionEmbed(p.questions, mode);
+    const embed = buildQuestionEmbed(p.questions, mode, sessionTag(p));
     // One string select per question (plus an Other entry), inflated by the gateway. Like the
     // permission card, this envelope only exists while the daemon holds the answer channel open,
     // so the pickers always take effect.
@@ -303,13 +303,17 @@ function previewOf(text: string): { text: string; clipped: boolean } {
   return { text: `${head.trimEnd()}\n…`, clipped: true };
 }
 
-/** "<folder> · <session prefix>" — the output card's footer, tying the card to the window
- *  that produced it. Several CLI windows can stream shell output at once, and untagged cards
+/** "<folder> · <session prefix>" — the footer tag tying a card to the window that produced it:
+ *  an output card's whole footer, and the tail of a permission or question card's, where it says
+ *  which session a tap releases. Several CLI windows can stream shell output at once, and untagged cards
  *  are indistinguishable on a phone: the working directory's basename is the human-meaningful
  *  origin, and the session-id prefix splits two windows running in the same directory. Either
  *  part may be absent (older daemon, internal sender) — the tag shrinks instead of guessing,
  *  down to the empty string (no footer). */
-function sessionTag(p: PayloadOf<'hook.notification'>): string {
+function sessionTag(p: {
+  cwd?: string | null | undefined;
+  sessionId?: string | null | undefined;
+}): string {
   // Hooks report native paths — split on both separators so Windows and POSIX paths both
   // yield a basename, and drop empty segments so a trailing separator can't blank the folder.
   const folder = p.cwd
