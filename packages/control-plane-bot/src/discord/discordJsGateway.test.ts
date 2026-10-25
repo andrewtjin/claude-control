@@ -2157,4 +2157,45 @@ describe('DiscordJsGateway — /quiet', () => {
     // The live card is posted, as before quiet mode existed.
     expect(sink.sends).toHaveLength(1);
   });
+
+  it('plans a frame under the quiet mode it was sent with, not the newer snapshot', async () => {
+    // A reconnect writes the current snapshot (quiet off) ahead of rows queued while quiet was on.
+    const gw = quietRelay().make();
+    const sink = new FakeSink();
+    gw.testSink = sink;
+    await gw.deliver(USER, snapshot(false));
+    const route = { sessionId: 's-replay' };
+    const reply = 'x'.repeat(2_500);
+    await gw.deliver(USER, envelope('session.status', { ...route, state: 'running', quiet: true }));
+    await gw.deliver(
+      USER,
+      envelope('session.output', {
+        ...route,
+        seq: 0,
+        kind: 'summary',
+        text: reply,
+        truncated: false,
+        quiet: true,
+      }),
+    );
+
+    // No live card, and the reply arrives whole across messages instead of clamped to one.
+    const posted = (sink.sends as Array<{ content?: string }>).map((s) => s.content ?? '');
+    expect(posted.length).toBeGreaterThan(1);
+    expect(posted.join('').split('x').length - 1).toBe(reply.length);
+  });
+
+  it('posts the live card for a frame sent with quiet off, even after quiet came on', async () => {
+    const gw = quietRelay().make();
+    const sink = new FakeSink();
+    gw.testSink = sink;
+    await gw.deliver(USER, snapshot(true));
+    await gw.deliver(
+      USER,
+      envelope('session.status', { sessionId: 's-older', state: 'running', quiet: false }),
+    );
+    // The one send is the card itself: an embed, not a quiet text line.
+    expect(sink.sends).toHaveLength(1);
+    expect((sink.sends[0] as { content?: string }).content).toBeUndefined();
+  });
 });

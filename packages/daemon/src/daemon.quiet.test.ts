@@ -115,6 +115,36 @@ describe('Daemon quiet mode: a phone-started session', () => {
     expect(statuses(h)).toEqual(['starting', 'running', 'waiting_input']);
   });
 
+  it('stamps every session frame with the quiet mode it was sent under', async () => {
+    const quiet = fakeQuiet(true);
+    harness = await createHarness({ quiet });
+    const h = harness;
+    await h.daemon.start();
+    const handle = await spawnSession(h);
+
+    handle.emit({ kind: 'status', state: 'running' });
+    handle.emit({ kind: 'summary', text: 'first turn' });
+    await waitFor(() => outputs(h).length === 1);
+    quiet.value = false;
+    handle.emit({ kind: 'output', text: 'second turn prose' });
+    handle.emit({ kind: 'status', state: 'waiting_input' });
+    await waitFor(sawStatus(h, 'waiting_input'));
+
+    // A frame replayed after a later change is still read under the mode that filtered it.
+    expect(outputs(h).map((o) => [o.text, o.quiet])).toEqual([
+      ['first turn', true],
+      ['second turn prose', false],
+    ]);
+    const stamped = h.sent.flatMap((e) =>
+      e.type === 'session.status' ? [[e.payload.state, e.payload.quiet]] : [],
+    );
+    expect(stamped).toEqual([
+      ['starting', true],
+      ['running', true],
+      ['waiting_input', false],
+    ]);
+  });
+
   it('posts the error that ended a failed turn as its one outcome line, before the status', async () => {
     harness = await createHarness({ quiet: fakeQuiet(true) });
     const h = harness;

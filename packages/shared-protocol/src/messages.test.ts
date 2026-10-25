@@ -1124,3 +1124,37 @@ describe('quiet mode (settings.snapshot.quiet, settings.quiet.set / .result)', (
     expect(set.success).toBe(true);
   });
 });
+
+describe('session frame quiet flag (additive, N/N-1 tolerant)', () => {
+  const output = { sessionId: 's1', seq: 0, kind: 'summary', text: 'done', truncated: false };
+  const status = { sessionId: 's1', state: 'running' };
+
+  it('parses session frames without it: a daemon predating the flag stays valid', () => {
+    for (const [type, payload] of [
+      ['session.output', output],
+      ['session.status', status],
+    ] as const) {
+      const result = decode(rawFrame(type, payload));
+      expect(result.ok).toBe(true);
+      if (
+        result.ok &&
+        (isType(result.envelope, 'session.output') || isType(result.envelope, 'session.status'))
+      ) {
+        expect(result.envelope.payload.quiet ?? undefined).toBeUndefined();
+      }
+    }
+  });
+
+  it('carries the flag through both frame types', () => {
+    const out = decode(rawFrame('session.output', { ...output, quiet: true }));
+    const st = decode(rawFrame('session.status', { ...status, quiet: false }));
+    expect(out.ok && isType(out.envelope, 'session.output') && out.envelope.payload.quiet).toBe(
+      true,
+    );
+    expect(st.ok && isType(st.envelope, 'session.status') && st.envelope.payload.quiet).toBe(false);
+  });
+
+  it('rejects a non-boolean flag', () => {
+    expect(decode(rawFrame('session.output', { ...output, quiet: 'on' })).ok).toBe(false);
+  });
+});

@@ -1257,9 +1257,10 @@ export class Daemon {
           this.logger.error({ err }, 'error handling settings.quiet.set');
         });
       },
-      // The settings report decides how the bot renders session frames (quiet mode above all), and
-      // the bot holds it in memory only — so every new connection opens with it, ahead of any
-      // replayed frame, rather than leaving a restarted bot to guess until the next poll cycle.
+      // The bot holds the settings report in memory only, and `/settings` and `/quiet` read it — so
+      // every new connection opens with it rather than leaving a restarted bot without it until
+      // the next poll cycle. Session frames do not depend on its order: each carries the quiet
+      // mode it was sent under.
       onOpen: () =>
         this.settingsReport
           ? [
@@ -4926,6 +4927,7 @@ export class Daemon {
           ...(spawnOrigin?.resumedFrom !== undefined
             ? { resumedFrom: spawnOrigin.resumedFrom }
             : {}),
+          quiet: this.isQuiet(),
         },
       });
       return;
@@ -4957,7 +4959,8 @@ export class Daemon {
     this.sendEnvelope({
       type: 'session.output',
       // `epoch` is this run's token so the bot can tell a restart-induced seq reset (which
-      // re-numbers from 0) apart from real output loss — see {@link outputEpoch}.
+      // re-numbers from 0) apart from real output loss — see {@link outputEpoch}. `quiet` is the
+      // mode this line was filtered under, which the bot plans it by even when it arrives later.
       payload: {
         sessionId,
         seq,
@@ -4965,6 +4968,7 @@ export class Daemon {
         text,
         truncated: false,
         epoch: this.outputEpoch,
+        quiet: this.isQuiet(),
       },
     });
   }

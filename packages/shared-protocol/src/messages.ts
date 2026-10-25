@@ -568,6 +568,14 @@ const SessionSpawnPayload = z.object({
   idempotencyKey: IdempotencyKey,
 });
 
+/** Whether quiet mode was on when the daemon sent a session frame. That mode decided which lines
+ *  the daemon sent and which it dropped, so the bot plans each frame under it, not under the mode
+ *  in force when the frame arrives: a frame replayed from the outbox after a reconnect, or still
+ *  queued when the mode changed, was filtered under the older value. Additive + tolerant like
+ *  `epoch`: a daemon predating it omits it, and the bot falls back to that daemon's last settings
+ *  snapshot. */
+const SessionQuiet = z.boolean().nullish();
+
 /** Long output is a presentation problem, not a wire problem (decision: "no silent
  *  truncation"): the daemon streams ALL output as ordered `seq` chunks and never drops text;
  *  when accumulated output crosses its inline-display threshold the BOT re-materializes the
@@ -590,6 +598,7 @@ const SessionOutputPayload = z.object({
    *  Additive + tolerant like `permissionMode`/`notificationType`: a pre-epoch daemon omits it and
    *  a current bot must treat its absence exactly as today (no reset). */
   epoch: z.string().min(1).nullish(),
+  quiet: SessionQuiet,
 });
 
 /** Phone-initiated stop of a managed session. Deliberately minimal: escalation semantics
@@ -673,6 +682,7 @@ const SessionStatusPayload = z.object({
    *  resumed session into the original session's thread). Same additive + tolerant contract
    *  as its sibling. */
   resumedFrom: SessionId.nullish(),
+  quiet: SessionQuiet,
 });
 
 /** Widened (not split into done/waiting variants) on purpose: title/body/level stays the one

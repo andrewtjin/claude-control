@@ -76,11 +76,11 @@ export interface ControlPlaneHandlers {
   /** Phone-initiated quiet-mode change (`/quiet on|off`). Routing only, as with every other
    *  inbound command — the env-pin refusal, the save and the result reply live in the daemon. */
   onQuietSet?: (msg: MessageOf<'settings.quiet.set'>) => void;
-  /** Envelopes the bot must hold before anything else this connection carries — the daemon's
-   *  current settings, which decide how the bot renders every session frame. Asked for each time
-   *  the handshake completes and written ahead of the outbox replay: the bot keeps that state in
-   *  memory only, so a bot that restarted would otherwise render the replayed and live frames
-   *  without it until the next periodic re-send. */
+  /** Envelopes the bot should hold before anything else this connection carries — the daemon's
+   *  current settings. Asked for each time the handshake completes and written ahead of the outbox
+   *  replay: the bot keeps that state in memory only, so a bot that restarted would otherwise be
+   *  without it until the next periodic re-send. Nothing here may change how an older queued row
+   *  is read, since it lands before rows that were queued under earlier state. */
   onOpen?: () => EnvelopeDraft[];
 }
 

@@ -978,7 +978,13 @@ export class DiscordJsGateway implements DiscordGateway {
       if (isType(envelope, 'session.status')) {
         await this.runPlan(
           route,
-          this.planner.onStatus(route, envelope.payload, this.clock(), mode, this.quietFor(route)),
+          this.planner.onStatus(
+            route,
+            envelope.payload,
+            this.clock(),
+            mode,
+            this.quietFor(route, envelope.payload),
+          ),
         );
         this.scheduleForget(route, envelope.payload.state);
         return;
@@ -986,7 +992,13 @@ export class DiscordJsGateway implements DiscordGateway {
       if (isType(envelope, 'session.output')) {
         await this.runPlan(
           route,
-          this.planner.onOutput(route, envelope.payload, this.clock(), mode, this.quietFor(route)),
+          this.planner.onOutput(
+            route,
+            envelope.payload,
+            this.clock(),
+            mode,
+            this.quietFor(route, envelope.payload),
+          ),
         );
       }
     } catch (err) {
@@ -994,12 +1006,13 @@ export class DiscordJsGateway implements DiscordGateway {
     }
   }
 
-  /** Whether this user's daemon last reported quiet mode on. Read per frame, from the snapshot the
-   *  daemon re-sends the moment quiet mode changes, so a change applies to sessions already
-   *  running. A daemon predating quiet mode reports nothing, which reads as off: that daemon still
+  /** The quiet mode a session frame is planned under: the one the daemon stamped on it when it
+   *  sent it, since that mode decided which lines it sent — a frame replayed after a reconnect may
+   *  predate a later change. A daemon that stamps nothing falls back to its last settings
+   *  snapshot; one predating quiet mode reports neither, which reads as off: that daemon still
    *  sends every line, and dropping them here would leave its sessions with no surface at all. */
-  private quietFor(route: SessionRoute): boolean {
-    return this.cache.getSettings(route.discordUserId)?.quiet === true;
+  private quietFor(route: SessionRoute, frame: { quiet?: boolean | null | undefined }): boolean {
+    return frame.quiet ?? this.cache.getSettings(route.discordUserId)?.quiet === true;
   }
 
   /** Execute a plan's ops in order, then (re)schedule its coalesced-flush timer. The single entry
