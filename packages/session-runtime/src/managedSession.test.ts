@@ -1161,3 +1161,50 @@ describe('startManagedSession turn identity', () => {
     expect(timers.pending.filter((p) => !p.fired && !p.canceled)).toHaveLength(0);
   });
 });
+
+describe('a turn started from idle', () => {
+  /** A turn that yields nothing until released — an SDK still resuming the conversation. */
+  function heldTurn(release: Promise<void>): Turn {
+    return () => ({
+      async *[Symbol.asyncIterator]() {
+        await release;
+        yield { type: 'turn_result', ok: true, summary: 'late' };
+      },
+    });
+  }
+
+  it('reports running before its first event, so a stop in that window reads as a turn cut off', async () => {
+    const release = deferred<void>();
+    const { client } = fakeClient([
+      [{ type: 'turn_result', ok: true, summary: 'first' }],
+      heldTurn(release.promise),
+    ]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    await tick();
+    expect(handle.getState()).toBe('waiting_input');
+    const events = collectEvents(handle);
+
+    await handle.send('follow-up');
+    await tick();
+    expect(handle.getState()).toBe('running');
+    await handle.stop();
+    release.resolve();
+    await tick();
+
+    expect(events.filter((e) => e.kind === 'status')).toEqual([
+      { kind: 'status', state: 'running' },
+      { kind: 'status', state: 'done' },
+    ]);
+  });
+
+  it('leaves the kickoff turn starting until its first event', async () => {
+    const release = deferred<void>();
+    const { client } = fakeClient([heldTurn(release.promise)]);
+    const handle = startManagedSession({ id: 's1', client, prompt: 'go' });
+    await tick();
+    expect(handle.getState()).toBe('starting');
+    release.resolve();
+    await tick();
+    expect(handle.getState()).toBe('waiting_input');
+  });
+});

@@ -562,6 +562,11 @@ export function startManagedSession(opts: ManagedSessionOptions): SessionHandle 
     // Any turn starting also ends a usage-limit park — whether it's the kick replaying the
     // stalled prompt or a human send() choosing their own continuation.
     setStalled(false);
+    // A turn started from idle (a send, or the stall kick) is under way from now, not from its
+    // first event: resuming the conversation can take seconds, and a stop in that window must read
+    // as a turn cut off, not as an idle session ended. The kickoff turn is already `starting`, and
+    // a retry starts mid-turn.
+    if (state === 'waiting_input') setState('running');
     try {
       const queryOpts: AgentSdkQueryOptions = {
         ...(resumeId !== undefined ? { resumeSessionId: resumeId } : {}),
