@@ -102,7 +102,8 @@ export interface SpawnManagedOptions {
   /** Called synchronously with the new handle, before its first turn can run. The manager
    *  persists the registry before it resolves, and a turn that fails at once (a missing CLI,
    *  a transport that throws on the first query) is over by then: a caller that subscribes
-   *  only after the await never hears why. Subscribing here sees every event. */
+   *  only after the await never hears why. Subscribing here sees every event. A rejection
+   *  after this ran is that first registry write failing: the handle is tracked and running. */
   onStart?: (handle: SessionHandle) => void;
 }
 

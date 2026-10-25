@@ -2226,6 +2226,38 @@ describe('Daemon lifecycle', () => {
     expect(relay.received.some((e) => e.type === 'error')).toBe(false);
   });
 
+  it('does not report a started spawn as failed when only its first registry write fails', async () => {
+    // The manager runs onStart before its first persist; a rejection after that leaves a live,
+    // piped session the phone already sees, so a spawn_failed would contradict it.
+    sessionManager.spawnManaged.mockImplementationOnce((opts: SpawnManagedOptions) => {
+      const handle = makeFakeHandle('spawned-session');
+      sessionManager.handles.set(handle.id, handle);
+      opts.onStart?.(handle);
+      return Promise.reject(new Error('EPERM: rename sessions.json'));
+    });
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-persist', prompt: 'go', idempotencyKey: 'k1' },
+    });
+    await waitFor(() =>
+      relay.received.some((e) => e.type === 'session.status' && e.payload.state === 'starting'),
+    );
+    // A second spawn failing before any handle exists: its error is ordered after anything the
+    // first spawn sent, so it is the proof the first sent nothing.
+    sessionManager.spawnManaged.mockRejectedValueOnce(new Error('no account available'));
+    const second = relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'session.spawn',
+      payload: { requestId: 'r-pre', prompt: 'go', idempotencyKey: 'k2' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const errors = relay.received.filter((e) => e.type === 'error');
+    expect(errors).toHaveLength(1);
+    if (errors[0]?.type === 'error') expect(errors[0].payload.relatesTo).toBe(second.id);
+  });
+
   it('stamps a stable per-run epoch on every session.output envelope', async () => {
     // The epoch lets the bot tell a restart-induced seq reset (re-numbered from 0) apart from real
     // output loss. It must be present and CONSTANT within a single daemon run.
@@ -3604,6 +3636,40 @@ describe('Daemon lifecycle', () => {
       expect(error.payload.code).toBe('resume_failed');
       expect(error.payload.message).toContain('no conversation on disk');
     }
+  });
+
+  it('does not report a re-attached orphan as failed when only its first registry write fails', async () => {
+    sessionManager.records.push(
+      { id: 'orphan-3', kind: 'managed', state: 'orphaned', startedAtMs: 0, resumeId: 'sdk-y' },
+      { id: 'orphan-4', kind: 'managed', state: 'orphaned', startedAtMs: 0, resumeId: 'sdk-z' },
+    );
+    sessionManager.resumeOrphan = (sessionId, opts) => {
+      // orphan-3 comes live then fails its persist; orphan-4 fails before any handle exists.
+      if (sessionId === 'orphan-4') return Promise.reject(new Error('no conversation on disk'));
+      const handle = makeFakeHandle(sessionId);
+      sessionManager.handles.set(sessionId, handle);
+      opts.onStart?.(handle);
+      return Promise.reject(new Error('EPERM: rename sessions.json'));
+    };
+    await daemon.start();
+    relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'orphan-3', text: 'continue', idempotencyKey: 'k1' },
+    });
+    await waitFor(() =>
+      relay.received.some((e) => e.type === 'session.status' && e.payload.sessionId === 'orphan-3'),
+    );
+    // Ordered after anything the first re-attach sent, so it proves that one sent no error.
+    const second = relay.push({
+      daemonId: 'daemon-under-test',
+      type: 'prompt.inject',
+      payload: { sessionId: 'orphan-4', text: 'continue', idempotencyKey: 'k2' },
+    });
+    await waitFor(() => relay.received.some((e) => e.type === 'error'));
+    const errors = relay.received.filter((e) => e.type === 'error');
+    expect(errors).toHaveLength(1);
+    if (errors[0]?.type === 'error') expect(errors[0].payload.relatesTo).toBe(second.id);
   });
 
   // ---- phone-initiated prune of dormant records ----

@@ -3342,6 +3342,9 @@ export class Daemon {
         return;
       }
     }
+    // Set once the resumed handle's pipes are attached: from then on the session reports itself,
+    // so a later failure (its first registry write) must not also reach the phone as an error.
+    let attached = false;
     try {
       // Re-attach on the SAME slot the session ran on: bind its account's config dir (a group
       // profile for a reserved member, else the shared config dir) so a resumed folder-bound
@@ -3366,6 +3369,7 @@ export class Daemon {
         onStart: (resumed) => {
           if (slot !== undefined) this.sessionSlots.set(resumed.id, slot);
           const onEvent = this.attachSessionPipes(resumed, record.accountId);
+          attached = true;
           // The runtime only emits on a change, so without this frame the phone keeps the
           // crashed run's last state (usually waiting_input) until the first SDK event, and a
           // stop in that window would read as waiting_input -> done with no outcome line.
@@ -3374,6 +3378,12 @@ export class Daemon {
       });
       this.logger.info({ sessionId }, 'orphaned session re-attached for an operator prompt');
     } catch (err) {
+      // The session is live and on the phone; the manager's next state-changing write retries
+      // the registry, so this is only worth a log line.
+      if (attached) {
+        this.logger.warn({ sessionId, err }, 're-attached session failed its first registry write');
+        return;
+      }
       // Un-resumable (e.g. no persisted resumeId): logged, the record stays 'orphaned' on
       // disk, and the phone is told — degraded but honest, never a crashed dispatch loop.
       this.logger.warn({ sessionId, err }, 'orphaned session could not be re-attached');
@@ -4193,13 +4203,14 @@ export class Daemon {
    * whatever happens next. Everything that goes wrong AFTER a handle exists already reaches the
    * phone — the session's own event stream carries it as text plus a `failed` status, which is
    * how an unauthenticated spawn surfaces "Not logged in · Please run /login". Everything that
-   * goes wrong BEFORE one exists (the registry failing to load, its first persist failing, the
-   * SDK adapter refusing to construct) had no channel at all and died in the daemon's log,
-   * leaving the phone on that ack forever with nothing to retry and nothing to read.
+   * goes wrong BEFORE one exists (the registry failing to load, the SDK adapter refusing to
+   * construct) had no channel at all and died in the daemon's log, leaving the phone on that ack
+   * forever with nothing to retry and nothing to read.
    *
    * So this window gets an explicit envelope, exactly like the un-resumable orphan above. It
-   * stays a NARROW catch — once `attachSessionPipes` has run, the handle owns its own reporting
-   * and a second channel would double-report the same failure.
+   * stays NARROW — once `attachSessionPipes` has run, the handle owns its own reporting and a
+   * second channel would double-report or contradict it. The manager's first registry write
+   * runs after that point, so its failure is logged, never sent.
    */
   private async handleSessionSpawn(msg: MessageOf<'session.spawn'>): Promise<void> {
     const { requestId, prompt, resumeSessionId, cwd, accountId } = msg.payload;
@@ -4255,6 +4266,8 @@ export class Daemon {
     // group's live member the resolver chose, not the (absent) payload account.
     const spawnAccountId = spawnSlot.accountId;
 
+    // Set once the handle's pipes are attached — the line the catch below must not cross.
+    let attached = false;
     try {
       const resumeAnchor = this.resolveSpawnResumeAnchor(resumeSessionId ?? undefined);
       // A global spawn (no bound config dir) must not silently run on a group profile that a
@@ -4294,6 +4307,7 @@ export class Daemon {
           // as global.
           if (spawnSlot.slot !== 'global') this.sessionSlots.set(handle.id, spawnSlot.slot);
           this.attachSessionPipes(handle, spawnAccountId, origin);
+          attached = true;
           // Announce the session NOW, before its first turn produces anything. The session
           // runtime only emits on a state CHANGE, and the first SDK event of a turn emits its
           // output BEFORE the starting→running transition — so without this frame the
@@ -4311,6 +4325,12 @@ export class Daemon {
         },
       });
     } catch (err) {
+      // The session is running and on the phone; the manager's next state-changing write
+      // retries the registry, so this is only worth a log line.
+      if (attached) {
+        this.logger.warn({ err, requestId }, 'spawned session failed its first registry write');
+        return;
+      }
       this.logger.error({ err, requestId }, 'session.spawn failed to start');
       this.sendEnvelope({
         type: 'error',
