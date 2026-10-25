@@ -3360,6 +3360,11 @@ export class Daemon {
         this.sessionSlots.set(resumed.id, await this.switchEngine.slotForConfigDir(configDir));
       }
       this.attachSessionPipes(resumed, record.accountId);
+      // The resumed handle starts at `starting` and the runtime only emits on a change, so
+      // without this frame the phone keeps the crashed run's last state (usually waiting_input)
+      // until the first SDK event. A stop or shutdown in that resume window would then read as
+      // waiting_input -> done, and the turn just asked for would end with no outcome line.
+      this.forwardSessionEvent(resumed.id, record.accountId, { kind: 'status', state: 'starting' });
       this.logger.info({ sessionId }, 'orphaned session re-attached for an operator prompt');
     } catch (err) {
       // Un-resumable (e.g. no persisted resumeId): logged, the record stays 'orphaned' on

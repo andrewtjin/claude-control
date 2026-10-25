@@ -86,6 +86,26 @@ describe('Daemon: re-attaching an orphaned session', () => {
     expect(manager.resumeOrphanCalls[0]?.opts.prompt).toBe('pick it up');
     expect(h.sent.filter((e) => e.type === 'error')).toEqual([]);
   });
+
+  it('announces the re-attached session as starting before its first event', async () => {
+    const manager = fakeSessionManager();
+    manager.records.push(orphanRecord({ cwd: await sandbox() }));
+    harness = await createHarness({ sessionManager: manager });
+    const h = harness;
+    await h.daemon.start();
+
+    inject(h, 's1', 'pick it up');
+    // The phone still holds the crashed run's state; a stop before the resumed turn's first
+    // event must read as starting -> done, not as a stale idle state -> done.
+    await waitFor(() =>
+      h.sent.some(
+        (e) =>
+          e.type === 'session.status' &&
+          (e.payload as { sessionId?: string; state?: string }).sessionId === 's1' &&
+          (e.payload as { state?: string }).state === 'starting',
+      ),
+    );
+  });
 });
 
 describe('Daemon: reporting what startup recovery found', () => {

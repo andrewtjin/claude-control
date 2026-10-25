@@ -2888,8 +2888,10 @@ describe('Daemon lifecycle', () => {
     const handle = sessionManager.get('orphan-1') as ReturnType<typeof makeFakeHandle> | undefined;
     expect(handle).toBeDefined();
     handle?.emit({ kind: 'status', state: 'running' });
-    await waitFor(() => relay.received.some((e) => e.type === 'session.status'));
-    const status = relay.received.find((e) => e.type === 'session.status');
+    const isRunning = (e: (typeof relay.received)[number]): boolean =>
+      e.type === 'session.status' && e.payload.state === 'running';
+    await waitFor(() => relay.received.some(isRunning));
+    const status = relay.received.find(isRunning);
     if (status?.type === 'session.status') {
       expect(status.payload).toMatchObject({
         sessionId: 'orphan-1',
