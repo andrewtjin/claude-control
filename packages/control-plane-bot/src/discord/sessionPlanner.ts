@@ -607,7 +607,9 @@ export class SessionPlanner {
    *  instead, as a skipped stream burst is. */
   private replyLines(view: SessionView, content: string, truncated: boolean): GatewayOp[] {
     if (!view.quiet) return [this.line(view, content, truncated)];
-    const text = `${this.label(view)}${truncated ? `${content} ⟨truncated⟩` : content}`;
+    const label = this.label(view);
+    const body = truncated ? `${content} ⟨truncated⟩` : content;
+    const text = `${label}${body}`;
     if (text.length > STREAM_SKIP_THRESHOLD_CHARS) {
       return [
         {
@@ -619,11 +621,16 @@ export class SessionPlanner {
         },
       ];
     }
-    return chunkMessage(text, { maxChunks: STREAM_FLUSH_MAX_CHUNKS }).map((chunk): GatewayOp => ({
+    // Every chunk carries the label, not just the first: two sessions' split replies can
+    // interleave in a shared DM, and an unlabeled continuation could belong to either.
+    return chunkMessage(body, {
+      max: MESSAGE_CONTENT_LIMIT - label.length,
+      maxChunks: STREAM_FLUSH_MAX_CHUNKS,
+    }).map((chunk): GatewayOp => ({
       kind: 'sendMessage',
       route: view.route,
       role: 'line',
-      content: chunk,
+      content: `${label}${chunk}`,
     }));
   }
 

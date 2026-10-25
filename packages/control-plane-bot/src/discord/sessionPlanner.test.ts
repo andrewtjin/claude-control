@@ -681,8 +681,11 @@ describe('SessionPlanner — quiet mode', () => {
         const r = p.onOutput(ROUTE, output(0, 'summary', reply), 10, mode, true);
         const lines = lineSends(r.ops).map((o) => (o.kind === 'sendMessage' ? o.content : ''));
         expect(lines.length).toBeGreaterThan(1);
-        for (const l of lines) expect(l!.length).toBeLessThanOrEqual(2000);
-        expect(lines.join('\n')).toBe(`${tag}📝 ${reply}`);
+        for (const l of lines) {
+          expect(l!.length).toBeLessThanOrEqual(2000);
+          expect(l!.startsWith(tag)).toBe(true);
+        }
+        expect(lines.map((l) => l!.slice(tag.length)).join('\n')).toBe(`📝 ${reply}`);
         expect(uploads(r.ops)).toHaveLength(0);
       });
 
@@ -793,6 +796,26 @@ describe('SessionPlanner — quiet mode', () => {
     expect(lineSends(reply(b)).map((o) => o.kind === 'sendMessage' && o.content)).toEqual([
       '`bbbbbbbb` 📝 Session complete: done',
     ]);
+  });
+
+  it('labels every chunk of a split quiet card-mode reply, each within the message limit', () => {
+    const p = new SessionPlanner();
+    const route: SessionRoute = { discordUserId: 'u1', sessionId: 'aaaaaaaa-1111' };
+    const long = Array.from({ length: 70 }, (_, i) => `line ${i} ${'x'.repeat(60)}`).join('\n');
+    expect(long.length).toBeGreaterThan(4_800);
+    const ops = p.onOutput(
+      route,
+      { ...output(0, 'summary', long), sessionId: route.sessionId },
+      10,
+      'card',
+      true,
+    ).ops;
+    const chunks = lineSends(ops).map((o) => (o.kind === 'sendMessage' ? (o.content ?? '') : ''));
+    expect(chunks.length).toBeGreaterThan(2);
+    for (const chunk of chunks) {
+      expect(chunk.startsWith('`aaaaaaaa` ')).toBe(true);
+      expect(chunk.length).toBeLessThanOrEqual(2000);
+    }
   });
 
   it('still attaches a burst a thread skipped before quiet mode came on, as its marker promised', () => {
