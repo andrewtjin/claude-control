@@ -720,6 +720,50 @@ describe('SessionPlanner — quiet mode', () => {
     expect(posted(ops)).toEqual(['📝 late reply']);
   });
 
+  for (const mode of ['card', 'stream'] as const) {
+    it(`shows a real gap in a quiet ${mode} session: the lost seqs were replies`, () => {
+      const p = new SessionPlanner({ gapGraceMs: 100 });
+      p.onStatus(ROUTE, status('running'), 0, mode, true);
+      p.onOutput(ROUTE, output(0, 'summary', 'first'), 10, mode, true);
+      // Seqs 1-2 were trimmed from the daemon's outbox during an outage.
+      const held = p.onOutput(ROUTE, output(3, 'summary', 'fourth'), 20, mode, true);
+      const shown = posted([...held.ops, ...p.flush(ROUTE, 500).ops]).join('|');
+      expect(shown).toMatch(/⟨gap: output seq 1–2 lost⟩.*📝 fourth/s);
+    });
+
+    it(`shows a gap from seq 0 after a daemon restart in a quiet ${mode} session`, () => {
+      const p = new SessionPlanner({ gapGraceMs: 100 });
+      p.onStatus(ROUTE, status('running'), 0, mode, true);
+      p.onOutput(ROUTE, output(0, 'summary', 'first', false, 'run-a'), 10, mode, true);
+      // The resumed run's seq 0 never arrived: that is lost output, not a late join.
+      const held = p.onOutput(
+        ROUTE,
+        output(1, 'summary', 'second', false, 'run-b'),
+        20,
+        mode,
+        true,
+      );
+      const shown = posted([...held.ops, ...p.flush(ROUTE, 500).ops]).join('|');
+      expect(shown).toMatch(/⟨gap: output seq 0–0 lost⟩.*📝 second/s);
+      expect(shown).not.toContain('output stream restarted');
+    });
+  }
+
+  it('tops up a card attachment that was owed before quiet mode came on', () => {
+    const p = new SessionPlanner();
+    p.onStatus(ROUTE, status('running'), 0, 'card', false);
+    const first = 'a'.repeat(20_000);
+    const crossing = p.onOutput(ROUTE, output(0, 'stdout', first), 10, 'card', false);
+    expect(uploads(crossing.ops)).toHaveLength(1);
+    const more = 'c'.repeat(5_000);
+    p.onOutput(ROUTE, output(1, 'stdout', more), 20, 'card', false);
+    // Quiet mode comes on; the session ends. Bytes past the first upload left the card's tail.
+    const end = p.onStatus(ROUTE, status('done'), 5000, 'card', true);
+    const files = uploads(end.ops);
+    expect(files).toHaveLength(1);
+    expect(files[0]!.kind === 'uploadAttachment' && files[0]!.text).toBe(first + more);
+  });
+
   it('keeps editing a card posted before quiet mode was turned on, adding no message', () => {
     const p = new SessionPlanner({ coalesceWindowMs: 1000 });
     expect(cardSends(p.onStatus(ROUTE, status('running'), 0, 'card', false).ops)).toHaveLength(1);

@@ -25,12 +25,13 @@
 // Discord's send budget) — it leaves a visible skip marker and the COMPLETE transcript is
 // attached at terminal, so every byte still reaches at least one surface, never zero.
 //
-// Quiet mode (the daemon's Discord quiet mode, read from its settings snapshot per frame): the
-// session posts only what the daemon still sends — one final-reply line per turn, or the line
-// saying why a turn failed — and the prompts, which travel outside this planner. No live card is
-// created, no waiting state lines, no gap or restart markers and no terminal summary embed are
-// posted, and nothing is attached. A reply too long for one message is split across several, so
-// none of it is lost. The state lines kept are the ones that are a turn's outcome: `orphaned`, and
+// Quiet mode (the daemon's Discord quiet mode, as stamped on each frame): the session posts only
+// what the daemon still sends — one final-reply line per turn, or the line saying why a turn
+// failed — and the prompts, which travel outside this planner. No live card is created, no waiting
+// state lines, no restart markers and no terminal summary embed are posted, and nothing is
+// attached beyond a file owed from before quiet mode came on. A gap marker is posted only for real
+// loss, never for the stream a restarted bot joins part-way. A reply too long for one message is
+// split across several, so none of it is lost. The state lines kept are the ones that are a turn's outcome: `orphaned`, and
 // a session stopped mid-turn — neither turn got a final reply. A card posted before quiet mode was
 // turned on keeps being edited in place — an edit adds no message — so it never freezes on a
 // stale state.
@@ -248,6 +249,10 @@ interface SessionView {
    *  resumed the session, so reassembly is reset. Stays `undefined` forever for a pre-epoch
    *  daemon, whose absent epoch never triggers a reset. */
   outputEpoch: string | undefined;
+  /** Whether a daemon-run change has replaced this view's reassembly. Until it has, a gap that
+   *  starts at seq 0 means this bot joined a stream already under way (it restarted mid-session),
+   *  not that the daemon lost lines; after it, seq 0 is the resumed run's first line. */
+  outputRestarted: boolean;
   /** The reassembled stdout+error transcript (with gap/truncation markers) — the attachment body. */
   fullStdout: string;
   attached: boolean;
@@ -446,6 +451,7 @@ export class SessionPlanner {
     if (view.outputEpoch === epoch) return; // same run: nothing to do
     view.outputEpoch = epoch;
     view.output = this.makeOrderedOutput();
+    view.outputRestarted = true;
     view.fullStdout += STREAM_RESTART_MARKER;
     // Quiet mode posts only replies and prompts, and a marker in the thread would be a message of
     // its own; the transcript still records it.
@@ -472,6 +478,7 @@ export class SessionPlanner {
         quiet: false,
         replied: false,
         outputEpoch: undefined,
+        outputRestarted: false,
         fullStdout: '',
         attached: false,
         attachedLen: -1,
@@ -523,13 +530,19 @@ export class SessionPlanner {
       if (item.kind === 'gap') {
         const marker = gapMarker(item.fromSeq, item.toSeq);
         view.fullStdout += marker;
-        // Stream mode has no card to badge, so the gap marker flows into the thread itself —
-        // the same "a loss is VISIBLE where the reader is looking" rule, different surface. Not in
-        // quiet mode, where the thread carries only replies (and the daemon skips no seq for the
-        // lines it drops, so a gap there is a bot restart, not lost output).
-        if (view.mode === 'stream' && !view.quiet) view.pendingStream += marker;
         view.hasGap = true;
         view.dirty = true;
+        // Quiet mode skips no seq for the lines it drops, so a gap there is lost output — a reply
+        // or a failure line, trimmed from the daemon's bounded outbox in a long outage — and is
+        // shown like any other. The one exception is the gap this bot sees for joining a stream
+        // already under way after it restarted: nothing was lost, and quiet mode posts nothing
+        // for it.
+        if (view.quiet && item.fromSeq === 0 && !view.outputRestarted) continue;
+        // Stream mode has no card to badge, so the gap marker flows into the thread itself —
+        // the same "a loss is VISIBLE where the reader is looking" rule, different surface. A
+        // quiet card-mode session has no card either, so it gets the marker as a line.
+        if (view.mode === 'stream') view.pendingStream += marker;
+        else if (view.quiet && !view.cardPosted) ops.push(this.line(view, marker.trim()));
         continue;
       }
       const text = item.truncated ? `${item.text}${TRUNCATION_MARKER}` : item.text;
@@ -623,9 +636,12 @@ export class SessionPlanner {
    *  duplicate what the reader scrolled past. */
   private attachIfNeeded(view: SessionView, ops: GatewayOp[], final: boolean): void {
     // Quiet mode attaches nothing: the daemon sends no transcript to attach, only reply lines. The
-    // one exception is a burst a stream thread skipped before quiet mode came on: its marker
-    // promised the transcript at the end, and those bytes reached no other surface.
-    if (view.quiet && !(view.mode === 'stream' && view.streamCut)) return;
+    // exception is a file the session already owed from before quiet mode came on — a burst a
+    // stream thread skipped (its marker promised the transcript at the end), or a card's
+    // attachment whose later bytes have since scrolled out of the card's tail. Either way those
+    // bytes reached no other surface, and the transcript no longer grows, so this sends only the
+    // final top-up that was owed.
+    if (view.quiet && !(view.mode === 'stream' ? view.streamCut : view.attached)) return;
     const len = view.fullStdout.length;
     if (len === 0) return;
     if (view.mode === 'stream') {
