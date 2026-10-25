@@ -184,6 +184,11 @@ export class ControlPlaneClient {
    *  identity, and the rows may be a previous paired run's backlog that a healthy restart
    *  should still deliver. */
   private undeliverable = false;
+  /** Whether the bot of the latest completed handshake plans quiet frames (see the hello.result
+   *  `quietFrames` field). Kept across a disconnect, so lines queued meanwhile are filtered for
+   *  the bot last seen; false until a first handshake, which only costs a queued line its
+   *  filtering — never its delivery. */
+  private quietFrames = false;
   /** Resolves the in-flight `connect()` promise once hello succeeds (or pairing completes and
    *  the follow-up hello succeeds) — lets tests/daemon.ts `await client.connect()`. */
   private connectedResolvers: { resolve: () => void; reject: (err: Error) => void }[] = [];
@@ -215,6 +220,12 @@ export class ControlPlaneClient {
 
   getIdentity(): DaemonIdentity | undefined {
     return this.identity;
+  }
+
+  /** Whether the bot can plan quiet frames — whether a quiet daemon may leave out a turn's
+   *  streamed prose (see {@link quietFrames}). */
+  botPlansQuietFrames(): boolean {
+    return this.quietFrames;
   }
 
   /** Replace the inbound-dispatch handlers. Lets a composing owner (daemon.ts) construct this
@@ -444,6 +455,7 @@ export class ControlPlaneClient {
     }
     this.state = 'open';
     this.reconnectAttempt = 0;
+    this.quietFrames = envelope.payload.quietFrames === true;
     this.startHeartbeat();
     // Straight to the socket, not through send(): with rows queued, send() would put these behind
     // the very frames they have to precede.

@@ -1158,3 +1158,21 @@ describe('session frame quiet flag (additive, N/N-1 tolerant)', () => {
     expect(decode(rawFrame('session.output', { ...output, quiet: 'on' })).ok).toBe(false);
   });
 });
+
+describe('hello.result quietFrames (additive, N/N-1 tolerant)', () => {
+  it('parses a result without it: a bot predating quiet frames stays valid and reads as unable', () => {
+    const result = decode(rawFrame('hello.result', { ok: true, negotiatedVersion: 1 }));
+    expect(result.ok).toBe(true);
+    if (result.ok && isType(result.envelope, 'hello.result')) {
+      expect(result.envelope.payload.quietFrames ?? undefined).toBeUndefined();
+    }
+  });
+
+  it('carries the flag, and rejects a non-boolean one', () => {
+    const result = decode(rawFrame('hello.result', { ok: true, quietFrames: true }));
+    expect(
+      result.ok && isType(result.envelope, 'hello.result') && result.envelope.payload.quietFrames,
+    ).toBe(true);
+    expect(decode(rawFrame('hello.result', { ok: true, quietFrames: 'yes' })).ok).toBe(false);
+  });
+});

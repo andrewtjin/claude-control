@@ -115,6 +115,30 @@ describe('Daemon quiet mode: a phone-started session', () => {
     expect(statuses(h)).toEqual(['starting', 'running', 'waiting_input']);
   });
 
+  it('streams the whole turn, stamped not quiet, to a bot that cannot plan quiet frames', async () => {
+    harness = await createHarness({ quiet: fakeQuiet(true), botQuietFrames: false });
+    const h = harness;
+    await h.daemon.start();
+    const handle = await spawnSession(h);
+
+    handle.emit({ kind: 'status', state: 'running' });
+    handle.emit({ kind: 'output', text: 'the reply, in full' });
+    handle.emit({ kind: 'summary', text: 'Session complete: the reply' });
+    handle.emit({ kind: 'status', state: 'waiting_input' });
+    await waitFor(sawStatus(h, 'waiting_input'));
+
+    // That bot clamps the summary to one message: the streamed prose is where the rest lives.
+    expect(outputs(h).map((o) => [o.kind, o.text, o.quiet])).toEqual([
+      ['stdout', 'the reply, in full', false],
+      ['summary', 'Session complete: the reply', false],
+    ]);
+    expect(h.sent.flatMap((e) => (e.type === 'session.status' ? [e.payload.quiet] : []))).toEqual([
+      false,
+      false,
+      false,
+    ]);
+  });
+
   it('stamps every session frame with the quiet mode it was sent under', async () => {
     const quiet = fakeQuiet(true);
     harness = await createHarness({ quiet });
@@ -276,6 +300,20 @@ describe("Daemon quiet mode: the daemon's own notices", () => {
     const h = harness;
     await h.daemon.start();
     // A full poll cycle has run, so startup recovery is long done.
+    await waitFor(() => h.sent.some((e) => e.type === 'usage.snapshot'));
+    expect(stallLost(h)).toEqual([]);
+  });
+
+  it('keeps a fleet notice off the phone whatever the bot can plan', async () => {
+    const manager = fakeSessionManager();
+    manager.recovered.push(parkedOrphan());
+    harness = await createHarness({
+      sessionManager: manager,
+      quiet: fakeQuiet(true),
+      botQuietFrames: false,
+    });
+    const h = harness;
+    await h.daemon.start();
     await waitFor(() => h.sent.some((e) => e.type === 'usage.snapshot'));
     expect(stallLost(h)).toEqual([]);
   });

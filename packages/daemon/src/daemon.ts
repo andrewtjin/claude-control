@@ -2321,6 +2321,14 @@ export class Daemon {
     return this.quiet?.isQuiet() ?? false;
   }
 
+  /** Whether a session's frames go out quiet: quiet mode is on AND the bot can plan them. An older
+   *  bot clamps the summary that is a quiet turn's only reply to one message, so it gets the full
+   *  stream instead — frames stamped not quiet, which it would plan that way anyway. The daemon's
+   *  own notices need no bot support to be left out, so they follow quiet mode alone. */
+  private quietSessionFrames(): boolean {
+    return this.isQuiet() && this.controlPlaneClient.botPlansQuietFrames();
+  }
+
   /** Push the current settings report, when there is one. Shared by the poll cycle's repeat and a
    *  live quiet-mode change, so `/settings` and the bot's planner read the same report either way. */
   private sendSettingsSnapshot(): void {
@@ -4927,7 +4935,7 @@ export class Daemon {
           ...(spawnOrigin?.resumedFrom !== undefined
             ? { resumedFrom: spawnOrigin.resumedFrom }
             : {}),
-          quiet: this.isQuiet(),
+          quiet: this.quietSessionFrames(),
         },
       });
       return;
@@ -4938,7 +4946,7 @@ export class Daemon {
     // (or why the turn failed). Prose, tool and milestone lines (retry, park and resume notes
     // included) stay off the phone; an error line is held as the possible failure reason (see
     // quietHeldErrors). Skipped lines take no seq, so the bot sees no gap where there is no loss.
-    if (this.isQuiet() && kind !== 'summary') {
+    if (this.quietSessionFrames() && kind !== 'summary') {
       if (kind === 'error') this.quietHeldErrors.set(sessionId, event.text);
       return;
     }
@@ -4968,7 +4976,7 @@ export class Daemon {
         text,
         truncated: false,
         epoch: this.outputEpoch,
-        quiet: this.isQuiet(),
+        quiet: this.quietSessionFrames(),
       },
     });
   }

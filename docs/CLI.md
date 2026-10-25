@@ -1369,10 +1369,12 @@ there and restart the daemon first. (A typo there pins it too: `cctl settings` t
 default value with the source `env`.) `cctl settings unset quiet` still removes the
 `config.json` entry in that case, and says the environment's value stays in force.
 
-The daemon does the dropping, so quiet mode works with any bot. Two parts live in the bot and
-need one from this release: `/quiet` itself, and leaving out a phone-started session's live
-card, waiting lines and summary card (an older bot still posts those). `/quiet` against a
-daemon older than this release says to update cctl on that machine instead of waiting.
+The daemon drops its own cards and notices, so that part works with any bot. A phone-started
+session goes quiet only with a bot from this release: the daemon cuts a session down to one
+reply per turn only for a bot that says it can post a long reply in full, and gives an older
+bot the session's whole output as before, live card, waiting lines and summary card included,
+so no reply is cut short. `/quiet` itself needs that bot too. `/quiet` against a daemon older
+than this release says to update cctl on that machine instead of waiting.
 
 ## Persisted settings and override precedence
 

@@ -721,6 +721,10 @@ const HelloResultPayload = z.object({
   ok: z.boolean(),
   negotiatedVersion: z.number().int().positive().nullish(),
   error: z.string().nullish(),
+  /** The bot plans session frames stamped quiet: it posts a turn's whole reply from its summary
+   *  line, however long. Only then may a quiet daemon leave out the prose it streams as stdout —
+   *  an older bot clamps the summary to one message and needs that stdout for the rest. */
+  quietFrames: z.boolean().nullish(),
 });
 
 const PairClaimPayload = z.object({

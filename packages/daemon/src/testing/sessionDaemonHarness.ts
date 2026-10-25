@@ -54,7 +54,9 @@ export class TestRelay {
   private socket: WebSocket | undefined;
   readonly received: Envelope[] = [];
 
-  constructor() {
+  /** `quietFrames: false` answers like a bot from before quiet mode, which never advertises it. */
+  constructor(opts: { quietFrames?: boolean } = {}) {
+    const quietFrames = opts.quietFrames ?? true;
     this.wss = new WebSocketServer({ port: 0 });
     this.wss.on('connection', (socket) => {
       this.socket = socket;
@@ -72,6 +74,7 @@ export class TestRelay {
                 payload: {
                   ok: negotiated !== null,
                   ...(negotiated !== null ? { negotiatedVersion: negotiated } : {}),
+                  ...(negotiated !== null && quietFrames ? { quietFrames: true } : {}),
                 },
               }),
             ),
@@ -333,6 +336,8 @@ export interface HarnessOptions {
   quiet?: QuietControl;
   /** The settings report the daemon pushes (see DaemonOptions.settingsReport). */
   settingsReport?: SettingsSnapshot;
+  /** Whether the relay's bot plans quiet frames (see TestRelay); absent = it does. */
+  botQuietFrames?: boolean;
 }
 
 export interface Harness {
@@ -352,7 +357,7 @@ export interface Harness {
  *  Store, a token-less UsagePoller, a real HookReceiver) and fakes for everything a session
  *  test needs to control. */
 export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
-  const relay = new TestRelay();
+  const relay = new TestRelay({ quietFrames: options.botQuietFrames ?? true });
   const relayPort = await relay.listen();
   const store = new Store(':memory:');
   const vaultDir = await mkdtemp(join(tmpdir(), 'daemon-sessions-'));

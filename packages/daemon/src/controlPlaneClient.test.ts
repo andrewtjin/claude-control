@@ -43,6 +43,8 @@ class FakeRelay {
   private readonly silentHello: boolean;
   private nextDaemonSeq = 1;
   readonly tokensByDaemonId = new Map<string, string>();
+  /** Whether a successful hello.result advertises quiet frames; an older bot sends no field. */
+  quietFrames = false;
   /** Every envelope any connected socket has sent us, in receipt order — lets tests assert on
    *  what the client actually put on the wire (e.g. outbox replay order). */
   readonly received: Envelope[] = [];
@@ -171,7 +173,11 @@ class FakeRelay {
         stamp({
           daemonId: envelope.daemonId,
           type: 'hello.result',
-          payload: { ok: true, negotiatedVersion: negotiated },
+          payload: {
+            ok: true,
+            negotiatedVersion: negotiated,
+            ...(this.quietFrames ? { quietFrames: true } : {}),
+          },
         }),
       ),
     );
@@ -574,6 +580,33 @@ describe('ControlPlaneClient', () => {
     );
     expect(titles).toEqual(['open-1', 'open-2', 'queued']);
     expect(store.countOutbox()).toBe(0);
+  });
+
+  it("reports the latest handshake's quiet-frames support, and keeps it while disconnected", async () => {
+    const identity: DaemonIdentity = { daemonId: 'assigned-daemon-1', daemonToken: 'tok' };
+    relay.tokensByDaemonId.set(identity.daemonId, identity.daemonToken);
+    client = new ControlPlaneClient({
+      url: relay.url(),
+      identityStore: memoryIdentityStore(identity),
+      store,
+      hostLabel: 'h',
+      heartbeatMs: 100_000,
+      reconnectBaseMs: 10,
+      reconnectCapMs: 50,
+    });
+    // No handshake yet, then a bot that sends no field: both read as an older bot.
+    expect(client.botPlansQuietFrames()).toBe(false);
+    await client.connect();
+    expect(client.botPlansQuietFrames()).toBe(false);
+    // The bot is upgraded behind the same relay: the next handshake says so.
+    relay.quietFrames = true;
+    relay.disconnectAll();
+    await waitFor(() => client!.getState() !== 'open');
+    await waitFor(() => client!.getState() === 'open', 5000);
+    expect(client.botPlansQuietFrames()).toBe(true);
+    relay.disconnectAll();
+    await waitFor(() => client!.getState() !== 'open');
+    expect(client.botPlansQuietFrames()).toBe(true);
   });
 
   it('bounds the outbox by dropping the oldest entries past the configured limit', () => {
