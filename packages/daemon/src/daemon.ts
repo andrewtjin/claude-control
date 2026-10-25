@@ -3359,12 +3359,14 @@ export class Daemon {
       if (configDir !== undefined && this.switchEngine.slotForConfigDir !== undefined) {
         this.sessionSlots.set(resumed.id, await this.switchEngine.slotForConfigDir(configDir));
       }
-      this.attachSessionPipes(resumed, record.accountId);
-      // The resumed handle starts at `starting` and the runtime only emits on a change, so
-      // without this frame the phone keeps the crashed run's last state (usually waiting_input)
-      // until the first SDK event. A stop or shutdown in that resume window would then read as
-      // waiting_input -> done, and the turn just asked for would end with no outcome line.
-      this.forwardSessionEvent(resumed.id, record.accountId, { kind: 'status', state: 'starting' });
+      const onEvent = this.attachSessionPipes(resumed, record.accountId);
+      // The runtime only emits on a change, so without this frame the phone keeps the crashed
+      // run's last state (usually waiting_input) until the first SDK event, and a stop in that
+      // window would read as waiting_input -> done with no outcome line. The handle's CURRENT
+      // state is replayed, not an assumed `starting`: its first turn begins while the resume is
+      // still being persisted, before these pipes existed, so a turn that failed at once is
+      // already terminal and must be reported (and cleaned up) as such.
+      onEvent({ kind: 'status', state: resumed.getState() });
       this.logger.info({ sessionId }, 'orphaned session re-attached for an operator prompt');
     } catch (err) {
       // Un-resumable (e.g. no persisted resumeId): logged, the record stays 'orphaned' on
@@ -4749,17 +4751,19 @@ export class Daemon {
    * envelopes, and STRUCTURED permission requests → the pending-permission pipeline. Also
    * sweeps the session's permission routes on terminal status — which is what keeps
    * `managedPermissionRoutes` bounded (a session's requests never outlive the session).
+   * Returns the event listener so a caller can replay a state the handle reached before it was
+   * subscribed through the same path, terminal cleanup included.
    */
   private attachSessionPipes(
     handle: SessionHandle,
     accountId: string | undefined,
     spawnOrigin?: SpawnOrigin,
-  ): void {
+  ): (event: SessionEvent) => void {
     // The account is looked up per event rather than closed over, because it can change under a
     // live session (see {@link sessionAccounts}). This is where it is seeded: a spawn's payload
     // or a re-attached record's account is the truth until a switch says otherwise.
     if (accountId !== undefined) this.sessionAccounts.set(handle.id, accountId);
-    handle.onEvent((event) => {
+    const onEvent = (event: SessionEvent): void => {
       const runningAs = this.sessionAccounts.get(handle.id) ?? accountId;
       // Captured before any terminal delete so the terminal frame still carries the slot.
       const slot = this.sessionSlots.get(handle.id) ?? 'global';
@@ -4772,7 +4776,8 @@ export class Daemon {
         this.sessionSlots.delete(handle.id);
       }
       this.forwardSessionEvent(handle.id, runningAs, event, spawnOrigin, slot);
-    });
+    };
+    handle.onEvent(onEvent);
     // Optional on SessionHandle (observed terminals have no structured permission seam);
     // managed handles always implement it.
     handle.onPermissionRequest?.((req) => {
@@ -4783,6 +4788,7 @@ export class Daemon {
     handle.onQuestionRequest?.((req) => {
       this.handleManagedQuestionRequest(handle.id, req);
     });
+    return onEvent;
   }
 
   /**

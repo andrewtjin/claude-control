@@ -193,6 +193,8 @@ export interface FakeSessionManager extends SessionManager {
   resumeOrphanCalls: Array<{ sessionId: string; opts: ResumeOrphanOptions }>;
   /** Every spawnManaged call's options, for asserting what the daemon threads into a spawn. */
   spawnCalls: unknown[];
+  /** Always implemented here, so a test can wrap it to shape the handle it returns. */
+  resumeOrphan: NonNullable<SessionManager['resumeOrphan']>;
 }
 
 export function fakeSessionManager(): FakeSessionManager {

@@ -5,12 +5,14 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { SessionRecord } from '@claude-control/session-runtime';
+import type { SessionRecord, SessionState } from '@claude-control/session-runtime';
 import {
   createHarness,
   fakeSessionManager,
   fakeSwitchEngine,
   waitFor,
+  type FakeManagedHandle,
+  type FakeSessionManager,
   type Harness,
 } from './testing/sessionDaemonHarness.js';
 
@@ -40,6 +42,26 @@ function orphanRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
     resumeId: 'sdk-1',
     ...overrides,
   };
+}
+
+/** Make the manager's resumed handle come back in `state`, as if it got there before the daemon
+ *  subscribed (emitting with no listener only moves the state). */
+function resumeIn(manager: FakeSessionManager, state: SessionState): void {
+  const resume = manager.resumeOrphan.bind(manager);
+  manager.resumeOrphan = async (sessionId, opts) => {
+    const handle = (await resume(sessionId, opts)) as FakeManagedHandle;
+    handle.emit({ kind: 'status', state });
+    return handle;
+  };
+}
+
+/** Every session.status state the phone was sent for `sessionId`, in order. */
+function statesSent(h: Harness, sessionId: string): Array<string | undefined> {
+  return h.sent
+    .filter((e) => e.type === 'session.status')
+    .map((e) => e.payload as { sessionId?: string; state?: string })
+    .filter((p) => p.sessionId === sessionId)
+    .map((p) => p.state);
 }
 
 function inject(h: Harness, sessionId: string, text: string): void {
@@ -89,6 +111,7 @@ describe('Daemon: re-attaching an orphaned session', () => {
 
   it('announces the re-attached session as starting before its first event', async () => {
     const manager = fakeSessionManager();
+    resumeIn(manager, 'starting');
     manager.records.push(orphanRecord({ cwd: await sandbox() }));
     harness = await createHarness({ sessionManager: manager });
     const h = harness;
@@ -97,14 +120,22 @@ describe('Daemon: re-attaching an orphaned session', () => {
     inject(h, 's1', 'pick it up');
     // The phone still holds the crashed run's state; a stop before the resumed turn's first
     // event must read as starting -> done, not as a stale idle state -> done.
-    await waitFor(() =>
-      h.sent.some(
-        (e) =>
-          e.type === 'session.status' &&
-          (e.payload as { sessionId?: string; state?: string }).sessionId === 's1' &&
-          (e.payload as { state?: string }).state === 'starting',
-      ),
-    );
+    await waitFor(() => statesSent(h, 's1').includes('starting'));
+  });
+
+  it('reports a resumed turn that already failed as failed, not as starting', async () => {
+    const manager = fakeSessionManager();
+    // The resumed turn died before the daemon subscribed, e.g. a missing CLI binary.
+    resumeIn(manager, 'failed');
+    manager.records.push(orphanRecord({ cwd: await sandbox() }));
+    harness = await createHarness({ sessionManager: manager });
+    const h = harness;
+    await h.daemon.start();
+
+    inject(h, 's1', 'pick it up');
+    await waitFor(() => statesSent(h, 's1').includes('failed'));
+    expect(statesSent(h, 's1')).not.toContain('starting');
+    expect(h.store.getSession('s1')?.state).toBe('failed');
   });
 });
 
