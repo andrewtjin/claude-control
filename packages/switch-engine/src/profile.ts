@@ -122,14 +122,22 @@ export const PROFILE_LOCAL_DIRS: readonly string[] = [
  * dir, so sharing it as one inode keeps both slots on one memory. keybindings.json is read-only to
  * Claude Code (no writer in the binary), so its hard link never breaks. history.jsonl is written in
  * place, so its hard link survives writes; the others are rewritten with temp+rename and are
- * repaired newest-wins on the next run.
+ * repaired newest-wins on the next run. stats-cache.json holds the per-day totals behind `/stats`
+ * and its activity heatmap; they are counted from the shared `projects` transcripts, so they belong
+ * to the machine rather than to an account, and days older than the transcript cleanup period live
+ * only in this cache. A profile with its own copy shows only the days since it first counted, so
+ * the copy is shared, and its repair keeps the longer history first (see `statsCacheWinner`).
  */
 export const SHARED_PROFILE_FILES: readonly string[] = [
   'settings.json',
   'settings.local.json',
   'keybindings.json',
   'history.jsonl',
+  'stats-cache.json',
 ];
+
+/** Claude Code's stats cache, the one shared file whose repair is decided by content first. */
+const STATS_CACHE_FILE = 'stats-cache.json';
 
 /**
  * `.claude.json` keys MIRRORED main -> profile on every sweep. These are onboarding, migration and
@@ -660,9 +668,68 @@ function planFile(
     return { name, target, link, action: 'copy' };
   }
   // Same volume, different inode: the hard link was broken by a temp+rename write. Rebuild it,
-  // newest mtime wins; ties go to main (the shared source of truth).
-  const winner: RepairWinner = profId.mtimeMs > mainId.mtimeMs ? 'profile' : 'main';
+  // newest mtime wins; ties go to main (the shared source of truth). The stats cache asks its
+  // content first, and falls back to the same rule when the content does not decide.
+  const winner: RepairWinner =
+    (name === STATS_CACHE_FILE ? statsCacheWinner(target, link, fs) : null) ??
+    (profId.mtimeMs > mainId.mtimeMs ? 'profile' : 'main');
   return { name, target, link, action: 'repair', winner };
+}
+
+/**
+ * The copy of a severed stats-cache link to keep, or `null` to leave it to newest-wins.
+ *
+ * Claude Code counts each finished day into this cache once and never counts it again, and it
+ * deletes transcripts older than its cleanup period, so a day survives only in a cache that counted
+ * it while its transcripts still existed. Main and the profile count the same shared transcripts, so
+ * the copy whose history starts earlier holds days, and fuller counts of the early days, that the
+ * other can no longer recover. Newest-wins alone would let a younger copy replace that history: a
+ * profile's own cache from before the file was shared, or one Claude Code rebuilt from scratch after
+ * it found the cache unreadable. Equal starts are ordinary day-to-day progress, where the newer copy
+ * has counted more.
+ */
+function statsCacheWinner(
+  mainPath: string,
+  profilePath: string,
+  fs: ProfileFs,
+): RepairWinner | null {
+  const mainStart = statsHistoryStart(mainPath, fs);
+  const profileStart = statsHistoryStart(profilePath, fs);
+  if (mainStart === profileStart) return null;
+  if (mainStart === null) return 'profile';
+  if (profileStart === null) return 'main';
+  return profileStart < mainStart ? 'profile' : 'main';
+}
+
+/** The earliest `YYYY-MM-DD` day in a stats cache's daily activity, or `null` when the file cannot
+ *  be read or parsed or holds no dated day. Such a copy has no history the other could lose. */
+function statsHistoryStart(path: string, fs: ProfileFs): string | null {
+  let parsed: unknown;
+  try {
+    const text = fs.readTextIfExists(path);
+    if (text === null) return null;
+    parsed = JSON.parse(text);
+  } catch {
+    // The planner runs before the per-entry fault guard, so a read fault must not escape it.
+    return null;
+  }
+  const days = asObject(parsed)?.dailyActivity;
+  if (!Array.isArray(days)) return null;
+  let start: string | null = null;
+  for (const day of days) {
+    const date = asObject(day)?.date;
+    if (!isStatsDay(date)) continue;
+    if (start === null || date < start) start = date;
+  }
+  return start;
+}
+
+/** A real calendar day in the zero-padded `YYYY-MM-DD` form, so day order is string order. Claude
+ *  Code drops any other day key when it loads the cache, so it must not decide a repair either. */
+function isStatsDay(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const day = new Date(value);
+  return Number.isFinite(day.getTime()) && day.toISOString().startsWith(value);
 }
 
 /** Cross-volume when main's file sits on a different volume than the profile root would. */
