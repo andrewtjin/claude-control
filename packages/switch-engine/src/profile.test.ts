@@ -62,19 +62,51 @@ function ino(path: string): bigint {
 }
 
 /** A stats cache in Claude Code's shape, holding one day of activity for each date given. */
-function statsCache(dates: string[]): string {
+function statsCache(dates: string[], messagesPerDay = 10): string {
   return JSON.stringify({
     version: 5,
     lastComputedDate: dates.at(-1) ?? null,
     dailyActivity: dates.map((date) => ({
       date,
-      messageCount: 10,
+      messageCount: messagesPerDay,
       sessionCount: 1,
       toolCallCount: 2,
     })),
     totalSessions: dates.length,
-    totalMessages: dates.length * 10,
+    totalMessages: dates.length * messagesPerDay,
   });
+}
+
+/** `count` consecutive `YYYY-MM-DD` days starting at `first`. */
+function dayRun(first: string, count: number): string[] {
+  const start = Date.parse(`${first}T00:00:00Z`);
+  return Array.from({ length: count }, (_, i) =>
+    new Date(start + i * 86_400_000).toISOString().slice(0, 10),
+  );
+}
+
+/** A profile whose stats cache has diverged from main's (as a profile that counted on its own, or
+ *  a severed link, leaves it), with one side's file made the newer. */
+function divergedStats(
+  mainText: string,
+  profileText: string,
+  newer: 'main' | 'profile',
+): { main: string; profile: string } {
+  const { main, profile } = sandbox();
+  mkdirSync(profile, { recursive: true });
+  writeFileSync(join(main, 'stats-cache.json'), mainText);
+  writeFileSync(join(profile, 'stats-cache.json'), profileText);
+  const [mainTime, profileTime] =
+    newer === 'profile' ? ['2020-01-01', '2030-01-01'] : ['2030-01-01', '2020-01-01'];
+  utimesSync(join(main, 'stats-cache.json'), new Date(mainTime), new Date(mainTime));
+  utimesSync(join(profile, 'stats-cache.json'), new Date(profileTime), new Date(profileTime));
+  return { main, profile };
+}
+
+/** Both names' stats-cache contents after a sweep, asserting they are one hard-linked file. */
+function sharedStats(main: string, profile: string): string {
+  expect(ino(join(profile, 'stats-cache.json'))).toBe(ino(join(main, 'stats-cache.json')));
+  return readFileSync(join(main, 'stats-cache.json'), 'utf8');
 }
 
 /** The contents of every backup the sweep kept of a profile's stats cache. */
@@ -497,21 +529,14 @@ describe('ensureGroupProfile (real filesystem)', () => {
   it("keeps main's longer stats history over a profile's newer but younger cache", () => {
     // A profile that counted on its own before the file was shared: it starts only where the
     // transcripts on disk started when it first ran, and it was written after main.
-    const { main, profile } = sandbox();
-    const mainCache = statsCache(['2026-03-02', '2026-08-03', '2026-10-05']);
-    const profileCache = statsCache(['2026-08-03', '2026-10-05']);
-    writeFileSync(join(main, 'stats-cache.json'), mainCache);
-    mkdirSync(profile, { recursive: true });
-    writeFileSync(join(profile, 'stats-cache.json'), profileCache);
-    utimesSync(join(main, 'stats-cache.json'), new Date('2020-01-01'), new Date('2020-01-01'));
-    utimesSync(join(profile, 'stats-cache.json'), new Date('2030-01-01'), new Date('2030-01-01'));
+    const mainCache = statsCache(dayRun('2026-03-02', 200));
+    const profileCache = statsCache(dayRun('2026-08-03', 60));
+    const { main, profile } = divergedStats(mainCache, profileCache, 'profile');
 
     const report = ensureGroupProfile(profile, main);
 
     expect(report.repaired).toContain('stats-cache.json');
-    expect(ino(join(profile, 'stats-cache.json'))).toBe(ino(join(main, 'stats-cache.json')));
-    expect(readFileSync(join(main, 'stats-cache.json'), 'utf8')).toBe(mainCache);
-    expect(readFileSync(join(profile, 'stats-cache.json'), 'utf8')).toBe(mainCache);
+    expect(sharedStats(main, profile)).toBe(mainCache);
     // The profile's own counts are kept as a backup, as for any repair.
     expect(statsBackups(profile)).toEqual([profileCache]);
   });
@@ -522,8 +547,8 @@ describe('ensureGroupProfile (real filesystem)', () => {
     const { main, profile } = sandbox();
     writeFileSync(join(main, 'stats-cache.json'), statsCache(['2026-01-01']));
     ensureGroupProfile(profile, main);
-    const profileCache = statsCache(['2026-01-01', '2026-10-05']);
-    const rebuilt = statsCache(['2026-09-07', '2026-10-05']);
+    const profileCache = statsCache(dayRun('2026-01-01', 200));
+    const rebuilt = statsCache(dayRun('2026-06-20', 30));
     breakLinkWithNewInode(join(profile, 'stats-cache.json'), profileCache);
     breakLinkWithNewInode(join(main, 'stats-cache.json'), rebuilt);
     utimesSync(join(profile, 'stats-cache.json'), new Date('2020-01-01'), new Date('2020-01-01'));
@@ -535,25 +560,43 @@ describe('ensureGroupProfile (real filesystem)', () => {
     expect(report.repaired).toContain('stats-cache.json');
     // Written into main's own inode in place, then the profile is re-linked to it.
     expect(ino(join(main, 'stats-cache.json'))).toBe(mainInode);
-    expect(ino(join(profile, 'stats-cache.json'))).toBe(mainInode);
-    expect(readFileSync(join(main, 'stats-cache.json'), 'utf8')).toBe(profileCache);
+    expect(sharedStats(main, profile)).toBe(profileCache);
     expect(statsBackups(profile)).toEqual([rebuilt]);
   });
 
-  it('repairs stats caches with the same history start newest-wins', () => {
+  it('does not let a stray old day in a rebuilt stats cache outweigh months of history', () => {
+    // A rebuild that picked up one old timestamp (a copied or imported session) starts earliest,
+    // yet holds a month of days against main's eight.
+    const mainCache = statsCache(dayRun('2026-03-01', 240));
+    const rebuilt = statsCache(['2001-01-01', ...dayRun('2026-09-27', 30)]);
+    const { main, profile } = divergedStats(mainCache, rebuilt, 'profile');
+
+    ensureGroupProfile(profile, main);
+
+    expect(sharedStats(main, profile)).toBe(mainCache);
+  });
+
+  it('keeps the stats cache that counted one more day, even when it is the older file', () => {
     // Ordinary progress: both copies come from one shared cache and one counted another day.
-    const { main, profile } = sandbox();
-    writeFileSync(join(main, 'stats-cache.json'), statsCache(['2026-03-02', '2026-10-04']));
-    ensureGroupProfile(profile, main);
-    const newer = statsCache(['2026-03-02', '2026-10-04', '2026-10-05']);
-    breakLinkWithNewInode(join(profile, 'stats-cache.json'), newer);
-    utimesSync(join(main, 'stats-cache.json'), new Date('2020-01-01'), new Date('2020-01-01'));
-    utimesSync(join(profile, 'stats-cache.json'), new Date('2030-01-01'), new Date('2030-01-01'));
+    const before = statsCache(dayRun('2026-03-02', 100));
+    const progressed = statsCache(dayRun('2026-03-02', 101));
+    const { main, profile } = divergedStats(before, progressed, 'main');
 
     ensureGroupProfile(profile, main);
 
-    expect(ino(join(profile, 'stats-cache.json'))).toBe(ino(join(main, 'stats-cache.json')));
-    expect(readFileSync(join(main, 'stats-cache.json'), 'utf8')).toBe(newer);
+    expect(sharedStats(main, profile)).toBe(progressed);
+  });
+
+  it('repairs stats caches holding the same days newest-wins', () => {
+    for (const newer of ['main', 'profile'] as const) {
+      const mainCache = statsCache(dayRun('2026-03-02', 100), 10);
+      const profileCache = statsCache(dayRun('2026-03-02', 100), 12);
+      const { main, profile } = divergedStats(mainCache, profileCache, newer);
+
+      ensureGroupProfile(profile, main);
+
+      expect(sharedStats(main, profile), newer).toBe(newer === 'main' ? mainCache : profileCache);
+    }
   });
 
   it('keeps the stats cache that has history over a newer one that has none', () => {
@@ -564,33 +607,68 @@ describe('ensureGroupProfile (real filesystem)', () => {
       { name: 'impossible day', text: statsCache(['2026-02-30']) },
       { name: 'not a cache', text: JSON.stringify(['2026-01-01']) },
     ];
+    const history = statsCache(dayRun('2026-06-01', 120));
     for (const c of cases) {
-      const { main, profile } = sandbox();
-      const mainCache = statsCache(['2026-06-01', '2026-10-05']);
-      writeFileSync(join(main, 'stats-cache.json'), mainCache);
-      mkdirSync(profile, { recursive: true });
-      writeFileSync(join(profile, 'stats-cache.json'), c.text);
-      utimesSync(join(main, 'stats-cache.json'), new Date('2020-01-01'), new Date('2020-01-01'));
-      utimesSync(join(profile, 'stats-cache.json'), new Date('2030-01-01'), new Date('2030-01-01'));
+      // Either side may be the one without history.
+      const a = divergedStats(history, c.text, 'profile');
+      ensureGroupProfile(a.profile, a.main);
+      expect(sharedStats(a.main, a.profile), `profile ${c.name}`).toBe(history);
 
-      ensureGroupProfile(profile, main);
-
-      expect(readFileSync(join(main, 'stats-cache.json'), 'utf8'), c.name).toBe(mainCache);
-      expect(readFileSync(join(profile, 'stats-cache.json'), 'utf8'), c.name).toBe(mainCache);
+      const b = divergedStats(c.text, history, 'main');
+      ensureGroupProfile(b.profile, b.main);
+      expect(sharedStats(b.main, b.profile), `main ${c.name}`).toBe(history);
     }
   });
 
-  it('repairs stats caches newest-wins when neither has history', () => {
-    const { main, profile } = sandbox();
-    writeFileSync(join(main, 'stats-cache.json'), 'not json');
-    mkdirSync(profile, { recursive: true });
-    writeFileSync(join(profile, 'stats-cache.json'), statsCache([]));
-    utimesSync(join(main, 'stats-cache.json'), new Date('2020-01-01'), new Date('2020-01-01'));
-    utimesSync(join(profile, 'stats-cache.json'), new Date('2030-01-01'), new Date('2030-01-01'));
+  it('repairs stats caches newest-wins when neither is a JSON object', () => {
+    const { main, profile } = divergedStats('not json', '{ "dailyActivity": [', 'profile');
 
     ensureGroupProfile(profile, main);
 
-    expect(readFileSync(join(main, 'stats-cache.json'), 'utf8')).toBe(statsCache([]));
+    expect(sharedStats(main, profile)).toBe('{ "dailyActivity": [');
+  });
+
+  it('keeps a stats cache of a newer version, whatever its days look like', () => {
+    // A later Claude Code may reshape a day; its cache cannot be counted by this shape, and an
+    // older-version copy must not keep replacing it.
+    const reshaped = JSON.stringify({ version: 6, days: { '2026-10-05': { messages: 3 } } });
+    const older = statsCache(dayRun('2026-03-02', 200));
+
+    const a = divergedStats(older, reshaped, 'main');
+    ensureGroupProfile(a.profile, a.main);
+    expect(sharedStats(a.main, a.profile)).toBe(reshaped);
+
+    const b = divergedStats(reshaped, older, 'profile');
+    ensureGroupProfile(b.profile, b.main);
+    expect(sharedStats(b.main, b.profile)).toBe(reshaped);
+  });
+
+  it('brings two profiles and main to the stats cache with the most history, in either order', () => {
+    const longest = statsCache(dayRun('2026-01-05', 250));
+    const middle = statsCache(dayRun('2026-04-01', 150));
+    const shortest = statsCache(dayRun('2026-09-01', 30));
+    for (const order of [
+      ['a', 'b'],
+      ['b', 'a'],
+    ] as const) {
+      const { root, main } = sandbox();
+      const profiles = { a: join(root, 'profiles', 'a'), b: join(root, 'profiles', 'b') };
+      writeFileSync(join(main, 'stats-cache.json'), middle);
+      for (const [dir, text] of [
+        [profiles.a, longest],
+        [profiles.b, shortest],
+      ] as const) {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, 'stats-cache.json'), text);
+      }
+
+      // One pass: a profile that wins writes into main's own inode, which an already-linked
+      // profile shares, so no profile is left on an older copy.
+      for (const p of order) ensureGroupProfile(profiles[p], main);
+
+      expect(sharedStats(main, profiles.a), order.join()).toBe(longest);
+      expect(sharedStats(main, profiles.b), order.join()).toBe(longest);
+    }
   });
 
   it('bounds the number of backups kept per file', () => {
@@ -1045,17 +1123,20 @@ describe('ensureGroupProfile (fake fs — platform primitives)', () => {
     expect(fs.lstatKind(join(PROFILE, '.cctl-backup'))).toBeNull();
   });
 
-  it('falls back to newest-wins when a stats cache cannot be read, without failing the sweep', () => {
+  it('leaves diverged stats caches it cannot read to the next run, without failing the sweep', () => {
     const mem = makeMemFs({ platform: 'win32' });
+    const mainCache = statsCache(dayRun('2026-03-02', 200));
+    const profileCache = statsCache(dayRun('2026-08-03', 60));
     seedFile(mem, join(MAIN, 'settings.json'), '{}');
-    seedFile(mem, join(MAIN, 'stats-cache.json'), statsCache(['2026-03-02']));
-    // Seeded after main, so the profile's copy is the newer one.
-    seedFile(mem, join(PROFILE, 'stats-cache.json'), statsCache(['2026-08-03']));
-    // The planner reads only the stats caches as text here; a held file fails that read.
+    seedFile(mem, join(MAIN, 'stats-cache.json'), mainCache);
+    // Seeded after main, so the profile's shorter copy is the newer one: newest-wins would pick it.
+    seedFile(mem, join(PROFILE, 'stats-cache.json'), profileCache);
+    // A held file fails main's read; the planner reads the stats caches as text, nothing else here.
+    let held = true;
     const fs: ProfileFs = {
       ...mem,
       readTextIfExists(p) {
-        if (basename(p) === 'stats-cache.json') {
+        if (held && p === join(MAIN, 'stats-cache.json')) {
           const e: NodeJS.ErrnoException = new Error('EBUSY');
           e.code = 'EBUSY';
           throw e;
@@ -1064,11 +1145,67 @@ describe('ensureGroupProfile (fake fs — platform primitives)', () => {
       },
     };
 
-    const report = ensureGroupProfile(PROFILE, MAIN, { fs });
+    const first = ensureGroupProfile(PROFILE, MAIN, { fs });
 
-    expect(report.repaired).toContain('stats-cache.json');
-    expect(report.linkedFiles).toContain('settings.json');
-    expect(mem.readTextIfExists(join(MAIN, 'stats-cache.json'))).toBe(statsCache(['2026-08-03']));
+    expect(first.linkedFiles).toContain('settings.json');
+    expect(first.repaired).toEqual([]);
+    const skip = first.skipped.find((s) => s.path === join(PROFILE, 'stats-cache.json'));
+    expect(skip?.reason).toMatch(/unreadable/);
+    expect(mem.readTextIfExists(join(MAIN, 'stats-cache.json'))).toBe(mainCache);
+    expect(mem.readTextIfExists(join(PROFILE, 'stats-cache.json'))).toBe(profileCache);
+
+    held = false;
+    const second = ensureGroupProfile(PROFILE, MAIN, { fs });
+
+    expect(second.repaired).toContain('stats-cache.json');
+    expect(mem.readTextIfExists(join(PROFILE, 'stats-cache.json'))).toBe(mainCache);
+  });
+
+  it("keeps a Windows cross-volume profile's stats cache while it holds more days than main's", () => {
+    const fs = makeMemFs({ platform: 'win32', separateVolumeUnder: 'C:/profiles' });
+    seedFile(fs, join(MAIN, 'stats-cache.json'), statsCache(dayRun('2026-03-02', 100)));
+    const first = ensureGroupProfile(PROFILE, MAIN, { fs });
+    expect(first.copiedFallback).toContain('stats-cache.json');
+
+    // The profile's session counts another day into its own copy; main's copy would drop it.
+    const progressed = statsCache(dayRun('2026-03-02', 101));
+    seedFile(fs, join(PROFILE, 'stats-cache.json'), progressed);
+    const second = ensureGroupProfile(PROFILE, MAIN, { fs });
+    expect(second.copiedFallback).toEqual([]);
+    expect(fs.readTextIfExists(join(PROFILE, 'stats-cache.json'))).toBe(progressed);
+    expect(fs.lstatKind(join(PROFILE, '.cctl-backup'))).toBeNull();
+
+    // Once main has counted further, its copy is the one to have, and the profile's is backed up.
+    const mainAhead = statsCache(dayRun('2026-03-02', 103));
+    seedFile(fs, join(MAIN, 'stats-cache.json'), mainAhead);
+    const third = ensureGroupProfile(PROFILE, MAIN, { fs });
+    expect(third.copiedFallback).toContain('stats-cache.json');
+    expect(fs.readTextIfExists(join(PROFILE, 'stats-cache.json'))).toBe(mainAhead);
+    const backups = fs
+      .readdirNames(join(PROFILE, '.cctl-backup'))
+      .filter((f) => f.startsWith('stats-cache.json.'));
+    expect(backups.map((f) => fs.readTextIfExists(join(PROFILE, '.cctl-backup', f)))).toEqual([
+      progressed,
+    ]);
+  });
+
+  it("keeps a POSIX cross-volume profile's own stats cache while it holds more days than main's", () => {
+    const fs = makeMemFs({ platform: 'posix', separateVolumeUnder: 'C:/profiles' });
+    seedFile(fs, join(MAIN, 'stats-cache.json'), statsCache(dayRun('2026-03-02', 100)));
+    ensureGroupProfile(PROFILE, MAIN, { fs });
+    expect(fs.lstatKind(join(PROFILE, 'stats-cache.json'))).toBe('symlink');
+
+    // Claude Code's temp+rename write replaces the symlink with a file of the profile's own.
+    const progressed = statsCache(dayRun('2026-03-02', 101));
+    fs.removePath(join(PROFILE, 'stats-cache.json'));
+    seedFile(fs, join(PROFILE, 'stats-cache.json'), progressed);
+    ensureGroupProfile(PROFILE, MAIN, { fs });
+    expect(fs.lstatKind(join(PROFILE, 'stats-cache.json'))).toBe('file');
+    expect(fs.readTextIfExists(join(PROFILE, 'stats-cache.json'))).toBe(progressed);
+
+    seedFile(fs, join(MAIN, 'stats-cache.json'), statsCache(dayRun('2026-03-02', 103)));
+    ensureGroupProfile(PROFILE, MAIN, { fs });
+    expect(fs.lstatKind(join(PROFILE, 'stats-cache.json'))).toBe('symlink');
   });
 });
 

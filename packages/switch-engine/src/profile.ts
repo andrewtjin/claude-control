@@ -116,28 +116,28 @@ export const PROFILE_LOCAL_DIRS: readonly string[] = [
   'bin',
 ];
 
+/** Claude Code's stats cache, the one shared file whose repair is decided by content first. */
+const STATS_CACHE_FILE = 'stats-cache.json';
+
 /**
  * Root files shared with main by HARD link, in addition to every root `*.md` (discovered at run
  * time). CLAUDE.md is picked up by the `*.md` scan; its `@import`s resolve relative to the config
  * dir, so sharing it as one inode keeps both slots on one memory. keybindings.json is read-only to
  * Claude Code (no writer in the binary), so its hard link never breaks. history.jsonl is written in
  * place, so its hard link survives writes; the others are rewritten with temp+rename and are
- * repaired newest-wins on the next run. stats-cache.json holds the per-day totals behind `/stats`
+ * repaired newest-wins on the next run. The stats cache holds the per-day totals behind `/stats`
  * and its activity heatmap; they are counted from the shared `projects` transcripts, so they belong
  * to the machine rather than to an account, and days older than the transcript cleanup period live
  * only in this cache. A profile with its own copy shows only the days since it first counted, so
- * the copy is shared, and its repair keeps the longer history first (see `statsCacheWinner`).
+ * the copy is shared, and its repair keeps the copy with more history (see `statsCacheVerdict`).
  */
 export const SHARED_PROFILE_FILES: readonly string[] = [
   'settings.json',
   'settings.local.json',
   'keybindings.json',
   'history.jsonl',
-  'stats-cache.json',
+  STATS_CACHE_FILE,
 ];
-
-/** Claude Code's stats cache, the one shared file whose repair is decided by content first. */
-const STATS_CACHE_FILE = 'stats-cache.json';
 
 /**
  * `.claude.json` keys MIRRORED main -> profile on every sweep. These are onboarding, migration and
@@ -661,71 +661,108 @@ function planFile(
     return { name, target, link, action: 'skip', reason: 'file identity unreadable' };
   }
   if (sameFile(mainId, profId)) return { name, target, link, action: 'ok' };
+  // The copy to keep when the two differ: newest mtime wins; ties go to main (the shared source of
+  // truth). The stats cache asks its content first and falls back to the same rule.
+  const verdict = name === STATS_CACHE_FILE ? statsCacheVerdict(target, link, fs) : 'undecided';
+  if (verdict === 'unreadable') {
+    return {
+      name,
+      target,
+      link,
+      action: 'skip',
+      reason: 'stats cache unreadable; next run retries',
+    };
+  }
+  const winner: RepairWinner =
+    verdict !== 'undecided' ? verdict : profId.mtimeMs > mainId.mtimeMs ? 'profile' : 'main';
   if (mainId.dev !== profId.dev) {
     // Different volumes: a hard link is impossible. POSIX re-points a symlink; Windows re-copies
-    // main's current content only when it has drifted (so a steady state is a no-op).
+    // main's current content only when it has drifted (so a steady state is a no-op). Both replace
+    // the profile's copy with main's, so a stats cache that wins against main's is kept instead.
+    if (name === STATS_CACHE_FILE && winner === 'profile') {
+      return { name, target, link, action: 'ok', reason: "kept the profile's own stats cache" };
+    }
     if (fs.platform !== 'win32') return { name, target, link, action: 'symlink' };
     return { name, target, link, action: 'copy' };
   }
-  // Same volume, different inode: the hard link was broken by a temp+rename write. Rebuild it,
-  // newest mtime wins; ties go to main (the shared source of truth). The stats cache asks its
-  // content first, and falls back to the same rule when the content does not decide.
-  const winner: RepairWinner =
-    (name === STATS_CACHE_FILE ? statsCacheWinner(target, link, fs) : null) ??
-    (profId.mtimeMs > mainId.mtimeMs ? 'profile' : 'main');
+  // Same volume, different inode: the hard link was broken by a temp+rename write. Rebuild it.
   return { name, target, link, action: 'repair', winner };
 }
 
+/** A content decision on two diverged stats caches: the side to keep, `'undecided'` to leave it to
+ *  newest-wins, or `'unreadable'` to leave both alone until a run that can read them. */
+type StatsCacheVerdict = RepairWinner | 'undecided' | 'unreadable';
+
+/** One copy of the stats cache as a repair sees it. */
+type StatsCacheCopy =
+  | { kind: 'unreadable' } // a read fault, or gone since its stat: decides nothing this run
+  | { kind: 'corrupt' } // not a JSON object (a torn write, say): it holds no history
+  | { kind: 'cache'; version: number | undefined; days: number };
+
 /**
- * The copy of a severed stats-cache link to keep, or `null` to leave it to newest-wins.
+ * Which copy of a diverged stats cache to keep.
  *
  * Claude Code counts each finished day into this cache once and never counts it again, and it
  * deletes transcripts older than its cleanup period, so a day survives only in a cache that counted
  * it while its transcripts still existed. Main and the profile count the same shared transcripts, so
- * the copy whose history starts earlier holds days, and fuller counts of the early days, that the
- * other can no longer recover. Newest-wins alone would let a younger copy replace that history: a
- * profile's own cache from before the file was shared, or one Claude Code rebuilt from scratch after
- * it found the cache unreadable. Equal starts are ordinary day-to-day progress, where the newer copy
- * has counted more.
+ * keeping the copy that holds more days loses the fewest days nobody can count again. Newest-wins
+ * alone would let a younger copy replace months of history: a profile's own cache from before the
+ * file was shared, or one Claude Code rebuilt from scratch after it found the cache unreadable. A
+ * count, unlike the earliest day, also outweighs a stray old day in such a rebuild.
+ *
+ * Caches of two different versions cannot be compared day by day (the shape of a day may change),
+ * and Claude Code migrates an older cache forward when it loads it, so the higher version wins. A
+ * copy that is not a JSON object loses to one that is. A copy that cannot be read decides nothing:
+ * guessing could overwrite the longer history with the shorter one. Equal counts are the same
+ * history or ordinary day-to-day progress, left to newest-wins.
  */
-function statsCacheWinner(
+function statsCacheVerdict(
   mainPath: string,
   profilePath: string,
   fs: ProfileFs,
-): RepairWinner | null {
-  const mainStart = statsHistoryStart(mainPath, fs);
-  const profileStart = statsHistoryStart(profilePath, fs);
-  if (mainStart === profileStart) return null;
-  if (mainStart === null) return 'profile';
-  if (profileStart === null) return 'main';
-  return profileStart < mainStart ? 'profile' : 'main';
+): StatsCacheVerdict {
+  const main = readStatsCache(mainPath, fs);
+  const profile = readStatsCache(profilePath, fs);
+  if (main.kind === 'unreadable' || profile.kind === 'unreadable') return 'unreadable';
+  if (main.kind === 'corrupt' || profile.kind === 'corrupt') {
+    if (main.kind === profile.kind) return 'undecided';
+    return main.kind === 'corrupt' ? 'profile' : 'main';
+  }
+  if (main.version !== undefined && profile.version !== undefined) {
+    if (main.version !== profile.version)
+      return profile.version > main.version ? 'profile' : 'main';
+  }
+  if (main.days === profile.days) return 'undecided';
+  return profile.days > main.days ? 'profile' : 'main';
 }
 
-/** The earliest `YYYY-MM-DD` day in a stats cache's daily activity, or `null` when the file cannot
- *  be read or parsed or holds no dated day. Such a copy has no history the other could lose. */
-function statsHistoryStart(path: string, fs: ProfileFs): string | null {
-  let parsed: unknown;
+/** Read one copy of the stats cache: its cache version and how many distinct valid days its daily
+ *  activity holds. Never throws — the planner runs before the per-entry fault guard. */
+function readStatsCache(path: string, fs: ProfileFs): StatsCacheCopy {
+  let parsed: ReturnType<typeof parseObject>;
   try {
-    const text = fs.readTextIfExists(path);
-    if (text === null) return null;
-    parsed = JSON.parse(text);
+    parsed = parseObject(fs.readTextIfExists(path));
   } catch {
-    // The planner runs before the per-entry fault guard, so a read fault must not escape it.
-    return null;
+    return { kind: 'unreadable' };
   }
-  const days = asObject(parsed)?.dailyActivity;
-  if (!Array.isArray(days)) return null;
-  let start: string | null = null;
-  for (const day of days) {
-    const date = asObject(day)?.date;
-    if (!isStatsDay(date)) continue;
-    if (start === null || date < start) start = date;
+  if (parsed === null) return { kind: 'unreadable' };
+  if (parsed === 'corrupt') return { kind: 'corrupt' };
+  const version =
+    typeof parsed.version === 'number' && Number.isFinite(parsed.version)
+      ? parsed.version
+      : undefined;
+  const days = new Set<string>();
+  if (Array.isArray(parsed.dailyActivity)) {
+    for (const day of parsed.dailyActivity) {
+      const date = asObject(day)?.date;
+      if (isStatsDay(date)) days.add(date);
+    }
   }
-  return start;
+  return { kind: 'cache', version, days: days.size };
 }
 
-/** A real calendar day in the zero-padded `YYYY-MM-DD` form, so day order is string order. Claude
- *  Code drops any other day key when it loads the cache, so it must not decide a repair either. */
+/** A real calendar day in the zero-padded `YYYY-MM-DD` form. Claude Code drops any other day key
+ *  when it loads the cache, so such a key must not count toward a repair either. */
 function isStatsDay(value: unknown): value is string {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
   const day = new Date(value);

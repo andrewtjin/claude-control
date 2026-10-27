@@ -451,7 +451,7 @@ function describeRepairedViolation(v: SlotViolation): string {
       // A dissolved binding's profile was still logged in; its login was cleared.
       return `${v.detail}; cctl cleared that login from the unused profile.`;
     default:
-      // broken_profile_link is not repaired by repairSlots (ensureGroupProfile owns it); a future
+      // broken_profile_link is never announced as repaired (re-linking is routine sync); a future
       // repairable kind lands here with an honest generic corrective clause rather than silence.
       return `${v.detail}; cctl repaired it.`;
   }
@@ -1874,6 +1874,9 @@ export class Daemon {
             'repaired slot invariant breaches',
           );
           for (const kind of new Set(result.repaired.map((v) => v.kind))) {
+            // A severed profile link is routine sync, as above: a parallel session's profile, which
+            // the self-heal skips, is re-linked here instead, and that is no news either.
+            if (kind === 'broken_profile_link') continue;
             const v = result.repaired.find((x) => x.kind === kind);
             if (v === undefined) continue;
             this.emitSlotAlert(`repaired:${kind}`, describeRepairedViolation(v));
