@@ -710,11 +710,13 @@ type StatsCacheCopy =
  * file was shared, or one Claude Code rebuilt from scratch after it found the cache unreadable. A
  * count, unlike the earliest day, also outweighs a stray old day in such a rebuild.
  *
- * Caches of two different versions cannot be compared day by day (the shape of a day may change),
- * and Claude Code migrates an older cache forward when it loads it, so the higher version wins. A
- * copy that is not a JSON object loses to one that is. A copy that cannot be read decides nothing:
- * guessing could overwrite the longer history with the shorter one. Equal counts are the same
- * history or ordinary day-to-day progress, left to newest-wins.
+ * Claude Code migrates an older cache version forward with its days intact, so a version alone does
+ * not decide: days are still compared. The exception is a newer version in which no day can be
+ * counted — a later Claude Code that reshaped its days — which must not keep losing to a stale
+ * older copy. On equal counts the newer version wins. A copy that is not a JSON object loses to one
+ * that is. A copy that cannot be read decides nothing: guessing could overwrite the longer history
+ * with the shorter one. Equal counts of one version are the same history or ordinary day-to-day
+ * progress, left to newest-wins.
  */
 function statsCacheVerdict(
   mainPath: string,
@@ -728,12 +730,16 @@ function statsCacheVerdict(
     if (main.kind === profile.kind) return 'undecided';
     return main.kind === 'corrupt' ? 'profile' : 'main';
   }
-  if (main.version !== undefined && profile.version !== undefined) {
-    if (main.version !== profile.version)
-      return profile.version > main.version ? 'profile' : 'main';
-  }
-  if (main.days === profile.days) return 'undecided';
-  return profile.days > main.days ? 'profile' : 'main';
+  const newer =
+    main.version === undefined || profile.version === undefined || main.version === profile.version
+      ? undefined
+      : profile.version > main.version
+        ? 'profile'
+        : 'main';
+  // A newer cache with no day this module can count is a shape it cannot read, not an empty one.
+  if (newer !== undefined && (newer === 'profile' ? profile : main).days === 0) return newer;
+  if (main.days !== profile.days) return profile.days > main.days ? 'profile' : 'main';
+  return newer ?? 'undecided';
 }
 
 /** Read one copy of the stats cache: its cache version and how many distinct valid days its daily

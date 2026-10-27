@@ -628,7 +628,7 @@ describe('ensureGroupProfile (real filesystem)', () => {
     expect(sharedStats(main, profile)).toBe('{ "dailyActivity": [');
   });
 
-  it('keeps a stats cache of a newer version, whatever its days look like', () => {
+  it('keeps a newer-version stats cache whose days cannot be counted', () => {
     // A later Claude Code may reshape a day; its cache cannot be counted by this shape, and an
     // older-version copy must not keep replacing it.
     const reshaped = JSON.stringify({ version: 6, days: { '2026-10-05': { messages: 3 } } });
@@ -641,6 +641,31 @@ describe('ensureGroupProfile (real filesystem)', () => {
     const b = divergedStats(reshaped, older, 'profile');
     ensureGroupProfile(b.profile, b.main);
     expect(sharedStats(b.main, b.profile)).toBe(reshaped);
+  });
+
+  it('keeps the older-version stats cache that holds more days: Claude Code migrates it', () => {
+    // Main last counted under an older cache version; the profile's copy is newer in every way
+    // but holds a month. The older version's days survive Claude Code's migration, so they win.
+    const olderVersion = statsCache(dayRun('2026-01-05', 250)).replace(
+      '"version":5',
+      '"version":4',
+    );
+    const newerVersion = statsCache(dayRun('2026-09-01', 30));
+    const { main, profile } = divergedStats(olderVersion, newerVersion, 'profile');
+
+    ensureGroupProfile(profile, main);
+
+    expect(sharedStats(main, profile)).toBe(olderVersion);
+  });
+
+  it('prefers the newer cache version when both hold the same days', () => {
+    const days = dayRun('2026-03-02', 100);
+    const migrated = statsCache(days).replace('"version":5', '"version":6');
+    const { main, profile } = divergedStats(statsCache(days), migrated, 'main');
+
+    ensureGroupProfile(profile, main);
+
+    expect(sharedStats(main, profile)).toBe(migrated);
   });
 
   it('brings two profiles and main to the stats cache with the most history, in either order', () => {

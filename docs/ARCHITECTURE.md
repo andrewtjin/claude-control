@@ -170,8 +170,9 @@ unruled folder's pool is the shared pool.
   every materialize and repaired newest-wins if Claude Code's temp-and-rename write ever
   severs it. `stats-cache.json` (the `/stats` totals and activity heatmap) is the exception
   to newest-wins: Claude Code counts each day into it once and later deletes the transcripts,
-  so its repair keeps the copy of the higher cache version, then the one holding more days,
-  and falls back to newest-wins only on a tie; a copy it cannot read waits for the next run.
+  so its repair keeps the copy holding more days (a newer cache version whose days cannot be
+  counted wins outright; on equal days the newer version wins) and falls back to newest-wins
+  only on a full tie; a copy it cannot read waits for the next run.
   Across volumes, a profile copy that wins is kept rather than replaced by main's.
   Account-scoped
   dirs (`statsig`, `logs`, `backups`, `telemetry`, the daemon's own runtime, …) stay
