@@ -165,9 +165,16 @@ unruled folder's pool is the shared pool.
   `sessions`, …) are directory junctions (Windows) or symlinks (POSIX) to main, so
   memories, skills and history are one set of files no matter which account a session runs
   on. Root files that are account-neutral (`settings.json`, `CLAUDE.md` and other root
-  `*.md`, `keybindings.json`, `history.jsonl`) are **hardlinks** to main — one inode, so an
-  edit through either name is seen by both; the link is re-verified on every materialize and
-  repaired newest-wins if Claude Code's temp-and-rename write ever severs it. Account-scoped
+  `*.md`, `keybindings.json`, `history.jsonl`, `stats-cache.json`) are **hardlinks** to main
+  — one inode, so an edit through either name is seen by both; the link is re-verified on
+  every materialize and repaired newest-wins if Claude Code's temp-and-rename write ever
+  severs it. `stats-cache.json` (the `/stats` totals and activity heatmap) is the exception
+  to newest-wins: Claude Code counts each day into it once and later deletes the transcripts,
+  so its repair keeps the copy holding more days (a newer cache version whose days cannot be
+  counted wins outright; on equal days the newer version wins) and falls back to newest-wins
+  only on a full tie; a copy it cannot read waits for the next run.
+  Across volumes, a profile copy that wins is kept rather than replaced by main's.
+  Account-scoped
   dirs (`statsig`, `logs`, `backups`, `telemetry`, the daemon's own runtime, …) stay
   profile-local. `.claude.json` is **profile-owned**: the profile keeps its own
   `oauthAccount`, and only an allowlist of account-neutral keys (onboarding flags, theme,

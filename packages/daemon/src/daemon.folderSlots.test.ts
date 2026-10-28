@@ -883,6 +883,46 @@ describe('daemon folder-bound slots — repair is surfaced to the operator', () 
     await waitFor(() => countUsageSnapshots(rig.relay) >= 3);
     expect(slotAlerts(rig.relay)).toHaveLength(2);
   });
+
+  it('does not alert on a profile link the repair re-linked (a parallel session, say)', async () => {
+    // The self-heal skips a parallel session's rule, so its severed links are re-linked by the
+    // repair instead. That is the same routine sync, and only the credential move alerts.
+    const { accounts, groups, live } = twoAccountGroup();
+    const brokenLink: SlotViolation = {
+      kind: 'broken_profile_link',
+      detail: 'parallel session profile: stats-cache.json is no longer linked to the main config',
+      ruleId: 'g1',
+    };
+    const repairedGroup: SlotViolation = {
+      kind: 'outside_pool_live_in_rule',
+      detail: '"Shared", which that folder excludes, is live in the folder slot of C:/work',
+      accountId: 's1',
+      ruleId: 'g1',
+    };
+    const controls = fakeEngine({
+      accounts,
+      groups,
+      live,
+      violations: [brokenLink, repairedGroup],
+      repair: { repaired: [brokenLink, repairedGroup], remaining: [], actions: [] },
+    });
+    const rig = await createRig({
+      controls,
+      bodyFor: () => ({
+        limits: [{ kind: 'weekly_all', percent: 10, resets_at: iso(NOW + DAY_MS) }],
+      }),
+      slotAlertWindowMs: 60 * 60_000,
+      pollIntervalMs: 25,
+    });
+    await rig.start();
+    await waitFor(() => slotAlerts(rig.relay).length >= 1);
+    await waitFor(() => countUsageSnapshots(rig.relay) >= 3);
+
+    const bodies = slotAlerts(rig.relay).map((a) => a.body);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain('is live in the folder slot of C:/work');
+    expect(bodies.some((b) => b.includes('no longer linked'))).toBe(false);
+  });
 });
 
 describe('daemon folder-bound slots — a spawn that cannot take its group slot is refused', () => {
