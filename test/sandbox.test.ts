@@ -306,8 +306,8 @@ describe('live-state guard: ways around the fs functions', () => {
   });
 
   it('reads a trailing separator after a planted link the way the OS does', () => {
-    // free/dang points at prot/new, which does not exist yet: a folder made through `dang/` is
-    // made there on every OS. free/lnk points at prot/sub: a POSIX kernel follows it for
+    // free/dang points at prot/new, which does not exist yet: `dang/` names prot/new, so a folder
+    // made through it is refused. free/lnk points at prot/sub: a POSIX kernel follows it for
     // `lnk/`, so a recursive remove empties prot/sub; Windows drops the separator and removes
     // only the link.
     const run = inGuardedChild(
