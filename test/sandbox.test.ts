@@ -278,6 +278,61 @@ describe('live-state guard: ways around the fs functions', () => {
     expect(fs.readdirSync(run.prot)).toEqual([]);
   });
 
+  it('steps back over a `..` after a planted link the way the OS does', () => {
+    // free/lnk points at prot/sub. A POSIX kernel follows the link before it steps back, so
+    // free/lnk/../up.txt is prot/up.txt; Windows steps back by name first, so it is free/up.txt.
+    // The second path steps back inside a folder the recursive mkdir creates, then through the
+    // link: prot/sub/deep on every OS.
+    const run = inGuardedChild(
+      `import fs from 'node:fs';
+       const [prot, free] = process.argv.slice(1);
+       const sep = process.platform === 'win32' ? '\\\\' : '/';
+       fs.symlinkSync(prot + sep + 'sub', free + sep + 'lnk', 'junction');
+       const attempt = (write) => { try { write(); return 'OK'; } catch (err) { return err.code; } };
+       console.log([
+         attempt(() => fs.writeFileSync([free, 'lnk', '..', 'up.txt'].join(sep), 'x')),
+         attempt(() => fs.mkdirSync([free, 'new', '..', 'lnk', 'deep'].join(sep), { recursive: true })),
+       ].join(' '));`,
+      (prot) => fs.mkdirSync(join(prot, 'sub')),
+    );
+    if (process.platform === 'win32') {
+      expect(run.out.trim()).toBe('OK ELIVEGUARD');
+      expect(existsSync(join(run.free, 'up.txt'))).toBe(true);
+    } else {
+      expect(run.out.trim()).toBe('ELIVEGUARD ELIVEGUARD');
+    }
+    expect(fs.readdirSync(run.prot)).toEqual(['sub']);
+    expect(fs.readdirSync(join(run.prot, 'sub'))).toEqual([]);
+  });
+
+  it('reads a trailing separator after a planted link the way the OS does', () => {
+    // free/dang points at prot/new, which does not exist yet: `dang/` names prot/new, so a folder
+    // made through it is refused. free/lnk points at prot/sub: a POSIX kernel follows it for
+    // `lnk/`, so a recursive remove empties prot/sub; Windows drops the separator and removes
+    // only the link.
+    const run = inGuardedChild(
+      `import fs from 'node:fs';
+       const [prot, free] = process.argv.slice(1);
+       const sep = process.platform === 'win32' ? '\\\\' : '/';
+       fs.symlinkSync(prot + sep + 'new', free + sep + 'dang', 'junction');
+       fs.symlinkSync(prot + sep + 'sub', free + sep + 'lnk', 'junction');
+       const attempt = (write) => { try { write(); return 'OK'; } catch (err) { return err.code; } };
+       console.log([
+         attempt(() => fs.mkdirSync(free + sep + 'dang' + sep, { recursive: true })),
+         attempt(() => fs.rmSync(free + sep + 'lnk' + sep, { recursive: true, force: true })),
+       ].join(' '));`,
+      (prot) => {
+        fs.mkdirSync(join(prot, 'sub'));
+        fs.writeFileSync(join(prot, 'sub', 'keep.txt'), 'x');
+      },
+    );
+    expect(run.out.trim()).toBe(
+      process.platform === 'win32' ? 'ELIVEGUARD OK' : 'ELIVEGUARD ELIVEGUARD',
+    );
+    expect(fs.readdirSync(run.prot)).toEqual(['sub']);
+    expect(fs.readdirSync(join(run.prot, 'sub'))).toEqual(['keep.txt']);
+  });
+
   it('keeps the guard in a node child spawned with an environment of its own', () => {
     // A child given only PATH would resolve the real home from the OS account.
     const run = inGuardedChild(
