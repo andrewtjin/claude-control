@@ -57,15 +57,30 @@ const realAppendFileSync = fs.appendFileSync;
 /** How many dangling links {@link canonical} follows before it stops, as the OS stops a loop. */
 const MAX_LINK_HOPS = 40;
 
+/** `parts` joined onto `base` as an absolute path, the way the OS will read it. Windows steps back
+ *  over a `..` by name before it follows any link, so a lexical join is exact there. A POSIX
+ *  kernel follows a link before it steps back out of it (`link/..` is the parent of the link's
+ *  target), so the `..` is kept as written for the existence checks and realpath below to read. */
+function joinAsRead(base, ...parts) {
+  if (process.platform === 'win32') return path.resolve(base, ...parts);
+  let out = path.isAbsolute(base) ? base : `${process.cwd()}/${base}`;
+  for (const part of parts) {
+    out = path.isAbsolute(part) ? part : `${out.replace(/\/+$/, '')}/${part}`;
+  }
+  return out;
+}
+
 /** Fold a path to the form protected entries are compared in: absolute, resolved through any
  *  junction or symlink on its existing part, and case-folded on Windows. With `follow` false the
  *  last component is kept as named, for calls that act on a link itself (removing or renaming
  *  it) rather than on what it points at. */
 function canonical(target, follow = true, hops = 0) {
-  let resolved = path.resolve(target);
-  if (!follow) {
+  let resolved = joinAsRead(target);
+  const name = path.basename(resolved);
+  // A last component of `.` or `..` names a folder reached through the rest, never a link itself.
+  if (!follow && name !== '.' && name !== '..') {
     const parent = path.dirname(resolved);
-    if (parent !== resolved) return path.join(canonical(parent), foldCase(path.basename(resolved)));
+    if (parent !== resolved) return path.join(canonical(parent), foldCase(name));
   }
   // Resolve links on the deepest part that exists, so a link planted inside the sandbox that
   // points at the real profile still lands on the protected side.
@@ -85,8 +100,8 @@ function canonical(target, follow = true, hops = 0) {
         // A relative target is read from where the link really is, so a `..` in it climbs out of
         // the real folder, not the lexical one; a `\\?\` prefix is dropped, as the OS reads it.
         const from = canonical(path.dirname(head), true, hops + 1);
-        const to = path.resolve(from, link.replace(/^\\\\\?\\/, ''));
-        return canonical(path.join(to, ...tail), true, hops + 1);
+        const to = joinAsRead(from, link.replace(/^\\\\\?\\/, ''));
+        return canonical(joinAsRead(to, ...tail), true, hops + 1);
       }
     }
     const parent = path.dirname(head);
@@ -98,6 +113,13 @@ function canonical(target, follow = true, hops = 0) {
     resolved = path.join(realRealpathSync(head), ...tail);
   } catch {
     // An unreadable ancestor leaves the lexical path, which is still compared.
+    return foldCase(path.normalize(resolved));
+  }
+  // The missing part is created as real folders (a recursive mkdir makes each one), so a `..` in
+  // it steps back by name. Where it steps back to may hold a link, so the shortened path is
+  // walked again; having no `..` left, it does not come back here.
+  if (hops < MAX_LINK_HOPS && tail.some((part) => part === '..' || part === '.')) {
+    return canonical(resolved, true, hops + 1);
   }
   return foldCase(resolved);
 }
