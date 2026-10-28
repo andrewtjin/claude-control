@@ -76,6 +76,14 @@ function joinAsRead(base, ...parts) {
  *  it) rather than on what it points at. */
 function canonical(target, follow = true, hops = 0) {
   let resolved = joinAsRead(target);
+  // A trailing separator makes a POSIX kernel follow a link in the last component too, even for
+  // a call that acts on the link itself (`rm -r link/` empties its target). Windows drops it
+  // (path.resolve already has). Either way the separator goes, so the walk reads the bare name.
+  const bare = resolved.replace(/(?<=[^/])\/+$/, '');
+  if (bare !== resolved) {
+    resolved = bare;
+    follow = true;
+  }
   const name = path.basename(resolved);
   // A last component of `.` or `..` names a folder reached through the rest, never a link itself.
   if (!follow && name !== '.' && name !== '..') {
@@ -117,7 +125,8 @@ function canonical(target, follow = true, hops = 0) {
   }
   // The missing part is created as real folders (a recursive mkdir makes each one), so a `..` in
   // it steps back by name. Where it steps back to may hold a link, so the shortened path is
-  // walked again; having no `..` left, it does not come back here.
+  // walked again. It has no `..` left, though a dangling link on it can bring one back from its
+  // target text; each such round spends hops, so a chain of them ends at the lexical path.
   if (hops < MAX_LINK_HOPS && tail.some((part) => part === '..' || part === '.')) {
     return canonical(resolved, true, hops + 1);
   }
