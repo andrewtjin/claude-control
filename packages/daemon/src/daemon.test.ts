@@ -2664,7 +2664,9 @@ describe('Daemon lifecycle', () => {
         (e.obj as { phase?: string }).phase === 'attributionJournal.sync',
     );
     const fields = journal?.obj as { elapsedMs: number; blockedMs: number };
-    expect(fields.elapsedMs).toBeGreaterThanOrEqual(LOOP_LAG_THRESHOLD_MS + 100);
+    // Well past the threshold, measured on another clock than the timer's, which can fire a
+    // millisecond short of the delay it was given.
+    expect(fields.elapsedMs).toBeGreaterThan(LOOP_LAG_THRESHOLD_MS + 50);
     expect(fields.blockedMs).toBeLessThan(LOOP_LAG_THRESHOLD_MS);
     expect(
       entries.some(

@@ -494,7 +494,10 @@ describe('the credential lock over a long import', () => {
 /**
  * Another process that takes the import's lock over and over, the way a cctl command or the daemon
  * would, each time waiting for it as they do (announced, polling every 100 ms), and says when it got
- * it. `started` puts it on the test's clock, so neither takes the other's claim for a stale one.
+ * it. It waits all along: between one hold and the next it rests a moment, and its announcement
+ * (written as acquireLock writes one) stays up through that rest, so every release of the import
+ * finds it waiting rather than only those that come after its next poll. `started` puts it on the
+ * test's clock, so neither takes the other's claim for a stale one.
  */
 async function contend(
   h: Harness,
@@ -506,12 +509,17 @@ async function contend(
     script,
     [
       `import { acquireLock } from ${JSON.stringify(lockModule)};`,
+      "import { rmSync, writeFileSync } from 'node:fs';",
       'const [dir, offset] = process.argv.slice(2);',
       'const clock = () => Date.now() + Number(offset);',
+      "const host = process.env.COMPUTERNAME || process.env.HOSTNAME || 'local';",
+      "const waiting = dir + '.waiting-contender-' + process.pid;",
       "process.stdout.write('ready\\n');",
       'for (;;) {',
       '  const lock = await acquireLock(dir, clock, { timeoutMs: 60000, pollMs: 100 });',
+      '  rmSync(waiting, { force: true });',
       "  process.stdout.write('got ' + Date.now() + '\\n');",
+      '  writeFileSync(waiting, JSON.stringify({ pid: process.pid, host }));',
       '  lock.release();',
       '  await new Promise((r) => setTimeout(r, 20));',
       '}',
