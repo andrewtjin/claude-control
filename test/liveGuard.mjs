@@ -89,7 +89,7 @@ function asDrivePath(p) {
   return `${share[2]}:${p.slice(share[0].length) || '\\'}`;
 }
 
-/** The name the link at `p` (whose lstat is `stat`) has on disk. Windows also answers to a
+/** The name the link at `p` (whose bigint lstat is `stat`) has on disk. Windows also answers to a
  *  short name (`CLAUDE~1`), and Windows and macOS to another case; such a spelling is matched to
  *  the folder entry it names by file identity. A name that cannot be listed is kept. */
 function nameOnDisk(p, stat) {
@@ -105,7 +105,8 @@ function nameOnDisk(p, stat) {
   return (
     names.find((n) => {
       try {
-        const s = realLstatSync(path.join(dir, n));
+        // As bigints: an NTFS file id does not fit a Number, and two rounded ones can collide.
+        const s = realLstatSync(path.join(dir, n), { bigint: true });
         return s.ino === stat.ino && s.dev === stat.dev;
       } catch {
         return false;
@@ -135,7 +136,7 @@ function canonical(target, follow = true, hops = 0) {
   if (!follow && name !== '.' && name !== '..') {
     let stat;
     try {
-      stat = realLstatSync(resolved);
+      stat = realLstatSync(resolved, { bigint: true });
     } catch {
       // Nothing there yet: the name is all there is to compare.
     }
@@ -246,6 +247,10 @@ function opensForWrite(flags) {
  * one above it is kind `link`, matched like a folder but left out of the check on what a child
  * process is handed (a home folder that is a link would otherwise refuse every command naming
  * anything in it).
+ *
+ * Each entry is also kept as written, for that same child-process check: a command names a path
+ * that way, not by where its links lead (macOS's /var is /private/var). No fs call is compared
+ * against it by mistake, since a canonical path never passes through a link.
  */
 function loadProtected() {
   let entries;
@@ -259,11 +264,18 @@ function loadProtected() {
   for (const e of entries) {
     if (!e || typeof e.path !== 'string' || e.path.trim() === '') continue;
     const kind = e.kind === 'prefix' ? 'prefix' : 'tree';
-    const own = path.resolve(e.path);
+    const typed = foldCase(path.resolve(e.path));
     // Protected paths are the user's own folders, never a chain of links too long to follow.
-    add(kind, canonical(e.path) ?? foldCase(own));
-    for (const link of linksOnTheWay(e.path)) {
-      add(link === own ? kind : 'link', canonical(link, false) ?? foldCase(link));
+    add(kind, canonical(e.path) ?? typed);
+    add(kind, typed);
+    const links = linksOnTheWay(e.path);
+    if (links.length === 0) continue;
+    // The entry's own link is told apart by where it is, not by how it is spelled: a link above
+    // it changes the spelling linksOnTheWay reports it by.
+    const own = canonical(e.path, false);
+    for (const link of links) {
+      const named = canonical(link, false) ?? foldCase(link);
+      add(named === own ? kind : 'link', named);
     }
   }
   return [...out.values()];
@@ -428,8 +440,12 @@ export function installLiveGuard() {
     let inside = [];
     try {
       inside = realReaddirSync(source, { recursive: true });
-    } catch {
-      return; // Not a folder: the target alone is written, and was checked above.
+    } catch (err) {
+      // Not a folder (or not there): the target alone is written, and was checked above. A
+      // folder that cannot be listed in full could hide an entry that lands anywhere, and the
+      // copy may still write the entries it can read, so that copy is refused.
+      if (err.code === 'ENOTDIR' || err.code === 'ENOENT') return;
+      refuse(`${name}(${source}, ${dest})`, `its source cannot be listed to check (${err.code})`);
     }
     for (const rel of inside) {
       const why = protectedBy(joinAsRead(dest, String(rel)), entries, true, false);

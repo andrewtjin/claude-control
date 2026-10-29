@@ -434,6 +434,69 @@ describe('live-state guard: ways around the fs functions', () => {
     expect(fs.readdirSync(join(run.prot, 'store', 'dotfiles', 'claude'))).toEqual(['keep.txt']);
   });
 
+  it('guards a linked protected folder whose home is itself reached through a link', () => {
+    // prot/home is a link to prot/realhome, and the protected prot/home/.claude is a link to
+    // prot/dot/claude: the folder is named through one link and is another.
+    const run = inGuardedChild(
+      `import fs from 'node:fs';
+       import { spawnSync } from 'node:child_process';
+       import { join } from 'node:path';
+       const [prot] = process.argv.slice(1);
+       const attempt = (write) => { try { write(); return 'OK'; } catch (err) { return err.code; } };
+       const typed = join(prot, 'home', '.claude', 'c.txt');
+       console.log([
+         attempt(() => fs.rmSync(join(prot, 'realhome', '.claude'), { recursive: true, force: true })),
+         attempt(() => fs.rmSync(join(prot, 'home', '.claude'), { recursive: true, force: true })),
+         attempt(() => process.platform === 'win32'
+           ? spawnSync('cmd.exe', ['/c', 'echo hi> ' + typed])
+           : spawnSync('sh', ['-c', 'echo hi > ' + typed])),
+       ].join(' '));`,
+      (prot) => {
+        fs.mkdirSync(join(prot, 'dot', 'claude'), { recursive: true });
+        fs.writeFileSync(join(prot, 'dot', 'claude', 'keep.txt'), 'x');
+        fs.mkdirSync(join(prot, 'realhome'));
+        fs.symlinkSync(join(prot, 'realhome'), join(prot, 'home'), 'junction');
+        const login = join(prot, 'realhome', '.claude');
+        fs.symlinkSync(join(prot, 'dot', 'claude'), login, 'junction');
+      },
+      (prot) => [{ kind: 'tree', path: join(prot, 'home', '.claude') }],
+    );
+    expect(run.out.trim()).toBe('ELIVEGUARD ELIVEGUARD ELIVEGUARD');
+    expect(fs.lstatSync(join(run.prot, 'realhome', '.claude')).isSymbolicLink()).toBe(true);
+    expect(fs.readdirSync(join(run.prot, 'dot', 'claude'))).toEqual(['keep.txt']);
+  });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'refuses a recursive copy whose source cannot be listed in full',
+    () => {
+      // A folder the copy cannot list could hide an entry that lands anywhere; free/dst/j points
+      // at prot, and the copy would write j/data.txt there before reaching the locked folder.
+      const run = inGuardedChild(
+        `import fs from 'node:fs';
+         import { join } from 'node:path';
+         const [prot, free] = process.argv.slice(1);
+         fs.mkdirSync(join(free, 'src', 'j'), { recursive: true });
+         fs.writeFileSync(join(free, 'src', 'j', 'data.txt'), 'fake');
+         fs.mkdirSync(join(free, 'src', 'zz-locked'), { mode: 0o000 });
+         fs.mkdirSync(join(free, 'dst'));
+         fs.symlinkSync(prot, join(free, 'dst', 'j'));
+         let out;
+         try {
+           fs.cpSync(join(free, 'src'), join(free, 'dst'), {
+             recursive: true,
+             filter: (s) => !s.endsWith('zz-locked'),
+           });
+           out = 'OK';
+         } catch (err) { out = err.code; }
+         fs.chmodSync(join(free, 'src', 'zz-locked'), 0o700);
+         console.log(out);`,
+        (prot) => fs.writeFileSync(join(prot, 'data.txt'), 'real'),
+      );
+      expect(run.out.trim()).toBe('ELIVEGUARD');
+      expect(fs.readFileSync(join(run.prot, 'data.txt'), 'utf8')).toBe('real');
+    },
+  );
+
   it('refuses a protected folder named another way the OS accepts', () => {
     // prot/LongProtectedName is protected. Windows also answers to its short name, any case and
     // an NTFS stream suffix, and to the admin share and device forms of its path; macOS to any
@@ -452,7 +515,10 @@ describe('live-state guard: ways around the fs functions', () => {
          const listing = execFileSync('cmd', ['/c', 'dir', '/x', prot], { encoding: 'utf8' });
          const short = /\\s(\\S+~\\d+)\\s+LongProtectedName\\s*$/m.exec(listing)?.[1];
          if (short) out.push(attempt('short', () => fs.rmSync(join(prot, short), { recursive: true })));
-         out.push(attempt('stream', () => fs.renameSync(long + '::$INDEX_ALLOCATION', join(free, 'moved'))));
+         // Only NTFS reads the suffix; a ReFS Dev Drive has no such name.
+         if (fs.existsSync(long + '::$INDEX_ALLOCATION')) {
+           out.push(attempt('stream', () => fs.renameSync(long + '::$INDEX_ALLOCATION', join(free, 'moved'))));
+         }
          const share = '\\\\\\\\localhost\\\\' + long[0] + '$' + long.slice(2);
          out.push(attempt('share', () => fs.rmSync(share, { recursive: true })));
          out.push(attempt('device', () => fs.rmSync('\\\\\\\\?\\\\' + long, { recursive: true })));
@@ -474,7 +540,7 @@ describe('live-state guard: ways around the fs functions', () => {
     }
     if (process.platform === 'win32') {
       expect(results.map((r) => r.split('=')[0])).toEqual(
-        expect.arrayContaining(['case', 'stream', 'share', 'device']),
+        expect.arrayContaining(['case', 'share', 'device']),
       );
     }
     expect(fs.readdirSync(join(run.prot, 'LongProtectedName'))).toEqual(['keep.txt']);
