@@ -166,13 +166,17 @@ afterEach(() => {
 });
 
 /**
- * Run `code` (an ES module) in a node child whose guard also protects a fresh scratch folder,
- * passing that folder and a second, unprotected one as argv[1] and argv[2]. The real locations
- * stay protected in the child too. Returns what the child printed, and the two folders.
+ * Run `code` (an ES module) in a node child whose guard also protects a fresh scratch folder (or
+ * what `protect` names in it), passing that folder and a second, unprotected one as argv[1] and
+ * argv[2]. The real locations stay protected in the child too. Returns what the child printed,
+ * and the two folders.
  */
 function inGuardedChild(
   code: string,
   setUp: (prot: string) => void = () => undefined,
+  protect: (prot: string) => { kind: string; path: string }[] = (prot) => [
+    { kind: 'tree', path: prot },
+  ],
 ): { out: string; prot: string; free: string } {
   const prot = fs.mkdtempSync(join(tmpdir(), 'cctl-guard-prot-'));
   const free = fs.mkdtempSync(join(tmpdir(), 'cctl-guard-free-'));
@@ -180,7 +184,7 @@ function inGuardedChild(
   setUp(prot);
   const protectedList = [
     ...(JSON.parse(process.env.CCTL_TEST_PROTECTED_PATHS ?? '[]') as unknown[]),
-    { kind: 'tree', path: prot },
+    ...protect(prot),
   ];
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', code, prot, free], {
     encoding: 'utf8',
@@ -331,6 +335,103 @@ describe('live-state guard: ways around the fs functions', () => {
     );
     expect(fs.readdirSync(run.prot)).toEqual(['sub']);
     expect(fs.readdirSync(join(run.prot, 'sub'))).toEqual(['keep.txt']);
+  });
+
+  it('refuses removing, moving or copying over a folder that holds a protected location', () => {
+    // prot/home stands in for the real home, holding a protected .claude folder; prot/home2 holds
+    // a protected .claude.json file.
+    const run = inGuardedChild(
+      `import fs from 'node:fs';
+       import { join } from 'node:path';
+       const [prot, free] = process.argv.slice(1);
+       const home = join(prot, 'home');
+       fs.mkdirSync(join(free, 'src', '.claude'), { recursive: true });
+       fs.writeFileSync(join(free, 'src', '.claude', 'creds.json'), 'fake');
+       const attempt = (write) => { try { write(); return 'OK'; } catch (err) { return err.code; } };
+       console.log([
+         attempt(() => fs.rmSync(home, { recursive: true, force: true })),
+         attempt(() => fs.rmSync(prot, { recursive: true, force: true })),
+         attempt(() => fs.renameSync(home, join(free, 'moved'))),
+         attempt(() => fs.cpSync(join(free, 'src'), home, { recursive: true })),
+         attempt(() => fs.rmSync(join(prot, 'home2'), { recursive: true, force: true })),
+         attempt(() => fs.rmSync(join(home, 'other'), { recursive: true })),
+       ].join(' '));`,
+      (prot) => {
+        fs.mkdirSync(join(prot, 'home', '.claude'), { recursive: true });
+        fs.writeFileSync(join(prot, 'home', '.claude', 'keep.txt'), 'x');
+        fs.mkdirSync(join(prot, 'home', 'other'));
+        fs.mkdirSync(join(prot, 'home2'));
+        fs.writeFileSync(join(prot, 'home2', '.claude.json'), '{}');
+      },
+      (prot) => [
+        { kind: 'tree', path: join(prot, 'home', '.claude') },
+        { kind: 'prefix', path: join(prot, 'home2', '.claude.json') },
+      ],
+    );
+    expect(run.out.trim()).toBe('ELIVEGUARD ELIVEGUARD ELIVEGUARD ELIVEGUARD ELIVEGUARD OK');
+    expect(fs.readdirSync(join(run.prot, 'home'))).toEqual(['.claude']);
+    expect(fs.readdirSync(join(run.prot, 'home', '.claude'))).toEqual(['keep.txt']);
+    expect(fs.readdirSync(join(run.prot, 'home2'))).toEqual(['.claude.json']);
+  });
+
+  it('guards a protected folder that is itself a link by both its names', () => {
+    // prot/home/.claude is a link into prot/dot, as a dotfiles setup keeps it. A write through it
+    // reaches prot/dot/claude; removing it or renaming over it replaces the link.
+    const run = inGuardedChild(
+      `import fs from 'node:fs';
+       import { join } from 'node:path';
+       const [prot, free] = process.argv.slice(1);
+       const login = join(prot, 'home', '.claude');
+       fs.mkdirSync(join(free, 'fake'));
+       const attempt = (write) => { try { write(); return 'OK'; } catch (err) { return err.code; } };
+       console.log([
+         attempt(() => fs.writeFileSync(join(login, 'probe.tmp'), 'x')),
+         attempt(() => fs.rmSync(login, { recursive: true, force: true })),
+         attempt(() => fs.renameSync(join(free, 'fake'), login)),
+         attempt(() => fs.rmSync(join(prot, 'dot'), { recursive: true, force: true })),
+       ].join(' '));`,
+      (prot) => {
+        fs.mkdirSync(join(prot, 'dot', 'claude'), { recursive: true });
+        fs.writeFileSync(join(prot, 'dot', 'claude', 'keep.txt'), 'x');
+        fs.mkdirSync(join(prot, 'home'));
+        fs.symlinkSync(join(prot, 'dot', 'claude'), join(prot, 'home', '.claude'), 'junction');
+      },
+      (prot) => [{ kind: 'tree', path: join(prot, 'home', '.claude') }],
+    );
+    expect(run.out.trim()).toBe('ELIVEGUARD ELIVEGUARD ELIVEGUARD ELIVEGUARD');
+    expect(fs.lstatSync(join(run.prot, 'home', '.claude')).isSymbolicLink()).toBe(true);
+    expect(fs.readdirSync(join(run.prot, 'dot', 'claude'))).toEqual(['keep.txt']);
+  });
+
+  it('refuses a path through more links than the OS follows', () => {
+    // free/a and free/b point at each other. On POSIX, a chain of 40 dangling links (as many as
+    // Linux follows) still resolves, and one of 41 is refused.
+    const run = inGuardedChild(
+      `import fs from 'node:fs';
+       import { join } from 'node:path';
+       const [, free] = process.argv.slice(1);
+       fs.symlinkSync(join(free, 'b'), join(free, 'a'), 'junction');
+       fs.symlinkSync(join(free, 'a'), join(free, 'b'), 'junction');
+       const chain = (name, length) => {
+         for (let i = 0; i < length - 1; i++) fs.symlinkSync(name + (i + 1), join(free, name + i));
+         fs.symlinkSync(name + '-end.txt', join(free, name + (length - 1)));
+         return join(free, name + 0);
+       };
+       const attempt = (write) => { try { write(); return 'OK'; } catch (err) { return err.code; } };
+       const out = [attempt(() => fs.writeFileSync(join(free, 'a', 'probe.tmp'), 'x'))];
+       if (process.platform !== 'win32') {
+         out.push(attempt(() => fs.writeFileSync(chain('p', 40), 'x')));
+         out.push(attempt(() => fs.writeFileSync(chain('q', 41), 'x')));
+       }
+       console.log(out.join(' '));`,
+    );
+    if (process.platform === 'win32') {
+      expect(run.out.trim()).toBe('ELIVEGUARD');
+    } else {
+      expect(run.out.trim()).toBe('ELIVEGUARD OK ELIVEGUARD');
+      expect(existsSync(join(run.free, 'p-end.txt'))).toBe(true);
+      expect(existsSync(join(run.free, 'q-end.txt'))).toBe(false);
+    }
   });
 
   it('keeps the guard in a node child spawned with an environment of its own', () => {

@@ -54,7 +54,8 @@ const realRealpathSync = fs.realpathSync.native;
 const realReadlinkSync = fs.readlinkSync;
 const realAppendFileSync = fs.appendFileSync;
 
-/** How many dangling links {@link canonical} follows before it stops, as the OS stops a loop. */
+/** The most dangling links {@link canonical} follows in one path: as many as Linux follows (macOS
+ *  follows 32). A path that needs more fails in the OS, and the guard refuses it. */
 const MAX_LINK_HOPS = 40;
 
 /** `parts` joined onto `base` as an absolute path, the way the OS will read it. Windows steps back
@@ -73,7 +74,8 @@ function joinAsRead(base, ...parts) {
 /** Fold a path to the form protected entries are compared in: absolute, resolved through any
  *  junction or symlink on its existing part, and case-folded on Windows. With `follow` false the
  *  last component is kept as named, for calls that act on a link itself (removing or renaming
- *  it) rather than on what it points at. */
+ *  it) rather than on what it points at. Null when reaching it takes more than
+ *  {@link MAX_LINK_HOPS} dangling links (a loop, say): the guard cannot tell where that lands. */
 function canonical(target, follow = true, hops = 0) {
   let resolved = joinAsRead(target);
   // A trailing separator makes a POSIX kernel follow a link in the last component too, even for
@@ -88,7 +90,10 @@ function canonical(target, follow = true, hops = 0) {
   // A last component of `.` or `..` names a folder reached through the rest, never a link itself.
   if (!follow && name !== '.' && name !== '..') {
     const parent = path.dirname(resolved);
-    if (parent !== resolved) return path.join(canonical(parent), foldCase(name));
+    if (parent !== resolved) {
+      const base = canonical(parent);
+      return base === null ? null : path.join(base, foldCase(name));
+    }
   }
   // Resolve links on the deepest part that exists, so a link planted inside the sandbox that
   // points at the real profile still lands on the protected side.
@@ -97,20 +102,20 @@ function canonical(target, follow = true, hops = 0) {
   while (!realExistsSync(head)) {
     // A link whose target does not exist yet does not "exist" either, yet a write through it
     // creates that target: follow it rather than step past it to the lexical path.
-    if (hops < MAX_LINK_HOPS) {
-      let link;
-      try {
-        link = realReadlinkSync(head);
-      } catch {
-        // Not a link: a part that is simply missing.
-      }
-      if (link !== undefined) {
-        // A relative target is read from where the link really is, so a `..` in it climbs out of
-        // the real folder, not the lexical one; a `\\?\` prefix is dropped, as the OS reads it.
-        const from = canonical(path.dirname(head), true, hops + 1);
-        const to = joinAsRead(from, link.replace(/^\\\\\?\\/, ''));
-        return canonical(joinAsRead(to, ...tail), true, hops + 1);
-      }
+    let link;
+    try {
+      link = realReadlinkSync(head);
+    } catch {
+      // Not a link: a part that is simply missing.
+    }
+    if (link !== undefined) {
+      if (hops >= MAX_LINK_HOPS) return null;
+      // A relative target is read from where the link really is, so a `..` in it climbs out of
+      // the real folder, not the lexical one; a `\\?\` prefix is dropped, as the OS reads it.
+      const from = canonical(path.dirname(head), true, hops + 1);
+      if (from === null) return null;
+      const to = joinAsRead(from, link.replace(/^\\\\\?\\/, ''));
+      return canonical(joinAsRead(to, ...tail), true, hops + 1);
     }
     const parent = path.dirname(head);
     if (parent === head) break;
@@ -125,11 +130,9 @@ function canonical(target, follow = true, hops = 0) {
   }
   // The missing part is created as real folders (a recursive mkdir makes each one), so a `..` in
   // it steps back by name. Where it steps back to may hold a link, so the shortened path is
-  // walked again. It has no `..` left, though a dangling link on it can bring one back from its
-  // target text; each such round spends hops, so a chain of them ends at the lexical path.
-  if (hops < MAX_LINK_HOPS && tail.some((part) => part === '..' || part === '.')) {
-    return canonical(resolved, true, hops + 1);
-  }
+  // walked again. That follows no link, so it spends no hop: the shortened path has no `..` left
+  // and comes back here only through a dangling link, which does spend one.
+  if (tail.some((part) => part === '..' || part === '.')) return canonical(resolved, true, hops);
   return foldCase(resolved);
 }
 
@@ -156,7 +159,10 @@ function opensForWrite(flags) {
   return !['r', 'rs', 'sr'].includes(String(flags));
 }
 
-/** Read the protected list from the environment, canonicalised once. */
+/** Read the protected list from the environment, canonicalised once. An entry that is itself a
+ *  link (a `~/.claude` kept in a dotfiles folder, say) is kept by both names: what it points at,
+ *  which a write through it reaches, and the link, which a rename over it or a removal of it
+ *  replaces. */
 function loadProtected() {
   let entries;
   try {
@@ -164,17 +170,44 @@ function loadProtected() {
   } catch {
     entries = [];
   }
-  return entries
-    .filter((e) => e && typeof e.path === 'string' && e.path.trim() !== '')
-    .map((e) => ({ kind: e.kind === 'prefix' ? 'prefix' : 'tree', path: canonical(e.path) }));
+  const out = new Map();
+  for (const e of entries) {
+    if (!e || typeof e.path !== 'string' || e.path.trim() === '') continue;
+    const kind = e.kind === 'prefix' ? 'prefix' : 'tree';
+    for (const form of [canonical(e.path), canonical(e.path, false)]) {
+      // Protected paths are the user's own folders, never a chain of links too long to follow.
+      const p = form ?? foldCase(path.resolve(e.path));
+      out.set(`${kind}\0${p}`, { kind, path: p });
+    }
+  }
+  return [...out.values()];
 }
 
-/** The protected entry `target` falls under, if any. */
-function protectedBy(target, entries, follow) {
+/** Whether canonical path `c` is protected entry `e` or lies inside it. */
+function within(c, e) {
+  return e.kind === 'prefix'
+    ? c.startsWith(e.path)
+    : c === e.path || c.startsWith(e.path + path.sep);
+}
+
+/** Whether protected entry `e` lies inside the folder at canonical path `c`. */
+function holds(c, e) {
+  return e.path.startsWith(c.endsWith(path.sep) ? c : c + path.sep);
+}
+
+/** Why a call on `target` would reach protected state, or undefined when it would not. With
+ *  `whole` the call also acts on everything inside the target (a recursive remove, a rename, a
+ *  recursive copy into it), so a folder that holds a protected location is refused too. */
+function protectedBy(target, entries, follow, whole) {
   const c = canonical(target, follow);
-  return entries.find((e) =>
-    e.kind === 'prefix' ? c.startsWith(e.path) : c === e.path || c.startsWith(e.path + path.sep),
-  );
+  if (c === null) {
+    return `it goes through more than ${MAX_LINK_HOPS} links, so where it lands cannot be checked`;
+  }
+  const hit = entries.find((e) => within(c, e));
+  if (hit) return `it is the real user's Claude login or cctl state (${hit.path})`;
+  const held = whole ? entries.find((e) => holds(c, e)) : undefined;
+  if (held) return `it holds the real user's Claude login or cctl state (${held.path})`;
+  return undefined;
 }
 
 /**
@@ -283,49 +316,50 @@ export function installLiveGuard() {
     throw err;
   };
 
-  /** Refuse the call when any path argument it writes through is protected. */
-  const check = (name, args, positions, flagsAt, follow = true) => {
-    if (flagsAt !== undefined && !opensForWrite(args[flagsAt])) return;
-    for (const i of positions) {
+  /**
+   * Refuse the call when any path argument it writes through is protected. `spec` says which
+   * arguments those are (`at`), where the open flags are (`flags`, open only), whether the call
+   * follows a link in the last component (`follow`, default true), and whether it acts on
+   * everything inside the target too (`whole`).
+   */
+  const check = (name, args, { at, flags, follow = true, whole = false }) => {
+    if (flags !== undefined && !opensForWrite(args[flags])) return;
+    for (const i of at) {
       const p = pathArg(args[i]);
       if (p === undefined) continue;
-      const hit = protectedBy(p, entries, follow);
-      if (hit) {
-        refuse(`${name}(${p})`, `it is the real user's Claude login or cctl state (${hit.path})`);
-      }
+      const why = protectedBy(p, entries, follow, whole);
+      if (why) refuse(`${name}(${p})`, why);
     }
   };
 
-  // name -> [indexes of path arguments it writes through, index of open flags (open only),
-  //          whether it follows a link in the last component]
   const targets = {
-    writeFile: [[0]],
-    appendFile: [[0]],
-    open: [[0], 1],
-    rename: [[0, 1], undefined, false],
-    copyFile: [[1]],
-    cp: [[1]],
-    rm: [[0], undefined, false],
-    rmdir: [[0], undefined, false],
-    unlink: [[0], undefined, false],
-    mkdir: [[0]],
-    mkdtemp: [[0]],
-    symlink: [[1], undefined, false],
+    writeFile: { at: [0] },
+    appendFile: { at: [0] },
+    open: { at: [0], flags: 1 },
+    rename: { at: [0, 1], follow: false, whole: true },
+    copyFile: { at: [1] },
+    cp: { at: [1], whole: true },
+    rm: { at: [0], follow: false, whole: true },
+    rmdir: { at: [0], follow: false, whole: true },
+    unlink: { at: [0], follow: false },
+    mkdir: { at: [0] },
+    mkdtemp: { at: [0] },
+    symlink: { at: [1], follow: false },
     // Both names: the new one is created, and the existing one gains a second name to write by.
-    link: [[0, 1], undefined, false],
-    truncate: [[0]],
-    chmod: [[0]],
-    utimes: [[0]],
+    link: { at: [0, 1], follow: false },
+    truncate: { at: [0] },
+    chmod: { at: [0] },
+    utimes: { at: [0] },
   };
 
   // Each form reports a refusal the way it reports any other failure, so callers handling errors
   // see it where they look: thrown (sync), rejected (promise) or passed to the callback.
-  const wrap = (holder, name, mode, positions, flagsAt, follow) => {
+  const wrap = (holder, name, mode, spec) => {
     const original = holder[name];
     if (typeof original !== 'function') return;
     holder[name] = function guarded(...args) {
       try {
-        check(name, args, positions, flagsAt, follow);
+        check(name, args, spec);
       } catch (err) {
         if (mode === 'promise') return Promise.reject(err);
         const callback = args.at(-1);
@@ -339,21 +373,21 @@ export function installLiveGuard() {
     };
   };
 
-  for (const [name, [positions, flagsAt, follow]] of Object.entries(targets)) {
-    wrap(fs, name, 'callback', positions, flagsAt, follow);
-    wrap(fs, `${name}Sync`, 'sync', positions, flagsAt, follow);
-    wrap(fs.promises, name, 'promise', positions, flagsAt, follow);
+  for (const [name, spec] of Object.entries(targets)) {
+    wrap(fs, name, 'callback', spec);
+    wrap(fs, `${name}Sync`, 'sync', spec);
+    wrap(fs.promises, name, 'promise', spec);
   }
   // Streams take the open flags from an options object (default 'w').
   const realCreateWriteStream = fs.createWriteStream;
   fs.createWriteStream = function guardedCreateWriteStream(target, options) {
     const flags = typeof options === 'object' && options?.flags ? options.flags : 'w';
-    check('createWriteStream', [target, flags], [0], 1);
+    check('createWriteStream', [target, flags], { at: [0], flags: 1 });
     return realCreateWriteStream.call(this, target, options);
   };
 
   guardSqlite(check);
-  guardChildProcesses(entries, refuse, (name, dir) => check(name, [dir], [0]));
+  guardChildProcesses(entries, refuse, (name, dir) => check(name, [dir], { at: [0] }));
   guardWorkers();
   syncBuiltinESMExports();
 }
@@ -380,7 +414,7 @@ function guardSqlite(check) {
         }
       }
       if (target !== undefined && target !== '' && target !== ':memory:') {
-        check('DatabaseSync', [target], [0]);
+        check('DatabaseSync', [target], { at: [0] });
       }
       super(location, ...rest);
     }
