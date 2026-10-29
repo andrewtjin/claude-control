@@ -12,7 +12,8 @@
 //    promise and stream forms (a hard link counts by both names: a link to a protected file is a
 //    second name for it, and a write through that name changes it);
 //  - a SQLite database opened there (node:sqlite writes from native code, not through fs);
-//  - a child process that is not node, handed a protected path, since nothing guards it inside;
+//  - a child process that is not node, handed a protected path (by its text), since nothing
+//    guards it inside;
 //    and any child process at all that would change state no home folder redirects: the Task
 //    Scheduler (cctl's autostart on Windows), launchd and systemd user services, the macOS
 //    Keychain (the login and the vault key live there), the Windows Run keys, and an elevated
@@ -52,9 +53,13 @@ const NODE_PRELOAD = `--import=${import.meta.url}`;
 const realExistsSync = fs.existsSync;
 const realRealpathSync = fs.realpathSync.native;
 const realReadlinkSync = fs.readlinkSync;
+const realLstatSync = fs.lstatSync;
+const realStatSync = fs.statSync;
+const realReaddirSync = fs.readdirSync;
 const realAppendFileSync = fs.appendFileSync;
 
-/** How many dangling links {@link canonical} follows before it stops, as the OS stops a loop. */
+/** The most dangling links {@link canonical} follows in one path: as many as Linux follows (macOS
+ *  follows 32). A path that needs more fails in the OS, and the guard refuses it. */
 const MAX_LINK_HOPS = 40;
 
 /** `parts` joined onto `base` as an absolute path, the way the OS will read it. Windows steps back
@@ -70,12 +75,55 @@ function joinAsRead(base, ...parts) {
   return out;
 }
 
+/** On Windows, `p` with a path that reaches a local drive by another route (an admin share such
+ *  as `\\localhost\C$\x`, its `\\?\UNC\` form, or the `\\?\C:\x` and `\\.\C:\x` device forms)
+ *  rewritten as the plain drive path, so it is compared as one. Anything else unchanged. */
+function asDrivePath(p) {
+  if (process.platform !== 'win32') return p;
+  const device = /^\\\\[?.]\\([a-z]):/i.exec(p);
+  if (device) return `${device[1]}:${p.slice(device[0].length) || '\\'}`;
+  // Any host's admin share, not only a name for this machine: a LAN address or an alias of it
+  // reaches its drive too, and tests never touch another machine's, so reading one as a
+  // local drive can only refuse more.
+  const share = /^\\\\(?:\?\\UNC\\)?[^\\]+\\([a-z])\$(?=\\|$)/i.exec(p);
+  if (!share) return p;
+  return `${share[1]}:${p.slice(share[0].length) || '\\'}`;
+}
+
+/** The name the link at `p` (whose bigint lstat is `stat`) has on disk. Windows also answers to a
+ *  short name (`CLAUDE~1`), and Windows and macOS to another case; such a spelling is matched to
+ *  the folder entry it names by file identity. A name that cannot be listed is kept. */
+function nameOnDisk(p, stat) {
+  const dir = path.dirname(p);
+  const name = path.basename(p);
+  let names;
+  try {
+    names = realReaddirSync(dir);
+  } catch {
+    return name;
+  }
+  if (names.includes(name)) return name;
+  return (
+    names.find((n) => {
+      try {
+        // As bigints: an NTFS file id does not fit a Number, and two rounded ones can collide.
+        const s = realLstatSync(path.join(dir, n), { bigint: true });
+        return s.ino === stat.ino && s.dev === stat.dev;
+      } catch {
+        return false;
+      }
+    }) ?? name
+  );
+}
+
 /** Fold a path to the form protected entries are compared in: absolute, resolved through any
- *  junction or symlink on its existing part, and case-folded on Windows. With `follow` false the
- *  last component is kept as named, for calls that act on a link itself (removing or renaming
- *  it) rather than on what it points at. */
+ *  junction or symlink on its existing part, spelled as on disk, and case-folded where the disk
+ *  ignores case. With `follow` false a link in the last component is kept by its own name, for
+ *  calls that act on a link itself (removing or renaming it) rather than on what it points at.
+ *  Null when reaching it takes more than {@link MAX_LINK_HOPS} dangling links (a loop, say): the
+ *  guard cannot tell where that lands. */
 function canonical(target, follow = true, hops = 0) {
-  let resolved = joinAsRead(target);
+  let resolved = asDrivePath(joinAsRead(target));
   // A trailing separator makes a POSIX kernel follow a link in the last component too, even for
   // a call that acts on the link itself (`rm -r link/` empties its target). Windows drops it
   // (path.resolve already has). Either way the separator goes, so the walk reads the bare name.
@@ -87,8 +135,21 @@ function canonical(target, follow = true, hops = 0) {
   const name = path.basename(resolved);
   // A last component of `.` or `..` names a folder reached through the rest, never a link itself.
   if (!follow && name !== '.' && name !== '..') {
+    let stat;
+    try {
+      stat = realLstatSync(resolved, { bigint: true });
+    } catch {
+      // Nothing there yet: the name is all there is to compare.
+    }
+    // Only a link makes acting on the name differ from acting on what it reaches. Anything else
+    // is resolved below like any path, which also spells it as the disk does (a Windows short
+    // name, another case, an NTFS `::$INDEX_ALLOCATION` suffix).
     const parent = path.dirname(resolved);
-    if (parent !== resolved) return path.join(canonical(parent), foldCase(name));
+    if ((!stat || stat.isSymbolicLink()) && parent !== resolved) {
+      const base = canonical(parent);
+      const own = stat ? nameOnDisk(resolved, stat) : name;
+      return base === null ? null : path.join(base, foldCase(own));
+    }
   }
   // Resolve links on the deepest part that exists, so a link planted inside the sandbox that
   // points at the real profile still lands on the protected side.
@@ -97,20 +158,20 @@ function canonical(target, follow = true, hops = 0) {
   while (!realExistsSync(head)) {
     // A link whose target does not exist yet does not "exist" either, yet a write through it
     // creates that target: follow it rather than step past it to the lexical path.
-    if (hops < MAX_LINK_HOPS) {
-      let link;
-      try {
-        link = realReadlinkSync(head);
-      } catch {
-        // Not a link: a part that is simply missing.
-      }
-      if (link !== undefined) {
-        // A relative target is read from where the link really is, so a `..` in it climbs out of
-        // the real folder, not the lexical one; a `\\?\` prefix is dropped, as the OS reads it.
-        const from = canonical(path.dirname(head), true, hops + 1);
-        const to = joinAsRead(from, link.replace(/^\\\\\?\\/, ''));
-        return canonical(joinAsRead(to, ...tail), true, hops + 1);
-      }
+    let link;
+    try {
+      link = realReadlinkSync(head);
+    } catch {
+      // Not a link: a part that is simply missing.
+    }
+    if (link !== undefined) {
+      if (hops >= MAX_LINK_HOPS) return null;
+      // A relative target is read from where the link really is, so a `..` in it climbs out of
+      // the real folder, not the lexical one; a `\\?\` prefix is dropped, as the OS reads it.
+      const from = canonical(path.dirname(head), true, hops + 1);
+      if (from === null) return null;
+      const to = joinAsRead(from, link.replace(/^\\\\\?\\/, ''));
+      return canonical(joinAsRead(to, ...tail), true, hops + 1);
     }
     const parent = path.dirname(head);
     if (parent === head) break;
@@ -118,24 +179,70 @@ function canonical(target, follow = true, hops = 0) {
     head = parent;
   }
   try {
-    resolved = path.join(realRealpathSync(head), ...tail);
+    // A mapped drive or a link to an admin share resolves to the share's path: read it as a drive.
+    resolved = path.join(asDrivePath(realRealpathSync(head)), ...tail);
   } catch {
     // An unreadable ancestor leaves the lexical path, which is still compared.
     return foldCase(path.normalize(resolved));
   }
   // The missing part is created as real folders (a recursive mkdir makes each one), so a `..` in
   // it steps back by name. Where it steps back to may hold a link, so the shortened path is
-  // walked again. It has no `..` left, though a dangling link on it can bring one back from its
-  // target text; each such round spends hops, so a chain of them ends at the lexical path.
-  if (hops < MAX_LINK_HOPS && tail.some((part) => part === '..' || part === '.')) {
-    return canonical(resolved, true, hops + 1);
-  }
+  // walked again. That follows no link, so it spends no hop: the shortened path has no `..` left
+  // and comes back here only through a dangling link, which does spend one.
+  if (tail.some((part) => part === '..' || part === '.')) return canonical(resolved, true, hops);
   return foldCase(resolved);
 }
 
-/** Case-fold on Windows, whose filesystems ignore case. */
+/** Case-fold on Windows and macOS, whose filesystems ignore case by default. (On a macOS volume
+ *  that does not, the guard refuses a little more than it must, never less.) */
 function foldCase(p) {
-  return process.platform === 'win32' ? p.toLowerCase() : p;
+  return process.platform === 'win32' || process.platform === 'darwin' ? p.toLowerCase() : p;
+}
+
+/** Each path inside folder `source` that a recursive copy of it writes, relative to it. A linked
+ *  folder is not entered: the copy writes the link itself there (with `dereference` it copies
+ *  what is inside, which is then checked only by the link's name). Throws when a folder cannot be
+ *  listed. */
+function copiedPaths(source) {
+  const out = [];
+  const walk = (rel) => {
+    for (const entry of realReaddirSync(path.join(source, rel), { withFileTypes: true })) {
+      const inner = path.join(rel, entry.name);
+      out.push(inner);
+      if (entry.isDirectory()) walk(inner);
+    }
+  };
+  walk('');
+  return out;
+}
+
+/** Each link met on the way to `target`: a folder above it, the target itself, or a part of what
+ *  one of those points at. Each is given as `{ at, whole, written }`: the path to the link
+ *  itself, whether it is all of what is left to reach (the target, or a link the target's chain
+ *  goes through) rather than a folder above it, and for such a link the path as the chain names
+ *  it (`target`, or the text of the link before it), before any link above it is followed. */
+function linksOnTheWay(target, hops = 0, written = target) {
+  const abs = path.resolve(target);
+  const root = path.parse(abs).root;
+  const parts = abs.slice(root.length).split(path.sep).filter(Boolean);
+  for (let i = 0; i < parts.length; i++) {
+    const at = path.join(root, ...parts.slice(0, i + 1));
+    let text;
+    try {
+      if (realLstatSync(at).isSymbolicLink()) text = realReadlinkSync(at);
+    } catch {
+      return []; // Nothing past a missing part.
+    }
+    if (text === undefined) continue;
+    const rest = parts.slice(i + 1);
+    const next = path.resolve(path.dirname(at), text.replace(/^\\\\\?\\/, ''), ...rest);
+    const whole = rest.length === 0;
+    const found = { at, whole, written };
+    // A folder above leaves the chain naming the same path; the target's own link names a new one.
+    const more = hops < MAX_LINK_HOPS ? linksOnTheWay(next, hops + 1, whole ? next : written) : [];
+    return [found, ...more];
+  }
+  return [];
 }
 
 /** Turn an fs path argument into a string, or undefined for a file descriptor. */
@@ -156,7 +263,23 @@ function opensForWrite(flags) {
   return !['r', 'rs', 'sr'].includes(String(flags));
 }
 
-/** Read the protected list from the environment, canonicalised once. */
+/**
+ * Read the protected list from the environment, canonicalised once, as `{ kind, path }`.
+ *
+ * A link on the way to an entry (a `~/.claude` kept in a dotfiles folder, or a folder above it
+ * that is a link) is protected by its own name too: what the entry resolves to is reached
+ * through it, so removing it, or renaming over it, and making a folder in its place moves the
+ * protected path somewhere a test can then write. The entry's own link, and each link its chain
+ * goes through as a whole (a link to a link), keeps the entry's kind, by its own name and as
+ * spelled on the way. A link to a folder above any of them is kind `link`, matched like a folder
+ * but left out of the check on what a child process is handed (a home folder that is a link
+ * would otherwise refuse every command naming anything in it).
+ *
+ * Each entry is also kept as written, for that same child-process check: a command names a path
+ * that way, not by where its links lead (macOS's /var is /private/var). No fs call is compared
+ * against it by mistake, since a canonical path never passes through a link. One written with a
+ * `..` is not kept so, since where that leads depends on the links before it.
+ */
 function loadProtected() {
   let entries;
   try {
@@ -164,17 +287,50 @@ function loadProtected() {
   } catch {
     entries = [];
   }
-  return entries
-    .filter((e) => e && typeof e.path === 'string' && e.path.trim() !== '')
-    .map((e) => ({ kind: e.kind === 'prefix' ? 'prefix' : 'tree', path: canonical(e.path) }));
+  const out = new Map();
+  const add = (kind, p) => out.set(`${kind}\0${p}`, { kind, path: p });
+  // A path kept as written, unless a `..` in it makes where it leads depend on the links before.
+  const addWritten = (kind, p) => {
+    if (!p.split(/[\\/]/).includes('..')) add(kind, foldCase(path.resolve(p)));
+  };
+  for (const e of entries) {
+    if (!e || typeof e.path !== 'string' || e.path.trim() === '') continue;
+    const kind = e.kind === 'prefix' ? 'prefix' : 'tree';
+    // Protected paths are the user's own folders, never a chain of links too long to follow.
+    add(kind, canonical(e.path) ?? foldCase(path.resolve(e.path)));
+    addWritten(kind, e.path);
+    for (const { at, whole, written } of linksOnTheWay(e.path)) {
+      add(whole ? kind : 'link', canonical(at, false) ?? foldCase(at));
+      if (whole) addWritten(kind, written);
+    }
+  }
+  return [...out.values()];
 }
 
-/** The protected entry `target` falls under, if any. */
-function protectedBy(target, entries, follow) {
+/** Whether canonical path `c` is protected entry `e` or lies inside it. */
+function within(c, e) {
+  if (e.kind === 'prefix') return c.startsWith(e.path);
+  return c === e.path || c.startsWith(e.path.endsWith(path.sep) ? e.path : e.path + path.sep);
+}
+
+/** Whether protected entry `e` lies inside the folder at canonical path `c`. */
+function holds(c, e) {
+  return e.path.startsWith(c.endsWith(path.sep) ? c : c + path.sep);
+}
+
+/** Why a call on `target` would reach protected state, or undefined when it would not. With
+ *  `whole` the call also acts on everything inside the target (a recursive remove, a rename),
+ *  so a folder that holds a protected location is refused too. */
+function protectedBy(target, entries, follow, whole) {
   const c = canonical(target, follow);
-  return entries.find((e) =>
-    e.kind === 'prefix' ? c.startsWith(e.path) : c === e.path || c.startsWith(e.path + path.sep),
-  );
+  if (c === null) {
+    return `it goes through more than ${MAX_LINK_HOPS} links, so where it lands cannot be checked`;
+  }
+  const hit = entries.find((e) => within(c, e));
+  if (hit) return `it is the real user's Claude login or cctl state (${hit.path})`;
+  const held = whole ? entries.find((e) => holds(c, e)) : undefined;
+  if (held) return `it holds the real user's Claude login or cctl state (${held.path})`;
+  return undefined;
 }
 
 /**
@@ -283,49 +439,84 @@ export function installLiveGuard() {
     throw err;
   };
 
-  /** Refuse the call when any path argument it writes through is protected. */
-  const check = (name, args, positions, flagsAt, follow = true) => {
-    if (flagsAt !== undefined && !opensForWrite(args[flagsAt])) return;
-    for (const i of positions) {
+  /**
+   * Refuse the call when any path argument it writes through is protected. `spec` says which
+   * arguments those are (`at`), where the open flags are (`flags`, open only), whether the call
+   * follows a link in the last component (`follow`, default true), which of them are also
+   * read through such a link whatever `follow` says (`through`), whether it acts on everything
+   * inside the target too (`whole`), and which argument is a folder it copies into the target
+   * when given `recursive` (`from`).
+   */
+  const check = (name, args, { at, flags, follow = true, through = [], whole = false, from }) => {
+    if (flags !== undefined && !opensForWrite(args[flags])) return;
+    for (const i of at) {
       const p = pathArg(args[i]);
       if (p === undefined) continue;
-      const hit = protectedBy(p, entries, follow);
-      if (hit) {
-        refuse(`${name}(${p})`, `it is the real user's Claude login or cctl state (${hit.path})`);
-      }
+      const why =
+        protectedBy(p, entries, follow, whole) ??
+        (through.includes(i) ? protectedBy(p, entries, true, false) : undefined);
+      if (why) refuse(`${name}(${p})`, why);
+    }
+    // A recursive copy writes each source entry at the same place under the target, through any
+    // link already there (and node's cpSync does it in native code, past every wrapper), so each
+    // of those paths is checked as a write of its own.
+    const options = args[at[0] + 1];
+    if (from === undefined || typeof options !== 'object' || !options?.recursive) return;
+    const source = pathArg(args[from]);
+    const dest = pathArg(args[at[0]]);
+    if (source === undefined || dest === undefined) return;
+    let top;
+    try {
+      top = realStatSync(source);
+    } catch {
+      return; // Nothing to copy: the copy fails.
+    }
+    if (!top.isDirectory()) return; // A file: the target alone is written, checked above.
+    let inside;
+    try {
+      inside = copiedPaths(source);
+    } catch (err) {
+      // A folder that cannot be listed could hide an entry that lands anywhere, and the copy may
+      // still write the ones it can read, so the whole copy is refused.
+      refuse(`${name}(${source}, ${dest})`, `its source cannot be listed to check (${err.code})`);
+    }
+    for (const rel of inside) {
+      const why = protectedBy(joinAsRead(dest, rel), entries, true, false);
+      if (why) refuse(`${name}(${source}, ${dest})`, `a copied entry lands there: ${why}`);
     }
   };
 
-  // name -> [indexes of path arguments it writes through, index of open flags (open only),
-  //          whether it follows a link in the last component]
   const targets = {
-    writeFile: [[0]],
-    appendFile: [[0]],
-    open: [[0], 1],
-    rename: [[0, 1], undefined, false],
-    copyFile: [[1]],
-    cp: [[1]],
-    rm: [[0], undefined, false],
-    rmdir: [[0], undefined, false],
-    unlink: [[0], undefined, false],
-    mkdir: [[0]],
-    mkdtemp: [[0]],
-    symlink: [[1], undefined, false],
+    writeFile: { at: [0] },
+    appendFile: { at: [0] },
+    open: { at: [0], flags: 1 },
+    rename: { at: [0, 1], follow: false, whole: true },
+    copyFile: { at: [1] },
+    // What a recursive copy writes is known entry by entry, so a target that merely holds a
+    // protected location is fine unless something copied lands on it.
+    cp: { at: [1], from: 0 },
+    rm: { at: [0], follow: false, whole: true },
+    rmdir: { at: [0], follow: false, whole: true },
+    unlink: { at: [0], follow: false },
+    mkdir: { at: [0] },
+    mkdtemp: { at: [0] },
+    symlink: { at: [1], follow: false },
     // Both names: the new one is created, and the existing one gains a second name to write by.
-    link: [[0, 1], undefined, false],
-    truncate: [[0]],
-    chmod: [[0]],
-    utimes: [[0]],
+    // macOS links what a symlink given as the existing name points at, so that is checked too.
+    link: { at: [0, 1], follow: false, through: [0] },
+    truncate: { at: [0] },
+    chmod: { at: [0] },
+    utimes: { at: [0] },
   };
 
   // Each form reports a refusal the way it reports any other failure, so callers handling errors
   // see it where they look: thrown (sync), rejected (promise) or passed to the callback.
-  const wrap = (holder, name, mode, positions, flagsAt, follow) => {
+  const wrap = (holder, name, mode, spec) => {
     const original = holder[name];
     if (typeof original !== 'function') return;
     holder[name] = function guarded(...args) {
       try {
-        check(name, args, positions, flagsAt, follow);
+        check(name, args, spec);
       } catch (err) {
         if (mode === 'promise') return Promise.reject(err);
         const callback = args.at(-1);
@@ -339,21 +530,21 @@ export function installLiveGuard() {
     };
   };
 
-  for (const [name, [positions, flagsAt, follow]] of Object.entries(targets)) {
-    wrap(fs, name, 'callback', positions, flagsAt, follow);
-    wrap(fs, `${name}Sync`, 'sync', positions, flagsAt, follow);
-    wrap(fs.promises, name, 'promise', positions, flagsAt, follow);
+  for (const [name, spec] of Object.entries(targets)) {
+    wrap(fs, name, 'callback', spec);
+    wrap(fs, `${name}Sync`, 'sync', spec);
+    wrap(fs.promises, name, 'promise', spec);
   }
   // Streams take the open flags from an options object (default 'w').
   const realCreateWriteStream = fs.createWriteStream;
   fs.createWriteStream = function guardedCreateWriteStream(target, options) {
     const flags = typeof options === 'object' && options?.flags ? options.flags : 'w';
-    check('createWriteStream', [target, flags], [0], 1);
+    check('createWriteStream', [target, flags], { at: [0], flags: 1 });
     return realCreateWriteStream.call(this, target, options);
   };
 
   guardSqlite(check);
-  guardChildProcesses(entries, refuse, (name, dir) => check(name, [dir], [0]));
+  guardChildProcesses(entries, refuse, (name, dir) => check(name, [dir], { at: [0] }));
   guardWorkers();
   syncBuiltinESMExports();
 }
@@ -380,7 +571,7 @@ function guardSqlite(check) {
         }
       }
       if (target !== undefined && target !== '' && target !== ':memory:') {
-        check('DatabaseSync', [target], [0]);
+        check('DatabaseSync', [target], { at: [0] });
       }
       super(location, ...rest);
     }
@@ -396,17 +587,19 @@ function guardSqlite(check) {
 function guardChildProcesses(entries, refuse, checkDir) {
   const childProcess = process.getBuiltinModule('node:child_process');
   /** Throw when `file` with `argv` (and `options.cwd`) would reach protected or machine-wide state. */
-  const checkCommand = (name, file, argv, options) => {
+  const checkCommand = (name, file, argv, options, hasArgv) => {
     const call = `${name}(${[file, ...argv].join(' ')})`;
     if (typeof options?.cwd === 'string' || options?.cwd instanceof URL)
       checkDir(name, options.cwd);
     const raw = [file, ...argv].map(String).join(' ');
     const text = [raw, ...decodedPayloads(raw)].join('\n');
-    if (!isNode(file)) {
+    // A command line run by a shell is a shell, whatever program it ends by calling.
+    if (!(hasArgv && !options?.shell && isNode(file))) {
       // Nothing guards a child that is not node from the inside, so a protected path it is
-      // handed is refused here.
-      const folded = process.platform === 'win32' ? text.toLowerCase().replace(/\//g, '\\') : text;
-      const hit = entries.find((e) => folded.includes(e.path));
+      // handed is refused here. This matches text only: a path the shell builds itself (from a
+      // variable, a relative name against the working folder, `~`) is not seen.
+      const folded = foldCase(process.platform === 'win32' ? text.replace(/\//g, '\\') : text);
+      const hit = entries.find((e) => e.kind !== 'link' && folded.includes(e.path));
       if (hit) refuse(call, `it hands a program that is not node a real location (${hit.path})`);
     }
     for (const { what, pattern } of MACHINE_WIDE) {
@@ -430,7 +623,7 @@ function guardChildProcesses(entries, refuse, checkDir) {
       at = 2;
     }
     const options = typeof args[at] === 'object' && args[at] !== null ? args[at] : undefined;
-    checkCommand(name, file, argv, options);
+    checkCommand(name, file, argv, options, hasArgv);
     if (options?.env === undefined || options.env === process.env) return args;
     const out = [...args];
     out[at] = { ...options, env: withGuardEnv(options.env) };
