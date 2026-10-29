@@ -469,34 +469,38 @@ describe('live-state guard: ways around the fs functions', () => {
 
   it('guards a linked protected folder whose home is itself reached through a link', () => {
     // prot/home is a link to prot/realhome, and the protected prot/home/.claude is a link to
-    // prot/dot/claude: the folder is named through one link and is another.
+    // prot/home/dot/claude, spelled through the home link as a dotfiles link usually is: the
+    // folder is named through one link and is another. A command naming anything else in that
+    // home is still let through.
     const run = inGuardedChild(
       `import fs from 'node:fs';
        import { spawnSync } from 'node:child_process';
        import { join } from 'node:path';
        const [prot] = process.argv.slice(1);
        const attempt = (write) => { try { write(); return 'OK'; } catch (err) { return err.code; } };
-       const typed = join(prot, 'home', '.claude', 'c.txt');
+       const shell = (target) => process.platform === 'win32'
+         ? spawnSync('cmd.exe', ['/c', 'echo hi> ' + target])
+         : spawnSync('sh', ['-c', 'echo hi > ' + target]);
        console.log([
          attempt(() => fs.rmSync(join(prot, 'realhome', '.claude'), { recursive: true, force: true })),
          attempt(() => fs.rmSync(join(prot, 'home', '.claude'), { recursive: true, force: true })),
-         attempt(() => process.platform === 'win32'
-           ? spawnSync('cmd.exe', ['/c', 'echo hi> ' + typed])
-           : spawnSync('sh', ['-c', 'echo hi > ' + typed])),
+         attempt(() => shell(join(prot, 'home', '.claude', 'c.txt'))),
+         attempt(() => shell(join(prot, 'home', 'notes.txt'))),
        ].join(' '));`,
       (prot) => {
-        fs.mkdirSync(join(prot, 'dot', 'claude'), { recursive: true });
-        fs.writeFileSync(join(prot, 'dot', 'claude', 'keep.txt'), 'x');
-        fs.mkdirSync(join(prot, 'realhome'));
+        fs.mkdirSync(join(prot, 'realhome', 'dot', 'claude'), { recursive: true });
+        fs.writeFileSync(join(prot, 'realhome', 'dot', 'claude', 'keep.txt'), 'x');
         fs.symlinkSync(join(prot, 'realhome'), join(prot, 'home'), 'junction');
         const login = join(prot, 'realhome', '.claude');
-        fs.symlinkSync(join(prot, 'dot', 'claude'), login, 'junction');
+        fs.symlinkSync(join(prot, 'home', 'dot', 'claude'), login, 'junction');
       },
       (prot) => [{ kind: 'tree', path: join(prot, 'home', '.claude') }],
     );
-    expect(run.out.trim()).toBe('ELIVEGUARD ELIVEGUARD ELIVEGUARD');
+    expect(run.out.trim()).toBe('ELIVEGUARD ELIVEGUARD ELIVEGUARD OK');
     expect(fs.lstatSync(join(run.prot, 'realhome', '.claude')).isSymbolicLink()).toBe(true);
-    expect(fs.readdirSync(join(run.prot, 'dot', 'claude'))).toEqual(['keep.txt']);
+    const dot = join(run.prot, 'realhome', 'dot', 'claude');
+    expect(fs.readdirSync(dot)).toEqual(['keep.txt']);
+    expect(fs.readFileSync(join(run.prot, 'realhome', 'notes.txt'), 'utf8').trim()).toBe('hi');
   });
 
   it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(

@@ -82,8 +82,8 @@ function asDrivePath(p) {
   if (process.platform !== 'win32') return p;
   const device = /^\\\\[?.]\\([a-z]):/i.exec(p);
   if (device) return `${device[1]}:${p.slice(device[0].length) || '\\'}`;
-  // Any host's admin share, not only the names in LOCAL_HOSTS: a LAN address or an alias of this
-  // machine reaches its drive too, and tests never touch another machine's, so reading one as a
+  // Any host's admin share, not only a name for this machine: a LAN address or an alias of it
+  // reaches its drive too, and tests never touch another machine's, so reading one as a
   // local drive can only refuse more.
   const share = /^\\\\(?:\?\\UNC\\)?[^\\]+\\([a-z])\$(?=\\|$)/i.exec(p);
   if (!share) return p;
@@ -200,7 +200,8 @@ function foldCase(p) {
 }
 
 /** Each path inside folder `source` that a recursive copy of it writes, relative to it. A linked
- *  folder is not entered: the copy writes the link itself there. Throws when a folder cannot be
+ *  folder is not entered: the copy writes the link itself there (with `dereference` it copies
+ *  what is inside, which is then checked only by the link's name). Throws when a folder cannot be
  *  listed. */
 function copiedPaths(source) {
   const out = [];
@@ -216,8 +217,11 @@ function copiedPaths(source) {
 }
 
 /** Each link met on the way to `target`: a folder above it, the target itself, or a part of what
- *  one of those points at. Each is given as the path to the link itself. */
-function linksOnTheWay(target, hops = 0) {
+ *  one of those points at. Each is given as `{ at, whole, written }`: the path to the link
+ *  itself, whether it is all of what is left to reach (the target, or a link the target's chain
+ *  goes through) rather than a folder above it, and for such a link the path as the chain names
+ *  it (`target`, or the text of the link before it), before any link above it is followed. */
+function linksOnTheWay(target, hops = 0, written = target) {
   const abs = path.resolve(target);
   const root = path.parse(abs).root;
   const parts = abs.slice(root.length).split(path.sep).filter(Boolean);
@@ -232,7 +236,11 @@ function linksOnTheWay(target, hops = 0) {
     if (text === undefined) continue;
     const rest = parts.slice(i + 1);
     const next = path.resolve(path.dirname(at), text.replace(/^\\\\\?\\/, ''), ...rest);
-    return [at, ...(hops < MAX_LINK_HOPS ? linksOnTheWay(next, hops + 1) : [])];
+    const whole = rest.length === 0;
+    const found = { at, whole, written };
+    // A folder above leaves the chain naming the same path; the target's own link names a new one.
+    const more = hops < MAX_LINK_HOPS ? linksOnTheWay(next, hops + 1, whole ? next : written) : [];
+    return [found, ...more];
   }
   return [];
 }
@@ -261,10 +269,11 @@ function opensForWrite(flags) {
  * A link on the way to an entry (a `~/.claude` kept in a dotfiles folder, or a folder above it
  * that is a link) is protected by its own name too: what the entry resolves to is reached
  * through it, so removing it, or renaming over it, and making a folder in its place moves the
- * protected path somewhere a test can then write. The entry's own link, and each link it leads
- * through to its target, keeps the entry's kind; one above it is kind `link`, matched like a
- * folder but left out of the check on what a child process is handed (a home folder that is a
- * link would otherwise refuse every command naming anything in it).
+ * protected path somewhere a test can then write. The entry's own link, and each link its chain
+ * goes through as a whole (a link to a link), keeps the entry's kind, by its own name and as
+ * spelled on the way. A link to a folder above any of them is kind `link`, matched like a folder
+ * but left out of the check on what a child process is handed (a home folder that is a link
+ * would otherwise refuse every command naming anything in it).
  *
  * Each entry is also kept as written, for that same child-process check: a command names a path
  * that way, not by where its links lead (macOS's /var is /private/var). No fs call is compared
@@ -280,21 +289,20 @@ function loadProtected() {
   }
   const out = new Map();
   const add = (kind, p) => out.set(`${kind}\0${p}`, { kind, path: p });
+  // A path kept as written, unless a `..` in it makes where it leads depend on the links before.
+  const addWritten = (kind, p) => {
+    if (!p.split(/[\\/]/).includes('..')) add(kind, foldCase(path.resolve(p)));
+  };
   for (const e of entries) {
     if (!e || typeof e.path !== 'string' || e.path.trim() === '') continue;
     const kind = e.kind === 'prefix' ? 'prefix' : 'tree';
-    const typed = foldCase(path.resolve(e.path));
     // Protected paths are the user's own folders, never a chain of links too long to follow.
-    add(kind, canonical(e.path) ?? typed);
-    if (!e.path.split(/[\\/]/).includes('..')) add(kind, typed);
-    const links = linksOnTheWay(e.path);
-    if (links.length === 0) continue;
-    // The entry's own link is told apart by where it is, not by how it is spelled: a link above
-    // it changes the spelling linksOnTheWay reports it by. The links after it are its target's.
-    const own = canonical(e.path, false);
-    const named = links.map((link) => canonical(link, false) ?? foldCase(link));
-    const ownAt = named.indexOf(own);
-    named.forEach((p, i) => add(ownAt !== -1 && i >= ownAt ? kind : 'link', p));
+    add(kind, canonical(e.path) ?? foldCase(path.resolve(e.path)));
+    addWritten(kind, e.path);
+    for (const { at, whole, written } of linksOnTheWay(e.path)) {
+      add(whole ? kind : 'link', canonical(at, false) ?? foldCase(at));
+      if (whole) addWritten(kind, written);
+    }
   }
   return [...out.values()];
 }
