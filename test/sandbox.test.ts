@@ -347,6 +347,8 @@ describe('live-state guard: ways around the fs functions', () => {
        const home = join(prot, 'home');
        fs.mkdirSync(join(free, 'src', '.claude'), { recursive: true });
        fs.writeFileSync(join(free, 'src', '.claude', 'creds.json'), 'fake');
+       fs.mkdirSync(join(free, 'notes'));
+       fs.writeFileSync(join(free, 'notes', 'notes.txt'), 'x');
        const attempt = (write) => { try { write(); return 'OK'; } catch (err) { return err.code; } };
        console.log([
          attempt(() => fs.rmSync(home, { recursive: true, force: true })),
@@ -355,6 +357,7 @@ describe('live-state guard: ways around the fs functions', () => {
          attempt(() => fs.cpSync(join(free, 'src'), home, { recursive: true })),
          attempt(() => fs.rmSync(join(prot, 'home2'), { recursive: true, force: true })),
          attempt(() => fs.rmSync(join(home, 'other'), { recursive: true })),
+         attempt(() => fs.cpSync(join(free, 'notes'), join(prot, 'home2'), { recursive: true })),
        ].join(' '));`,
       (prot) => {
         fs.mkdirSync(join(prot, 'home', '.claude'), { recursive: true });
@@ -368,10 +371,11 @@ describe('live-state guard: ways around the fs functions', () => {
         { kind: 'prefix', path: join(prot, 'home2', '.claude.json') },
       ],
     );
-    expect(run.out.trim()).toBe('ELIVEGUARD ELIVEGUARD ELIVEGUARD ELIVEGUARD ELIVEGUARD OK');
+    // A copy that only puts files beside a protected one is let through.
+    expect(run.out.trim()).toBe('ELIVEGUARD ELIVEGUARD ELIVEGUARD ELIVEGUARD ELIVEGUARD OK OK');
     expect(fs.readdirSync(join(run.prot, 'home'))).toEqual(['.claude']);
     expect(fs.readdirSync(join(run.prot, 'home', '.claude'))).toEqual(['keep.txt']);
-    expect(fs.readdirSync(join(run.prot, 'home2'))).toEqual(['.claude.json']);
+    expect(fs.readdirSync(join(run.prot, 'home2')).sort()).toEqual(['.claude.json', 'notes.txt']);
   });
 
   it('guards a protected folder that is itself a link by both its names', () => {
@@ -432,6 +436,35 @@ describe('live-state guard: ways around the fs functions', () => {
     expect(run.out.trim()).toBe('ELIVEGUARD ELIVEGUARD ELIVEGUARD OK');
     expect(fs.lstatSync(join(run.prot, 'home', 'dotfiles')).isSymbolicLink()).toBe(true);
     expect(fs.readdirSync(join(run.prot, 'store', 'dotfiles', 'claude'))).toEqual(['keep.txt']);
+  });
+
+  it('guards each link a protected link leads through to its folder', () => {
+    // prot/home/.claude -> prot/mid -> prot/dot/claude: prot/mid is part of the login's own
+    // chain, so a command handed it is refused like one handed the login.
+    const run = inGuardedChild(
+      `import fs from 'node:fs';
+       import { spawnSync } from 'node:child_process';
+       import { join } from 'node:path';
+       const [prot] = process.argv.slice(1);
+       const attempt = (write) => { try { write(); return 'OK'; } catch (err) { return err.code; } };
+       const viaMid = join(prot, 'mid', 'c.txt');
+       console.log([
+         attempt(() => fs.rmSync(join(prot, 'mid'), { recursive: true, force: true })),
+         attempt(() => process.platform === 'win32'
+           ? spawnSync('cmd.exe', ['/c', 'echo hi> ' + viaMid])
+           : spawnSync('sh', ['-c', 'echo hi > ' + viaMid])),
+       ].join(' '));`,
+      (prot) => {
+        fs.mkdirSync(join(prot, 'dot', 'claude'), { recursive: true });
+        fs.writeFileSync(join(prot, 'dot', 'claude', 'keep.txt'), 'x');
+        fs.symlinkSync(join(prot, 'dot', 'claude'), join(prot, 'mid'), 'junction');
+        fs.mkdirSync(join(prot, 'home'));
+        fs.symlinkSync(join(prot, 'mid'), join(prot, 'home', '.claude'), 'junction');
+      },
+      (prot) => [{ kind: 'tree', path: join(prot, 'home', '.claude') }],
+    );
+    expect(run.out.trim()).toBe('ELIVEGUARD ELIVEGUARD');
+    expect(fs.readdirSync(join(run.prot, 'dot', 'claude'))).toEqual(['keep.txt']);
   });
 
   it('guards a linked protected folder whose home is itself reached through a link', () => {
@@ -504,6 +537,7 @@ describe('live-state guard: ways around the fs functions', () => {
     const run = inGuardedChild(
       `import fs from 'node:fs';
        import { execFileSync } from 'node:child_process';
+       import os from 'node:os';
        import { join } from 'node:path';
        const [prot, free] = process.argv.slice(1);
        const long = join(prot, 'LongProtectedName');
@@ -521,6 +555,12 @@ describe('live-state guard: ways around the fs functions', () => {
          }
          const share = '\\\\\\\\localhost\\\\' + long[0] + '$' + long.slice(2);
          out.push(attempt('share', () => fs.rmSync(share, { recursive: true })));
+         const lan = Object.values(os.networkInterfaces()).flat()
+           .find((a) => a && a.family === 'IPv4' && !a.internal)?.address;
+         if (lan) {
+           const viaLan = '\\\\\\\\' + lan + '\\\\' + long[0] + '$' + long.slice(2);
+           out.push(attempt('lan', () => fs.rmSync(viaLan, { recursive: true })));
+         }
          out.push(attempt('device', () => fs.rmSync('\\\\\\\\?\\\\' + long, { recursive: true })));
        }
        console.log(out.join(' '));`,
@@ -579,7 +619,8 @@ describe('live-state guard: ways around the fs functions', () => {
     const run = inGuardedChild(
       `import fs from 'node:fs';
        import { join } from 'node:path';
-       const [, free] = process.argv.slice(1);
+       // The real path, so no link above the folder (macOS's /var) counts toward the limit.
+       const free = fs.realpathSync(process.argv[2]);
        fs.symlinkSync(join(free, 'b'), join(free, 'a'), 'junction');
        fs.symlinkSync(join(free, 'a'), join(free, 'b'), 'junction');
        const chain = (name, length) => {

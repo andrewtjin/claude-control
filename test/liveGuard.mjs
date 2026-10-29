@@ -12,7 +12,8 @@
 //    promise and stream forms (a hard link counts by both names: a link to a protected file is a
 //    second name for it, and a write through that name changes it);
 //  - a SQLite database opened there (node:sqlite writes from native code, not through fs);
-//  - a child process that is not node, handed a protected path, since nothing guards it inside;
+//  - a child process that is not node, handed a protected path (by its text), since nothing
+//    guards it inside;
 //    and any child process at all that would change state no home folder redirects: the Task
 //    Scheduler (cctl's autostart on Windows), launchd and systemd user services, the macOS
 //    Keychain (the login and the vault key live there), the Windows Run keys, and an elevated
@@ -27,7 +28,6 @@
 
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import util from 'node:util';
@@ -54,6 +54,7 @@ const realExistsSync = fs.existsSync;
 const realRealpathSync = fs.realpathSync.native;
 const realReadlinkSync = fs.readlinkSync;
 const realLstatSync = fs.lstatSync;
+const realStatSync = fs.statSync;
 const realReaddirSync = fs.readdirSync;
 const realAppendFileSync = fs.appendFileSync;
 
@@ -74,19 +75,19 @@ function joinAsRead(base, ...parts) {
   return out;
 }
 
-/** The names a Windows UNC path can give this machine. */
-const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '.', os.hostname().toLowerCase()]);
-
-/** On Windows, `p` with a path that reaches a local drive by another route (the admin share
- *  `\\localhost\C$\x`, its `\\?\UNC\` form, or the `\\?\C:\x` and `\\.\C:\x` device forms)
+/** On Windows, `p` with a path that reaches a local drive by another route (an admin share such
+ *  as `\\localhost\C$\x`, its `\\?\UNC\` form, or the `\\?\C:\x` and `\\.\C:\x` device forms)
  *  rewritten as the plain drive path, so it is compared as one. Anything else unchanged. */
 function asDrivePath(p) {
   if (process.platform !== 'win32') return p;
   const device = /^\\\\[?.]\\([a-z]):/i.exec(p);
   if (device) return `${device[1]}:${p.slice(device[0].length) || '\\'}`;
-  const share = /^\\\\(?:\?\\UNC\\)?([^\\]+)\\([a-z])\$(?=\\|$)/i.exec(p);
-  if (!share || !LOCAL_HOSTS.has(share[1].toLowerCase())) return p;
-  return `${share[2]}:${p.slice(share[0].length) || '\\'}`;
+  // Any host's admin share, not only the names in LOCAL_HOSTS: a LAN address or an alias of this
+  // machine reaches its drive too, and tests never touch another machine's, so reading one as a
+  // local drive can only refuse more.
+  const share = /^\\\\(?:\?\\UNC\\)?[^\\]+\\([a-z])\$(?=\\|$)/i.exec(p);
+  if (!share) return p;
+  return `${share[1]}:${p.slice(share[0].length) || '\\'}`;
 }
 
 /** The name the link at `p` (whose bigint lstat is `stat`) has on disk. Windows also answers to a
@@ -178,7 +179,8 @@ function canonical(target, follow = true, hops = 0) {
     head = parent;
   }
   try {
-    resolved = path.join(realRealpathSync(head), ...tail);
+    // A mapped drive or a link to an admin share resolves to the share's path: read it as a drive.
+    resolved = path.join(asDrivePath(realRealpathSync(head)), ...tail);
   } catch {
     // An unreadable ancestor leaves the lexical path, which is still compared.
     return foldCase(path.normalize(resolved));
@@ -195,6 +197,22 @@ function canonical(target, follow = true, hops = 0) {
  *  that does not, the guard refuses a little more than it must, never less.) */
 function foldCase(p) {
   return process.platform === 'win32' || process.platform === 'darwin' ? p.toLowerCase() : p;
+}
+
+/** Each path inside folder `source` that a recursive copy of it writes, relative to it. A linked
+ *  folder is not entered: the copy writes the link itself there. Throws when a folder cannot be
+ *  listed. */
+function copiedPaths(source) {
+  const out = [];
+  const walk = (rel) => {
+    for (const entry of realReaddirSync(path.join(source, rel), { withFileTypes: true })) {
+      const inner = path.join(rel, entry.name);
+      out.push(inner);
+      if (entry.isDirectory()) walk(inner);
+    }
+  };
+  walk('');
+  return out;
 }
 
 /** Each link met on the way to `target`: a folder above it, the target itself, or a part of what
@@ -243,14 +261,15 @@ function opensForWrite(flags) {
  * A link on the way to an entry (a `~/.claude` kept in a dotfiles folder, or a folder above it
  * that is a link) is protected by its own name too: what the entry resolves to is reached
  * through it, so removing it, or renaming over it, and making a folder in its place moves the
- * protected path somewhere a test can then write. The entry's own link keeps the entry's kind;
- * one above it is kind `link`, matched like a folder but left out of the check on what a child
- * process is handed (a home folder that is a link would otherwise refuse every command naming
- * anything in it).
+ * protected path somewhere a test can then write. The entry's own link, and each link it leads
+ * through to its target, keeps the entry's kind; one above it is kind `link`, matched like a
+ * folder but left out of the check on what a child process is handed (a home folder that is a
+ * link would otherwise refuse every command naming anything in it).
  *
  * Each entry is also kept as written, for that same child-process check: a command names a path
  * that way, not by where its links lead (macOS's /var is /private/var). No fs call is compared
- * against it by mistake, since a canonical path never passes through a link.
+ * against it by mistake, since a canonical path never passes through a link. One written with a
+ * `..` is not kept so, since where that leads depends on the links before it.
  */
 function loadProtected() {
   let entries;
@@ -267,25 +286,23 @@ function loadProtected() {
     const typed = foldCase(path.resolve(e.path));
     // Protected paths are the user's own folders, never a chain of links too long to follow.
     add(kind, canonical(e.path) ?? typed);
-    add(kind, typed);
+    if (!e.path.split(/[\\/]/).includes('..')) add(kind, typed);
     const links = linksOnTheWay(e.path);
     if (links.length === 0) continue;
     // The entry's own link is told apart by where it is, not by how it is spelled: a link above
-    // it changes the spelling linksOnTheWay reports it by.
+    // it changes the spelling linksOnTheWay reports it by. The links after it are its target's.
     const own = canonical(e.path, false);
-    for (const link of links) {
-      const named = canonical(link, false) ?? foldCase(link);
-      add(named === own ? kind : 'link', named);
-    }
+    const named = links.map((link) => canonical(link, false) ?? foldCase(link));
+    const ownAt = named.indexOf(own);
+    named.forEach((p, i) => add(ownAt !== -1 && i >= ownAt ? kind : 'link', p));
   }
   return [...out.values()];
 }
 
 /** Whether canonical path `c` is protected entry `e` or lies inside it. */
 function within(c, e) {
-  return e.kind === 'prefix'
-    ? c.startsWith(e.path)
-    : c === e.path || c.startsWith(e.path + path.sep);
+  if (e.kind === 'prefix') return c.startsWith(e.path);
+  return c === e.path || c.startsWith(e.path.endsWith(path.sep) ? e.path : e.path + path.sep);
 }
 
 /** Whether protected entry `e` lies inside the folder at canonical path `c`. */
@@ -294,8 +311,8 @@ function holds(c, e) {
 }
 
 /** Why a call on `target` would reach protected state, or undefined when it would not. With
- *  `whole` the call also acts on everything inside the target (a recursive remove, a rename, a
- *  recursive copy into it), so a folder that holds a protected location is refused too. */
+ *  `whole` the call also acts on everything inside the target (a recursive remove, a rename),
+ *  so a folder that holds a protected location is refused too. */
 function protectedBy(target, entries, follow, whole) {
   const c = canonical(target, follow);
   if (c === null) {
@@ -417,16 +434,19 @@ export function installLiveGuard() {
   /**
    * Refuse the call when any path argument it writes through is protected. `spec` says which
    * arguments those are (`at`), where the open flags are (`flags`, open only), whether the call
-   * follows a link in the last component (`follow`, default true), whether it acts on
-   * everything inside the target too (`whole`), and which argument is a folder it copies into
-   * the target when given `recursive` (`from`).
+   * follows a link in the last component (`follow`, default true), which of them are also
+   * read through such a link whatever `follow` says (`through`), whether it acts on everything
+   * inside the target too (`whole`), and which argument is a folder it copies into the target
+   * when given `recursive` (`from`).
    */
-  const check = (name, args, { at, flags, follow = true, whole = false, from }) => {
+  const check = (name, args, { at, flags, follow = true, through = [], whole = false, from }) => {
     if (flags !== undefined && !opensForWrite(args[flags])) return;
     for (const i of at) {
       const p = pathArg(args[i]);
       if (p === undefined) continue;
-      const why = protectedBy(p, entries, follow, whole);
+      const why =
+        protectedBy(p, entries, follow, whole) ??
+        (through.includes(i) ? protectedBy(p, entries, true, false) : undefined);
       if (why) refuse(`${name}(${p})`, why);
     }
     // A recursive copy writes each source entry at the same place under the target, through any
@@ -437,18 +457,23 @@ export function installLiveGuard() {
     const source = pathArg(args[from]);
     const dest = pathArg(args[at[0]]);
     if (source === undefined || dest === undefined) return;
-    let inside = [];
+    let top;
     try {
-      inside = realReaddirSync(source, { recursive: true });
+      top = realStatSync(source);
+    } catch {
+      return; // Nothing to copy: the copy fails.
+    }
+    if (!top.isDirectory()) return; // A file: the target alone is written, checked above.
+    let inside;
+    try {
+      inside = copiedPaths(source);
     } catch (err) {
-      // Not a folder (or not there): the target alone is written, and was checked above. A
-      // folder that cannot be listed in full could hide an entry that lands anywhere, and the
-      // copy may still write the entries it can read, so that copy is refused.
-      if (err.code === 'ENOTDIR' || err.code === 'ENOENT') return;
+      // A folder that cannot be listed could hide an entry that lands anywhere, and the copy may
+      // still write the ones it can read, so the whole copy is refused.
       refuse(`${name}(${source}, ${dest})`, `its source cannot be listed to check (${err.code})`);
     }
     for (const rel of inside) {
-      const why = protectedBy(joinAsRead(dest, String(rel)), entries, true, false);
+      const why = protectedBy(joinAsRead(dest, rel), entries, true, false);
       if (why) refuse(`${name}(${source}, ${dest})`, `a copied entry lands there: ${why}`);
     }
   };
@@ -459,7 +484,9 @@ export function installLiveGuard() {
     open: { at: [0], flags: 1 },
     rename: { at: [0, 1], follow: false, whole: true },
     copyFile: { at: [1] },
-    cp: { at: [1], whole: true, from: 0 },
+    // What a recursive copy writes is known entry by entry, so a target that merely holds a
+    // protected location is fine unless something copied lands on it.
+    cp: { at: [1], from: 0 },
     rm: { at: [0], follow: false, whole: true },
     rmdir: { at: [0], follow: false, whole: true },
     unlink: { at: [0], follow: false },
@@ -467,7 +494,8 @@ export function installLiveGuard() {
     mkdtemp: { at: [0] },
     symlink: { at: [1], follow: false },
     // Both names: the new one is created, and the existing one gains a second name to write by.
-    link: { at: [0, 1], follow: false },
+    // macOS links what a symlink given as the existing name points at, so that is checked too.
+    link: { at: [0, 1], follow: false, through: [0] },
     truncate: { at: [0] },
     chmod: { at: [0] },
     utimes: { at: [0] },
@@ -551,15 +579,17 @@ function guardSqlite(check) {
 function guardChildProcesses(entries, refuse, checkDir) {
   const childProcess = process.getBuiltinModule('node:child_process');
   /** Throw when `file` with `argv` (and `options.cwd`) would reach protected or machine-wide state. */
-  const checkCommand = (name, file, argv, options) => {
+  const checkCommand = (name, file, argv, options, hasArgv) => {
     const call = `${name}(${[file, ...argv].join(' ')})`;
     if (typeof options?.cwd === 'string' || options?.cwd instanceof URL)
       checkDir(name, options.cwd);
     const raw = [file, ...argv].map(String).join(' ');
     const text = [raw, ...decodedPayloads(raw)].join('\n');
-    if (!isNode(file)) {
+    // A command line run by a shell is a shell, whatever program it ends by calling.
+    if (!(hasArgv && !options?.shell && isNode(file))) {
       // Nothing guards a child that is not node from the inside, so a protected path it is
-      // handed is refused here.
+      // handed is refused here. This matches text only: a path the shell builds itself (from a
+      // variable, a relative name against the working folder, `~`) is not seen.
       const folded = foldCase(process.platform === 'win32' ? text.replace(/\//g, '\\') : text);
       const hit = entries.find((e) => e.kind !== 'link' && folded.includes(e.path));
       if (hit) refuse(call, `it hands a program that is not node a real location (${hit.path})`);
@@ -585,7 +615,7 @@ function guardChildProcesses(entries, refuse, checkDir) {
       at = 2;
     }
     const options = typeof args[at] === 'object' && args[at] !== null ? args[at] : undefined;
-    checkCommand(name, file, argv, options);
+    checkCommand(name, file, argv, options, hasArgv);
     if (options?.env === undefined || options.env === process.env) return args;
     const out = [...args];
     out[at] = { ...options, env: withGuardEnv(options.env) };
